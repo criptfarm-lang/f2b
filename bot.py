@@ -337,6 +337,14 @@ async def save_media(message: Message, media_type: str):
 
     if media_type == "photo":
         file_id = message.photo[-1].file_id  # берём наибольшее разрешение
+        if not caption:
+            # Уведомляем что фото сохранено без тега
+            await message.reply_text(
+                "📸 Фото сохранено в базу без подписи.
+"
+                "Чтобы его можно было найти, ответь на это фото с подписью — например: *форель трим С*",
+                parse_mode="Markdown"
+            )
     else:
         file_id = message.document.file_id
         caption = caption or message.document.file_name or ""
