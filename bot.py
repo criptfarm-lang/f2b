@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 db = Database()
 
 # ─── Определяем обращение к боту ─────────────────────────────────────────────
-BOT_TRIGGERS = ["бот,", "бот ", "@бот", "bot,", "bot "]
+BOT_TRIGGERS = ["бот,", "бот ", "@бот", "bot,", "bot ", "@f2b_assistant_bot", "@f2b_assistant"]
 
 
 def is_bot_addressed(text: str) -> bool:
@@ -40,7 +40,13 @@ def is_bot_addressed(text: str) -> bool:
     if not text:
         return False
     text_lower = text.lower().strip()
-    return any(text_lower.startswith(t) for t in BOT_TRIGGERS)
+    # Реагируем на обращение в начале или @mention в любом месте
+    if any(text_lower.startswith(t) for t in BOT_TRIGGERS):
+        return True
+    # @mention может быть в любом месте сообщения
+    if "@f2b_assistant" in text_lower:
+        return True
+    return False
 
 
 def clean_query(text: str) -> str:
@@ -64,9 +70,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• бот, мои задачи\n"
         "• бот, контакт Малахова\n\n"
         "Команды:\n"
-        "/задачи — мои открытые задачи\n"
-        "/отчет — отчёт по команде\n"
-        "/помощь — все команды",
+        "/tasks — мои задачи\n"
+        "/report — отчёт\n"
+        "/help — все команды",
         parse_mode="Markdown"
     )
 
@@ -75,11 +81,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *Все команды:*\n\n"
         "*Задачи:*\n"
-        "/задачи — мои открытые задачи\n"
-        "/все\\_задачи — все задачи команды\n"
-        "/просрочка — просроченные задачи\n\n"
+        "/tasks — мои задачи\n"
+        "/all_tasks — все задачи команды\n"
+        "/overdue — просроченные задачи\n\n"
         "*Отчёты:*\n"
-        "/отчет — недельный отчёт\n"
+        "/report — недельный отчёт\n"
         "/дебиторка — срез по дебиторке\n\n"
         "*База знаний:*\n"
         "/фото [товар] — найти фото\n"
@@ -184,7 +190,7 @@ async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск фото по команде /фото [товар]."""
     query = " ".join(context.args) if context.args else ""
     if not query:
-        await update.message.reply_text("Укажи товар: /фото тунец")
+        await update.message.reply_text("Укажи товар: /photo тунец")
         return
     await search_and_send_photo(update, context, query)
 
@@ -205,7 +211,7 @@ async def cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск контакта."""
     query = " ".join(context.args) if context.args else ""
     if not query:
-        await update.message.reply_text("Укажи имя: /контакт Малахов")
+        await update.message.reply_text("Укажи имя: /contact Малахов")
         return
 
     contacts = db.search_contacts(query)
