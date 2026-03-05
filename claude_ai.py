@@ -1,7 +1,6 @@
 """
-Интеграция с Claude API
-- Ответы на свободные вопросы
-- Извлечение задач из сообщений руководителя
+Claude AI — мозг бота F2B PRO
+Все запросы проходят через Claude, который сам решает что делать
 """
 
 import os
@@ -11,40 +10,122 @@ import re
 from anthropic import AsyncAnthropic
 
 logger = logging.getLogger(__name__)
-
 client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-SYSTEM_PROMPT = """Ты — корпоративный ассистент компании F2B PRO (оптовая торговля рыбой и морепродуктами).
-Ты работаешь в Telegram-группах отдела продаж.
+# ─── Список сотрудников для контекста ────────────────────────────────────────
+EMPLOYEES_CONTEXT = """
+Сотрудники компании F2B PRO:
+- Белякова Александра (менеджер закупок) — Александра, Белякова, Саша
+- Алексей Леонтьев — Алексей, Леонтьев, Лёша
+- Ярослав — Ярослав, Ярик
+- Андрей Иванов — Андрей, Иванов
+- Инесса Скляр — Инесса, Скляр
+- Маланчук Александр — Маланчук
+- Карина Баласанян — Карина, Баласанян
+- Елена Мерзлякова — Елена, Лена, Мерзлякова, Марзлякова
+- Татьяна Голубева — Татьяна, Таня, Голубева
+- Васильев Виктор (руководитель) — Виктор, Васильев
+"""
 
-Твои задачи:
-- Отвечать на вопросы сотрудников кратко и по делу
-- Помогать с текстами для клиентов
-- Давать справки по продуктам компании (лосось, форель, тунец, креветки, угорь и др.)
-- Помогать с расчётами, ценами, логистикой
+# ─── Главный промпт-диспетчер ─────────────────────────────────────────────────
+DISPATCHER_PROMPT = f"""Ты — умный диспетчер корпоративного бота компании F2B PRO (оптовая торговля рыбой и морепродуктами).
 
-Стиль: профессиональный, но дружелюбный. Отвечай на русском языке.
-Если не знаешь точного ответа — скажи честно и предложи как найти информацию.
-Отвечай кратко — максимум 3-4 предложения если не просят подробно."""
+{EMPLOYEES_CONTEXT}
+
+Продукция компании: лосось, форель, тунец, креветки, угорь, кальмар, треска, минтай, семга, нерка, кета и другие морепродукты.
+
+Твоя задача — понять запрос пользователя и вернуть JSON с действием.
+
+ДОСТУПНЫЕ ДЕЙСТВИЯ:
+- get_tasks: показать задачи сотрудника
+- get_all_tasks: показать все задачи команды  
+- get_overdue: показать просроченные задачи
+- get_report: недельный отчёт
+- get_debtors: дебиторка
+- find_photo: найти фото товара
+- get_price: получить прайс
+- find_contact: найти контакт
+- answer: ответить на вопрос текстом (когда не подходит ни одно действие выше)
+
+ФОРМАТ ОТВЕТА — только JSON, никакого текста вокруг:
+{{
+  "action": "название_действия",
+  "params": {{
+    // параметры зависят от действия:
+    // get_tasks: "employee" — полное имя из списка сотрудников, или null если спрашивают про себя
+    // find_photo: "query" — название товара для поиска
+    // find_contact: "query" — имя или компания
+    // answer: "text" — готовый ответ пользователю
+  }},
+  "confidence": 0.0-1.0  // уверенность в интерпретации
+}}
+
+ПРИМЕРЫ:
+Запрос: "покажи что висит у Лены"
+Ответ: {{"action": "get_tasks", "params": {{"employee": "Елена Мерзлякова"}}, "confidence": 0.95}}
+
+Запрос: "пришли фото форель трим С"
+Ответ: {{"action": "find_photo", "params": {{"query": "форель трим С"}}, "confidence": 0.99}}
+
+Запрос: "кто должен нам деньги?"
+Ответ: {{"action": "get_debtors", "params": {{}}, "confidence": 0.9}}
+
+Запрос: "какой срок годности у замороженного лосося?"
+Ответ: {{"action": "answer", "params": {{"text": "Срок годности замороженного лосося при температуре -18°C составляет обычно 6-9 месяцев. При -25°C — до 12 месяцев. После разморозки хранить не более 2 суток в холодильнике."}}, "confidence": 0.95}}
+
+Запрос: "мои задачи"
+Ответ: {{"action": "get_tasks", "params": {{"employee": null}}, "confidence": 1.0}}
+
+Отвечай ТОЛЬКО валидным JSON. Никаких пояснений, никакого markdown."""
 
 
-async def ask_claude(query: str, context: str = "") -> str:
-    """Отправляет вопрос Claude и возвращает ответ."""
+async def dispatch(query: str, user_name: str, context_data: str = "") -> dict:
+    """
+    Главная функция — Claude разбирает запрос и возвращает действие.
+    Возвращает dict: {"action": "...", "params": {...}, "confidence": 0.9}
+    """
     try:
-        user_content = query
-        if context:
-            user_content = f"Контекст о компании:\n{context}\n\nВопрос: {query}"
+        user_context = f"Запрос от: {user_name}\nКонтекст системы: {context_data}\n\nЗапрос: {query}"
 
         response = await client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1000,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_content}]
+            max_tokens=500,
+            system=DISPATCHER_PROMPT,
+            messages=[{"role": "user", "content": user_context}]
+        )
+
+        raw = response.content[0].text.strip()
+        raw = re.sub(r"```json|```", "", raw).strip()
+        result = json.loads(raw)
+        logger.info(f"Dispatch: '{query}' → {result['action']} (conf={result.get('confidence', '?')})")
+        return result
+
+    except Exception as e:
+        logger.error(f"Dispatch error: {e}")
+        # Фолбек — отправить на текстовый ответ
+        return {"action": "answer", "params": {"text": "Не смог разобрать запрос. Попробуй переформулировать."}, "confidence": 0.0}
+
+
+async def smart_answer(query: str, user_name: str, context_data: str = "") -> str:
+    """Умный ответ на вопрос — когда нужен текст, а не действие."""
+    try:
+        system = f"""Ты — корпоративный ассистент компании F2B PRO (оптовая торговля рыбой и морепродуктами).
+{EMPLOYEES_CONTEXT}
+Контекст системы: {context_data}
+
+Отвечай кратко, по делу, на русском языке. Максимум 4-5 предложений если не просят подробнее.
+Если вопрос про рыбу/морепродукты — отвечай профессионально как эксперт отрасли."""
+
+        response = await client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=800,
+            system=system,
+            messages=[{"role": "user", "content": f"{user_name} спрашивает: {query}"}]
         )
         return response.content[0].text
 
     except Exception as e:
-        logger.error(f"Ошибка Claude API: {e}")
+        logger.error(f"Smart answer error: {e}")
         return "Извини, не смог обработать запрос. Попробуй позже."
 
 
@@ -54,20 +135,26 @@ async def extract_tasks_from_message(text: str, author: str) -> list:
     Возвращает список: [{"task": "...", "executor": "...", "deadline": "YYYY-MM-DD"}]
     """
     try:
-        prompt = f"""Проанализируй сообщение руководителя и извлеки из него задачи для сотрудников.
+        prompt = f"""Ты анализируешь сообщение руководителя компании F2B PRO и извлекаешь из него задачи.
+
+{EMPLOYEES_CONTEXT}
 
 Сообщение от {author}:
 \"\"\"{text}\"\"\"
 
-Верни ТОЛЬКО JSON массив. Каждая задача:
+Верни ТОЛЬКО JSON массив задач. Каждая задача:
 {{
-  "task": "краткое описание задачи",
-  "executor": "имя исполнителя (если указано, иначе пустая строка)",
-  "deadline": "дата в формате YYYY-MM-DD (если указана, иначе null)"
+  "task": "краткое чёткое описание задачи",
+  "executor": "полное имя исполнителя из списка сотрудников (если упомянут), иначе пустая строка",
+  "deadline": "дата в формате YYYY-MM-DD если указана (учти 'до конца марта' = 2026-03-31, 'до пятницы' = ближайшая пятница), иначе null"
 }}
 
-Если задач нет — верни пустой массив [].
-Не включай общие объявления и информационные сообщения — только конкретные поручения.
+Правила:
+- Извлекай только конкретные поручения, не общую информацию
+- Если задача адресована нескольким людям — создай отдельную запись для каждого
+- Если исполнитель не указан явно — попробуй определить по контексту
+- Если задач нет — верни []
+
 Только JSON, без пояснений."""
 
         response = await client.messages.create(
@@ -77,51 +164,42 @@ async def extract_tasks_from_message(text: str, author: str) -> list:
         )
 
         raw = response.content[0].text.strip()
-        # Убираем markdown-обёртку если есть
         raw = re.sub(r"```json|```", "", raw).strip()
         tasks = json.loads(raw)
         return tasks if isinstance(tasks, list) else []
 
     except Exception as e:
-        logger.warning(f"Не удалось извлечь задачи: {e}")
+        logger.warning(f"Task extraction error: {e}")
         return []
 
 
 async def generate_morning_summary(tasks_today: list, tasks_overdue: list) -> str:
-    """Генерирует утреннюю сводку для отправки в группу."""
+    """Генерирует утреннюю сводку."""
     try:
-        tasks_str = "\n".join([f"- {t['executor']}: {t['text']}" for t in tasks_today]) or "нет"
-        overdue_str = "\n".join([f"- {t['executor']}: {t['text']} [срок: {t['deadline']}]"
+        tasks_str = "\n".join([f"- {t.get('executor','?')}: {t['text']}" for t in tasks_today]) or "нет"
+        overdue_str = "\n".join([f"- {t.get('executor','?')}: {t['text']} [срок: {t.get('deadline','?')}]"
                                   for t in tasks_overdue]) or "нет"
-
-        prompt = f"""Составь короткое утреннее сообщение для рабочей группы в Telegram.
-
-Задачи на сегодня:
-{tasks_str}
-
-Просроченные задачи:
-{overdue_str}
-
-Стиль: деловой, краткий, мотивирующий. Используй эмодзи уместно.
-Максимум 15 строк."""
 
         response = await client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=500,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content":
+                f"Составь короткое деловое утреннее сообщение для рабочей Telegram-группы.\n\n"
+                f"Задачи на сегодня:\n{tasks_str}\n\n"
+                f"Просроченные задачи:\n{overdue_str}\n\n"
+                f"Стиль: деловой, краткий. Используй эмодзи уместно. Максимум 12 строк."}]
         )
         return response.content[0].text
 
     except Exception as e:
-        logger.error(f"Ошибка генерации сводки: {e}")
-        # Фолбек без Claude
-        lines = ["🌅 *Доброе утро, команда F2B PRO!*\n"]
+        logger.error(f"Morning summary error: {e}")
+        lines = ["🌅 *Доброе утро, F2B PRO!*\n"]
         if tasks_today:
             lines.append("📋 *На сегодня:*")
             for t in tasks_today:
-                lines.append(f"• {t.get('executor', '?')}: {t['text']}")
+                lines.append(f"• {t.get('executor','?')}: {t['text']}")
         if tasks_overdue:
-            lines.append("\n🔴 *Просрочено — требует внимания:*")
+            lines.append("\n🔴 *Просрочено:*")
             for t in tasks_overdue:
-                lines.append(f"• {t.get('executor', '?')}: {t['text']} [{t.get('deadline')}]")
+                lines.append(f"• {t.get('executor','?')}: {t['text']}")
         return "\n".join(lines)
