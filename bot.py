@@ -363,7 +363,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_chat_action("typing")
     context_data = db.get_context_summary()
 
+    logger.info(f"Dispatching query='{query}' from '{user.full_name}'")
     result = await dispatch(query, user.full_name, context_data)
+    logger.info(f"Dispatch result: {result}")
     action = result.get("action", "answer")
     params = result.get("params", {})
 
