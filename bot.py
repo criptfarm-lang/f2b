@@ -19,7 +19,7 @@ from telegram.ext import (
 
 from database import Database
 from scheduler import setup_scheduler
-from claude_ai import ask_claude, extract_tasks_from_message
+from claude_ai import dispatch, smart_answer, extract_tasks_from_message
 
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
 EMPLOYEES = {
@@ -356,67 +356,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = clean_query(text)
     query_lower = query.lower()
 
-    # ── Поиск фото ──
-    if any(w in query_lower for w in ["фото", "photo", "картинк", "покажи"]):
-        product = re.sub(r"(фото|photo|картинк\w*|покажи|пришли|дай)", "", query_lower).strip()
-        await search_and_send_photo(update, context, product or query)
-        return
+    # ── Всё через Claude — он сам разбирается что нужно ──
+    await message.reply_chat_action("typing")
+    context_data = db.get_context_summary()
 
-    # ── Прайс ──
-    if any(w in query_lower for w in ["прайс", "цен", "price", "стоимость", "почём"]):
-        await cmd_price(update, context)
-        return
+    result = await dispatch(query, user.full_name, context_data)
+    action = result.get("action", "answer")
+    params = result.get("params", {})
 
-    # ── Задачи ──
-    if any(w in query_lower for w in ["задачи", "что делать", "что надо", "мои задачи", "поручения", "задание"]):
-        # Ищем упоминание сотрудника в запросе через словарь EMPLOYEES
-        target_name = find_employee(query_lower)
-
-        if target_name:
-            tasks = db.get_tasks_for_user(target_name)
+    if action == "get_tasks":
+        employee = params.get("employee")
+        if employee:
+            tasks = db.get_tasks_for_user(employee)
             if not tasks:
-                await message.reply_text(
-                    f"✅ У *{target_name}* нет открытых задач.",
-                    parse_mode="Markdown"
-                )
+                await message.reply_text(f"✅ У *{employee}* нет открытых задач.", parse_mode="Markdown")
             else:
-                lines = [f"📋 *Задачи — {target_name}:*\n"]
+                lines = [f"📋 *Задачи — {employee}:*\n"]
                 for t in tasks:
                     deadline_str = f" — до {t['deadline']}" if t.get("deadline") else ""
                     icon = "🔴" if t.get("overdue") else "🟡"
                     lines.append(f"{icon} {t['text']}{deadline_str}")
                 await message.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
-            # Имя не найдено — показываем задачи спрашивающего
             await cmd_my_tasks(update, context)
-        return
 
-    # ── Дебиторка ──
-    if any(w in query_lower for w in ["дебиторк", "долг", "оплат", "должн"]):
+    elif action == "get_all_tasks":
+        await cmd_all_tasks(update, context)
+
+    elif action == "get_overdue":
+        await cmd_overdue(update, context)
+
+    elif action == "get_report":
+        await cmd_report(update, context)
+
+    elif action == "get_debtors":
         await cmd_debtors(update, context)
-        return
 
-    # ── Контакт ──
-    if any(w in query_lower for w in ["контакт", "телефон", "номер", "связаться"]):
-        name = re.sub(r"(контакт|телефон|номер|связаться с|найди)", "", query_lower).strip()
-        contacts = db.search_contacts(name)
+    elif action == "find_photo":
+        photo_query = params.get("query", query)
+        await search_and_send_photo(update, context, photo_query)
+
+    elif action == "get_price":
+        await cmd_price(update, context)
+
+    elif action == "find_contact":
+        contact_query = params.get("query", "")
+        contacts = db.search_contacts(contact_query)
         if contacts:
             lines = [f"📞 *{c['name']}* — {c['phone']} ({c.get('company', '')})" for c in contacts]
             await message.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
-            await message.reply_text(f"Контакт '{name}' не найден.")
-        return
+            await message.reply_text(f"Контакт '{contact_query}' не найден в базе.")
 
-    # ── Отчёт ──
-    if any(w in query_lower for w in ["отчёт", "отчет", "статистик", "итог"]):
-        await cmd_report(update, context)
-        return
+    elif action == "answer":
+        text = params.get("text")
+        if text:
+            await message.reply_text(text)
+        else:
+            # Claude не дал готовый ответ — спрашиваем отдельно
+            response = await smart_answer(query, user.full_name, context_data)
+            await message.reply_text(response)
 
-    # ── Всё остальное — отправляем Claude ──
-    await message.reply_chat_action("typing")
-    context_data = db.get_context_summary()
-    response = await ask_claude(query, context_data)
-    await message.reply_text(response)
+    else:
+        # Неизвестное действие — текстовый ответ
+        response = await smart_answer(query, user.full_name, context_data)
+        await message.reply_text(response)
 
 
 async def save_media(message: Message, media_type: str):
