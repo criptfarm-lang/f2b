@@ -326,28 +326,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Message from user.id={user.id}, name={user.full_name}, manager_ids={manager_ids}")
 
     if user.id in manager_ids and len(text) > 15:
-        tasks = await extract_tasks_from_message(text, user.full_name)
-        for task in tasks:
-            db.save_task(
-                text=task["task"],
-                executor=task.get("executor", ""),
-                deadline=task.get("deadline"),
-                source_chat=chat_id,
-                source_message_id=message.message_id,
-                created_by=user.full_name
-            )
-            if task.get("executor") and task.get("task"):
-                logger.info(f"Задача извлечена: {task['executor']} → {task['task']}")
-                # Уведомляем в чат что задача зафиксирована
-                executor = task.get("executor", "")
-                deadline = task.get("deadline")
-                deadline_str = f" до {deadline}" if deadline else ""
-                await message.reply_text(
-                    f"📌 Задача зафиксирована\n"
-                    f"👤 Исполнитель: *{executor}*{deadline_str}\n"
-                    f"📝 {task['task']}",
-                    parse_mode="Markdown"
-                )
+        # Не обрабатываем обращения к боту как задачи
+        if not is_bot_addressed(text):
+            tasks = await extract_tasks_from_message(text, user.full_name)
+            saved_count = 0
+            task_lines = []
+            for task in tasks:
+                if task.get("task"):
+                    db.save_task(
+                        text=task["task"],
+                        executor=task.get("executor", ""),
+                        deadline=task.get("deadline"),
+                        source_chat=chat_id,
+                        source_message_id=message.message_id,
+                        created_by=user.full_name
+                    )
+                    saved_count += 1
+                    executor = task.get("executor", "—")
+                    deadline = task.get("deadline")
+                    deadline_str = f" · до {deadline}" if deadline else ""
+                    task_lines.append(f"👤 *{executor}*{deadline_str}: {task['task']}")
+                    logger.info(f"Задача: {executor} → {task['task']}")
+
+            if saved_count > 0:
+                lines = [f"📌 Зафиксировано задач: {saved_count}\n"] + task_lines
+                await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     # 3. Реагируем на обращение к боту
     if not is_bot_addressed(text):
