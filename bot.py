@@ -20,6 +20,7 @@ from telegram.ext import (
 from database import Database
 from scheduler import setup_scheduler
 from claude_ai import dispatch, smart_answer, extract_tasks_from_message
+from moysklad import search_products, get_price_list, format_products, format_price_list, get_product_image, download_image
 
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
 EMPLOYEES = {
@@ -402,7 +403,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await search_and_send_photo(update, context, photo_query)
 
     elif action == "get_price":
+        # Сначала пробуем МойСклад
+        ms_token = os.getenv("MOYSKLAD_TOKEN")
+        if ms_token:
+            await message.reply_chat_action("typing")
+            products = await get_price_list(limit=50)
+            if products:
+                text = format_price_list(products)
+                # Telegram ограничивает 4096 символов
+                if len(text) > 4000:
+                    text = text[:3900] + "\n\n_...показаны первые позиции_"
+                await message.reply_text(text, parse_mode="Markdown")
+                return
         await cmd_price(update, context)
+
+    elif action == "ms_search":
+        # Поиск товара в МойСклад
+        ms_query = params.get("query", query)
+        await message.reply_chat_action("typing")
+        products = await search_products(ms_query)
+        text = format_products(products, ms_query)
+        if len(text) > 4000:
+            text = text[:3900] + "\n\n_...слишком много результатов, уточни запрос_"
+        await message.reply_text(text, parse_mode="Markdown")
+
+        # Если один товар и есть фото — пробуем прислать
+        if len(products) == 1 and products[0].get("image_href"):
+            try:
+                img_bytes = await download_image(products[0]["image_href"])
+                if img_bytes:
+                    import io
+                    await message.reply_photo(
+                        photo=io.BytesIO(img_bytes),
+                        caption=f"📸 {products[0]['name']}"
+                    )
+            except Exception as e:
+                logger.warning(f"Не удалось отправить фото из МойСклад: {e}")
 
     elif action == "find_contact":
         contact_query = params.get("query", "")
