@@ -54,7 +54,7 @@ def setup_scheduler(app: Application, db):
     # Пн–пт 17:00 — напоминание прислать реестр (для Беляковой)
     scheduler.add_job(
         registry_reminder,
-        CronTrigger(day_of_week="mon-fri", hour=17, minute=0),
+        CronTrigger(day_of_week="mon-fri", hour=18, minute=0),
         args=[app, db],
         id="registry_reminder"
     )
