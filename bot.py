@@ -21,6 +21,64 @@ from database import Database
 from scheduler import setup_scheduler
 from claude_ai import ask_claude, extract_tasks_from_message
 
+# ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
+EMPLOYEES = {
+    "Белякова Александра": [
+        "александра", "александры", "александре", "александру",
+        "белякова", "беляковой", "белякову",
+        "саша", "саши", "саше", "сашу",
+    ],
+    "Алексей Леонтьев": [
+        "алексей", "алексея", "алексею", "алексеем",
+        "леонтьев", "леонтьева", "леонтьеву",
+        "лёша", "лёши", "лёше", "леша", "леши", "лёшу",
+    ],
+    "Ярослав": [
+        "ярослав", "ярослава", "ярославу", "ярославом",
+        "ярик", "ярика", "ярику",
+    ],
+    "Андрей Иванов": [
+        "андрей", "андрея", "андрею", "андреем",
+        "иванов", "иванова", "иванову",
+    ],
+    "Инесса Скляр": [
+        "инесса", "инессы", "инессе", "инессу", "инессой",
+        "скляр",
+    ],
+    "Маланчук Александр": [
+        "маланчук", "маланчука", "маланчуку",
+    ],
+    "Карина Баласанян": [
+        "карина", "карины", "карине", "карину", "кариной",
+        "баласанян",
+    ],
+    "Елена Мерзлякова": [
+        "елена", "елены", "елене", "елену", "еленой",
+        "мерзлякова", "мерзляковой", "мерзлякову",
+        "марзлякова", "марзляковой",
+        "лена", "лены", "лене", "лену", "леной",
+    ],
+    "Татьяна Голубева": [
+        "татьяна", "татьяны", "татьяне", "татьяну", "татьяной",
+        "голубева", "голубевой", "голубеву",
+        "таня", "тани", "тане", "таню", "таней",
+    ],
+}
+
+def find_employee(query: str) -> str | None:
+    """Ищет сотрудника по любому варианту имени/фамилии в запросе."""
+    query_lower = query.lower()
+    # Сначала ищем точное совпадение слова
+    for full_name, variants in EMPLOYEES.items():
+        for variant in variants:
+            # Проверяем что вариант встречается как отдельное слово
+            import re as _re
+            if _re.search(r"\b" + _re.escape(variant) + r"\b", query_lower):
+                return full_name
+    return None
+
+
+
 # ─── Логирование ────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -277,6 +335,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if task.get("executor") and task.get("task"):
                 logger.info(f"Задача извлечена: {task['executor']} → {task['task']}")
+                # Уведомляем в чат что задача зафиксирована
+                executor = task.get("executor", "")
+                deadline = task.get("deadline")
+                deadline_str = f" до {deadline}" if deadline else ""
+                await message.reply_text(
+                    f"📌 Задача зафиксирована\n"
+                    f"👤 Исполнитель: *{executor}*{deadline_str}\n"
+                    f"📝 {task['task']}",
+                    parse_mode="Markdown"
+                )
 
     # 3. Реагируем на обращение к боту
     if not is_bot_addressed(text):
@@ -297,8 +365,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Задачи ──
-    if any(w in query_lower for w in ["мои задачи", "задачи", "что делать", "что надо"]):
-        await cmd_my_tasks(update, context)
+    if any(w in query_lower for w in ["задачи", "что делать", "что надо", "мои задачи", "поручения", "задание"]):
+        # Ищем упоминание сотрудника в запросе через словарь EMPLOYEES
+        target_name = find_employee(query_lower)
+
+        if target_name:
+            tasks = db.get_tasks_for_user(target_name)
+            if not tasks:
+                await message.reply_text(
+                    f"✅ У *{target_name}* нет открытых задач.",
+                    parse_mode="Markdown"
+                )
+            else:
+                lines = [f"📋 *Задачи — {target_name}:*\n"]
+                for t in tasks:
+                    deadline_str = f" — до {t['deadline']}" if t.get("deadline") else ""
+                    icon = "🔴" if t.get("overdue") else "🟡"
+                    lines.append(f"{icon} {t['text']}{deadline_str}")
+                await message.reply_text("\n".join(lines), parse_mode="Markdown")
+        else:
+            # Имя не найдено — показываем задачи спрашивающего
+            await cmd_my_tasks(update, context)
         return
 
     # ── Дебиторка ──
