@@ -35,7 +35,13 @@ async def search_products(query: str, limit: int = 20) -> list:
             # Разбиваем запрос на ключевые слова и ищем по каждому
             # Берём самое длинное слово как основной фильтр (лучшая селективность)
             stop_words = {"с", "в", "на", "по", "из", "от", "до", "и", "а", "кг", "см", "г"}
-            words = [w for w in query.lower().split() if len(w) > 2 and w not in stop_words]
+            words = [
+                w.lower() for w in query.split()
+                if w not in stop_words and (
+                    len(w) > 2 or  # обычные слова
+                    w.isupper()    # аббревиатуры: ПР, СС, ОХЛ и т.д.
+                )
+            ]
 
             all_products = []
             seen_ids = set()
