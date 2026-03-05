@@ -40,14 +40,22 @@ async def search_products(query: str, limit: int = 10) -> list:
                 "expand": "productFolder",
             }
             async with session.get(url, headers=get_headers(), params=params) as resp:
+                text = await resp.text()
+                logger.info(f"МойСклад search status={resp.status}, body={text[:500]}")
                 if resp.status != 200:
-                    text = await resp.text()
                     logger.error(f"МойСклад search error {resp.status}: {text}")
                     return []
-                data = await resp.json()
+                import json as _json
+                data = _json.loads(text)
 
             products = data.get("rows", [])
+            logger.info(f"МойСклад found {len(products)} products for query='{query}'")
             if not products:
+                # Попробуем поиск без фильтра чтобы проверить что API вообще работает
+                async with session.get(url, headers=get_headers(), params={"limit": 3}) as resp2:
+                    data2 = await resp2.json()
+                    sample = [r.get("name") for r in data2.get("rows", [])]
+                    logger.info(f"МойСклад sample products (no filter): {sample}")
                 return []
 
             # 2. Получаем остатки одним запросом
