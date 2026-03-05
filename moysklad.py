@@ -61,13 +61,28 @@ async def search_products(query: str, limit: int = 20) -> list:
                         seen_ids.add(p["id"])
                         all_products.append(p)
 
-            # Сортируем — сначала те у кого больше совпадений с запросом
+            # Нормализуем окончания для нечёткого совпадения (черную → черн)
+            def normalize(word):
+                return word[:-2] if len(word) > 5 else word
+
             def score(p):
                 name = p.get("name", "").lower()
-                return sum(1 for w in words if w in name)
+                return sum(1 for w in words
+                           if w in name or normalize(w) in name)
 
-            all_products.sort(key=score, reverse=True)
-            products = all_products[:limit]
+            if words:
+                # Строгий фильтр — все слова (с нормализацией)
+                strict = [p for p in all_products if score(p) == len(words)]
+                if strict:
+                    products = strict[:limit]
+                else:
+                    # Мягкий — хотя бы половина слов, сортируем по релевантности
+                    threshold = max(1, len(words) // 2)
+                    soft = [p for p in all_products if score(p) >= threshold]
+                    soft.sort(key=score, reverse=True)
+                    products = soft[:limit]
+            else:
+                products = all_products[:limit]
 
             logger.info(f"МойСклад found {len(products)} products for query='{query}' (words={words})")
             if not products:
