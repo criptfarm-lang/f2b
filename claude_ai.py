@@ -95,15 +95,27 @@ async def dispatch(query: str, user_name: str, context_data: str = "") -> dict:
         )
 
         raw = response.content[0].text.strip()
+        logger.info(f"Dispatch raw response: {raw!r}")
+
+        # Убираем markdown обёртку
         raw = re.sub(r"```json|```", "", raw).strip()
+
+        # Ищем JSON даже если вокруг есть текст
+        json_match = re.search(r'[{].*[}]', raw, re.DOTALL)
+        if json_match:
+            raw = json_match.group(0)
+
         result = json.loads(raw)
         logger.info(f"Dispatch: '{query}' → {result['action']} (conf={result.get('confidence', '?')})")
         return result
 
+    except json.JSONDecodeError as e:
+        logger.error(f"Dispatch JSON error: {e}, raw: {raw!r}")
+        # Фолбек на умный текстовый ответ
+        return {"action": "answer", "params": {"text": None}, "confidence": 0.0}
     except Exception as e:
         logger.error(f"Dispatch error: {e}")
-        # Фолбек — отправить на текстовый ответ
-        return {"action": "answer", "params": {"text": "Не смог разобрать запрос. Попробуй переформулировать."}, "confidence": 0.0}
+        return {"action": "answer", "params": {"text": None}, "confidence": 0.0}
 
 
 async def smart_answer(query: str, user_name: str, context_data: str = "") -> str:
