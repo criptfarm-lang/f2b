@@ -27,35 +27,50 @@ def get_headers():
     }
 
 
-async def search_products(query: str, limit: int = 10) -> list:
+async def search_products(query: str, limit: int = 20) -> list:
     """Ищет товары по названию, возвращает список с остатками и ценами."""
     try:
         async with aiohttp.ClientSession() as session:
 
-            # 1. Ищем товары
-            url = f"{MS_BASE}/entity/product"
-            params = {
-                "filter": f"name~{query}",
-                "limit": limit,
-                "expand": "productFolder",
-            }
-            async with session.get(url, headers=get_headers(), params=params) as resp:
-                text = await resp.text()
-                logger.info(f"МойСклад search status={resp.status}, body={text[:500]}")
-                if resp.status != 200:
-                    logger.error(f"МойСклад search error {resp.status}: {text}")
-                    return []
-                import json as _json
-                data = _json.loads(text)
+            # Разбиваем запрос на ключевые слова и ищем по каждому
+            # Берём самое длинное слово как основной фильтр (лучшая селективность)
+            stop_words = {"с", "в", "на", "по", "из", "от", "до", "и", "а", "кг", "см", "г"}
+            words = [w for w in query.lower().split() if len(w) > 2 and w not in stop_words]
 
-            products = data.get("rows", [])
-            logger.info(f"МойСклад found {len(products)} products for query='{query}'")
+            all_products = []
+            seen_ids = set()
+
+            url = f"{MS_BASE}/entity/product"
+
+            # Ищем по каждому слову отдельно
+            search_terms = words[:3] if words else [query]
+            for term in search_terms:
+                params = {
+                    "filter": f"name~{term}",
+                    "limit": limit,
+                }
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.error(f"МойСклад search error {resp.status}: {text[:200]}")
+                        continue
+                    data = await resp.json()
+
+                for p in data.get("rows", []):
+                    if p["id"] not in seen_ids:
+                        seen_ids.add(p["id"])
+                        all_products.append(p)
+
+            # Сортируем — сначала те у кого больше совпадений с запросом
+            def score(p):
+                name = p.get("name", "").lower()
+                return sum(1 for w in words if w in name)
+
+            all_products.sort(key=score, reverse=True)
+            products = all_products[:limit]
+
+            logger.info(f"МойСклад found {len(products)} products for query='{query}' (words={words})")
             if not products:
-                # Попробуем поиск без фильтра чтобы проверить что API вообще работает
-                async with session.get(url, headers=get_headers(), params={"limit": 3}) as resp2:
-                    data2 = await resp2.json()
-                    sample = [r.get("name") for r in data2.get("rows", [])]
-                    logger.info(f"МойСклад sample products (no filter): {sample}")
                 return []
 
             # 2. Получаем остатки одним запросом
