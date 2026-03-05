@@ -10,7 +10,13 @@ import re
 from anthropic import AsyncAnthropic
 
 logger = logging.getLogger(__name__)
-client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+def get_client():
+    """Lazy client init — ensures env vars are loaded."""
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY not set!")
+    return AsyncAnthropic(api_key=api_key)
 
 # ─── Список сотрудников для контекста ────────────────────────────────────────
 EMPLOYEES_CONTEXT = """
@@ -87,7 +93,7 @@ async def dispatch(query: str, user_name: str, context_data: str = "") -> dict:
     try:
         user_context = f"Запрос от: {user_name}\nКонтекст системы: {context_data}\n\nЗапрос: {query}"
 
-        response = await client.messages.create(
+        response = await get_client().messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=500,
             system=DISPATCHER_PROMPT,
@@ -128,7 +134,7 @@ async def smart_answer(query: str, user_name: str, context_data: str = "") -> st
 Отвечай кратко, по делу, на русском языке. Максимум 4-5 предложений если не просят подробнее.
 Если вопрос про рыбу/морепродукты — отвечай профессионально как эксперт отрасли."""
 
-        response = await client.messages.create(
+        response = await get_client().messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=800,
             system=system,
@@ -169,7 +175,7 @@ async def extract_tasks_from_message(text: str, author: str) -> list:
 
 Только JSON, без пояснений."""
 
-        response = await client.messages.create(
+        response = await get_client().messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}]
@@ -192,7 +198,7 @@ async def generate_morning_summary(tasks_today: list, tasks_overdue: list) -> st
         overdue_str = "\n".join([f"- {t.get('executor','?')}: {t['text']} [срок: {t.get('deadline','?')}]"
                                   for t in tasks_overdue]) or "нет"
 
-        response = await client.messages.create(
+        response = await get_client().messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=500,
             messages=[{"role": "user", "content":
