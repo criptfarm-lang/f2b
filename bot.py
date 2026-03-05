@@ -322,6 +322,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     manager_ids_str = os.getenv("MANAGER_IDS", "")
     manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
 
+    # Логируем ID для диагностики
+    logger.info(f"Message from user.id={user.id}, name={user.full_name}, manager_ids={manager_ids}")
+
     if user.id in manager_ids and len(text) > 15:
         tasks = await extract_tasks_from_message(text, user.full_name)
         for task in tasks:
