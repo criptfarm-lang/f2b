@@ -90,7 +90,7 @@ logger = logging.getLogger(__name__)
 db = Database()
 
 # ─── Определяем обращение к боту ─────────────────────────────────────────────
-BOT_TRIGGERS = ["бот,", "бот ", "@бот", "bot,", "bot ", "@f2b_assistant_bot", "@f2b_assistant"]
+BOT_TRIGGERS = ["эф,", "эф ", "бот,", "бот ", "@эф", "bot,", "bot ", "@f2b_assistant_bot", "@f2b_assistant"]
 
 
 def is_bot_addressed(text: str) -> bool:
@@ -102,7 +102,7 @@ def is_bot_addressed(text: str) -> bool:
     if any(text_lower.startswith(t) for t in BOT_TRIGGERS):
         return True
     # @mention может быть в любом месте сообщения
-    if "@f2b_assistant" in text_lower:
+    if "@f2b_assistant" in text_lower or "эф," in text_lower or text_lower.startswith("эф "):
         return True
     return False
 
@@ -120,13 +120,13 @@ def clean_query(text: str) -> str:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я ассистент F2B PRO.\n\n"
-        "Обращайся ко мне: *бот, [вопрос]*\n\n"
+        "👋 Привет! Я Эф — ассистент F2B PRO.\n\n"
+        "Обращайся ко мне: *Эф, [вопрос]*\n\n"
         "Примеры:\n"
-        "• бот, пришли фото тунца\n"
-        "• бот, какая цена на лосось?\n"
-        "• бот, мои задачи\n"
-        "• бот, контакт Малахова\n\n"
+        "• Эф, пришли фото тунца\n"
+        "• Эф, какая цена на лосось?\n"
+        "• Эф, задачи Карины\n"
+        "• Эф, кто нам должен?\n\n"
         "Команды:\n"
         "/tasks — мои задачи\n"
         "/report — отчёт\n"
