@@ -20,7 +20,7 @@ from telegram.ext import (
 from database import Database
 from scheduler import setup_scheduler
 from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion
-from moysklad import search_products, get_price_list, format_products, format_price_list, get_product_image, download_image, get_image_download_url
+from moysklad import search_products, search_products_filtered, get_price_list, format_products, format_price_list, get_product_image, download_image, get_image_download_url
 
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
 EMPLOYEES = {
@@ -445,10 +445,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_price(update, context)
 
     elif action == "ms_search":
-        # Поиск товара в МойСклад
+        # Поиск товара в МойСклад — Claude разбирает запрос на фильтры
         ms_query = params.get("query", query)
         await message.reply_chat_action("typing")
-        products = await search_products(ms_query)
+        parsed = await parse_product_query(ms_query)
+        products = await search_products_filtered(parsed)
+        if not products:
+            products = await search_products(ms_query)
         text = format_products(products, ms_query)
         if len(text) > 4000:
             text = text[:3900] + "\n\n_...слишком много результатов, уточни запрос_"
