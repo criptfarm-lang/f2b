@@ -473,30 +473,40 @@ async def search_products_filtered(parsed: dict, limit: int = 20) -> list:
 
 
 async def get_counterparty_balance(query: str) -> list:
-    """Ищет контрагента по имени и возвращает его баланс (дебиторку).
-    Баланс в МойСклад: отрицательный = нам должны (дебиторка).
-    """
+    """Ищет контрагента по имени и возвращает баланс через /report/counterparty."""
     try:
         async with aiohttp.ClientSession() as session:
+            # Шаг 1: найти контрагента по имени
             url = f"{MS_BASE}/entity/counterparty"
-            params = {
-                "filter": f"name~{query}",
-                "limit": 10,
-            }
+            params = {"filter": f"name~{query}", "limit": 10}
             async with session.get(url, headers=get_headers(), params=params) as resp:
                 if resp.status != 200:
-                    text = await resp.text()
-                    logger.error(f"counterparty search error {resp.status}: {text[:200]}")
+                    logger.error(f"counterparty search {resp.status}")
                     return []
                 data = await resp.json()
 
+            rows = data.get("rows", [])
+            if not rows:
+                return []
+
+            # Шаг 2: для каждого контрагента получить баланс через report
             result = []
-            for c in data.get("rows", []):
-                balance = c.get("balance", 0) or 0
-                # В МойСклад: положительный баланс = нам должны (дебиторка)
+            for c in rows:
+                cid = c["id"]
+                report_url = f"{MS_BASE}/report/counterparty/{cid}"
+                async with session.get(report_url, headers=get_headers()) as resp2:
+                    if resp2.status != 200:
+                        body = await resp2.text()
+                        logger.error(f"counterparty report {resp2.status}: {body[:200]}")
+                        balance = 0
+                    else:
+                        rdata = await resp2.json()
+                        logger.info(f"counterparty report keys: {list(rdata.keys())}")
+                        balance = rdata.get("balance", 0) or 0
+
                 debt = balance if balance > 0 else 0
                 result.append({
-                    "id": c["id"],
+                    "id": cid,
                     "name": c.get("name", ""),
                     "balance": balance,
                     "debt": debt,
@@ -504,31 +514,32 @@ async def get_counterparty_balance(query: str) -> list:
             return result
 
     except Exception as e:
-        logger.error(f"get_counterparty_balance error: {e}")
+        logger.error(f"get_counterparty_balance error: {e}", exc_info=True)
         return []
 
 
 async def get_all_debtors() -> list:
-    """Получает всех контрагентов с долгами из МойСклад."""
+    """Получает всех контрагентов с долгами через /report/counterparty."""
     try:
         async with aiohttp.ClientSession() as session:
-            url = f"{MS_BASE}/entity/counterparty"
-            params = {
-                "limit": 100,
-                "filter": "balance>0",
-            }
+            # /report/counterparty возвращает список с балансами
+            url = f"{MS_BASE}/report/counterparty"
+            params = {"limit": 100}
             async with session.get(url, headers=get_headers(), params=params) as resp:
                 if resp.status != 200:
+                    body = await resp.text()
+                    logger.error(f"report/counterparty {resp.status}: {body[:200]}")
                     return []
                 data = await resp.json()
 
             result = []
             for c in data.get("rows", []):
                 balance = c.get("balance", 0) or 0
-                if balance > 0:
+                if balance > 0:  # положительный = нам должны
+                    name = c.get("counterparty", {}).get("name", c.get("name", ""))
                     result.append({
-                        "id": c["id"],
-                        "name": c.get("name", ""),
+                        "id": c.get("counterparty", {}).get("id", ""),
+                        "name": name,
                         "debt": balance,
                     })
 
