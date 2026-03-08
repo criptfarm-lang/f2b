@@ -1066,7 +1066,8 @@ def format_overdue_demands(items: list, tag: str = None) -> str:
         demands = c.get("demands", [])
         if len(demands) > 1:
             for d in demands:
-                lines.append(f"   └ {d['name']} · {d['due']} · {fmt_money(d['unpaid'])}")
+                due_fmt = '.'.join(reversed(d['due'].split('-'))) if d['due'] else d['due']
+                lines.append(f"   └ {d['name']} · {due_fmt} · {fmt_money(d['unpaid'])}")
         lines.append("")
 
     return "\n".join(lines).rstrip()
@@ -1082,7 +1083,8 @@ def format_debt_reminder(client: dict) -> str:
         "",
     ]
     for d in demands:
-        lines.append(f"• Заказ {d['name']} от {d['due']} — {fmt_money(d['unpaid'])}")
+        due_fmt = '.'.join(reversed(d['due'].split('-'))) if d['due'] else d['due']
+        lines.append(f"• Заказ {d['name']} от {due_fmt} — {fmt_money(d['unpaid'])}")
     lines += [
         "",
         f"Итого к оплате: {fmt_money(client['overdue_sum'])}",
