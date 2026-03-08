@@ -991,6 +991,7 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
 
                 if agent_id not in by_agent:
                     by_agent[agent_id] = {
+                        "id": agent_id,
                         "name": agent_name,
                         "overdue_sum": 0,
                         "max_days": 0,
@@ -1007,6 +1008,30 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                 })
 
             result = list(by_agent.values())
+
+            # Проверяем реальный баланс через report/counterparty
+            # Просрочка не может превышать общий долг клиента
+            for agent in result:
+                try:
+                    report_url = f"{MS_BASE}/report/counterparty/{agent['id']}"
+                    async with session.get(report_url, headers=get_headers()) as rr:
+                        if rr.status == 200:
+                            rdata = await rr.json()
+                            real_balance = (rdata.get("balance", 0) or 0) / 100
+                            real_debt = -real_balance if real_balance < 0 else 0
+                            if agent["overdue_sum"] > real_debt:
+                                if real_debt <= 0:
+                                    agent["overdue_sum"] = 0
+                                else:
+                                    ratio = real_debt / agent["overdue_sum"]
+                                    agent["overdue_sum"] = real_debt
+                                    for d in agent["demands"]:
+                                        d["unpaid"] = round(d["unpaid"] * ratio, 2)
+                except Exception as e:
+                    logger.warning(f"balance check failed for {agent.get('name')}: {e}")
+
+            # Убираем агентов с нулевой просрочкой после коррекции
+            result = [a for a in result if a["overdue_sum"] > 0]
             result.sort(key=lambda x: x["overdue_sum"], reverse=True)
             logger.info(f"get_overdue_demands: {len(result)} agents with overdue debt")
             return result
