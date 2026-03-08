@@ -458,10 +458,6 @@ async def search_products_filtered(parsed: dict, limit: int = 20) -> list:
                     "image_href": p.get("images", {}).get("meta", {}).get("href") if p.get("images") else None,
                 })
             
-            # Фильтр "только в наличии" если запрошен
-            if filters.get("in_stock"):
-                result = [r for r in result if r["stock"] > 0]
-
             # Фильтр "только в наличии"
             if filters.get("in_stock"):
                 result = [r for r in result if r["stock"] > 0]
