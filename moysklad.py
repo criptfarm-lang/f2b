@@ -868,130 +868,115 @@ def format_clients_by_tag(items: list, tag: str) -> str:
 
 
 async def get_overdue_demands(tag: str = None, query: str = None) -> list:
-    """Получает просроченные отгрузки: paymentPlannedMoment < сегодня, есть долг.
+    """Просроченная дебиторка через /report/counterparty (overdueDebtSum).
     
-    Группирует по контрагенту, возвращает список с суммой и кол-вом дней просрочки.
+    Если query — ищем конкретного контрагента.
+    Если tag — фильтруем локально по тегу.
     """
     try:
         from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d 00:00:00")
+        today_dt = datetime.now(timezone.utc)
 
         async with aiohttp.ClientSession() as session:
-            url = f"{MS_BASE}/entity/demand"
-            # Фильтр по конкретному контрагенту если задан query
-            agent_filter = ""
+
             if query:
-                # Сначала найдём id контрагента
+                # Конкретный контрагент — ищем его и берём отчёт
                 cp_url = f"{MS_BASE}/entity/counterparty"
-                async with session.get(cp_url, headers=get_headers(), params={"filter": f"name~{query}", "limit": 5}) as cr:
-                    if cr.status == 200:
-                        cp_data = await cr.json()
-                        cp_rows = cp_data.get("rows", [])
-                        if cp_rows:
-                            # Берём первого подходящего
-                            agent_href = cp_rows[0].get("meta", {}).get("href", "")
-                            agent_filter = f";agent={agent_href}" if agent_href else ""
+                rows = []
+                for q in [query, query.upper(), query.lower(), query.capitalize()]:
+                    async with session.get(cp_url, headers=get_headers(), params={"filter": f"name~{q}", "limit": 10}) as cr:
+                        if cr.status == 200:
+                            cp_data = await cr.json()
+                            rows = cp_data.get("rows", [])
+                            if rows:
+                                break
 
-            params = {
-                "limit": 100,
-                "filter": f"paymentPlannedMoment<{today}{agent_filter}",
-                "expand": "agent",
-                "order": "paymentPlannedMoment,asc",
-            }
-            async with session.get(url, headers=get_headers(), params=params) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.error(f"get_overdue_demands {resp.status}: {body[:300]}")
-                    return []
-                data = await resp.json()
-            logger.info(f"get_overdue_demands: {data.get('meta', {}).get('size', '?')} total demands found")
+                result = []
+                for c in rows:
+                    cid = c["id"]
+                    report_url = f"{MS_BASE}/report/counterparty/{cid}"
+                    async with session.get(report_url, headers=get_headers()) as r:
+                        if r.status != 200:
+                            continue
+                        rdata = await r.json()
 
-            rows = data.get("rows", [])
-            logger.info(f"get_overdue_demands: {len(rows)} overdue demands found")
-            if rows:
-                logger.info(f"demand sample keys: {list(rows[0].keys())[:15]}")
+                    overdue = (rdata.get("overdueDebtSum", 0) or 0) / 100
+                    debt = (rdata.get("debtSum", 0) or 0) / 100
+                    balance = (rdata.get("balance", 0) or 0) / 100
 
-            today_dt = datetime.now(timezone.utc)
+                    # Если нет overdueDebtSum, считаем просрочкой отрицательный баланс
+                    if overdue <= 0 and balance < 0:
+                        overdue = -balance
 
-            # Группируем по контрагенту
-            by_agent = {}
-            for d in rows:
-                agent = d.get("agent", {})
-                agent_id = agent.get("id", "")
-                agent_name = agent.get("name", "неизвестно")
-                agent_tags = agent.get("tags", [])
+                    logger.info(f"overdue report '{c.get('name')}': balance={balance} overdueDebtSum={overdue} debtSum={debt}")
 
-                # Фильтр по тегу если задан
-                if tag:
-                    tags_lower = [t.lower() for t in agent_tags]
-                    if not any(tag.lower() in t for t in tags_lower):
-                        continue
+                    if overdue > 0 or debt > 0:
+                        result.append({
+                            "name": c.get("name", ""),
+                            "overdue_sum": overdue,
+                            "debt_sum": debt,
+                            "balance": balance,
+                            "demands": [],
+                            "max_days": 0,
+                        })
+                return result
 
-                # Дата планируемой оплаты
-                ppm = d.get("paymentPlannedMoment", "")
-                try:
-                    due_dt = datetime.fromisoformat(ppm.replace("Z", "+00:00"))
-                    days_overdue = (today_dt - due_dt).days
-                except Exception:
-                    days_overdue = 0
+            else:
+                # Все контрагенты — общий отчёт
+                report_url = f"{MS_BASE}/report/counterparty"
+                all_rows = []
+                offset = 0
+                while True:
+                    async with session.get(report_url, headers=get_headers(), params={"limit": 100, "offset": offset}) as r:
+                        if r.status != 200:
+                            break
+                        rdata = await r.json()
+                        batch = rdata.get("rows", [])
+                        all_rows.extend(batch)
+                        if len(batch) < 100:
+                            break
+                        offset += 100
 
-                # Сумма долга по отгрузке
-                sum_val = (d.get("sum", 0) or 0) / 100
-                paid = (d.get("payedSum", 0) or 0) / 100
-                unpaid = sum_val - paid
-                if unpaid <= 0:
-                    continue
+                logger.info(f"get_overdue_demands: {len(all_rows)} total report rows")
 
-                if agent_id not in by_agent:
-                    by_agent[agent_id] = {
-                        "name": agent_name,
-                        "tags": agent_tags,
-                        "total_overdue": 0,
-                        "demands": [],
-                        "max_days": 0,
-                    }
-                by_agent[agent_id]["total_overdue"] += unpaid
-                by_agent[agent_id]["max_days"] = max(by_agent[agent_id]["max_days"], days_overdue)
-                by_agent[agent_id]["demands"].append({
-                    "name": d.get("name", ""),
-                    "due": ppm[:10] if ppm else "",
-                    "unpaid": unpaid,
-                    "days": days_overdue,
-                })
+                result = []
+                for row in all_rows:
+                    cp = row.get("counterparty", {})
+                    name = cp.get("name", "")
+                    cp_tags = cp.get("tags", [])
 
-            result = list(by_agent.values())
-            result.sort(key=lambda x: x["total_overdue"], reverse=True)
-            return result
+                    # Фильтр по тегу если задан
+                    if tag:
+                        tags_lower = [t.lower() for t in cp_tags]
+                        if not any(tag.lower() in t for t in tags_lower):
+                            continue
+
+                    overdue = (row.get("overdueDebtSum", 0) or 0) / 100
+                    debt = (row.get("debtSum", 0) or 0) / 100
+                    balance = (row.get("balance", 0) or 0) / 100
+
+                    # Если нет overdueDebtSum, берём отрицательный баланс как просрочку
+                    if overdue <= 0 and balance < 0:
+                        overdue = -balance
+
+                    if overdue > 0:
+                        result.append({
+                            "name": name,
+                            "overdue_sum": overdue,
+                            "debt_sum": debt,
+                            "balance": balance,
+                            "demands": [],
+                            "max_days": 0,
+                        })
+
+                result.sort(key=lambda x: x["overdue_sum"], reverse=True)
+                logger.info(f"get_overdue_demands: {len(result)} with overdue debt")
+                return result
 
     except Exception as e:
         logger.error(f"get_overdue_demands error: {e}", exc_info=True)
         return []
 
-
-def format_overdue_demands(items: list, tag: str = None) -> str:
-    """Форматирует просроченные отгрузки."""
-    if not items:
-        label = f" по группе *{tag.capitalize()}*" if tag else ""
-        return f"✅ Просроченных отгрузок{label} нет."
-
-    total = sum(i["total_overdue"] for i in items)
-    label = f" — {tag.capitalize()}" if tag else ""
-    lines = [
-        f"⚠️ *Просроченная дебиторка{label}*",
-        f"{len(items)} клиентов · Итого: *{fmt_money(total)}*\n",
-    ]
-    for c in items:
-        days = c["max_days"]
-        days_str = f"{days} дн." if days > 0 else "сегодня"
-        lines.append(f"🔴 *{c['name']}*")
-        lines.append(f"   {fmt_money(c['total_overdue'])} · просрочка {days_str}")
-        # Детализация по отгрузкам если больше одной
-        if len(c["demands"]) > 1:
-            for dem in c["demands"][:3]:
-                lines.append(f"   └ {dem['name']} · {dem['due']} · {fmt_money(dem['unpaid'])}")
-        lines.append("")
-
-    return "\n".join(lines).rstrip()
 
 async def get_price_list(limit: int = 100) -> list:
     """Получает прайс-лист — все товары с ценами и остатками."""
