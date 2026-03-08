@@ -43,14 +43,6 @@ def setup_scheduler(app: Application, db):
         id="remind_today"
     )
 
-    # 18:00 — запрос среза по дебиторке
-    scheduler.add_job(
-        debt_reminder,
-        CronTrigger(hour=18, minute=0),
-        args=[app, db],
-        id="debt_reminder"
-    )
-
     # Пн–пт 17:00 — напоминание прислать реестр (для Беляковой)
     scheduler.add_job(
         registry_reminder,
@@ -105,27 +97,6 @@ async def remind_today_tasks(app: Application, db):
             await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Ошибка напоминания в {chat_id}: {e}")
-
-
-async def debt_reminder(app: Application, db):
-    """Запрашивает у менеджеров срез по дебиторке."""
-    group_ids = get_group_ids()
-    if not group_ids:
-        return
-
-    text = (
-        "💰 *Срез по дебиторке — до 18:30*\n\n"
-        "Менеджеры, напишите:\n"
-        "1️⃣ Кто должен был оплатить сегодня — пришли?\n"
-        "2️⃣ У кого срок оплаты завтра — клиент: сумма\n\n"
-        "_Формат: Название клиента — сумма_"
-    )
-
-    for chat_id in group_ids:
-        try:
-            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Ошибка debt_reminder в {chat_id}: {e}")
 
 
 async def registry_reminder(app: Application, db):
