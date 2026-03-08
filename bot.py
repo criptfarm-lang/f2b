@@ -26,7 +26,7 @@ from moysklad import (search_products, search_products_filtered, get_price_list,
     find_counterparty_info, format_counterparty_info,
     get_debtors_by_tag, get_clients_by_tag, resolve_tag,
     format_debtors_by_tag, format_clients_by_tag,
-    get_overdue_demands, format_overdue_demands)
+    get_overdue_demands, format_overdue_demands, format_overdue_summary)
 
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
 EMPLOYEES = {
@@ -468,11 +468,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "get_overdue_debt":
         raw_tag = params.get("tag", "")
         raw_query = params.get("query", "")
+        brief = params.get("brief", False)
         tag = resolve_tag(raw_tag) if raw_tag else None
         await message.reply_chat_action("typing")
         items = await get_overdue_demands(tag=tag, query=raw_query)
         label = raw_query or (tag or None)
-        text = format_overdue_demands(items, tag=label)
+        if brief and not raw_query:
+            text = format_overdue_summary(items)
+        else:
+            text = format_overdue_demands(items, tag=label)
         if len(text) > 4000:
             text = text[:3900] + "\n\n_...уточни запрос_"
         await message.reply_text(text, parse_mode="Markdown")
