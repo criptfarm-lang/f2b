@@ -509,12 +509,9 @@ async def get_counterparty_balance(query: str) -> list:
                         balance = 0
                     else:
                         rdata = await resp2.json()
-                        logger.info(f"counterparty report keys: {list(rdata.keys())}")
                         # МойСклад хранит деньги в копейках — делим на 100
                         raw_balance = rdata.get("balance", 0) or 0
                         balance = raw_balance / 100
-                        # Логируем все поля для отладки знака баланса
-                        logger.info(f"counterparty '{c.get('name')}' raw_balance={raw_balance} balance={balance} tags={c.get('tags', [])} companyType={c.get('companyType')}")
 
                 # Для покупателей: баланс < 0 = нам должны, баланс > 0 = мы должны
                 debt = -balance if balance < 0 else 0
