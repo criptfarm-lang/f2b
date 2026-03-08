@@ -8,6 +8,7 @@
 
 import os
 import logging
+import re
 import aiohttp
 import asyncio
 from typing import Optional
@@ -29,102 +30,168 @@ def get_headers():
 
 
 async def search_products(query: str, limit: int = 20) -> list:
-    """Ищет товары по названию, возвращает список с остатками и ценами."""
+    """Ищет товары по названию с поддержкой сокращений и синонимов."""
     try:
+        # ── Словарь сокращений ──────────────────────────────────────────
+        # Термин обработки / состояния
+        ABBR = {
+            "хк":      ["х/к", "холодн"],
+            "х/к":     ["х/к", "холодн"],
+            "гк":      ["г/к", "горяч"],
+            "г/к":     ["г/к", "горяч"],
+            "сс":      ["с/с", "слабосол"],
+            "с/с":     ["с/с", "слабосол"],
+            "охл":     ["охл"],
+            "зам":     ["заморож"],
+            "заморож": ["заморож"],
+            "мрм":     ["мурманск", "мурм", "мрм"],
+            "мурманск": ["мурманск"],
+            # Вид разделки
+            "пр":      ["пр"],
+            "тримпр":  ["трим пр"],
+            "трим":    ["трим"],
+            # Виды разделки (буква)
+            "а":       ["трим а", " а "],
+            "б":       ["трим б", " б "],
+            "д":       ["трим д", " д "],
+            "е":       ["трим е", " е "],
+            "с":       ["трим с", " с "],
+        }
+        # Синонимы названий рыб
+        SYNONYMS = {
+            "семга":   "лосось",
+            "сёмга":   "лосось",
+            "сёмга":   "лосось",
+            "форель":  "форель",
+            "масляная": "масляная",
+            "маслян":  "масляная",
+            "угорь":   "угорь",
+            "осьминог": "осьминог",
+            "палтус":  "палтус",
+            "треска":  "треска",
+            "минтай":  "минтай",
+            "горбуша": "горбуша",
+            "кета":    "кета",
+            "чавыча":  "чавыча",
+            "кижуч":   "кижуч",
+            "нерка":   "нерка",
+            "сибас":   "сибас",
+            "дорада":  "дорада",
+            "тунец":   "тунец",
+            "скумбрия": "скумбрия",
+            "сельдь":  "сельдь",
+            "мойва":   "мойва",
+            "краб":    "краб",
+            "креветка": "крев",
+            "крев":    "крев",
+            "кальмар": "кальмар",
+        }
+
+        stop_words = {"с", "в", "на", "по", "из", "от", "до", "и", "а", "кг", "гр", "см", "г", "филе"}
+
+        raw_words = query.lower().split()
+
+        # Нормализуем каждое слово
+        search_tokens = []   # что ищем в МойСклад (для API запроса — основное слово)
+        match_tokens  = []   # что проверяем в названии (может быть несколько вариантов)
+
+        for w in raw_words:
+            w = w.strip(".,;:()/-")
+            if not w or w in stop_words:
+                continue
+
+            # Числа-диапазоны (1.6-2.0) — пропускаем
+            if re.match(r'^[0-9.,\-]+$', w):
+                continue
+
+            # Синоним
+            canon = SYNONYMS.get(w, w)
+
+            # Сокращение → варианты для матчинга
+            if w in ABBR:
+                variants = ABBR[w]
+                match_tokens.append(variants)
+                # Не добавляем в API поиск — аббревиатура не поможет
+            else:
+                match_tokens.append([canon])
+                if len(canon) > 2 or canon.isupper():
+                    search_tokens.append(canon)
+
+        # Если search_tokens пустые — берём первые слова из match_tokens
+        if not search_tokens:
+            for mt in match_tokens:
+                if len(mt[0]) > 2:
+                    search_tokens.append(mt[0])
+                    break
+
+        logger.info(f"search_products: query='{query}' search_tokens={search_tokens} match_tokens={match_tokens}")
+
         async with aiohttp.ClientSession() as session:
-
-            # Разбиваем запрос на ключевые слова и ищем по каждому
-            # Берём самое длинное слово как основной фильтр (лучшая селективность)
-            stop_words = {"с", "в", "на", "по", "из", "от", "до", "и", "а", "кг", "см", "г"}
-            words = [
-                w.lower() for w in query.split()
-                if w not in stop_words and (
-                    len(w) > 2 or  # обычные слова
-                    w.isupper()    # аббревиатуры: ПР, СС, ОХЛ и т.д.
-                )
-            ]
-
             all_products = []
             seen_ids = set()
-
             url = f"{MS_BASE}/entity/product"
 
-            # Ищем по каждому слову отдельно
-            search_terms = words[:3] if words else [query]
-            for term in search_terms:
-                params = {
-                    "filter": f"name~{term}",
-                    "limit": limit,
-                }
+            # Ищем по первым 2 токенам
+            for term in search_tokens[:2]:
+                params = {"filter": f"name~{term}", "limit": 50}
                 async with session.get(url, headers=get_headers(), params=params) as resp:
                     if resp.status != 200:
-                        text = await resp.text()
-                        logger.error(f"МойСклад search error {resp.status}: {text[:200]}")
                         continue
                     data = await resp.json()
-
                 for p in data.get("rows", []):
                     if p["id"] not in seen_ids:
                         seen_ids.add(p["id"])
                         all_products.append(p)
 
-            # Нормализуем окончания для нечёткого совпадения (черную → черн)
-            def normalize(word):
-                return word[:-2] if len(word) > 5 else word
-
+            # Скоринг: считаем сколько match_tokens встречается в названии
             def score(p):
                 name = p.get("name", "").lower()
-                return sum(1 for w in words
-                           if w in name or normalize(w) in name)
+                # Нормализуем окончания (лосос* → лосось, заморож* → заморож)
+                def norm(w): return w[:-2] if len(w) > 5 else w
+                hits = 0
+                for variants in match_tokens:
+                    # Хотя бы один вариант из группы должен быть в названии
+                    if any(norm(v) in name or v in name for v in variants):
+                        hits += 1
+                return hits
 
-            if words:
-                # Строгий фильтр — все слова (с нормализацией)
-                strict = [p for p in all_products if score(p) == len(words)]
-                if strict:
-                    products = strict[:limit]
-                else:
-                    # Мягкий — хотя бы половина слов, сортируем по релевантности
-                    threshold = max(1, len(words) // 2)
-                    soft = [p for p in all_products if score(p) >= threshold]
-                    soft.sort(key=score, reverse=True)
-                    products = soft[:limit]
-            else:
+            total = len(match_tokens)
+            if total == 0:
                 products = all_products[:limit]
+            else:
+                # Строгий: все токены совпали
+                strict = [p for p in all_products if score(p) == total]
+                if strict:
+                    products = sorted(strict, key=score, reverse=True)[:limit]
+                else:
+                    # Мягкий: хотя бы половина
+                    threshold = max(1, total // 2)
+                    soft = [p for p in all_products if score(p) >= threshold]
+                    products = sorted(soft, key=score, reverse=True)[:limit]
 
-            logger.info(f"МойСклад found {len(products)} products for query='{query}' (words={words})")
+            logger.info(f"МойСклад found {len(products)} products for query='{query}' tokens={search_tokens}")
             if not products:
                 return []
 
-            # 2. Получаем остатки одним запросом
+            # Получаем остатки
             product_ids = [p["id"] for p in products]
             stocks = await get_stocks(session, product_ids)
 
-            # 3. Собираем результат
             result = []
             for p in products:
                 pid = p["id"]
                 stock_info = stocks.get(pid, {})
-
-                # Достаём цену продажи
                 sale_price = None
                 for price in p.get("salePrices", []):
                     if price.get("value", 0) > 0:
-                        sale_price = price["value"] / 100  # МойСклад хранит в копейках
+                        sale_price = price["value"] / 100
                         break
-
                 result.append({
                     "id": pid,
                     "name": p.get("name", ""),
-                    "code": p.get("code", ""),
-                    "article": p.get("article", ""),
-                    "folder": p.get("productFolder", {}).get("name", "") if p.get("productFolder") else "",
+                    "sale_price": sale_price,
                     "stock": stock_info.get("stock", 0),
                     "reserve": stock_info.get("reserve", 0),
-                    "in_transit": stock_info.get("inTransit", 0),
-                    "price": sale_price,
-                    "unit": p.get("uom", {}).get("name", "кг") if p.get("uom") else "кг",
-                    "description": p.get("description", ""),
-                    "weight": p.get("weight"),
                     "image_href": p.get("images", {}).get("meta", {}).get("href") if p.get("images") else None,
                 })
 
