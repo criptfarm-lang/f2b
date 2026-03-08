@@ -502,7 +502,8 @@ async def get_counterparty_balance(query: str) -> list:
                     else:
                         rdata = await resp2.json()
                         logger.info(f"counterparty report keys: {list(rdata.keys())}")
-                        balance = rdata.get("balance", 0) or 0
+                        # МойСклад хранит деньги в копейках — делим на 100
+                        balance = (rdata.get("balance", 0) or 0) / 100
 
                 debt = balance if balance > 0 else 0
                 result.append({
