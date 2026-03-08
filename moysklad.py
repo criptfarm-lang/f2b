@@ -1072,6 +1072,45 @@ def format_overdue_demands(items: list, tag: str = None) -> str:
     return "\n".join(lines).rstrip()
 
 
+def format_debt_reminder(client: dict) -> str:
+    """Готовит текст напоминания клиенту об оплате."""
+    demands = client.get("demands", [])
+    lines = [
+        "Добрый день!",
+        "",
+        "Напоминаем о наличии просроченной задолженности перед компанией F2B PRO:",
+        "",
+    ]
+    for d in demands:
+        lines.append(f"• Заказ {d['name']} от {d['due']} — {fmt_money(d['unpaid'])}")
+    lines += [
+        "",
+        f"Итого к оплате: {fmt_money(client['overdue_sum'])}",
+        "",
+        "Просим произвести оплату в ближайшее время.",
+        "По вопросам свяжитесь с вашим менеджером.",
+    ]
+    return "\n".join(lines)
+
+
+def format_reminders_for_manager(items: list, manager_display: str) -> str:
+    """Форматирует пакет напоминаний для менеджера — по одному на клиента."""
+    if not items:
+        return "✅ Просроченных клиентов нет — напоминания не нужны."
+
+    lines = [
+        f"📋 *Напоминания об оплате — {manager_display}*",
+        f"{len(items)} клиентов · скопируй и отправь каждому\n",
+    ]
+    for c in sorted(items, key=lambda x: x["overdue_sum"], reverse=True):
+        lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"*{c['name']}* — {fmt_money(c['overdue_sum'])}")
+        lines.append("```")
+        lines.append(format_debt_reminder(c))
+        lines.append("```")
+    return "\n".join(lines)
+
+
 async def get_price_list(limit: int = 100) -> list:
     """Получает прайс-лист — все товары с ценами и остатками."""
     try:
