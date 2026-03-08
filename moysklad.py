@@ -493,7 +493,8 @@ async def get_counterparty_balance(query: str) -> list:
             result = []
             for c in data.get("rows", []):
                 balance = c.get("balance", 0) or 0
-                debt = -balance if balance < 0 else 0
+                # В МойСклад: положительный баланс = нам должны (дебиторка)
+                debt = balance if balance > 0 else 0
                 result.append({
                     "id": c["id"],
                     "name": c.get("name", ""),
@@ -514,7 +515,7 @@ async def get_all_debtors() -> list:
             url = f"{MS_BASE}/entity/counterparty"
             params = {
                 "limit": 100,
-                "filter": "balance<0",
+                "filter": "balance>0",
             }
             async with session.get(url, headers=get_headers(), params=params) as resp:
                 if resp.status != 200:
@@ -524,11 +525,11 @@ async def get_all_debtors() -> list:
             result = []
             for c in data.get("rows", []):
                 balance = c.get("balance", 0) or 0
-                if balance < 0:
+                if balance > 0:
                     result.append({
                         "id": c["id"],
                         "name": c.get("name", ""),
-                        "debt": -balance,
+                        "debt": balance,
                     })
 
             result.sort(key=lambda x: x["debt"], reverse=True)
@@ -565,10 +566,10 @@ def format_counterparty_balance(counterparties: list, query: str) -> str:
     for c in counterparties:
         balance = c["balance"]
         name = c["name"]
-        if balance < 0:
-            lines.append(f"\U0001f534 *{name}*\n\u0414\u043e\u043b\u0433 \u043f\u0435\u0440\u0435\u0434 \u043d\u0430\u043c\u0438: *{-balance:,.0f} \u0440\u0443\u0431.*")
-        elif balance > 0:
-            lines.append(f"\U0001f7e2 *{name}*\n\u041c\u044b \u0434\u043e\u043b\u0436\u043d\u044b \u0438\u043c: *{balance:,.0f} \u0440\u0443\u0431.*")
+        if balance > 0:
+            lines.append(f"\U0001f534 *{name}*\n\u0414\u043e\u043b\u0433 \u043f\u0435\u0440\u0435\u0434 \u043d\u0430\u043c\u0438: *{balance:,.0f} \u0440\u0443\u0431.*")
+        elif balance < 0:
+            lines.append(f"\U0001f7e2 *{name}*\n\u041c\u044b \u0434\u043e\u043b\u0436\u043d\u044b \u0438\u043c: *{-balance:,.0f} \u0440\u0443\u0431.*")
         else:
             lines.append(f"\u2705 *{name}*\n\u0411\u0430\u043b\u0430\u043d\u0441 \u043d\u0443\u043b\u0435\u0432\u043e\u0439, \u0434\u043e\u043b\u0433\u043e\u0432 \u043d\u0435\u0442.")
 
