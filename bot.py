@@ -449,6 +449,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ms_query = params.get("query", query)
         await message.reply_chat_action("typing")
         parsed = await parse_product_query(ms_query)
+        logger.info(f"parse_product_query result: {parsed}")
+        
+        # Принудительный in_stock если пользователь явно спросил "в наличии" / "есть на складе"
+        stock_keywords = ["в наличии", "на складе", "есть ли", "что есть", "имеется"]
+        if any(kw in ms_query.lower() for kw in stock_keywords):
+            parsed.setdefault("filters", {})["in_stock"] = True
+            logger.info("Forced in_stock=True based on query keywords")
+        
         products = await search_products_filtered(parsed)
         if not products:
             products = await search_products(ms_query)
