@@ -297,6 +297,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = message.from_user
     text = message.text or message.caption or ""
 
+    # Сохраняем все сообщения в историю чата
+    if text and user:
+        db.save_message(
+            chat_id=chat_id,
+            user_id=user.id,
+            user_name=user.full_name,
+            text=text[:1000],  # обрезаем очень длинные
+        )
+
     # 1. Сохраняем фото и документы в базу
     if message.photo:
         await save_media(message, "photo")
@@ -363,9 +372,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Всё через Claude — он сам разбирается что нужно ──
     await message.reply_chat_action("typing")
     context_data = db.get_context_summary()
+    chat_history = db.format_history(chat_id, limit=40)
+    memories = db.format_memories()
 
     logger.info(f"Dispatching query='{query}' from '{user.full_name}'")
-    result = await dispatch(query, user.full_name, context_data)
+    result = await dispatch(query, user.full_name, context_data,
+                            chat_history=chat_history, memories=memories)
     logger.info(f"Dispatch result: {result}")
     action = result.get("action", "answer")
     params = result.get("params", {})
@@ -516,6 +528,32 @@ async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает что Эф помнит."""
+    memories = db.get_all_memories()
+    if not memories:
+        await update.message.reply_text("🧠 Долгосрочная память пуста.")
+        return
+    lines = ["🧠 *Что я помню:*\n"]
+    for m in memories[:20]:
+        lines.append(f"• *{m['key']}*: {m['value']}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Явно запомнить факт: /remember ключ: значение"""
+    args = " ".join(context.args) if context.args else ""
+    if ":" not in args:
+        await update.message.reply_text(
+            "Формат: /remember ключ: значение\n"
+            "Например: /remember скидка Иванову: 5%"
+        )
+        return
+    key, value = args.split(":", 1)
+    db.remember(key.strip(), value.strip())
+    await update.message.reply_text(f"✅ Запомнил: *{key.strip()}* → {value.strip()}", parse_mode="Markdown")
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -536,6 +574,10 @@ def main():
     app.add_handler(CommandHandler("contact", cmd_contact))
 
     # Все сообщения (текст + медиа)
+    app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("remember", cmd_remember))
+    app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(MessageHandler(filters.ALL, handle_message))
 
     # Планировщик (утренние сводки, напоминания)
