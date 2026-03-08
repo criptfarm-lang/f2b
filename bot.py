@@ -25,7 +25,8 @@ from moysklad import (search_products, search_products_filtered, get_price_list,
     get_counterparty_balance, get_all_debtors, format_debtors_ms, format_counterparty_balance,
     find_counterparty_info, format_counterparty_info,
     get_debtors_by_tag, get_clients_by_tag, resolve_tag,
-    format_debtors_by_tag, format_clients_by_tag)
+    format_debtors_by_tag, format_clients_by_tag,
+    get_overdue_demands, format_overdue_demands)
 
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
 EMPLOYEES = {
@@ -465,6 +466,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = format_clients_by_tag(items, tag)
         if len(text) > 4000:
             text = text[:3900] + "\n\n_...слишком много, уточни_"
+        await message.reply_text(text, parse_mode="Markdown")
+
+    elif action == "get_overdue":
+        raw_tag = params.get("tag", "")
+        tag = resolve_tag(raw_tag) if raw_tag else None
+        await message.reply_chat_action("typing")
+        items = await get_overdue_demands(tag=tag)
+        text = format_overdue_demands(items, tag=tag)
+        if len(text) > 4000:
+            text = text[:3900] + "\n\n_...уточни запрос_"
         await message.reply_text(text, parse_mode="Markdown")
 
     elif action == "find_photo":
