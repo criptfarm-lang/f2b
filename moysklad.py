@@ -837,7 +837,7 @@ def format_clients_by_tag(items: list, tag: str) -> str:
 
 
 
-async def get_overdue_demands(tag: str = None) -> list:
+async def get_overdue_demands(tag: str = None, query: str = None) -> list:
     """Получает просроченные отгрузки: paymentPlannedMoment < сегодня, есть долг.
     
     Группирует по контрагенту, возвращает список с суммой и кол-вом дней просрочки.
@@ -848,9 +848,23 @@ async def get_overdue_demands(tag: str = None) -> list:
 
         async with aiohttp.ClientSession() as session:
             url = f"{MS_BASE}/entity/demand"
+            # Фильтр по конкретному контрагенту если задан query
+            agent_filter = ""
+            if query:
+                # Сначала найдём id контрагента
+                cp_url = f"{MS_BASE}/entity/counterparty"
+                async with session.get(cp_url, headers=get_headers(), params={"filter": f"name~{query}", "limit": 5}) as cr:
+                    if cr.status == 200:
+                        cp_data = await cr.json()
+                        cp_rows = cp_data.get("rows", [])
+                        if cp_rows:
+                            # Берём первого подходящего
+                            agent_href = cp_rows[0].get("meta", {}).get("href", "")
+                            agent_filter = f";agent={agent_href}" if agent_href else ""
+
             params = {
                 "limit": 100,
-                "filter": f"paymentPlannedMoment<{today};paymentState=notpaid,partialpaid",
+                "filter": f"paymentPlannedMoment<{today};paymentState=notpaid,partialpaid{agent_filter}",
                 "expand": "agent",
                 "order": "paymentPlannedMoment,asc",
             }
