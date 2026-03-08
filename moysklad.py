@@ -1009,8 +1009,9 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
 
             result = list(by_agent.values())
 
-            # Проверяем реальный баланс через report/counterparty
-            # Просрочка не может превышать общий долг клиента
+            # Сверяем с реальным балансом из report/counterparty
+            # Клиент в ПДЗ только если реальный долг >= сумме просроченных заказов
+            filtered = []
             for agent in result:
                 try:
                     report_url = f"{MS_BASE}/report/counterparty/{agent['id']}"
@@ -1019,22 +1020,20 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                             rdata = await rr.json()
                             real_balance = (rdata.get("balance", 0) or 0) / 100
                             real_debt = -real_balance if real_balance < 0 else 0
-                            if agent["overdue_sum"] > real_debt:
-                                if real_debt <= 0:
-                                    agent["overdue_sum"] = 0
-                                else:
-                                    ratio = real_debt / agent["overdue_sum"]
-                                    agent["overdue_sum"] = real_debt
-                                    for d in agent["demands"]:
-                                        d["unpaid"] = round(d["unpaid"] * ratio, 2)
+                            # Если реальный долг меньше просрочки — старые заказы фактически закрыты
+                            if real_debt >= agent["overdue_sum"]:
+                                filtered.append(agent)
+                            else:
+                                logger.info(f"Excluding {agent['name']}: real_debt={real_debt:.2f} < overdue={agent['overdue_sum']:.2f}")
+                        else:
+                            filtered.append(agent)  # не смогли проверить — оставляем
                 except Exception as e:
                     logger.warning(f"balance check failed for {agent.get('name')}: {e}")
+                    filtered.append(agent)  # не смогли проверить — оставляем
 
-            # Убираем агентов с нулевой просрочкой после коррекции
-            result = [a for a in result if a["overdue_sum"] > 0]
-            result.sort(key=lambda x: x["overdue_sum"], reverse=True)
-            logger.info(f"get_overdue_demands: {len(result)} agents with overdue debt")
-            return result
+            filtered.sort(key=lambda x: x["overdue_sum"], reverse=True)
+            logger.info(f"get_overdue_demands: {len(filtered)} agents with overdue debt (after balance check)")
+            return filtered
 
     except Exception as e:
         logger.error(f"get_overdue_demands error: {e}", exc_info=True)
