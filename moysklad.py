@@ -970,12 +970,27 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
 
                 days_overdue = (today_dt - due_dt).days
 
+                # Определяем менеджера по тегам
+                MANAGER_TAG_MAP = {
+                    "баласанян": "Карина Баласанян",
+                    "скляр": "Инесса Скляр",
+                    "мерзлякова": "Елена Мерзлякова",
+                    "голубева": "Татьяна Голубева",
+                    "леонтьев": "Алексей Леонтьев",
+                }
+                manager_name = "Без менеджера"
+                for t in agent_tags:
+                    if t.lower() in MANAGER_TAG_MAP:
+                        manager_name = MANAGER_TAG_MAP[t.lower()]
+                        break
+
                 if agent_id not in by_agent:
                     by_agent[agent_id] = {
                         "name": agent_name,
                         "overdue_sum": 0,
                         "max_days": 0,
                         "demands": [],
+                        "manager": manager_name,
                     }
                 by_agent[agent_id]["overdue_sum"] += unpaid
                 by_agent[agent_id]["max_days"] = max(by_agent[agent_id]["max_days"], days_overdue)
@@ -994,6 +1009,33 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
     except Exception as e:
         logger.error(f"get_overdue_demands error: {e}", exc_info=True)
         return []
+
+
+def format_overdue_summary(items: list) -> str:
+    """Краткий формат ПДЗ: итог + по менеджерам со списком клиентов."""
+    if not items:
+        return "✅ Просроченных долгов нет."
+
+    total_all = sum(c["overdue_sum"] for c in items)
+    lines = [
+        f"⚠️ *Просроченная дебиторка* — {len(items)} клиентов · *{fmt_money(total_all)}*\n"
+    ]
+
+    by_manager = {}
+    for c in items:
+        manager = c.get("manager", "Без менеджера")
+        if manager not in by_manager:
+            by_manager[manager] = {"total": 0, "clients": []}
+        by_manager[manager]["total"] += c["overdue_sum"]
+        by_manager[manager]["clients"].append(c)
+
+    for manager, data in sorted(by_manager.items(), key=lambda x: x[1]["total"], reverse=True):
+        lines.append(f"👤 *{manager}* — {fmt_money(data['total'])}")
+        for c in sorted(data["clients"], key=lambda x: x["overdue_sum"], reverse=True):
+            lines.append(f"   • {c['name']} — {fmt_money(c['overdue_sum'])}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
 
 
 def format_overdue_demands(items: list, tag: str = None) -> str:
