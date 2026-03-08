@@ -306,10 +306,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=text[:1000],  # обрезаем очень длинные
         )
 
-    # 1. Сохраняем фото и документы в базу
-    if message.photo:
-        await save_media(message, "photo")
-
+    # 1. Сохраняем документы в базу (фото берём из МойСклад)
     if message.document:
         fname = message.document.file_name or ""
         if any(fname.lower().endswith(ext) for ext in [".pdf", ".xlsx", ".xls", ".docx"]):
@@ -523,25 +520,50 @@ async def save_media(message: Message, media_type: str):
 
 
 async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
-    """Ищет фото по запросу во всех группах."""
-    results = db.search_media(query, media_type="photo")
+    """Ищет фото товара в МойСклад."""
+    import io
+    await update.message.reply_chat_action("upload_photo")
 
-    if not results:
-        await update.message.reply_text(
-            f"😕 Фото '{query}' не найдено в базе.\n"
-            f"Скиньте фото с подписью '{query}' — я его сохраню!"
-        )
+    products = await search_products(query)
+    # Оставляем только товары с фото
+    with_photo = [p for p in products if p.get("image_href")]
+
+    if not with_photo:
+        # Нет фото — показываем текстовый результат если товары найдены
+        if products:
+            text = format_products(products, query)
+            await update.message.reply_text(
+                f"😕 Фото не найдено, но вот что есть:\n\n{text}",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"😕 Товар '{query}' не найден в МойСклад.")
         return
 
-    # Отправляем первые 3 результата
-    for r in results[:3]:
+    # Отправляем фото (до 3 штук)
+    sent = 0
+    for product in with_photo[:3]:
         try:
-            await update.message.reply_photo(
-                photo=r['file_id'],
-                caption=f"📸 {r['caption']} (из чата, {r['date'][:10]})"
-            )
+            img_bytes = await download_image(product["image_href"])
+            if img_bytes:
+                name = product.get("name", query)
+                price = product.get("sale_price", 0)
+                stock = product.get("stock", 0)
+                caption = f"📸 {name}"
+                if price:
+                    caption += f"\n💰 {price} руб/кг"
+                if stock and stock > 0:
+                    caption += f"\n📦 В наличии: {stock} кг"
+                await update.message.reply_photo(
+                    photo=io.BytesIO(img_bytes),
+                    caption=caption
+                )
+                sent += 1
         except Exception as e:
-            logger.warning(f"Не удалось отправить фото: {e}")
+            logger.warning(f"Не удалось отправить фото {product.get('name')}: {e}")
+
+    if sent == 0:
+        await update.message.reply_text(f"😕 Фото '{query}' есть в МойСклад, но не удалось загрузить.")
 
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
