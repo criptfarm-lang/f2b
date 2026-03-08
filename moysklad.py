@@ -965,7 +965,15 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                     if not any(tag.lower() in t for t in tags_lower):
                         continue
 
+                # Пропускаем розничных покупателей
+                if "розничный покупатель" in agent_name.lower():
+                    continue
+
                 days_overdue = (today_dt - due_dt).days
+
+                # Пропускаем розничных покупателей
+                if "розничный покупатель" in agent_name.lower():
+                    continue
 
                 # Определяем менеджера по тегам
                 MANAGER_TAG_MAP = {
