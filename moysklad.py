@@ -481,17 +481,20 @@ async def get_counterparty_balance(query: str) -> list:
     """Ищет контрагента по имени и возвращает баланс через /report/counterparty."""
     try:
         async with aiohttp.ClientSession() as session:
-            # Шаг 1: найти контрагента по имени
+            # Шаг 1: найти контрагента по имени — пробуем оригинал и uppercase
             url = f"{MS_BASE}/entity/counterparty"
-            params = {"filter": f"name~{query}", "limit": 10}
-            async with session.get(url, headers=get_headers(), params=params) as resp:
-                if resp.status != 200:
-                    logger.error(f"counterparty search {resp.status}")
-                    return []
-                data = await resp.json()
-
-            rows = data.get("rows", [])
+            rows = []
+            for q in [query, query.upper(), query.lower(), query.capitalize()]:
+                params = {"filter": f"name~{q}", "limit": 10}
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        rows = data.get("rows", [])
+                        if rows:
+                            logger.info(f"counterparty found with query variant '{q}'")
+                            break
             if not rows:
+                logger.info(f"counterparty not found for query='{query}'")
                 return []
 
             # Шаг 2: для каждого контрагента получить баланс через report
@@ -618,14 +621,18 @@ async def find_counterparty_info(query: str) -> list:
     try:
         async with aiohttp.ClientSession() as session:
             url = f"{MS_BASE}/entity/counterparty"
-            params = {"filter": f"name~{query}", "limit": 10}
-            async with session.get(url, headers=get_headers(), params=params) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
+            rows = []
+            for q in [query, query.upper(), query.lower(), query.capitalize()]:
+                params = {"filter": f"name~{q}", "limit": 10}
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        rows = data.get("rows", [])
+                        if rows:
+                            break
 
             result = []
-            for c in data.get("rows", []):
+            for c in rows:
                 tags = [t.lower() for t in c.get("tags", [])]
 
                 # Определяем менеджера по тегам
