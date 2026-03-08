@@ -978,6 +978,26 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
         return []
 
 
+def format_overdue_demands(items: list, tag: str = None) -> str:
+    """Форматирует просроченную дебиторку."""
+    if not items:
+        label = f" по *{tag.capitalize()}*" if tag else ""
+        return f"✅ Просроченных долгов{label} нет."
+
+    total = sum(i["overdue_sum"] for i in items)
+    label = f" — {tag.capitalize()}" if tag else ""
+    lines = [
+        f"⚠️ *Просроченная дебиторка{label}*",
+        f"{len(items)} клиентов · Итого: *{fmt_money(total)}*\n",
+    ]
+    for c in items:
+        lines.append(f"🔴 *{c['name']}*")
+        lines.append(f"   {fmt_money(c['overdue_sum'])}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
 async def get_price_list(limit: int = 100) -> list:
     """Получает прайс-лист — все товары с ценами и остатками."""
     try:
