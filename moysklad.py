@@ -188,32 +188,46 @@ async def download_image(url: str) -> Optional[bytes]:
     url может быть либо ссылкой на список изображений, либо на само фото.
     """
     try:
+        logger.info(f"download_image: start url={url}")
         async with aiohttp.ClientSession() as session:
             # Если это ссылка на коллекцию images — сначала получаем список
             if "/images" in url and "downloadHref" not in url:
+                logger.info("download_image: fetching images list...")
                 async with session.get(url, headers=get_headers()) as resp:
+                    logger.info(f"download_image: images list status={resp.status}")
                     if resp.status != 200:
-                        logger.error(f"images list status={resp.status} url={url}")
+                        body = await resp.text()
+                        logger.error(f"images list error body={body[:200]}")
                         return None
                     data = await resp.json()
                 rows = data.get("rows", [])
+                logger.info(f"download_image: images rows count={len(rows)}")
                 if not rows:
+                    logger.warning("download_image: no images in rows")
                     return None
                 # Берём downloadHref первого фото
                 meta = rows[0].get("meta", {})
+                logger.info(f"download_image: first image meta={meta}")
                 download_url = meta.get("downloadHref") or meta.get("href")
                 if not download_url:
+                    logger.error("download_image: no downloadHref or href in meta")
                     return None
                 url = download_url
+                logger.info(f"download_image: resolved url={url}")
 
             # Скачиваем само фото
-            async with session.get(url, headers=get_headers()) as resp:
+            logger.info(f"download_image: downloading photo from {url}")
+            async with session.get(url, headers=get_headers(), allow_redirects=True) as resp:
+                logger.info(f"download_image: photo status={resp.status} content-type={resp.content_type}")
                 if resp.status == 200:
-                    return await resp.read()
-                logger.error(f"download_image status={resp.status} url={url}")
+                    data = await resp.read()
+                    logger.info(f"download_image: got {len(data)} bytes")
+                    return data
+                body = await resp.text()
+                logger.error(f"download_image: photo error status={resp.status} body={body[:200]}")
         return None
     except Exception as e:
-        logger.error(f"download_image error: {e}")
+        logger.error(f"download_image error: {e}", exc_info=True)
         return None
 
 
