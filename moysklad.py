@@ -514,7 +514,7 @@ async def get_counterparty_balance(query: str) -> list:
                         raw_balance = rdata.get("balance", 0) or 0
                         balance = raw_balance / 100
                         # Логируем все поля для отладки знака баланса
-                        logger.info(f"counterparty '{c.get('name')}' raw_balance={raw_balance} balance={balance} tags={[t.get('name') for t in c.get('tags', [])]} companyType={c.get('companyType')}")
+                        logger.info(f"counterparty '{c.get('name')}' raw_balance={raw_balance} balance={balance} tags={c.get('tags', [])} companyType={c.get('companyType')}")
 
                 # Для покупателей: баланс < 0 = нам должны, баланс > 0 = мы должны
                 debt = -balance if balance < 0 else 0
