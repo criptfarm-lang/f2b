@@ -758,19 +758,24 @@ async def get_clients_by_tag(tag: str, limit: int = 100) -> list:
     try:
         async with aiohttp.ClientSession() as session:
             url = f"{MS_BASE}/entity/counterparty"
-            params = {"filter": f"tag={tag}", "limit": limit}
-            async with session.get(url, headers=get_headers(), params=params) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.error(f"get_clients_by_tag {resp.status}: {body[:200]}")
-                    return []
-                data = await resp.json()
+            # МойСклад: фильтр по тегу через tags~значение (частичное совпадение)
+            rows = []
+            for filter_str in [f"tag={tag}", f"tags={tag}"]:
+                params = {"filter": filter_str, "limit": limit}
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    body_text = await resp.text()
+                    logger.info(f"get_clients_by_tag filter='{filter_str}' status={resp.status} len={len(body_text)}")
+                    if resp.status == 200:
+                        import json as _json
+                        data = _json.loads(body_text)
+                        rows = data.get("rows", [])
+                        logger.info(f"  → {len(rows)} rows")
+                        if rows:
+                            break
 
-            rows = data.get("rows", [])
-            logger.info(f"get_clients_by_tag tag='{tag}': {len(rows)} found")
             if not rows:
-                # Логируем первых 3 контрагентов без фильтра чтобы увидеть реальные теги
-                async with session.get(url, headers=get_headers(), params={"limit": 3}) as r2:
+                logger.info(f"get_clients_by_tag: no results, showing sample tags")
+                async with session.get(url, headers=get_headers(), params={"limit": 5}) as r2:
                     if r2.status == 200:
                         sample = await r2.json()
                         for s in sample.get("rows", []):
