@@ -712,18 +712,27 @@ async def get_debtors_by_tag(tag: str, limit: int = 100) -> list:
     """Возвращает должников с определённым тегом (менеджер, хорека, опт и т.д.)"""
     try:
         async with aiohttp.ClientSession() as session:
-            # МойСклад поддерживает фильтр по тегу
+            # МойСклад не поддерживает filter=tag — грузим всех, фильтруем локально
             url = f"{MS_BASE}/entity/counterparty"
-            params = {"filter": f"tag={tag}", "limit": limit}
-            async with session.get(url, headers=get_headers(), params=params) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.error(f"get_debtors_by_tag {resp.status}: {body[:200]}")
-                    return []
-                data = await resp.json()
+            all_rows = []
+            offset = 0
+            while True:
+                params = {"limit": 100, "offset": offset}
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+                    batch = data.get("rows", [])
+                    all_rows.extend(batch)
+                    if len(batch) < 100:
+                        break
+                    offset += 100
+                    if offset >= 1000:
+                        break
 
-            rows = data.get("rows", [])
-            logger.info(f"get_debtors_by_tag tag='{tag}': {len(rows)} counterparties found")
+            tag_lower = tag.lower()
+            rows = [c for c in all_rows if any(tag_lower in t.lower() for t in c.get("tags", []))]
+            logger.info(f"get_debtors_by_tag tag='{tag}': {len(rows)}/{len(all_rows)} counterparties match")
 
             # Получаем балансы через report параллельно
             result = []
@@ -753,41 +762,41 @@ async def get_debtors_by_tag(tag: str, limit: int = 100) -> list:
         return []
 
 
-async def get_clients_by_tag(tag: str, limit: int = 100) -> list:
-    """Возвращает всех контрагентов с тегом (список клиентов менеджера)."""
+async def get_clients_by_tag(tag: str, limit: int = 1000) -> list:
+    """Возвращает всех контрагентов с тегом (список клиентов менеджера).
+    МойСклад не поддерживает filter=tag, поэтому грузим всех и фильтруем локально.
+    """
     try:
         async with aiohttp.ClientSession() as session:
             url = f"{MS_BASE}/entity/counterparty"
-            # МойСклад: фильтр по тегу через tags~значение (частичное совпадение)
-            rows = []
-            for filter_str in [f"tag={tag}", f"tags={tag}"]:
-                params = {"filter": filter_str, "limit": limit}
+            all_rows = []
+            offset = 0
+            while True:
+                params = {"limit": 100, "offset": offset}
                 async with session.get(url, headers=get_headers(), params=params) as resp:
-                    body_text = await resp.text()
-                    logger.info(f"get_clients_by_tag filter='{filter_str}' status={resp.status} len={len(body_text)}")
-                    if resp.status == 200:
-                        import json as _json
-                        data = _json.loads(body_text)
-                        rows = data.get("rows", [])
-                        logger.info(f"  → {len(rows)} rows")
-                        if rows:
-                            break
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+                    rows = data.get("rows", [])
+                    all_rows.extend(rows)
+                    if len(rows) < 100:
+                        break
+                    offset += 100
+                    if offset >= limit:
+                        break
 
-            if not rows:
-                logger.info(f"get_clients_by_tag: no results, showing sample tags")
-                async with session.get(url, headers=get_headers(), params={"limit": 5}) as r2:
-                    if r2.status == 200:
-                        sample = await r2.json()
-                        for s in sample.get("rows", []):
-                            logger.info(f"  sample: {s.get('name')} tags={s.get('tags', [])}")
-
+            logger.info(f"get_clients_by_tag: loaded {len(all_rows)} total, filtering by tag='{tag}'")
+            tag_lower = tag.lower()
             result = []
-            for c in rows:
-                result.append({
-                    "id": c["id"],
-                    "name": c.get("name", ""),
-                    "tags": c.get("tags", []),
-                })
+            for c in all_rows:
+                tags = [t.lower() for t in c.get("tags", [])]
+                if any(tag_lower in t for t in tags):
+                    result.append({
+                        "id": c["id"],
+                        "name": c.get("name", ""),
+                        "tags": c.get("tags", []),
+                    })
+            logger.info(f"get_clients_by_tag: {len(result)} matching tag='{tag}'")
             return result
 
     except Exception as e:
