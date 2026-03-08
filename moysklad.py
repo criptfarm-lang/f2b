@@ -904,8 +904,9 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                     "offset": offset,
                     "expand": "agent",
                     "order": "moment,desc",
-                    "filter": f"state.name!=Отменён{agent_filter}",
                 }
+                if agent_filter:
+                    params["filter"] = agent_filter.lstrip(";")
                 async with session.get(url, headers=get_headers(), params=params) as resp:
                     if resp.status != 200:
                         body = await resp.text()
