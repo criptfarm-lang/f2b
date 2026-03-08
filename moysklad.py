@@ -510,7 +510,8 @@ async def get_counterparty_balance(query: str) -> list:
                         # МойСклад хранит деньги в копейках — делим на 100
                         raw_balance = rdata.get("balance", 0) or 0
                         balance = raw_balance / 100
-                        logger.info(f"counterparty '{c.get('name')}' raw_balance={raw_balance} balance={balance}")
+                        # Логируем все поля для отладки знака баланса
+                        logger.info(f"counterparty '{c.get('name')}' raw_balance={raw_balance} balance={balance} tags={[t.get('name') for t in c.get('tags', [])]} companyType={c.get('companyType')}")
 
                 # Для покупателей: баланс < 0 = нам должны, баланс > 0 = мы должны
                 debt = -balance if balance < 0 else 0
@@ -594,6 +595,114 @@ def format_counterparty_balance(counterparties: list, query: str) -> str:
             lines.append(f"\u2705 *{name}*\n\u0411\u0430\u043b\u0430\u043d\u0441 \u043d\u0443\u043b\u0435\u0432\u043e\u0439, \u0434\u043e\u043b\u0433\u043e\u0432 \u043d\u0435\u0442.")
 
     return "\n\n".join(lines)
+
+# Карта тегов → менеджер
+MANAGER_TAGS = {
+    "баласанян": "Карина Баласанян",
+    "голубева":  "Татьяна Голубева",
+    "леонтьев":  "Алексей Леонтьев",
+    "мерзлякова": "Елена Мерзлякова",
+    "скляр":     "Инесса Скляр",
+}
+
+# Тип покупателя
+BUYER_TYPE_TAGS = {
+    "хорека": "ХОРЕКА (рестораны)",
+    "опт":    "ОПТ (оптовые покупатели)",
+    "покупатели": "Покупатель",
+}
+
+
+async def find_counterparty_info(query: str) -> list:
+    """Находит контрагента и возвращает его теги, менеджера, тип покупателя и баланс."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/counterparty"
+            params = {"filter": f"name~{query}", "limit": 10}
+            async with session.get(url, headers=get_headers(), params=params) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+
+            result = []
+            for c in data.get("rows", []):
+                tags = [t.lower() for t in c.get("tags", [])]
+
+                # Определяем менеджера по тегам
+                manager = None
+                for tag in tags:
+                    for key, name in MANAGER_TAGS.items():
+                        if key in tag:
+                            manager = name
+                            break
+
+                # Определяем тип покупателя
+                buyer_type = None
+                for tag in tags:
+                    for key, label in BUYER_TYPE_TAGS.items():
+                        if key in tag:
+                            buyer_type = label
+                            break
+
+                # Получаем баланс через report
+                balance = 0
+                try:
+                    report_url = f"{MS_BASE}/report/counterparty/{c['id']}"
+                    async with session.get(report_url, headers=get_headers()) as r2:
+                        if r2.status == 200:
+                            rdata = await r2.json()
+                            balance = (rdata.get("balance", 0) or 0) / 100
+                except Exception:
+                    pass
+
+                result.append({
+                    "id": c["id"],
+                    "name": c.get("name", ""),
+                    "tags": c.get("tags", []),
+                    "manager": manager,
+                    "buyer_type": buyer_type,
+                    "balance": balance,
+                })
+            return result
+
+    except Exception as e:
+        logger.error(f"find_counterparty_info error: {e}", exc_info=True)
+        return []
+
+
+def format_counterparty_info(counterparties: list, query: str) -> str:
+    """Форматирует информацию о контрагенте."""
+    if not counterparties:
+        return f"Контрагент «{query}» не найден в МойСклад."
+
+    lines = []
+    for c in counterparties:
+        name = c["name"]
+        parts = [f"*{name}*"]
+
+        if c.get("buyer_type"):
+            parts.append(f"Тип: {c['buyer_type']}")
+
+        if c.get("manager"):
+            parts.append(f"Менеджер: {c['manager']}")
+        else:
+            parts.append("Менеджер: не указан")
+
+        balance = c["balance"]
+        if balance < 0:
+            parts.append(f"Долг перед нами: *{fmt_money(-balance)}*")
+        elif balance > 0:
+            parts.append(f"Мы должны им: *{fmt_money(balance)}*")
+        else:
+            parts.append("Баланс нулевой")
+
+        if c.get("tags"):
+            parts.append(f"Теги: {', '.join(c['tags'])}")
+
+        lines.append("\n".join(parts))
+
+    return "\n\n".join(lines)
+
 
 async def get_price_list(limit: int = 100) -> list:
     """Получает прайс-лист — все товары с ценами и остатками."""
