@@ -894,7 +894,7 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
 
             params = {
                 "limit": 100,
-                "filter": f"paymentPlannedMoment<{today};paymentState=notpaid,partialpaid{agent_filter}",
+                "filter": f"paymentPlannedMoment<{today}{agent_filter}",
                 "expand": "agent",
                 "order": "paymentPlannedMoment,asc",
             }
@@ -902,19 +902,9 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                 if resp.status != 200:
                     body = await resp.text()
                     logger.error(f"get_overdue_demands {resp.status}: {body[:300]}")
-                    # Fallback: попробуем без paymentState фильтра
-                    params2 = {
-                        "limit": 100,
-                        "filter": f"paymentPlannedMoment<{today}",
-                        "expand": "agent",
-                        "order": "paymentPlannedMoment,asc",
-                    }
-                    async with session.get(url, headers=get_headers(), params=params2) as resp2:
-                        if resp2.status != 200:
-                            return []
-                        data = await resp2.json()
-                else:
-                    data = await resp.json()
+                    return []
+                data = await resp.json()
+            logger.info(f"get_overdue_demands: {data.get('meta', {}).get('size', '?')} total demands found")
 
             rows = data.get("rows", [])
             logger.info(f"get_overdue_demands: {len(rows)} overdue demands found")
