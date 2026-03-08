@@ -512,7 +512,8 @@ async def get_counterparty_balance(query: str) -> list:
                         balance = raw_balance / 100
                         logger.info(f"counterparty '{c.get('name')}' raw_balance={raw_balance} balance={balance}")
 
-                debt = balance if balance > 0 else 0
+                # Для покупателей: баланс < 0 = нам должны, баланс > 0 = мы должны
+                debt = -balance if balance < 0 else 0
                 result.append({
                     "id": cid,
                     "name": c.get("name", ""),
@@ -543,12 +544,12 @@ async def get_all_debtors() -> list:
             result = []
             for c in data.get("rows", []):
                 balance = (c.get("balance", 0) or 0) / 100
-                if balance > 0:  # положительный = нам должны
+                if balance < 0:  # отрицательный = нам должны (покупатели)
                     name = c.get("counterparty", {}).get("name", c.get("name", ""))
                     result.append({
                         "id": c.get("counterparty", {}).get("id", ""),
                         "name": name,
-                        "debt": balance,
+                        "debt": -balance,
                     })
 
             result.sort(key=lambda x: x["debt"], reverse=True)
@@ -585,11 +586,10 @@ def format_counterparty_balance(counterparties: list, query: str) -> str:
     for c in counterparties:
         balance = c["balance"]
         name = c["name"]
-        if balance > 0:
-            lines.append(f"\U0001f534 *{name}*\n\u0414\u043e\u043b\u0433 \u043f\u0435\u0440\u0435\u0434 \u043d\u0430\u043c\u0438: *{fmt_money(balance)}*")
-        elif balance < 0:
-            # Отрицательный баланс — временно показываем сырое значение для отладки
-            lines.append(f"\U0001f534 *{name}*\n\u0414\u043e\u043b\u0433 \u043f\u0435\u0440\u0435\u0434 \u043d\u0430\u043c\u0438: *{fmt_money(-balance)}* (\u043e\u0442\u0440. \u0431\u0430\u043b\u0430\u043d\u0441)")
+        if balance < 0:
+            lines.append(f"\U0001f534 *{name}*\n\u0414\u043e\u043b\u0433 \u043f\u0435\u0440\u0435\u0434 \u043d\u0430\u043c\u0438: *{fmt_money(-balance)}*")
+        elif balance > 0:
+            lines.append(f"\U0001f7e2 *{name}*\n\u041c\u044b \u0434\u043e\u043b\u0436\u043d\u044b \u0438\u043c: *{fmt_money(balance)}*")
         else:
             lines.append(f"\u2705 *{name}*\n\u0411\u0430\u043b\u0430\u043d\u0441 \u043d\u0443\u043b\u0435\u0432\u043e\u0439, \u0434\u043e\u043b\u0433\u043e\u0432 \u043d\u0435\u0442.")
 
