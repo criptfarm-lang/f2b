@@ -20,7 +20,7 @@ from telegram.ext import (
 from database import Database
 from scheduler import setup_scheduler
 from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion
-from moysklad import search_products, get_price_list, format_products, format_price_list, get_product_image, download_image
+from moysklad import search_products, get_price_list, format_products, format_price_list, get_product_image, download_image, get_image_download_url
 
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
 EMPLOYEES = {
@@ -457,11 +457,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Если один товар и есть фото — пробуем прислать
         if len(products) == 1 and products[0].get("image_href"):
             try:
-                img_bytes = await download_image(products[0]["image_href"])
-                if img_bytes:
-                    import io
+                img_url = await get_image_download_url(products[0]["image_href"])
+                if img_url:
                     await message.reply_photo(
-                        photo=io.BytesIO(img_bytes),
+                        photo=img_url,
                         caption=f"📸 {products[0]['name']}"
                     )
             except Exception as e:
@@ -544,8 +543,9 @@ async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TY
     sent = 0
     for product in with_photo[:3]:
         try:
-            img_bytes = await download_image(product["image_href"])
-            if img_bytes:
+            # Получаем прямую ссылку — Telegram сам скачает
+            img_url = await get_image_download_url(product["image_href"])
+            if img_url:
                 name = product.get("name", query)
                 price = product.get("sale_price", 0)
                 stock = product.get("stock", 0)
@@ -555,7 +555,7 @@ async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TY
                 if stock and stock > 0:
                     caption += f"\n📦 В наличии: {stock} кг"
                 await update.message.reply_photo(
-                    photo=io.BytesIO(img_bytes),
+                    photo=img_url,
                     caption=caption
                 )
                 sent += 1
