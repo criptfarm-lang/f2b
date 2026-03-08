@@ -362,18 +362,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines = [f"📌 Зафиксировано задач: {saved_count}\n"] + task_lines
                 await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    # 3. Автозакрытие задач по контексту переписки
-    # Только если это НЕ постановка задачи (нет новых задач из этого сообщения)
-    # и сообщение содержит признаки выполнения
-    DONE_KEYWORDS = ["выполнен", "готово", "сделал", "сделала", "сделано", "закончил",
-                     "закончила", "отправил", "отправила", "позвонил", "позвонила",
-                     "проставил", "проставила", "отработал", "готов", "готова",
-                     "завершил", "завершила", "провел", "провела", "согласовал"]
-
-    text_lower_check = text.lower()
-    looks_like_done = any(kw in text_lower_check for kw in DONE_KEYWORDS)
-
-    if not is_bot_addressed(text) and looks_like_done and len(text) > 5:
+    # 3. Автозакрытие задач — Claude анализирует контекст без списков слов
+    if not is_bot_addressed(text) and len(text) > 5:
         open_tasks = db.get_all_open_tasks()
         if open_tasks:
             completed_ids = await detect_task_completion(text, open_tasks)
