@@ -903,7 +903,7 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                     "limit": 100,
                     "offset": offset,
                     "expand": "agent",
-                    "order": "moment,desc",
+                    "order": "moment,asc",
                 }
                 if agent_filter:
                     params["filter"] = agent_filter.lstrip(";")
@@ -919,9 +919,6 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                     if len(batch) < 100:
                         break
                     offset += 100
-                    # Не грузим слишком много — берём последние 500
-                    if offset >= 500:
-                        break
 
             logger.info(f"get_overdue_demands: {len(all_orders)} total orders loaded")
 
