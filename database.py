@@ -69,6 +69,23 @@ class Database:
                 days INTEGER,
                 updated_at TEXT DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                user_id INTEGER,
+                user_name TEXT,
+                text TEXT,
+                message_type TEXT DEFAULT 'text',
+                ts TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT UNIQUE NOT NULL,
+                value TEXT,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
         """)
         self.conn.commit()
 
@@ -233,6 +250,79 @@ class Database:
             "SELECT * FROM debtors ORDER BY days DESC"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ─── ИСТОРИЯ СООБЩЕНИЙ ───────────────────────────────────────────────────
+
+    def save_message(self, chat_id: int, user_id: int, user_name: str,
+                     text: str, message_type: str = 'text'):
+        """Сохраняет сообщение из чата."""
+        self.conn.execute(
+            """INSERT INTO chat_messages (chat_id, user_id, user_name, text, message_type)
+               VALUES (?, ?, ?, ?, ?)""",
+            (chat_id, user_id, user_name, text, message_type)
+        )
+        # Оставляем только последние 500 сообщений на чат
+        self.conn.execute(
+            """DELETE FROM chat_messages WHERE chat_id = ? AND id NOT IN (
+               SELECT id FROM chat_messages WHERE chat_id = ?
+               ORDER BY id DESC LIMIT 500)""",
+            (chat_id, chat_id)
+        )
+        self.conn.commit()
+
+    def get_recent_messages(self, chat_id: int, limit: int = 50) -> List[Dict]:
+        """Возвращает последние N сообщений из чата."""
+        rows = self.conn.execute(
+            """SELECT user_name, text, ts, message_type
+               FROM chat_messages WHERE chat_id = ?
+               ORDER BY id DESC LIMIT ?""",
+            (chat_id, limit)
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    def format_history(self, chat_id: int, limit: int = 50) -> str:
+        """Форматирует историю сообщений для промпта Claude."""
+        messages = self.get_recent_messages(chat_id, limit)
+        if not messages:
+            return ""
+        lines = []
+        for m in messages:
+            ts = m['ts'][11:16] if m.get('ts') else ""  # HH:MM
+            lines.append(f"[{ts}] {m['user_name']}: {m['text']}")
+        return "\n".join(lines)
+
+    # ─── ДОЛГОСРОЧНАЯ ПАМЯТЬ ──────────────────────────────────────────────────
+
+    def remember(self, key: str, value: str):
+        """Сохраняет факт в долгосрочную память."""
+        self.conn.execute(
+            """INSERT OR REPLACE INTO memory (key, value, updated_at)
+               VALUES (?, ?, datetime('now'))""",
+            (key, value)
+        )
+        self.conn.commit()
+
+    def recall(self, key: str) -> Optional[str]:
+        """Извлекает факт из памяти."""
+        row = self.conn.execute(
+            "SELECT value FROM memory WHERE key = ?", (key,)
+        ).fetchone()
+        return row['value'] if row else None
+
+    def get_all_memories(self) -> List[Dict]:
+        """Все сохранённые факты."""
+        rows = self.conn.execute(
+            "SELECT key, value, updated_at FROM memory ORDER BY updated_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def format_memories(self) -> str:
+        """Форматирует память для промпта Claude."""
+        memories = self.get_all_memories()
+        if not memories:
+            return ""
+        lines = [f"- {m['key']}: {m['value']}" for m in memories[:30]]
+        return "\n".join(lines)
 
     # ─── КОНТЕКСТ ДЛЯ CLAUDE ──────────────────────────────────────────────────
 
