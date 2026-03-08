@@ -44,6 +44,11 @@ async def search_products(query: str, limit: int = 20) -> list:
             "охл":     ["охл"],
             "зам":     ["заморож"],
             "заморож": ["заморож"],
+            # СМ = сырой мороженый: есть заморож, нет х/к и с/с
+            # Обрабатывается отдельно в score()
+            "см":      ["__СМ__"],
+            "с/м":     ["__СМ__"],
+            
             "мрм":     ["мурманск", "мурм", "мрм"],
             "мурманск": ["мурманск"],
             # Вид разделки
@@ -146,12 +151,14 @@ async def search_products(query: str, limit: int = 20) -> list:
             # Скоринг: считаем сколько match_tokens встречается в названии
             def score(p):
                 name = p.get("name", "").lower()
-                # Нормализуем окончания (лосос* → лосось, заморож* → заморож)
                 def norm(w): return w[:-2] if len(w) > 5 else w
                 hits = 0
                 for variants in match_tokens:
-                    # Хотя бы один вариант из группы должен быть в названии
-                    if any(norm(v) in name or v in name for v in variants):
+                    if "__СМ__" in variants:
+                        # СМ = заморож + НЕ х/к + НЕ с/с
+                        if "заморож" in name and "х/к" not in name and "с/с" not in name:
+                            hits += 1
+                    elif any(norm(v) in name or v in name for v in variants):
                         hits += 1
                 return hits
 
@@ -161,13 +168,18 @@ async def search_products(query: str, limit: int = 20) -> list:
             else:
                 # Строгий: все токены совпали
                 strict = [p for p in all_products if score(p) == total]
+                def sort_key(p):
+                    # Сначала те что в наличии, потом по релевантности
+                    in_stock = 1 if p.get("stock", 0) > 0 else 0
+                    return (in_stock, score(p))
+
                 if strict:
-                    products = sorted(strict, key=score, reverse=True)[:limit]
+                    products = sorted(strict, key=sort_key, reverse=True)[:limit]
                 else:
                     # Мягкий: хотя бы половина
                     threshold = max(1, total // 2)
                     soft = [p for p in all_products if score(p) >= threshold]
-                    products = sorted(soft, key=score, reverse=True)[:limit]
+                    products = sorted(soft, key=sort_key, reverse=True)[:limit]
 
             logger.info(f"МойСклад found {len(products)} products for query='{query}' tokens={search_tokens}")
             if not products:
