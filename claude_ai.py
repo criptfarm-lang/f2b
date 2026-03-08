@@ -158,6 +158,73 @@ async def detect_task_completion(text: str, open_tasks: list) -> list:
         logger.error(f"detect_task_completion error: {e}")
     return []
 
+async def parse_product_query(query: str) -> dict:
+    """Claude разбирает запрос на товар и возвращает структурированные фильтры.
+    
+    Возвращает:
+    {
+        "search_term": "основное слово для поиска в API",
+        "filters": {
+            "trim": "пр"|"а"|"б"|"д"|"е"|"с"|null,
+            "processing": "хк"|"сс"|"см"|"охл"|null,
+            "frozen": true|false|null,
+            "region": "мурманск"|null,
+            "caliber": "1.6-2.0"|null
+        },
+        "raw_tokens": ["слова", "для", "скоринга"]
+    }
+    """
+    client = get_client()
+    
+    prompt = f"""Ты помощник для поиска рыбных товаров на складе.
+Разбери запрос и верни JSON с параметрами поиска.
+
+СПРАВОЧНИК СОКРАЩЕНИЙ:
+- ПР, пр = вид разделки "Трим ПР"
+- А, Б, Д, Е, С = вид разделки "Трим А/Б/Д/Е/С"  
+- ХК, х/к = холодное копчение
+- ГК, г/к = горячее копчение
+- СС, с/с = слабосолёный
+- СМ, с/м = сырой мороженый (нет копчения и засолки)
+- ОХЛ = охлаждённый
+- ЗАМ, ЗАМОРОЖ = замороженный
+- МРМ = Мурманск (происхождение)
+- Семга, сёмга = лосось
+
+ФОРМАТ ОТВЕТА — только JSON:
+{{
+  "search_term": "главное слово для поиска (название рыбы)",
+  "filters": {{
+    "trim": "пр" | "а" | "б" | "д" | "е" | "с" | null,
+    "processing": "хк" | "гк" | "сс" | "см" | null,
+    "state": "охл" | "заморож" | null,
+    "region": "мурманск" | null,
+    "caliber": "диапазон кг если указан" | null
+  }},
+  "raw_tokens": ["все", "значимые", "слова", "для", "скоринга"]
+}}
+
+Запрос: "{query}"
+
+Отвечай ТОЛЬКО валидным JSON."""
+
+    try:
+        response = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = response.content[0].text.strip()
+        text = re.sub(r'^```json|^```|```$', '', text, flags=re.MULTILINE).strip()
+        result = json.loads(text)
+        logger.info(f"parse_product_query: '{query}' → {result}")
+        return result
+    except Exception as e:
+        logger.error(f"parse_product_query error: {e}")
+        # Fallback — вернуть запрос как есть
+        return {"search_term": query, "filters": {}, "raw_tokens": query.lower().split()}
+
+
 async def dispatch(query: str, user_name: str, context_data: str = "",
                    chat_history: str = "", memories: str = "") -> dict:
     """
