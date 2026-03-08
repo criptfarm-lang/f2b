@@ -19,7 +19,7 @@ from telegram.ext import (
 
 from database import Database
 from scheduler import setup_scheduler
-from claude_ai import dispatch, smart_answer, extract_tasks_from_message
+from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion
 from moysklad import search_products, get_price_list, format_products, format_price_list, get_product_image, download_image
 
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
@@ -362,7 +362,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines = [f"📌 Зафиксировано задач: {saved_count}\n"] + task_lines
                 await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    # 3. Реагируем на обращение к боту
+    # 3. Автозакрытие задач по контексту переписки
+    if not is_bot_addressed(text) and len(text) > 5:
+        open_tasks = db.get_all_open_tasks()
+        if open_tasks:
+            completed_ids = await detect_task_completion(text, open_tasks)
+            if completed_ids:
+                closed = []
+                for task_id in completed_ids:
+                    # Проверяем что задача существует
+                    task = next((t for t in open_tasks if t['id'] == task_id), None)
+                    if task:
+                        db.complete_task(task_id)
+                        executor = task.get('executor', '')
+                        closed.append(f"✅ *{executor}*: {task['text']}")
+                        logger.info(f"Автозакрытие задачи {task_id}: {task['text']}")
+                if closed:
+                    lines = ["🤖 Эф зафиксировал выполнение:\n"] + closed
+                    await message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    # 4. Реагируем на обращение к боту
     if not is_bot_addressed(text):
         return
 
