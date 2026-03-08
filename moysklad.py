@@ -184,12 +184,33 @@ async def get_product_image(product_id: str) -> Optional[str]:
 
 
 async def download_image(url: str) -> Optional[bytes]:
-    """Скачивает фото товара из МойСклад."""
+    """Скачивает фото товара из МойСклад.
+    url может быть либо ссылкой на список изображений, либо на само фото.
+    """
     try:
         async with aiohttp.ClientSession() as session:
+            # Если это ссылка на коллекцию images — сначала получаем список
+            if "/images" in url and "downloadHref" not in url:
+                async with session.get(url, headers=get_headers()) as resp:
+                    if resp.status != 200:
+                        logger.error(f"images list status={resp.status} url={url}")
+                        return None
+                    data = await resp.json()
+                rows = data.get("rows", [])
+                if not rows:
+                    return None
+                # Берём downloadHref первого фото
+                meta = rows[0].get("meta", {})
+                download_url = meta.get("downloadHref") or meta.get("href")
+                if not download_url:
+                    return None
+                url = download_url
+
+            # Скачиваем само фото
             async with session.get(url, headers=get_headers()) as resp:
                 if resp.status == 200:
                     return await resp.read()
+                logger.error(f"download_image status={resp.status} url={url}")
         return None
     except Exception as e:
         logger.error(f"download_image error: {e}")
