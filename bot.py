@@ -27,7 +27,7 @@ from moysklad import (search_products, search_products_filtered, get_price_list,
     get_debtors_by_tag, get_clients_by_tag, resolve_tag,
     format_debtors_by_tag, format_clients_by_tag,
     get_overdue_demands, format_overdue_demands, format_overdue_summary,
-    format_reminders_for_manager)
+    format_reminders_for_manager, format_debt_reminder, fmt_money)
 
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
 EMPLOYEES = {
@@ -509,16 +509,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not manager_tag and params.get("tag"):
             manager_tag = resolve_tag(params["tag"])
             manager_display = USER_MANAGER_DISPLAY.get(manager_tag, params["tag"].capitalize())
+        raw_query = params.get("query", "")
         await message.reply_chat_action("typing")
-        items = await get_overdue_demands(tag=manager_tag)
-        text = format_reminders_for_manager(items, manager_display)
-        # Разбиваем на части если длинно
-        if len(text) > 4000:
-            parts = [text[i:i+3900] for i in range(0, len(text), 3900)]
-            for part in parts:
-                await message.reply_text(part, parse_mode="Markdown")
+        items = await get_overdue_demands(tag=manager_tag, query=raw_query)
+        if not items:
+            await message.reply_text("✅ Просроченных клиентов нет — напоминания не нужны.")
         else:
-            await message.reply_text(text, parse_mode="Markdown")
+            header = (
+                f"📋 *Напоминания об оплате — {manager_display}*\n"
+                f"{len(items)} клиентов · скопируй и отправь каждому"
+            )
+            await message.reply_text(header, parse_mode="Markdown")
+            for c in sorted(items, key=lambda x: x["overdue_sum"], reverse=True):
+                reminder = format_debt_reminder(c)
+                label = f"💬 {c['name']} — {fmt_money(c['overdue_sum'])}\n\n{reminder}"
+                await message.reply_text(label)
 
     elif action == "find_photo":
         photo_query = params.get("query", query)
