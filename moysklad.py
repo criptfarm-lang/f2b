@@ -939,7 +939,10 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                     continue
 
                 try:
-                    due_dt = datetime.fromisoformat(ppm.replace("Z", "+00:00"))
+                    due_dt = datetime.fromisoformat(ppm.replace(".000", "").replace("Z", ""))
+                    # Добавляем UTC если нет timezone
+                    if due_dt.tzinfo is None:
+                        due_dt = due_dt.replace(tzinfo=timezone.utc)
                 except Exception:
                     continue
 
