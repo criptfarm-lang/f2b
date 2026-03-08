@@ -92,7 +92,7 @@ async def search_products(query: str, limit: int = 20) -> list:
             "кальмар": "кальмар",
         }
 
-        stop_words = {"с", "в", "на", "по", "из", "от", "до", "и", "а", "кг", "гр", "см", "г", "филе"}
+        stop_words = {"с", "в", "на", "по", "из", "от", "до", "и", "а", "кг", "гр", "г", "филе"}
 
         raw_words = query.lower().split()
 
@@ -329,6 +329,119 @@ async def download_image(url: str) -> Optional[bytes]:
     except Exception as e:
         logger.error(f"download_image error: {e}", exc_info=True)
         return None
+
+
+async def search_products_filtered(parsed: dict, limit: int = 20) -> list:
+    """Поиск товаров используя разобранные Claude фильтры."""
+    search_term = parsed.get("search_term", "")
+    filters = parsed.get("filters", {})
+    raw_tokens = parsed.get("raw_tokens", [])
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/product"
+            params = {"filter": f"name~{search_term}", "limit": 100}
+            
+            async with session.get(url, headers=get_headers(), params=params) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+            
+            all_products = data.get("rows", [])
+            
+            def matches(p):
+                name = p.get("name", "").lower()
+                
+                # Вид разделки
+                trim = filters.get("trim")
+                if trim:
+                    if f"трим {trim}" not in name:
+                        return False
+                
+                # Обработка
+                processing = filters.get("processing")
+                if processing == "хк":
+                    if "х/к" not in name:
+                        return False
+                elif processing == "гк":
+                    if "г/к" not in name:
+                        return False
+                elif processing == "сс":
+                    if "с/с" not in name:
+                        return False
+                elif processing == "см":
+                    # Сырой мороженый — нет копчения, нет засолки
+                    if "х/к" in name or "г/к" in name or "с/с" in name:
+                        return False
+                    if "заморож" not in name:
+                        return False
+                
+                # Состояние
+                state = filters.get("state")
+                if state == "охл":
+                    if "охл" not in name:
+                        return False
+                elif state == "заморож":
+                    if "заморож" not in name:
+                        return False
+                
+                # Регион
+                region = filters.get("region")
+                if region == "мурманск":
+                    if "мурманск" not in name and "мрм" not in name:
+                        return False
+                
+                # Калибр
+                caliber = filters.get("caliber")
+                if caliber and caliber not in name:
+                    return False
+                
+                return True
+            
+            products = [p for p in all_products if matches(p)]
+            
+            # Сортируем: сначала в наличии
+            # (остатки получим ниже, пока просто берём первые limit)
+            if not products:
+                # Fallback: без строгих фильтров, только по search_term
+                logger.info(f"search_products_filtered: no strict matches, falling back")
+                products = all_products
+            
+            products = products[:limit]
+            logger.info(f"search_products_filtered: '{search_term}' filters={filters} → {len(products)} products")
+            
+            if not products:
+                return []
+            
+            # Получаем остатки
+            product_ids = [p["id"] for p in products]
+            stocks = await get_stocks(session, product_ids)
+            
+            result = []
+            for p in products:
+                pid = p["id"]
+                stock_info = stocks.get(pid, {})
+                sale_price = None
+                for price in p.get("salePrices", []):
+                    if price.get("value", 0) > 0:
+                        sale_price = price["value"] / 100
+                        break
+                result.append({
+                    "id": pid,
+                    "name": p.get("name", ""),
+                    "sale_price": sale_price,
+                    "stock": stock_info.get("stock", 0),
+                    "reserve": stock_info.get("reserve", 0),
+                    "image_href": p.get("images", {}).get("meta", {}).get("href") if p.get("images") else None,
+                })
+            
+            # Сортируем: в наличии первыми
+            result.sort(key=lambda x: (1 if x["stock"] > 0 else 0), reverse=True)
+            return result
+            
+    except Exception as e:
+        logger.error(f"search_products_filtered error: {e}")
+        return []
 
 
 async def get_price_list(limit: int = 100) -> list:
