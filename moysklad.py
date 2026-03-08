@@ -242,13 +242,23 @@ async def download_image(url: str) -> Optional[bytes]:
                     cdn_url = resp.headers.get("Location")
                     logger.info(f"download_image: redirect to CDN {cdn_url}")
                     if cdn_url:
-                        # CDN не требует авторизации
-                        async with session.get(cdn_url) as r2:
-                            logger.info(f"download_image: CDN status={r2.status}")
-                            if r2.status == 200:
-                                data = await r2.read()
-                                logger.info(f"download_image: got {len(data)} bytes from CDN")
-                                return data
+                        try:
+                            # CDN на :8080 — используем отдельный таймаут
+                            cdn_timeout = aiohttp.ClientTimeout(total=20)
+                            async with aiohttp.ClientSession(timeout=cdn_timeout) as cdn_session:
+                                async with cdn_session.get(cdn_url) as r2:
+                                    logger.info(f"download_image: CDN status={r2.status} content-type={r2.content_type}")
+                                    if r2.status == 200:
+                                        data = await r2.read()
+                                        logger.info(f"download_image: got {len(data)} bytes from CDN")
+                                        return data
+                                    else:
+                                        body = await r2.text()
+                                        logger.error(f"download_image: CDN error body={body[:200]}")
+                        except asyncio.TimeoutError:
+                            logger.error(f"download_image: CDN TIMEOUT {cdn_url}")
+                        except Exception as e:
+                            logger.error(f"download_image: CDN exception {e}")
                 else:
                     body = await resp.text()
                     logger.error(f"download_image: error status={resp.status} body={body[:200]}")
