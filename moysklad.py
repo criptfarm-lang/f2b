@@ -704,6 +704,138 @@ def format_counterparty_info(counterparties: list, query: str) -> str:
     return "\n\n".join(lines)
 
 
+async def get_debtors_by_tag(tag: str, limit: int = 100) -> list:
+    """Возвращает должников с определённым тегом (менеджер, хорека, опт и т.д.)"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # МойСклад поддерживает фильтр по тегу
+            url = f"{MS_BASE}/entity/counterparty"
+            params = {"filter": f"tag={tag}", "limit": limit}
+            async with session.get(url, headers=get_headers(), params=params) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.error(f"get_debtors_by_tag {resp.status}: {body[:200]}")
+                    return []
+                data = await resp.json()
+
+            rows = data.get("rows", [])
+            logger.info(f"get_debtors_by_tag tag='{tag}': {len(rows)} counterparties found")
+
+            # Получаем балансы через report параллельно
+            result = []
+            for c in rows:
+                try:
+                    report_url = f"{MS_BASE}/report/counterparty/{c['id']}"
+                    async with session.get(report_url, headers=get_headers()) as r2:
+                        balance = 0
+                        if r2.status == 200:
+                            rdata = await r2.json()
+                            balance = (rdata.get("balance", 0) or 0) / 100
+                except Exception:
+                    balance = 0
+
+                result.append({
+                    "id": c["id"],
+                    "name": c.get("name", ""),
+                    "tags": c.get("tags", []),
+                    "balance": balance,
+                    "debt": -balance if balance < 0 else 0,
+                })
+
+            return result
+
+    except Exception as e:
+        logger.error(f"get_debtors_by_tag error: {e}", exc_info=True)
+        return []
+
+
+async def get_clients_by_tag(tag: str, limit: int = 100) -> list:
+    """Возвращает всех контрагентов с тегом (список клиентов менеджера)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/counterparty"
+            params = {"filter": f"tag={tag}", "limit": limit}
+            async with session.get(url, headers=get_headers(), params=params) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+
+            result = []
+            for c in data.get("rows", []):
+                result.append({
+                    "id": c["id"],
+                    "name": c.get("name", ""),
+                    "tags": c.get("tags", []),
+                })
+            return result
+
+    except Exception as e:
+        logger.error(f"get_clients_by_tag error: {e}")
+        return []
+
+
+def resolve_tag(query: str) -> str:
+    """Определяет тег МойСклад по запросу пользователя."""
+    q = query.lower().strip()
+    # Менеджеры
+    manager_map = {
+        "баласанян": "баласанян",
+        "карина": "баласанян",
+        "голубева": "голубева",
+        "татьяна": "голубева",
+        "леонтьев": "леонтьев",
+        "алексей": "леонтьев",
+        "мерзлякова": "мерзлякова",
+        "елена": "мерзлякова",
+        "лена": "мерзлякова",
+        "скляр": "скляр",
+        "инесса": "скляр",
+    }
+    # Типы
+    type_map = {
+        "хорека": "хорека",
+        "рестораны": "хорека",
+        "ресторан": "хорека",
+        "опт": "опт",
+        "оптовые": "опт",
+        "покупатели": "покупатели",
+    }
+    for key, tag in {**manager_map, **type_map}.items():
+        if key in q:
+            return tag
+    return q  # вернуть как есть
+
+
+def format_debtors_by_tag(items: list, tag: str) -> str:
+    """Форматирует долги по группе/менеджеру."""
+    debtors = [i for i in items if i["debt"] > 0]
+    tag_label = tag.capitalize()
+
+    if not debtors:
+        return f"✅ По группе *{tag_label}* долгов нет."
+
+    total = sum(d["debt"] for d in debtors)
+    lines = [
+        f"💰 *Долги по группе {tag_label}* — {len(debtors)} клиентов",
+        f"Итого: *{fmt_money(total)}*\n",
+    ]
+    for d in sorted(debtors, key=lambda x: x["debt"], reverse=True):
+        lines.append(f"• {d['name']} — *{fmt_money(d['debt'])}*")
+    return "\n".join(lines)
+
+
+def format_clients_by_tag(items: list, tag: str) -> str:
+    """Форматирует список клиентов группы."""
+    tag_label = tag.capitalize()
+    if not items:
+        return f"По группе *{tag_label}* клиентов не найдено."
+
+    lines = [f"📋 *Клиенты группы {tag_label}* — {len(items)} шт.\n"]
+    for c in items:
+        lines.append(f"• {c['name']}")
+    return "\n".join(lines)
+
+
 async def get_price_list(limit: int = 100) -> list:
     """Получает прайс-лист — все товары с ценами и остатками."""
     try:
