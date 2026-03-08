@@ -209,61 +209,52 @@ async def get_image_download_url(url: str) -> Optional[str]:
 
 async def download_image(url: str) -> Optional[bytes]:
     """Скачивает фото товара из МойСклад.
-    url может быть либо ссылкой на список изображений, либо на само фото.
+    МойСклад /download/ делает редирект на CDN — скачиваем в два шага.
     """
     try:
-        logger.info(f"download_image: start url={url}")
-        async with aiohttp.ClientSession() as session:
-            # Если это ссылка на коллекцию images — сначала получаем список
-            if "/images" in url and "downloadHref" not in url:
-                logger.info("download_image: fetching images list...")
+        timeout = aiohttp.ClientTimeout(total=30)
+        # Шаг 1: получаем список изображений если нужно
+        if "/images" in url and "download" not in url:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url, headers=get_headers()) as resp:
-                    logger.info(f"download_image: images list status={resp.status}")
                     if resp.status != 200:
-                        body = await resp.text()
-                        logger.error(f"images list error body={body[:200]}")
                         return None
                     data = await resp.json()
-                rows = data.get("rows", [])
-                logger.info(f"download_image: images rows count={len(rows)}")
-                if not rows:
-                    logger.warning("download_image: no images in rows")
-                    return None
-                # Берём downloadHref первого фото
-                meta = rows[0].get("meta", {})
-                logger.info(f"download_image: first image meta={meta}")
-                download_url = meta.get("downloadHref") or meta.get("href")
-                if not download_url:
-                    logger.error("download_image: no downloadHref or href in meta")
-                    return None
-                url = download_url
-                logger.info(f"download_image: resolved url={url}")
+            rows = data.get("rows", [])
+            if not rows:
+                return None
+            meta = rows[0].get("meta", {})
+            url = meta.get("downloadHref") or meta.get("href")
+            if not url:
+                return None
 
-            # Скачиваем само фото с таймаутом 15 сек
-            logger.info(f"download_image: downloading photo from {url}")
-            timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=timeout) as dl_session:
-                async with dl_session.get(url, headers=get_headers(), allow_redirects=True) as resp:
-                    logger.info(f"download_image: photo status={resp.status} content-type={resp.content_type}")
-                    if resp.status == 200:
-                        data = await resp.read()
-                        logger.info(f"download_image: got {len(data)} bytes")
-                        return data
-                    # Попробуем без авторизации (публичный CDN редирект)
-                    if resp.status in (301, 302, 303, 307, 308):
-                        redirect_url = resp.headers.get("Location")
-                        logger.info(f"download_image: redirect to {redirect_url}")
-                        if redirect_url:
-                            async with dl_session.get(redirect_url) as r2:
-                                if r2.status == 200:
-                                    data = await r2.read()
-                                    logger.info(f"download_image: got {len(data)} bytes via redirect")
-                                    return data
+        # Шаг 2: /download/ делает редирект на CDN — следуем вручную
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Первый запрос — получаем редирект без скачивания тела
+            async with session.get(url, headers=get_headers(),
+                                   allow_redirects=False) as resp:
+                logger.info(f"download_image: step2 status={resp.status}")
+                if resp.status == 200:
+                    data = await resp.read()
+                    logger.info(f"download_image: got {len(data)} bytes directly")
+                    return data
+                elif resp.status in (301, 302, 303, 307, 308):
+                    cdn_url = resp.headers.get("Location")
+                    logger.info(f"download_image: redirect to CDN {cdn_url}")
+                    if cdn_url:
+                        # CDN не требует авторизации
+                        async with session.get(cdn_url) as r2:
+                            logger.info(f"download_image: CDN status={r2.status}")
+                            if r2.status == 200:
+                                data = await r2.read()
+                                logger.info(f"download_image: got {len(data)} bytes from CDN")
+                                return data
+                else:
                     body = await resp.text()
-                    logger.error(f"download_image: photo error status={resp.status} body={body[:300]}")
+                    logger.error(f"download_image: error status={resp.status} body={body[:200]}")
         return None
     except asyncio.TimeoutError:
-        logger.error(f"download_image: TIMEOUT after 15s url={url}")
+        logger.error(f"download_image: TIMEOUT url={url}")
         return None
     except Exception as e:
         logger.error(f"download_image error: {e}", exc_info=True)
