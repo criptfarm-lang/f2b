@@ -26,7 +26,8 @@ from moysklad import (search_products, search_products_filtered, get_price_list,
     find_counterparty_info, format_counterparty_info,
     get_debtors_by_tag, get_clients_by_tag, resolve_tag,
     format_debtors_by_tag, format_clients_by_tag,
-    get_overdue_demands, format_overdue_demands, format_overdue_summary)
+    get_overdue_demands, format_overdue_demands, format_overdue_summary,
+    format_reminders_for_manager)
 
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
 EMPLOYEES = {
@@ -480,6 +481,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(text) > 4000:
             text = text[:3900] + "\n\n_...уточни запрос_"
         await message.reply_text(text, parse_mode="Markdown")
+
+    elif action == "prepare_reminders":
+        USER_MANAGER_TAGS = {
+            "карина": "баласанян", "баласанян": "баласанян",
+            "инесса": "скляр", "скляр": "скляр",
+            "елена": "мерзлякова", "мерзлякова": "мерзлякова",
+            "татьяна": "голубева", "голубева": "голубева",
+            "алексей": "леонтьев", "леонтьев": "леонтьев",
+        }
+        USER_MANAGER_DISPLAY = {
+            "баласанян": "Карина Баласанян",
+            "скляр": "Инесса Скляр",
+            "мерзлякова": "Елена Мерзлякова",
+            "голубева": "Татьяна Голубева",
+            "леонтьев": "Алексей Леонтьев",
+        }
+        full_name_lower = user.full_name.lower()
+        manager_tag = None
+        manager_display = user.full_name
+        for key, tag in USER_MANAGER_TAGS.items():
+            if key in full_name_lower:
+                manager_tag = tag
+                manager_display = USER_MANAGER_DISPLAY.get(tag, user.full_name)
+                break
+        # Руководитель может указать тег явно
+        if not manager_tag and params.get("tag"):
+            manager_tag = resolve_tag(params["tag"])
+            manager_display = USER_MANAGER_DISPLAY.get(manager_tag, params["tag"].capitalize())
+        await message.reply_chat_action("typing")
+        items = await get_overdue_demands(tag=manager_tag)
+        text = format_reminders_for_manager(items, manager_display)
+        # Разбиваем на части если длинно
+        if len(text) > 4000:
+            parts = [text[i:i+3900] for i in range(0, len(text), 3900)]
+            for part in parts:
+                await message.reply_text(part, parse_mode="Markdown")
+        else:
+            await message.reply_text(text, parse_mode="Markdown")
 
     elif action == "find_photo":
         photo_query = params.get("query", query)
