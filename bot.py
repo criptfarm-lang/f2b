@@ -20,7 +20,12 @@ from telegram.ext import (
 from database import Database
 from scheduler import setup_scheduler
 from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion, parse_product_query
-from moysklad import search_products, search_products_filtered, get_price_list, format_products, format_price_list, get_product_image, download_image, get_image_download_url, get_counterparty_balance, get_all_debtors, format_debtors_ms, format_counterparty_balance, find_counterparty_info, format_counterparty_info
+from moysklad import (search_products, search_products_filtered, get_price_list, format_products,
+    format_price_list, get_product_image, download_image, get_image_download_url,
+    get_counterparty_balance, get_all_debtors, format_debtors_ms, format_counterparty_balance,
+    find_counterparty_info, format_counterparty_info,
+    get_debtors_by_tag, get_clients_by_tag, resolve_tag,
+    format_debtors_by_tag, format_clients_by_tag)
 
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
 EMPLOYEES = {
@@ -440,6 +445,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_chat_action("typing")
         counterparties = await find_counterparty_info(cp_query)
         text = format_counterparty_info(counterparties, cp_query)
+        await message.reply_text(text, parse_mode="Markdown")
+
+    elif action == "get_group_debts":
+        raw_tag = params.get("tag", "")
+        tag = resolve_tag(raw_tag)
+        await message.reply_chat_action("typing")
+        items = await get_debtors_by_tag(tag)
+        text = format_debtors_by_tag(items, tag)
+        if len(text) > 4000:
+            text = text[:3900] + "\n\n_...уточни запрос_"
+        await message.reply_text(text, parse_mode="Markdown")
+
+    elif action == "get_group_clients":
+        raw_tag = params.get("tag", "")
+        tag = resolve_tag(raw_tag)
+        await message.reply_chat_action("typing")
+        items = await get_clients_by_tag(tag)
+        text = format_clients_by_tag(items, tag)
+        if len(text) > 4000:
+            text = text[:3900] + "\n\n_...слишком много, уточни_"
         await message.reply_text(text, parse_mode="Markdown")
 
     elif action == "find_photo":
