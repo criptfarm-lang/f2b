@@ -1015,10 +1015,10 @@ def format_overdue_demands(items: list, tag: str = None) -> str:
         if days_str:
             header += f" · просрочка {days_str}"
         lines.append(header)
-        # Детализация по заказам если их несколько
+        # Детализация по всем просроченным заказам
         demands = c.get("demands", [])
         if len(demands) > 1:
-            for d in demands[:3]:
+            for d in demands:
                 lines.append(f"   └ {d['name']} · {d['due']} · {fmt_money(d['unpaid'])}")
         lines.append("")
 
