@@ -422,9 +422,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "get_all_tasks":
         await cmd_all_tasks(update, context)
 
-    elif action == "get_overdue_debt":
-        await cmd_overdue(update, context)
-
     elif action == "get_report":
         await cmd_report(update, context)
 
