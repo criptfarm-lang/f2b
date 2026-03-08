@@ -20,7 +20,7 @@ from telegram.ext import (
 from database import Database
 from scheduler import setup_scheduler
 from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion, parse_product_query
-from moysklad import search_products, search_products_filtered, get_price_list, format_products, format_price_list, get_product_image, download_image, get_image_download_url
+from moysklad import search_products, search_products_filtered, get_price_list, format_products, format_price_list, get_product_image, download_image, get_image_download_url, get_counterparty_balance, get_all_debtors, format_debtors_ms, format_counterparty_balance
 
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
 EMPLOYEES = {
@@ -423,7 +423,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_report(update, context)
 
     elif action == "get_debtors":
-        await cmd_debtors(update, context)
+        await message.reply_chat_action("typing")
+        debtors = await get_all_debtors()
+        text = format_debtors_ms(debtors)
+        await message.reply_text(text, parse_mode="Markdown")
+
+    elif action == "get_debt":
+        debt_query = params.get("query", "")
+        await message.reply_chat_action("typing")
+        counterparties = await get_counterparty_balance(debt_query)
+        text = format_counterparty_balance(counterparties, debt_query)
+        await message.reply_text(text, parse_mode="Markdown")
 
     elif action == "find_photo":
         photo_query = params.get("query", query)
