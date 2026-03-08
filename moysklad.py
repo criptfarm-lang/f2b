@@ -925,17 +925,16 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
 
             logger.info(f"get_overdue_demands: {len(all_orders)} total orders loaded")
 
-            # DEBUG: показываем attributes первого заказа
-            if all_orders:
-                dbg = all_orders[0]
-                agent_name = dbg.get("agent", {}).get("name", "?")
-                attrs = dbg.get("attributes", [])
-                logger.info(f"DEBUG attributes ({len(attrs)} шт): {attrs}")
+
 
             by_agent = {}
             for order in all_orders:
-                # Дата планируемой оплаты
-                ppm = order.get("paymentPlannedMoment", "")
+                # Дата планируемой оплаты — кастомный атрибут
+                ppm = ""
+                for attr in order.get("attributes", []):
+                    if attr.get("name") == "Дата планируемой оплаты":
+                        ppm = attr.get("value", "")
+                        break
                 if not ppm:
                     continue
 
