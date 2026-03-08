@@ -471,6 +471,109 @@ async def search_products_filtered(parsed: dict, limit: int = 20) -> list:
         return []
 
 
+
+async def get_counterparty_balance(query: str) -> list:
+    """Ищет контрагента по имени и возвращает его баланс (дебиторку).
+    Баланс в МойСклад: отрицательный = нам должны (дебиторка).
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/counterparty"
+            params = {
+                "filter": f"name~{query}",
+                "limit": 10,
+            }
+            async with session.get(url, headers=get_headers(), params=params) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"counterparty search error {resp.status}: {text[:200]}")
+                    return []
+                data = await resp.json()
+
+            result = []
+            for c in data.get("rows", []):
+                balance = c.get("balance", 0) or 0
+                debt = -balance if balance < 0 else 0
+                result.append({
+                    "id": c["id"],
+                    "name": c.get("name", ""),
+                    "balance": balance,
+                    "debt": debt,
+                })
+            return result
+
+    except Exception as e:
+        logger.error(f"get_counterparty_balance error: {e}")
+        return []
+
+
+async def get_all_debtors() -> list:
+    """Получает всех контрагентов с долгами из МойСклад."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/counterparty"
+            params = {
+                "limit": 100,
+                "filter": "balance<0",
+            }
+            async with session.get(url, headers=get_headers(), params=params) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+
+            result = []
+            for c in data.get("rows", []):
+                balance = c.get("balance", 0) or 0
+                if balance < 0:
+                    result.append({
+                        "id": c["id"],
+                        "name": c.get("name", ""),
+                        "debt": -balance,
+                    })
+
+            result.sort(key=lambda x: x["debt"], reverse=True)
+            logger.info(f"get_all_debtors: found {len(result)} debtors")
+            return result
+
+    except Exception as e:
+        logger.error(f"get_all_debtors error: {e}")
+        return []
+
+
+def format_debtors_ms(debtors: list) -> str:
+    """Форматирует список должников из МойСклад."""
+    if not debtors:
+        return "\u2705 \u0414\u0435\u0431\u0438\u0442\u043e\u0440\u0441\u043a\u043e\u0439 \u0437\u0430\u0434\u043e\u043b\u0436\u0435\u043d\u043d\u043e\u0441\u0442\u0438 \u043d\u0435\u0442."
+
+    total = sum(d["debt"] for d in debtors)
+    lines = [
+        f"\U0001f4b0 *\u0414\u0435\u0431\u0438\u0442\u043e\u0440\u0441\u043a\u0430\u044f \u0437\u0430\u0434\u043e\u043b\u0436\u0435\u043d\u043d\u043e\u0441\u0442\u044c \u2014 {len(debtors)} \u043a\u043b\u0438\u0435\u043d\u0442\u043e\u0432*",
+        f"\u0418\u0442\u043e\u0433\u043e: *{total:,.0f} \u0440\u0443\u0431.*\n",
+    ]
+    for d in debtors:
+        lines.append(f"\u2022 {d['name']} \u2014 *{d['debt']:,.0f} \u0440\u0443\u0431.*")
+
+    return "\n".join(lines)
+
+
+def format_counterparty_balance(counterparties: list, query: str) -> str:
+    """Форматирует баланс конкретного контрагента."""
+    if not counterparties:
+        return f"\u041a\u043e\u043d\u0442\u0440\u0430\u0433\u0435\u043d\u0442 \u00ab{query}\u00bb \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d \u0432 \u041c\u043e\u0439\u0421\u043a\u043b\u0430\u0434."
+
+    lines = []
+    for c in counterparties:
+        balance = c["balance"]
+        name = c["name"]
+        if balance < 0:
+            lines.append(f"\U0001f534 *{name}*\n\u0414\u043e\u043b\u0433 \u043f\u0435\u0440\u0435\u0434 \u043d\u0430\u043c\u0438: *{-balance:,.0f} \u0440\u0443\u0431.*")
+        elif balance > 0:
+            lines.append(f"\U0001f7e2 *{name}*\n\u041c\u044b \u0434\u043e\u043b\u0436\u043d\u044b \u0438\u043c: *{balance:,.0f} \u0440\u0443\u0431.*")
+        else:
+            lines.append(f"\u2705 *{name}*\n\u0411\u0430\u043b\u0430\u043d\u0441 \u043d\u0443\u043b\u0435\u0432\u043e\u0439, \u0434\u043e\u043b\u0433\u043e\u0432 \u043d\u0435\u0442.")
+
+    return "\n\n".join(lines)
+
 async def get_price_list(limit: int = 100) -> list:
     """Получает прайс-лист — все товары с ценами и остатками."""
     try:
