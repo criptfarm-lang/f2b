@@ -15,6 +15,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+def fmt_money(amount: float) -> str:
+    """Форматирует сумму в рублях: 192 850,45 руб."""
+    return f"{amount:,.2f}".replace(",", " ").replace(".", ",").rstrip("0").rstrip(",") + " руб."
+
+
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 
 
@@ -535,7 +540,7 @@ async def get_all_debtors() -> list:
 
             result = []
             for c in data.get("rows", []):
-                balance = c.get("balance", 0) or 0
+                balance = (c.get("balance", 0) or 0) / 100
                 if balance > 0:  # положительный = нам должны
                     name = c.get("counterparty", {}).get("name", c.get("name", ""))
                     result.append({
@@ -561,10 +566,10 @@ def format_debtors_ms(debtors: list) -> str:
     total = sum(d["debt"] for d in debtors)
     lines = [
         f"\U0001f4b0 *\u0414\u0435\u0431\u0438\u0442\u043e\u0440\u0441\u043a\u0430\u044f \u0437\u0430\u0434\u043e\u043b\u0436\u0435\u043d\u043d\u043e\u0441\u0442\u044c \u2014 {len(debtors)} \u043a\u043b\u0438\u0435\u043d\u0442\u043e\u0432*",
-        f"\u0418\u0442\u043e\u0433\u043e: *{total:,.0f} \u0440\u0443\u0431.*\n",
+        f"\u0418\u0442\u043e\u0433\u043e: *{fmt_money(total)}*\n",
     ]
     for d in debtors:
-        lines.append(f"\u2022 {d['name']} \u2014 *{d['debt']:,.0f} \u0440\u0443\u0431.*")
+        lines.append(f"\u2022 {d['name']} \u2014 *{fmt_money(d['debt'])}*")
 
     return "\n".join(lines)
 
@@ -579,9 +584,9 @@ def format_counterparty_balance(counterparties: list, query: str) -> str:
         balance = c["balance"]
         name = c["name"]
         if balance > 0:
-            lines.append(f"\U0001f534 *{name}*\n\u0414\u043e\u043b\u0433 \u043f\u0435\u0440\u0435\u0434 \u043d\u0430\u043c\u0438: *{balance:,.0f} \u0440\u0443\u0431.*")
+            lines.append(f"\U0001f534 *{name}*\n\u0414\u043e\u043b\u0433 \u043f\u0435\u0440\u0435\u0434 \u043d\u0430\u043c\u0438: *{fmt_money(balance)}*")
         elif balance < 0:
-            lines.append(f"\U0001f7e2 *{name}*\n\u041c\u044b \u0434\u043e\u043b\u0436\u043d\u044b \u0438\u043c: *{-balance:,.0f} \u0440\u0443\u0431.*")
+            lines.append(f"\U0001f7e2 *{name}*\n\u041c\u044b \u0434\u043e\u043b\u0436\u043d\u044b \u0438\u043c: *{fmt_money(-balance)}*")
         else:
             lines.append(f"\u2705 *{name}*\n\u0411\u0430\u043b\u0430\u043d\u0441 \u043d\u0443\u043b\u0435\u0432\u043e\u0439, \u0434\u043e\u043b\u0433\u043e\u0432 \u043d\u0435\u0442.")
 
