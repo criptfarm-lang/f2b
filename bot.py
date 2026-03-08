@@ -422,7 +422,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "get_all_tasks":
         await cmd_all_tasks(update, context)
 
-    elif action == "get_overdue":
+    elif action == "get_overdue_debt":
         await cmd_overdue(update, context)
 
     elif action == "get_report":
@@ -468,7 +468,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = text[:3900] + "\n\n_...слишком много, уточни_"
         await message.reply_text(text, parse_mode="Markdown")
 
-    elif action == "get_overdue":
+    elif action == "get_overdue_debt":
         raw_tag = params.get("tag", "")
         raw_query = params.get("query", "")
         tag = resolve_tag(raw_tag) if raw_tag else None
