@@ -347,11 +347,30 @@ async def search_products_filtered(parsed: dict, limit: int = 20) -> list:
                     return []
                 data = await resp.json()
             
-            all_products = data.get("rows", [])
+            # Исключаем нерыбные товары (красители, упаковка и т.п.)
+            NON_FISH = ["краситель", "упаковк", "пакет", "контейнер", "лоток", "соус", "маринад"]
+            all_products = [
+                p for p in data.get("rows", [])
+                if not any(kw in p.get("name", "").lower() for kw in NON_FISH)
+            ]
             
             def matches(p):
                 name = p.get("name", "").lower()
-                
+
+                # Исключаем нерыбные товары
+                junk_words = ["краситель", "упаковк", "пакет", "лоток", "соус", "маринад"]
+                if any(j in name for j in junk_words):
+                    return False
+
+                # Тип разделки (тушка/филе)
+                cut = filters.get("cut")
+                if cut == "псг":
+                    if "псг" not in name:
+                        return False
+                elif cut == "филе":
+                    if "филе" not in name or "псг" in name:
+                        return False
+
                 # Вид разделки
                 trim = filters.get("trim")
                 if trim:
@@ -390,6 +409,11 @@ async def search_products_filtered(parsed: dict, limit: int = 20) -> list:
                 if region == "мурманск":
                     if "мурманск" not in name and "мрм" not in name:
                         return False
+                elif region == "чили":
+                    if "чили" not in name:
+                        return False
+                    if "чили" not in name:
+                        return False
                 
                 # Калибр
                 caliber = filters.get("caliber")
@@ -400,12 +424,11 @@ async def search_products_filtered(parsed: dict, limit: int = 20) -> list:
             
             products = [p for p in all_products if matches(p)]
             
-            # Сортируем: сначала в наличии
-            # (остатки получим ниже, пока просто берём первые limit)
             if not products:
-                # Fallback: без строгих фильтров, только по search_term
                 logger.info(f"search_products_filtered: no strict matches, falling back")
-                products = all_products
+                products = [p for p in all_products if not any(
+                    j in p.get("name","").lower() for j in ["краситель","упаковк","пакет","лоток"]
+                )]
             
             products = products[:limit]
             logger.info(f"search_products_filtered: '{search_term}' filters={filters} → {len(products)} products")
@@ -435,6 +458,14 @@ async def search_products_filtered(parsed: dict, limit: int = 20) -> list:
                     "image_href": p.get("images", {}).get("meta", {}).get("href") if p.get("images") else None,
                 })
             
+            # Фильтр "только в наличии" если запрошен
+            if filters.get("in_stock"):
+                result = [r for r in result if r["stock"] > 0]
+
+            # Фильтр "только в наличии"
+            if filters.get("in_stock"):
+                result = [r for r in result if r["stock"] > 0]
+
             # Сортируем: в наличии первыми
             result.sort(key=lambda x: (1 if x["stock"] > 0 else 0), reverse=True)
             return result
