@@ -925,14 +925,16 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
 
             logger.info(f"get_overdue_demands: {len(all_orders)} total orders loaded")
 
-            # DEBUG: показываем первые 3 заказа
-            for dbg in all_orders[:3]:
+            # DEBUG: показываем все ключи первого заказа
+            if all_orders:
+                dbg = all_orders[0]
                 agent_name = dbg.get("agent", {}).get("name", "?")
-                logger.info(
-                    f"DEBUG order: {dbg.get('name')} | agent={agent_name} | "
-                    f"ppm={dbg.get('paymentPlannedMoment','НЕТУ')} | "
-                    f"sum={dbg.get('sum',0)/100} | payedSum={dbg.get('payedSum',0)/100}"
-                )
+                keys = [k for k in dbg.keys()]
+                logger.info(f"DEBUG order keys: {keys}")
+                # Ищем поля с датой
+                date_fields = {k: v for k, v in dbg.items() if "moment" in k.lower() or "date" in k.lower() or "payment" in k.lower() or "plan" in k.lower()}
+                logger.info(f"DEBUG date/payment fields: {date_fields}")
+                logger.info(f"DEBUG agent={agent_name} sum={dbg.get('sum',0)/100} payedSum={dbg.get('payedSum',0)/100}")
 
             by_agent = {}
             for order in all_orders:
