@@ -208,77 +208,41 @@ async def get_image_download_url(url: str) -> Optional[str]:
 
 
 async def download_image(url: str) -> Optional[bytes]:
-    """Скачивает фото товара из МойСклад.
-    МойСклад /download/ делает редирект на CDN — скачиваем в два шага.
+    """Скачивает миниатюру фото товара из МойСклад.
+    Использует /miniature endpoint — работает через порт 443, без CDN.
     """
     try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        # Шаг 1: получаем список изображений если нужно
-        if "/images" in url and "download" not in url:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Шаг 1: получаем href первого изображения
+            if "/images" in url and "download" not in url:
                 async with session.get(url, headers=get_headers()) as resp:
                     if resp.status != 200:
                         return None
                     data = await resp.json()
-            rows = data.get("rows", [])
-            if not rows:
-                return None
-            meta = rows[0].get("meta", {})
-            url = meta.get("downloadHref") or meta.get("href")
-            if not url:
-                return None
+                rows = data.get("rows", [])
+                if not rows:
+                    return None
+                img_href = rows[0].get("meta", {}).get("href")
+                if not img_href:
+                    return None
+                logger.info(f"download_image: img_href={img_href}")
+            else:
+                img_href = url
 
-        # Шаг 2: используем miniature (превью) — идёт через порт 443, не CDN :8080
-        # Преобразуем /download/UUID → /entity/product/.../images/UUID/miniature
-        # Или используем прямой GET с параметром miniature через основной API
-        miniature_url = url.replace("/download/", "/entity/product/") 
-        # Попробуем получить миниатюру через images endpoint
-        # url вида: https://api.moysklad.ru/api/remap/1.2/download/UUID
-        # miniature доступна через: GET images endpoint с Accept: image/*
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Пробуем скачать через основной API с заголовком Accept image
-            headers_img = dict(get_headers())
-            headers_img["Accept"] = "image/png, image/jpeg, image/*, */*"
-            async with session.get(url, headers=headers_img,
+            # Шаг 2: miniature — превью через основной API (порт 443, без CDN)
+            miniature_url = img_href + "/miniature"
+            logger.info(f"download_image: fetching {miniature_url}")
+            async with session.get(miniature_url, headers=get_headers(),
                                    allow_redirects=True) as resp:
-                logger.info(f"download_image: direct status={resp.status} content-type={resp.content_type}")
-                if resp.status == 200 and resp.content_type.startswith("image"):
+                logger.info(f"download_image: status={resp.status} type={resp.content_type}")
+                if resp.status == 200 and "image" in resp.content_type:
                     data = await resp.read()
-                    logger.info(f"download_image: got {len(data)} bytes direct")
+                    logger.info(f"download_image: got {len(data)} bytes")
                     return data
-                elif resp.status in (301, 302, 303, 307, 308):
-                    cdn_url = resp.headers.get("Location", "")
-                    logger.info(f"download_image: redirect to {cdn_url}")
-                    # Если CDN на нестандартном порту — пробуем заменить порт на 443
-                    if ":8080" in cdn_url:
-                        cdn_url_443 = cdn_url.replace(":8080", "")
-                        logger.info(f"download_image: trying port 443 version: {cdn_url_443[:80]}...")
-                        try:
-                            async with session.get(cdn_url_443) as r2:
-                                logger.info(f"download_image: port443 status={r2.status}")
-                                if r2.status == 200:
-                                    data = await r2.read()
-                                    logger.info(f"download_image: got {len(data)} bytes via port443")
-                                    return data
-                        except Exception as e:
-                            logger.error(f"download_image: port443 error {e}")
-                    # Пробуем CDN как есть (вдруг Railway разрешает)
-                    try:
-                        cdn_timeout = aiohttp.ClientTimeout(total=10)
-                        async with aiohttp.ClientSession(timeout=cdn_timeout) as cdn_s:
-                            async with cdn_s.get(cdn_url) as r3:
-                                logger.info(f"download_image: CDN direct status={r3.status}")
-                                if r3.status == 200:
-                                    data = await r3.read()
-                                    logger.info(f"download_image: got {len(data)} bytes from CDN")
-                                    return data
-                    except asyncio.TimeoutError:
-                        logger.error(f"download_image: CDN:8080 TIMEOUT — port blocked")
-                    except Exception as e:
-                        logger.error(f"download_image: CDN error {e}")
                 else:
                     body = await resp.text()
-                    logger.error(f"download_image: error status={resp.status} body={body[:200]}")
+                    logger.error(f"download_image: error body={body[:300]}")
         return None
     except asyncio.TimeoutError:
         logger.error(f"download_image: TIMEOUT url={url}")
