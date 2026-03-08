@@ -457,10 +457,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Если один товар и есть фото — пробуем прислать
         if len(products) == 1 and products[0].get("image_href"):
             try:
-                img_url = await get_image_download_url(products[0]["image_href"])
-                if img_url:
+                img_bytes = await download_image(products[0]["image_href"])
+                if img_bytes:
+                    import io as _io
                     await message.reply_photo(
-                        photo=img_url,
+                        photo=_io.BytesIO(img_bytes),
                         caption=f"📸 {products[0]['name']}"
                     )
             except Exception as e:
@@ -544,8 +545,8 @@ async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TY
     for product in with_photo[:3]:
         try:
             # Получаем прямую ссылку — Telegram сам скачает
-            img_url = await get_image_download_url(product["image_href"])
-            if img_url:
+            img_bytes = await download_image(product["image_href"])
+            if img_bytes:
                 name = product.get("name", query)
                 price = product.get("sale_price", 0)
                 stock = product.get("stock", 0)
@@ -554,8 +555,9 @@ async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TY
                     caption += f"\n💰 {price} руб/кг"
                 if stock and stock > 0:
                     caption += f"\n📦 В наличии: {stock} кг"
+                import io as _io
                 await update.message.reply_photo(
-                    photo=img_url,
+                    photo=_io.BytesIO(img_bytes),
                     caption=caption
                 )
                 sent += 1
