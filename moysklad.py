@@ -370,7 +370,7 @@ def format_products(products: list, query: str = "") -> str:
     for p in products:
         name = p["name"]
         stock = p.get("stock", 0)
-        price = p.get("price")
+        price = p.get("sale_price") or p.get("price")
         reserve = p.get("reserve", 0)
 
         # Статус наличия
@@ -404,7 +404,7 @@ def format_price_list(products: list) -> str:
     lines = ["📋 *Актуальный прайс-лист МойСклад*\n"]
     for p in products:
         stock = p.get("stock", 0)
-        price = p.get("price")
+        price = p.get("sale_price") or p.get("price")
         icon = "🟢" if stock > 0 else "🔴"
         price_str = f"{price:,.0f} руб" if price else "цена не указана"
         lines.append(f"{icon} {p['name']} — {price_str}")
