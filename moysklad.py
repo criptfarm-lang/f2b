@@ -184,6 +184,29 @@ async def get_product_image(product_id: str) -> Optional[str]:
         return None
 
 
+async def get_image_download_url(url: str) -> Optional[str]:
+    """Возвращает прямую ссылку на скачивание фото из МойСклад."""
+    try:
+        logger.info(f"get_image_download_url: url={url}")
+        async with aiohttp.ClientSession() as session:
+            if "/images" in url and "downloadHref" not in url:
+                async with session.get(url, headers=get_headers()) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                rows = data.get("rows", [])
+                if not rows:
+                    return None
+                meta = rows[0].get("meta", {})
+                download_url = meta.get("downloadHref") or meta.get("href")
+                logger.info(f"get_image_download_url: resolved={download_url}")
+                return download_url
+            return url
+    except Exception as e:
+        logger.error(f"get_image_download_url error: {e}")
+        return None
+
+
 async def download_image(url: str) -> Optional[bytes]:
     """Скачивает фото товара из МойСклад.
     url может быть либо ссылкой на список изображений, либо на само фото.
