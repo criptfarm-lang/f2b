@@ -761,11 +761,23 @@ async def get_clients_by_tag(tag: str, limit: int = 100) -> list:
             params = {"filter": f"tag={tag}", "limit": limit}
             async with session.get(url, headers=get_headers(), params=params) as resp:
                 if resp.status != 200:
+                    body = await resp.text()
+                    logger.error(f"get_clients_by_tag {resp.status}: {body[:200]}")
                     return []
                 data = await resp.json()
 
+            rows = data.get("rows", [])
+            logger.info(f"get_clients_by_tag tag='{tag}': {len(rows)} found")
+            if not rows:
+                # Логируем первых 3 контрагентов без фильтра чтобы увидеть реальные теги
+                async with session.get(url, headers=get_headers(), params={"limit": 3}) as r2:
+                    if r2.status == 200:
+                        sample = await r2.json()
+                        for s in sample.get("rows", []):
+                            logger.info(f"  sample: {s.get('name')} tags={s.get('tags', [])}")
+
             result = []
-            for c in data.get("rows", []):
+            for c in rows:
                 result.append({
                     "id": c["id"],
                     "name": c.get("name", ""),
