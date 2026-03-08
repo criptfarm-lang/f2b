@@ -470,10 +470,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "get_overdue":
         raw_tag = params.get("tag", "")
+        raw_query = params.get("query", "")
         tag = resolve_tag(raw_tag) if raw_tag else None
         await message.reply_chat_action("typing")
-        items = await get_overdue_demands(tag=tag)
-        text = format_overdue_demands(items, tag=tag)
+        items = await get_overdue_demands(tag=tag, query=raw_query)
+        label = raw_query or (tag or None)
+        text = format_overdue_demands(items, tag=label)
         if len(text) > 4000:
             text = text[:3900] + "\n\n_...уточни запрос_"
         await message.reply_text(text, parse_mode="Markdown")
