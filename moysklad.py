@@ -9,6 +9,7 @@
 import os
 import logging
 import aiohttp
+import asyncio
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -215,16 +216,31 @@ async def download_image(url: str) -> Optional[bytes]:
                 url = download_url
                 logger.info(f"download_image: resolved url={url}")
 
-            # Скачиваем само фото
+            # Скачиваем само фото с таймаутом 15 сек
             logger.info(f"download_image: downloading photo from {url}")
-            async with session.get(url, headers=get_headers(), allow_redirects=True) as resp:
-                logger.info(f"download_image: photo status={resp.status} content-type={resp.content_type}")
-                if resp.status == 200:
-                    data = await resp.read()
-                    logger.info(f"download_image: got {len(data)} bytes")
-                    return data
-                body = await resp.text()
-                logger.error(f"download_image: photo error status={resp.status} body={body[:200]}")
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as dl_session:
+                async with dl_session.get(url, headers=get_headers(), allow_redirects=True) as resp:
+                    logger.info(f"download_image: photo status={resp.status} content-type={resp.content_type}")
+                    if resp.status == 200:
+                        data = await resp.read()
+                        logger.info(f"download_image: got {len(data)} bytes")
+                        return data
+                    # Попробуем без авторизации (публичный CDN редирект)
+                    if resp.status in (301, 302, 303, 307, 308):
+                        redirect_url = resp.headers.get("Location")
+                        logger.info(f"download_image: redirect to {redirect_url}")
+                        if redirect_url:
+                            async with dl_session.get(redirect_url) as r2:
+                                if r2.status == 200:
+                                    data = await r2.read()
+                                    logger.info(f"download_image: got {len(data)} bytes via redirect")
+                                    return data
+                    body = await resp.text()
+                    logger.error(f"download_image: photo error status={resp.status} body={body[:300]}")
+        return None
+    except asyncio.TimeoutError:
+        logger.error(f"download_image: TIMEOUT after 15s url={url}")
         return None
     except Exception as e:
         logger.error(f"download_image error: {e}", exc_info=True)
