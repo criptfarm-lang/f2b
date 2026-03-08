@@ -19,7 +19,7 @@ from telegram.ext import (
 
 from database import Database
 from scheduler import setup_scheduler
-from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion
+from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion, parse_product_query
 from moysklad import search_products, search_products_filtered, get_price_list, format_products, format_price_list, get_product_image, download_image, get_image_download_url
 
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
