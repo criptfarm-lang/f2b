@@ -1229,19 +1229,23 @@ def format_price_list(products: list) -> str:
     return "\n".join(lines)
 
 
-async def get_counterparties_by_product(product_query: str) -> list:
+async def get_counterparties_by_product(product_query: str, period_days: int = 180) -> list:
     """
     Находит всех контрагентов которые покупали товар по названию.
-    Ищет через заказы покупателей в МойСклад.
+    period_days — за сколько дней анализировать заказы (по умолчанию 180 = 6 месяцев).
     Возвращает список уникальных названий контрагентов.
     """
     import aiohttp
+    from datetime import datetime, timedelta
+
     product_lower = product_query.lower()
     found = {}  # id -> name
 
+    # Дата начала периода
+    date_from = (datetime.now() - timedelta(days=period_days)).strftime("%Y-%m-%d %H:%M:%S")
+
     try:
         async with aiohttp.ClientSession() as session:
-            # Загружаем заказы с expand agent и positions
             offset = 0
             limit = 100
             while True:
@@ -1250,6 +1254,7 @@ async def get_counterparties_by_product(product_query: str) -> list:
                     "limit": limit,
                     "offset": offset,
                     "expand": "agent,positions.assortment",
+                    "filter": f"moment>{date_from}",
                 }
                 async with session.get(url, headers=get_headers(), params=params) as resp:
                     if resp.status != 200:
@@ -1272,12 +1277,8 @@ async def get_counterparties_by_product(product_query: str) -> list:
                     if agent_id in found:
                         continue
 
-                    # Проверяем позиции заказа
                     positions = order.get("positions", {})
-                    if isinstance(positions, dict):
-                        pos_rows = positions.get("rows", [])
-                    else:
-                        pos_rows = []
+                    pos_rows = positions.get("rows", []) if isinstance(positions, dict) else []
 
                     for pos in pos_rows:
                         assortment = pos.get("assortment", {})
@@ -1289,6 +1290,8 @@ async def get_counterparties_by_product(product_query: str) -> list:
                 offset += limit
                 if len(rows) < limit:
                     break
+
+        logger.info(f"get_counterparties_by_product: '{product_query}' за {period_days} дней → {len(found)} контрагентов")
 
     except Exception as e:
         logger.error(f"get_counterparties_by_product: {e}")
