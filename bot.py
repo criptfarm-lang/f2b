@@ -400,6 +400,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     # 4. Реагируем на обращение к боту
+    # Автоматически реагируем на IT-проблемы даже без обращения "Эф,"
+    IT_KEYWORDS = [
+        "телеграм не", "telegram не", "амо не", "амосрм", "amocrm",
+        "crm не", "срм не", "не отправляется", "не загружается",
+        "не проходят звонки", "звонки не", "почта не", "не приходит письмо",
+        "не работает телеграм", "не работает амо", "не работает crm",
+        "слетела интеграция", "нет сообщений в амо", "не открывается амо",
+    ]
+    text_lower_it = text.lower()
+    if not is_bot_addressed(text) and any(kw in text_lower_it for kw in IT_KEYWORDS):
+        await message.reply_text(
+            "По техническим вопросам (Telegram, amoCRM, звонки, почта) "
+            "пишите в группу **IT8 & ОП ФИШ ТУ БИЗНЕС** 🛠",
+            parse_mode="Markdown"
+        )
+        return
+
     if not is_bot_addressed(text):
         return
 
