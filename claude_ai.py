@@ -508,3 +508,85 @@ async def generate_morning_summary(tasks_today: list, tasks_overdue: list) -> st
             for t in tasks_overdue:
                 lines.append(f"• {t.get('executor','?')}: {t['text']}")
         return "\n".join(lines)
+
+
+async def analyze_pdz_responses(results: dict) -> str:
+    """
+    Анализирует ответы менеджеров из переписки группы и формирует сводку по ПДЗ.
+
+    results: {
+        "Карина": {
+            "items": [...клиенты с просрочкой...],
+            "messages": ["Карина: ИП Орехов оплатит 12.03", ...]
+        },
+        ...
+    }
+    """
+    try:
+        sections = []
+        for manager_name, data in results.items():
+            items = data.get("items", [])
+            messages = data.get("messages", [])
+
+            if not items:
+                continue
+
+            clients = ", ".join(
+                f"{c['name']} ({c['overdue_sum']:,.0f} руб.)".replace(",", " ")
+                for c in items
+            )
+            msgs_text = "\n".join(messages) if messages else "(нет ответов)"
+            sections.append(
+                f"Менеджер: {manager_name}\n"
+                f"Клиенты с ПДЗ: {clients}\n"
+                f"Сообщения в группе:\n{msgs_text}"
+            )
+
+        if not sections:
+            return "Сегодня активных клиентов с ПДЗ не найдено."
+
+        prompt = f"""Ты анализируешь переписку менеджеров по работе с просроченной дебиторской задолженностью.
+
+По каждому менеджеру дан список клиентов с ПДЗ и сообщения менеджера из группы за сегодня.
+
+Составь сводку в формате:
+
+*Карина:*
+• ИП Орехов — оплатит 16.03
+• ООО Атмосфера — недозвонились
+• ИП Иванов — нет ответа от менеджера
+
+*Елена:*
+• ...
+
+Правила:
+- Если в сообщениях есть упоминание клиента и дата/обещание — пиши "оплатит ДД.ММ"
+- Если менеджер написал что не дозвонился — "недозвонились"
+- Если по клиенту нет ни одного упоминания — "нет ответа от менеджера"
+- Используй только данные из сообщений, не придумывай
+- В конце добавь итоговую строку: всего клиентов, получен ответ по X, нет ответа по Y
+
+Данные:
+
+{chr(10).join(sections)}
+
+Только сводка, без вступления."""
+
+        response = await get_client().messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+
+    except Exception as e:
+        logger.error(f"analyze_pdz_responses error: {e}", exc_info=True)
+        # Fallback — простая сводка без AI
+        lines = []
+        for manager_name, data in results.items():
+            if not data.get("items"):
+                continue
+            lines.append(f"*{manager_name}:*")
+            for c in data["items"]:
+                lines.append(f"• {c['name']} — нет ответа от менеджера")
+        return "\n".join(lines) if lines else "Нет данных."
