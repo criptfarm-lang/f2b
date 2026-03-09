@@ -652,11 +652,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await message.reply_chat_action("typing")
-        await message.reply_text(f"🔍 Ищу клиентов которые покупали *{product}* в МойСклад...", parse_mode="Markdown")
+        period_days = params.get("period_days", 180)
+        await message.reply_text(
+            f"🔍 Ищу клиентов которые покупали *{product}* за последние {period_days} дней...",
+            parse_mode="Markdown"
+        )
 
         # 1. Находим контрагентов в МойСклад по товару
         from moysklad import get_counterparties_by_product
-        counterparty_names = await get_counterparties_by_product(product)
+        counterparty_names = await get_counterparties_by_product(product, period_days=period_days)
 
         if not counterparty_names:
             await message.reply_text(f"❌ Не найдено клиентов покупавших *{product}* в МойСклад.", parse_mode="Markdown")
@@ -686,6 +690,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         confirm_text = (
             f"📣 *Рассылка готова*\n\n"
             f"*Товар:* {product}\n"
+            f"*Период анализа:* последние {period_days} дней\n"
             f"*Текст:* _{broadcast_text}_\n\n"
             f"*Получатели ({len(contacts)}):*\n{names_preview}\n\n"
             f"⏱ Рассылка займёт ~{duration_min} мин (1 сообщение в минуту)\n\n"
