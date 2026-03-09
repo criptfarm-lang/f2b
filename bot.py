@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 
 from database import Database
-from scheduler import setup_scheduler
+from scheduler import setup_scheduler, record_group_message, PDZ_MANAGERS, get_group_chat_id
 from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion, parse_product_query
 from moysklad import (search_products, search_products_filtered, get_price_list, format_products,
     format_price_list, get_product_image, download_image, get_image_download_url,
@@ -313,6 +313,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=text[:1000],  # обрезаем очень длинные
         )
 
+
+    # Записываем сообщения группы для анализа ПДЗ (пн/ср)
+    group_chat_id = get_group_chat_id()
+    if text and user and group_chat_id and chat_id == group_chat_id:
+        from datetime import date as _date
+        if _date.today().weekday() in (0, 2):  # 0=пн, 2=ср
+            sender_lower = user.full_name.lower()
+            matched = False
+            for mgr in PDZ_MANAGERS:
+                if mgr["name"].lower() in sender_lower or mgr["tag"] in sender_lower:
+                    record_group_message(user.full_name, mgr["tag"], text)
+                    matched = True
+                    break
+            if not matched:
+                record_group_message(user.full_name, "_all", text)
     # 1. Сохраняем документы в базу (фото берём из МойСклад)
     if message.document:
         fname = message.document.file_name or ""
