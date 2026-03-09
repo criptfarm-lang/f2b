@@ -893,7 +893,10 @@ def main():
     setup_scheduler(app, db)
 
     logger.info("🤖 Бот запущен!")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post"]
+    )
 
 
 if __name__ == "__main__":
