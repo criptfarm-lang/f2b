@@ -454,6 +454,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_addressed(text):
         return
 
+    query = clean_query(text)
+
     # ── Всё через Claude — он сам разбирается что нужно ──
     await message.reply_chat_action("typing")
     context_data = db.get_context_summary()
