@@ -1232,16 +1232,13 @@ def format_price_list(products: list) -> str:
 async def get_counterparties_by_product(product_query: str, period_days: int = 180) -> list:
     """
     Находит всех контрагентов которые покупали товар по названию.
-    period_days — за сколько дней анализировать заказы (по умолчанию 180 = 6 месяцев).
-    Возвращает список уникальных названий контрагентов.
+    Возвращает список: [{"id": ..., "name": ..., "phone": ...}]
     """
     import aiohttp
     from datetime import datetime, timedelta
 
     product_lower = product_query.lower()
-    found = {}  # id -> name
-
-    # Дата начала периода
+    found = {}  # id -> {name, phone}
     date_from = (datetime.now() - timedelta(days=period_days)).strftime("%Y-%m-%d %H:%M:%S")
 
     try:
@@ -1284,12 +1281,35 @@ async def get_counterparties_by_product(product_query: str, period_days: int = 1
                         assortment = pos.get("assortment", {})
                         pos_name = assortment.get("name", "").lower()
                         if product_lower in pos_name:
-                            found[agent_id] = agent_name
+                            found[agent_id] = {"name": agent_name, "phone": None}
                             break
 
                 offset += limit
                 if len(rows) < limit:
                     break
+
+            # Загружаем телефоны контрагентов
+            for agent_id in list(found.keys()):
+                try:
+                    url = f"{MS_BASE}/entity/counterparty/{agent_id}"
+                    async with session.get(url, headers=get_headers()) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            # Телефон может быть в phone или actualAddress
+                            phone = data.get("phone", "")
+                            if not phone:
+                                # Ищем в контактах
+                                contacts_data = data.get("contactpersons", {})
+                                if isinstance(contacts_data, dict):
+                                    cp_rows = contacts_data.get("rows", [])
+                                    for cp in cp_rows:
+                                        if cp.get("phone"):
+                                            phone = cp["phone"]
+                                            break
+                            if phone:
+                                found[agent_id]["phone"] = phone
+                except Exception:
+                    pass
 
         logger.info(f"get_counterparties_by_product: '{product_query}' за {period_days} дней → {len(found)} контрагентов")
 
