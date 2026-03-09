@@ -1227,3 +1227,70 @@ def format_price_list(products: list) -> str:
         lines.append(f"{icon} {p['name']} — {price_str}")
 
     return "\n".join(lines)
+
+
+async def get_counterparties_by_product(product_query: str) -> list:
+    """
+    Находит всех контрагентов которые покупали товар по названию.
+    Ищет через заказы покупателей в МойСклад.
+    Возвращает список уникальных названий контрагентов.
+    """
+    import aiohttp
+    product_lower = product_query.lower()
+    found = {}  # id -> name
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Загружаем заказы с expand agent и positions
+            offset = 0
+            limit = 100
+            while True:
+                url = f"{MS_BASE}/entity/customerorder"
+                params = {
+                    "limit": limit,
+                    "offset": offset,
+                    "expand": "agent,positions.assortment",
+                }
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+
+                rows = data.get("rows", [])
+                if not rows:
+                    break
+
+                for order in rows:
+                    agent = order.get("agent", {})
+                    agent_id = agent.get("id", "")
+                    agent_name = agent.get("name", "")
+
+                    if not agent_id or not agent_name:
+                        continue
+                    if "розничный покупатель" in agent_name.lower():
+                        continue
+                    if agent_id in found:
+                        continue
+
+                    # Проверяем позиции заказа
+                    positions = order.get("positions", {})
+                    if isinstance(positions, dict):
+                        pos_rows = positions.get("rows", [])
+                    else:
+                        pos_rows = []
+
+                    for pos in pos_rows:
+                        assortment = pos.get("assortment", {})
+                        pos_name = assortment.get("name", "").lower()
+                        if product_lower in pos_name:
+                            found[agent_id] = agent_name
+                            break
+
+                offset += limit
+                if len(rows) < limit:
+                    break
+
+    except Exception as e:
+        logger.error(f"get_counterparties_by_product: {e}")
+
+    return list(found.values())
