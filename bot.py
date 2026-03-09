@@ -722,6 +722,57 @@ async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Запомнил: *{key.strip()}* → {value.strip()}", parse_mode="Markdown")
 
 
+async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тестовый запуск утренних задач ПДЗ. /pdz_test [имя|all]"""
+    user = update.message.from_user
+    manager_ids_str = os.getenv("MANAGER_IDS", "")
+    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
+    if user.id not in manager_ids:
+        await update.message.reply_text("⛔ Только для руководителей.")
+        return
+
+    arg = (context.args[0].lower() if context.args else "all")
+
+    from scheduler import pdz_morning_task, PDZ_MANAGERS
+    app = update.get_bot()  # используем контекст
+
+    targets = PDZ_MANAGERS if arg == "all" else [
+        m for m in PDZ_MANAGERS if m["name"].lower() == arg or m["tag"] == arg
+    ]
+
+    if not targets:
+        names = ", ".join(m["name"].lower() for m in PDZ_MANAGERS)
+        await update.message.reply_text(f"Не найдено. Варианты: all, {names}")
+        return
+
+    await update.message.reply_text(
+        f"🧪 Запускаю тест ПДЗ для: {', '.join(m['name'] for m in targets)}..."
+    )
+
+    for mgr in targets:
+        try:
+            await pdz_morning_task(context.application, mgr)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка для {mgr['name']}: {e}")
+
+
+async def cmd_pdz_evening_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тестовый запуск вечерней сводки ПДЗ. /pdz_evening"""
+    user = update.message.from_user
+    manager_ids_str = os.getenv("MANAGER_IDS", "")
+    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
+    if user.id not in manager_ids:
+        await update.message.reply_text("⛔ Только для руководителей.")
+        return
+
+    await update.message.reply_text("🧪 Запускаю тест вечерней сводки ПДЗ...")
+    from scheduler import pdz_evening_summary
+    try:
+        await pdz_evening_summary(context.application)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -746,6 +797,8 @@ def main():
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("remember", cmd_remember))
+    app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
+    app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
     app.add_handler(MessageHandler(filters.ALL, handle_message))
 
     # Планировщик (утренние сводки, напоминания)
