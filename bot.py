@@ -13,6 +13,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    TypeHandler,
     ContextTypes,
     filters,
 )
@@ -886,8 +887,13 @@ def main():
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
-    app.add_handler(MessageHandler(filters.ALL, handle_message))
+    # DEBUG: логируем все апдейты (удалить после отладки)
+    async def debug_all_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info(f"DEBUG update: {update.update_id} type={type(update).__name__} channel_post={update.channel_post} message={update.message and update.message.chat_id}")
+    app.add_handler(TypeHandler(Update, debug_all_updates), group=-1)
+
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
 
     # Планировщик (утренние сводки, напоминания)
     setup_scheduler(app, db)
