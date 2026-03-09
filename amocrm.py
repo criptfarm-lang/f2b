@@ -132,16 +132,18 @@ async def find_contacts_for_broadcast(counterparty_names: list) -> list:
     """
     found = []
     for name in counterparty_names:
-        # Нормализуем имя для поиска
         search_query = normalize_name(name)
         if len(search_query) < 2:
             search_query = name
 
+        logger.info(f"amoCRM поиск: '{name}' → normalized='{search_query}'")
+
         # Ищем как компанию
         companies = await find_company_by_name(search_query)
+        logger.info(f"amoCRM companies по '{search_query}': {[c.get('name') for c in companies]}")
         if not companies:
-            # Пробуем оригинальное название
             companies = await find_company_by_name(name)
+            logger.info(f"amoCRM companies по оригиналу '{name}': {[c.get('name') for c in companies]}")
 
         if companies:
             company = companies[0]
