@@ -337,7 +337,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
 
     # Логируем ID для диагностики
-    logger.info(f"Message from user.id={user.id}, name={user.full_name}, manager_ids={manager_ids}")
+    logger.info(f"Message from user.id={user.id}, name={user.full_name}, chat_id={message.chat_id}, manager_ids={manager_ids}")
 
     if user.id in manager_ids and len(text) > 15:
         # Не обрабатываем обращения к боту как задачи
