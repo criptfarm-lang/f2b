@@ -29,7 +29,8 @@ async def amo_get(path: str, params: dict = None) -> Optional[dict]:
     """GET запрос к amoCRM API."""
     url = f"{AMO_BASE_URL}{path}"
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, headers=get_headers(), params=params) as resp:
                 if resp.status == 200:
                     raw = await resp.read()
@@ -46,6 +47,9 @@ async def amo_get(path: str, params: dict = None) -> Optional[dict]:
                     text = await resp.text()
                     logger.error(f"amoCRM GET {path}: {resp.status} {text[:200]}")
                     return None
+    except asyncio.TimeoutError:
+        logger.error(f"amoCRM GET {path}: таймаут 10 сек")
+        return None
     except Exception as e:
         logger.error(f"amoCRM GET {path}: {e}")
         return None
@@ -55,7 +59,8 @@ async def amo_post(path: str, data: dict) -> Optional[dict]:
     """POST запрос к amoCRM API."""
     url = f"{AMO_BASE_URL}{path}"
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, headers=get_headers(), json=data) as resp:
                 if resp.status in (200, 201):
                     return await resp.json()
@@ -63,6 +68,9 @@ async def amo_post(path: str, data: dict) -> Optional[dict]:
                     text = await resp.text()
                     logger.error(f"amoCRM POST {path}: {resp.status} {text[:200]}")
                     return None
+    except asyncio.TimeoutError:
+        logger.error(f"amoCRM POST {path}: таймаут 10 сек")
+        return None
     except Exception as e:
         logger.error(f"amoCRM POST {path}: {e}")
         return None
