@@ -3,6 +3,7 @@ F2B PRO — Telegram Bot
 Ассистент отдела продаж: задачи, фото, прайсы, дебиторка
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -21,6 +22,7 @@ from telegram.ext import (
 from database import Database
 from scheduler import setup_scheduler, record_group_message, PDZ_MANAGERS, get_group_chat_id
 from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion, parse_product_query
+from amocrm import find_contacts_for_broadcast, broadcast_to_leads, check_connection as amo_check
 from moysklad import (search_products, search_products_filtered, get_price_list, format_products,
     format_price_list, get_product_image, download_image, get_image_download_url,
     get_counterparty_balance, get_all_debtors, format_debtors_ms, format_counterparty_balance,
@@ -418,10 +420,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Проверяем подтверждение рассылки
+    if text.lower().strip() in ("да, рассылай", "да рассылай", "рассылай", "подтверждаю"):
+        pending = context.user_data.get("pending_broadcast")
+        if pending:
+            lead_ids = pending["lead_ids"]
+            broadcast_text = pending["text"]
+            product = pending["product"]
+            count = pending["count"]
+            context.user_data.pop("pending_broadcast", None)
+
+            await message.reply_text(
+                f"🚀 Начинаю рассылку по *{product}*\n"
+                f"📨 {count} получателей · ~{count} мин\n"
+                f"Отчёт пришлю по завершении.",
+                parse_mode="Markdown"
+            )
+
+            async def run_broadcast():
+                from amocrm import broadcast_to_leads as _broadcast
+                stats = await _broadcast(lead_ids, broadcast_text, delay_seconds=60)
+                result_text = (
+                    f"✅ *Рассылка завершена!*\n"
+                    f"📨 Отправлено: {stats['sent']}/{count}\n"
+                )
+                if stats["failed"]:
+                    result_text += f"❌ Ошибок: {stats['failed']}\n"
+                await context.bot.send_message(chat_id=chat_id, text=result_text, parse_mode="Markdown")
+
+            asyncio.create_task(run_broadcast())
+            return
+
     if not is_bot_addressed(text):
         return
-
-    query = clean_query(text)
     query_lower = query.lower()
 
     # ── Всё через Claude — он сам разбирается что нужно ──
@@ -610,6 +641,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             except Exception as e:
                 logger.warning(f"Не удалось отправить фото из МойСклад: {e}")
+
+    elif action == "broadcast":
+        product = params.get("product", "")
+        broadcast_text = params.get("message", "")
+
+        if not product or not broadcast_text:
+            await message.reply_text("❌ Не указан товар или текст сообщения.")
+            return
+
+        await message.reply_chat_action("typing")
+        await message.reply_text(f"🔍 Ищу клиентов которые покупали *{product}* в МойСклад...", parse_mode="Markdown")
+
+        # 1. Находим контрагентов в МойСклад по товару
+        from moysklad import get_counterparties_by_product
+        counterparty_names = await get_counterparties_by_product(product)
+
+        if not counterparty_names:
+            await message.reply_text(f"❌ Не найдено клиентов покупавших *{product}* в МойСклад.", parse_mode="Markdown")
+            return
+
+        await message.reply_text(f"📋 Найдено {len(counterparty_names)} клиентов в МойСклад.\n🔍 Ищу их в amoCRM...", parse_mode="Markdown")
+
+        # 2. Находим их в amoCRM
+        contacts = await find_contacts_for_broadcast(counterparty_names)
+
+        if not contacts:
+            await message.reply_text(
+                f"❌ Клиенты найдены в МойСклад, но не найдены в amoCRM.\n"
+                f"Клиенты МойСклад: {', '.join(counterparty_names[:5])}{'...' if len(counterparty_names) > 5 else ''}",
+                parse_mode="Markdown"
+            )
+            return
+
+        lead_ids = [c["lead_id"] for c in contacts]
+        duration_min = len(lead_ids)
+
+        # 3. Показываем список и просим подтверждение
+        names_preview = "\n".join(f"• {c['amo_name']}" for c in contacts[:10])
+        if len(contacts) > 10:
+            names_preview += f"\n_...и ещё {len(contacts) - 10}_"
+
+        confirm_text = (
+            f"📣 *Рассылка готова*\n\n"
+            f"*Товар:* {product}\n"
+            f"*Текст:* _{broadcast_text}_\n\n"
+            f"*Получатели ({len(contacts)}):*\n{names_preview}\n\n"
+            f"⏱ Рассылка займёт ~{duration_min} мин (1 сообщение в минуту)\n\n"
+            f"Для подтверждения напиши: *да, рассылай*"
+        )
+        await message.reply_text(confirm_text, parse_mode="Markdown")
+
+        # Сохраняем данные рассылки в память бота для подтверждения
+        context.user_data["pending_broadcast"] = {
+            "lead_ids": lead_ids,
+            "text": broadcast_text,
+            "product": product,
+            "count": len(lead_ids),
+        }
 
     elif action == "find_contact":
         contact_query = params.get("query", "")
