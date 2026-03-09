@@ -662,17 +662,49 @@ async def save_media(message: Message, media_type: str):
     )
 
 
+async def search_photo_in_content_channel(context: ContextTypes.DEFAULT_TYPE, query: str) -> list:
+    """Ищет фото в канале Контент F2B по ключевым словам в подписи.
+    Возвращает список (file_id, caption) подходящих фото.
+    """
+    content_chat_id = int(os.getenv("CONTENT_CHAT_ID", "-1001433042091"))
+    query_lower = query.lower()
+    results = []
+
+    # Ищем в локальной БД (фото из канала сохраняются при поступлении)
+    photos = db.search_media(query_lower, media_type="photo")
+    for p in photos:
+        if p.get("chat_id") == content_chat_id:
+            results.append({"file_id": p["file_id"], "caption": p.get("caption", "")})
+
+    return results
+
+
 async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
-    """Ищет фото товара в МойСклад."""
-    import io
+    """Ищет фото товара: сначала в канале Контент, потом в МойСклад."""
+    import io as _io
     await update.message.reply_chat_action("upload_photo")
 
+    # 1. Ищем в канале Контент F2B
+    content_photos = await search_photo_in_content_channel(context, query)
+    if content_photos:
+        sent = 0
+        for p in content_photos[:3]:
+            try:
+                await update.message.reply_photo(
+                    photo=p["file_id"],
+                    caption=f"📸 {p['caption']}" if p["caption"] else f"📸 {query}"
+                )
+                sent += 1
+            except Exception as e:
+                logger.warning(f"Не удалось отправить фото из Контент: {e}")
+        if sent > 0:
+            return
+
+    # 2. Fallback — ищем в МойСклад
     products = await search_products(query)
-    # Оставляем только товары с фото
     with_photo = [p for p in products if p.get("image_href")]
 
     if not with_photo:
-        # Нет фото — показываем текстовый результат если товары найдены
         if products:
             text = format_products(products, query)
             await update.message.reply_text(
@@ -680,14 +712,12 @@ async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
         else:
-            await update.message.reply_text(f"😕 Товар '{query}' не найден в МойСклад.")
+            await update.message.reply_text(f"😕 Фото '{query}' не найдено ни в канале Контент, ни в МойСклад.")
         return
 
-    # Отправляем фото (до 3 штук)
     sent = 0
     for product in with_photo[:3]:
         try:
-            # Получаем прямую ссылку — Telegram сам скачает
             img_bytes = await download_image(product["image_href"])
             if img_bytes:
                 name = product.get("name", query)
@@ -698,7 +728,6 @@ async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TY
                     caption += f"\n💰 {price} руб/кг"
                 if stock and stock > 0:
                     caption += f"\n📦 В наличии: {stock} кг"
-                import io as _io
                 await update.message.reply_photo(
                     photo=_io.BytesIO(img_bytes),
                     caption=caption
@@ -709,6 +738,47 @@ async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TY
 
     if sent == 0:
         await update.message.reply_text(f"😕 Фото '{query}' есть в МойСклад, но не удалось загрузить.")
+
+
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает посты из канала Контент F2B — сохраняет фото в БД."""
+    message = update.channel_post
+    if not message:
+        return
+
+    # Логируем chat_id для диагностики (можно удалить после настройки)
+    logger.info(f"channel_post from chat_id={message.chat_id}, title='{message.chat.title}', caption='{message.caption or message.text or ''}'")
+
+    content_chat_id = int(os.getenv("CONTENT_CHAT_ID", "-1001433042091"))
+    if message.chat_id != content_chat_id:
+        logger.info(f"channel_post: chat_id {message.chat_id} != CONTENT_CHAT_ID {content_chat_id}, пропускаем")
+        return
+
+    caption = message.caption or message.text or ""
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        db.save_media(
+            file_id=file_id,
+            media_type="photo",
+            caption=caption,
+            chat_id=message.chat_id,
+            uploader="Контент F2B",
+            date=datetime.now().isoformat()
+        )
+        logger.info(f"Сохранено фото из канала Контент: '{caption}' file_id={file_id}")
+
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+        file_id = message.document.file_id
+        db.save_media(
+            file_id=file_id,
+            media_type="photo",
+            caption=caption or message.document.file_name or "",
+            chat_id=message.chat_id,
+            uploader="Контент F2B",
+            date=datetime.now().isoformat()
+        )
+        logger.info(f"Сохранено фото-документ из канала Контент: '{caption}'")
 
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
@@ -817,6 +887,7 @@ def main():
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
     app.add_handler(MessageHandler(filters.ALL, handle_message))
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
 
     # Планировщик (утренние сводки, напоминания)
     setup_scheduler(app, db)
