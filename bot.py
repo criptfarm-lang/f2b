@@ -1071,19 +1071,47 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
     elif action == "price_comment":
         new_text = query.message.text + f"\n\n💬 *{user.first_name} ждёт комментарий менеджера*"
         await query.edit_message_text(new_text, parse_mode="Markdown")
-
-        # Сообщение в группу с запросом комментария
         if group_chat_id:
             contact = MANAGERS_CONTACTS.get(manager_name)
-            if contact:
-                mgr_mention = contact  # @username или телефон
-            elif manager_name:
-                mgr_mention = f"*{manager_name}*"
-            else:
-                mgr_mention = "Менеджер"
+            mgr_mention = contact if contact else f"*{manager_name}*" if manager_name else "Менеджер"
             await context.bot.send_message(
                 chat_id=group_chat_id,
                 text=f"{mgr_mention}, дай комментарий по занижению цены.",
+                parse_mode="Markdown"
+            )
+
+    elif action == "pdz_ok":
+        await query.message.delete()
+
+    elif action == "pdz_comment":
+        order_id = parts[1] if len(parts) > 1 else ""
+        pdz_data = _pdz_alert_data.get(order_id, {})
+        client = pdz_data.get("client", "")
+        manager_name_pdz = pdz_data.get("manager", manager_name)
+        order_name_pdz = pdz_data.get("order_name", "")
+        debt_amount = pdz_data.get("debt_amount", 0)
+        debt_days = pdz_data.get("debt_days", 0)
+
+        # Сохраняем в БД
+        db.save_pdz_comment(
+            client=client,
+            manager=manager_name_pdz,
+            order_name=order_name_pdz,
+            debt_amount=debt_amount,
+            debt_days=debt_days,
+            comment="Запрошен комментарий руководителем",
+            commented_by=user.first_name,
+        )
+
+        new_text = query.message.text + f"\n\n💬 *{user.first_name} ждёт комментарий менеджера*"
+        await query.edit_message_text(new_text, parse_mode="Markdown")
+
+        if group_chat_id:
+            contact = MANAGERS_CONTACTS.get(manager_name_pdz)
+            mgr_mention = contact if contact else f"*{manager_name_pdz}*" if manager_name_pdz else "Менеджер"
+            await context.bot.send_message(
+                chat_id=group_chat_id,
+                text=f"{mgr_mention}, дай комментарий по заказу *{order_name_pdz}* — у клиента просрочка {debt_days} дней.",
                 parse_mode="Markdown"
             )
 
@@ -1111,7 +1139,7 @@ def main():
     app.add_handler(CommandHandler("add_webhook", cmd_add_webhook))
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
-    app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^price_"))
+    app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
 
@@ -1178,7 +1206,80 @@ MANAGERS_CONTACTS = {
     "Скляр Инесса Ионасовна":          "+79622522903",
     "Голубева Татьяна":                "@tanya_keratin14",
 }
+# Кэш для дедупликации webhook — order_id → timestamp последней проверки
 _price_check_cache: dict = {}
+# Хранилище данных алертов ПДЗ — order_id → {client, manager, debt_amount, debt_days, order_name}
+_pdz_alert_data: dict = {}
+
+
+async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
+    """Проверяет есть ли у клиента просрочка > 5 дней при новом заказе."""
+    try:
+        import aiohttp
+        from moysklad import get_headers, MS_BASE
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                order_href, headers=get_headers(),
+                params={"expand": "agent,owner"}
+            ) as resp:
+                if resp.status != 200:
+                    return
+                order = await resp.json()
+
+        agent = order.get("agent", {})
+        agent_id = agent.get("id", "")
+        agent_name = agent.get("name", "")
+        order_name = order.get("name", "")
+        owner = order.get("owner", {})
+        manager_name = owner.get("name", "не указан")
+
+        if not agent_id:
+            return
+
+        # Получаем баланс контрагента
+        from moysklad import get_counterparty_debt
+        debt_info = await get_counterparty_debt(agent_id)
+        if not debt_info:
+            return
+
+        debt_amount = debt_info.get("debt", 0)
+        debt_days = debt_info.get("overdue_days", 0)
+
+        if debt_days <= 5 or debt_amount <= 0:
+            return
+
+        order_id = order_href.split("/")[-1]
+        _pdz_alert_data[order_id] = {
+            "client": agent_name,
+            "manager": manager_name,
+            "order_name": order_name,
+            "debt_amount": debt_amount,
+            "debt_days": debt_days,
+        }
+
+        text = (
+            f"🔴 *Новый заказ от клиента с просрочкой!*\n\n"
+            f"*{agent_name}* | Заказ *{order_name}*\n"
+            f"Менеджер: {manager_name}\n\n"
+            f"Просрочка: *{debt_days} дней* | Сумма: *{debt_amount:,.0f} руб*"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Согласовано", callback_data=f"pdz_ok|{order_id}"),
+                InlineKeyboardButton("💬 Требуется комментарий", callback_data=f"pdz_comment|{order_id}"),
+            ]
+        ])
+        await bot.send_message(
+            chat_id=group_chat_id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+        logger.info(f"ПДЗ алерт: {agent_name}, просрочка {debt_days} дней, заказ {order_name}")
+
+    except Exception as e:
+        logger.error(f"check_debtor_alert: {e}")
 # Кэш позиций заказа — order_id → frozenset(позиций) для отслеживания изменений цен/номенклатуры
 _order_positions_cache: dict = {}
 
@@ -1238,6 +1339,10 @@ async def process_ms_webhook(data: dict, bot):
                     parse_mode="Markdown",
                     reply_markup=keyboard
                 )
+
+            # Проверяем просрочку клиента только для новых заказов (CREATE)
+            if event.get("action") == "CREATE":
+                await check_debtor_alert(order_href, bot, group_chat_id)
 
     except Exception as e:
         logger.error(f"process_ms_webhook: {e}")
