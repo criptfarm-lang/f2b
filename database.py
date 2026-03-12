@@ -86,6 +86,17 @@ class Database:
                 value TEXT,
                 updated_at TEXT DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS pdz_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client TEXT NOT NULL,
+                manager TEXT,
+                order_name TEXT,
+                debt_amount REAL,
+                debt_days INTEGER,
+                comment TEXT,
+                commented_by TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
         """)
         self.conn.commit()
 
@@ -340,3 +351,24 @@ class Database:
             f"Сотрудники: Белякова А. (закупки), Баласанян К. (продажи), "
             f"Скляр И. (продажи), Малышкин А. (финансы), Гераскина Ю. (CRM)."
         )
+
+    # ─── ПДЗ КОММЕНТАРИИ ──────────────────────────────────────────────────────
+
+    def save_pdz_comment(self, client: str, manager: str, order_name: str,
+                         debt_amount: float, debt_days: int, comment: str,
+                         commented_by: str) -> int:
+        cur = self.conn.execute(
+            """INSERT INTO pdz_comments
+               (client, manager, order_name, debt_amount, debt_days, comment, commented_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (client, manager, order_name, debt_amount, debt_days, comment, commented_by)
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_pdz_comments(self, limit: int = 50) -> list:
+        rows = self.conn.execute(
+            """SELECT * FROM pdz_comments ORDER BY created_at DESC LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
