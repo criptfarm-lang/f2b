@@ -1217,8 +1217,8 @@ async def process_ms_webhook(data: dict, bot):
                 text = "⚠️ *Цена ниже минимальной!*\n\n" + "\n\n".join(alerts)
                 keyboard = InlineKeyboardMarkup([
                     [
-                        InlineKeyboardButton("✅ Согласовано", callback_data=f"price_ok|{order_href}"),
-                        InlineKeyboardButton("💬 Требуется комментарий", callback_data=f"price_comment|{order_href}"),
+                        InlineKeyboardButton("✅ Согласовано", callback_data=f"price_ok|{order_id}"),
+                        InlineKeyboardButton("💬 Требуется комментарий", callback_data=f"price_comment|{order_id}"),
                     ]
                 ])
                 await bot.send_message(
