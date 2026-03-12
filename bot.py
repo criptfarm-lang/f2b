@@ -1066,8 +1066,7 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
     group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
 
     if action == "price_ok":
-        new_text = query.message.text + f"\n\n✅ *Согласовано* — {user.first_name}"
-        await query.edit_message_text(new_text, parse_mode="Markdown")
+        await query.message.delete()
 
     elif action == "price_comment":
         new_text = query.message.text + f"\n\n💬 *{user.first_name} ждёт комментарий менеджера*"
@@ -1180,6 +1179,8 @@ MANAGERS_CONTACTS = {
     "Голубева Татьяна":                "@tanya_keratin14",
 }
 _price_check_cache: dict = {}
+# Кэш позиций заказа — order_id → frozenset(позиций) для отслеживания изменений цен/номенклатуры
+_order_positions_cache: dict = {}
 
 
 async def process_ms_webhook(data: dict, bot):
@@ -1202,13 +1203,23 @@ async def process_ms_webhook(data: dict, bot):
             if not order_href:
                 continue
 
-            # Дедупликация — один заказ не чаще раза в 60 секунд
+            # Дедупликация — один заказ не чаще раза в 10 секунд
             order_id = order_href.split("/")[-1]
             now = time.time()
             if now - _price_check_cache.get(order_id, 0) < 10:
                 logger.info(f"Webhook: заказ {order_id} уже проверялся, пропускаем")
                 continue
             _price_check_cache[order_id] = now
+
+            # Получаем снапшот позиций (товар + цена) и сравниваем с предыдущим
+            from moysklad import get_order_positions_snapshot
+            snapshot = await get_order_positions_snapshot(order_href)
+            prev_snapshot = _order_positions_cache.get(order_id)
+            _order_positions_cache[order_id] = snapshot
+
+            if prev_snapshot is not None and snapshot == prev_snapshot:
+                logger.info(f"Webhook: заказ {order_id} — цены/номенклатура не изменились, пропускаем")
+                continue
 
             logger.info(f"Webhook: проверяю цены заказа {order_id}")
             alerts = await check_order_prices(order_href)
