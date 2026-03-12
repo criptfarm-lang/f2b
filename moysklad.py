@@ -1420,7 +1420,7 @@ async def check_order_prices(order_href: str) -> list:
             async with session.get(
                 order_href,
                 headers=get_headers(),
-                params={"expand": "agent,positions.assortment"}
+                params={"expand": "agent,positions.assortment,owner"}
             ) as resp:
                 if resp.status != 200:
                     logger.error(f"check_order_prices: не удалось загрузить заказ {order_href}")
@@ -1431,6 +1431,10 @@ async def check_order_prices(order_href: str) -> list:
             agent_name = agent.get("name", "неизвестно")
             agent_id = agent.get("id", "")
             order_name = order.get("name", "")
+
+            # Менеджер (владелец заказа)
+            owner = order.get("owner", {})
+            manager_name = owner.get("name", "не указан")
 
             # 2. Определяем тег контрагента (хорека или опт)
             agent_tags = agent.get("tags", [])
@@ -1485,15 +1489,61 @@ async def check_order_prices(order_href: str) -> list:
                 if order_price < min_price:
                     diff = min_price - order_price
                     alerts.append(
-                        f"📦 *{product_name}*\n"
-                        f"   Цена в заказе: *{order_price:,.0f} руб*\n"
-                        f"   Минимум ({price_type_name}): {min_price:,.0f} руб\n"
-                        f"   Занижена на: {diff:,.0f} руб\n"
-                        f"   Клиент: {agent_name} ({client_type})\n"
-                        f"   Заказ: {order_name}"
+                        f"📦 *{agent_name}* | Заказ *{order_name}*\n"
+                        f"Менеджер: {manager_name}\n\n"
+                        f"*{product_name}*\n"
+                        f"Цена в заказе: {order_price:,.0f} руб | Минимальная ({client_type}): {min_price:,.0f} руб\n"
+                        f"*Занижена на: {diff:,.0f} руб*"
                     )
 
     except Exception as e:
         logger.error(f"check_order_prices: {e}")
 
     return alerts
+
+
+async def get_order_manager(order_href: str) -> dict:
+    """
+    Возвращает имя и Telegram ID менеджера-владельца заказа.
+    Маппинг имён на Telegram ID берётся из переменной окружения MANAGER_TG_IDS
+    формат: "Иванов Андрей:123456789,Баласанян Карина:987654321"
+    """
+    import aiohttp
+    import re
+
+    manager_info = {"name": "", "telegram_id": None}
+
+    # Маппинг имя → telegram_id из переменной окружения
+    mapping_str = os.getenv("MANAGER_TG_IDS", "")
+    mapping = {}
+    for item in mapping_str.split(","):
+        item = item.strip()
+        if ":" in item:
+            name, tg_id = item.rsplit(":", 1)
+            try:
+                mapping[name.strip().lower()] = int(tg_id.strip())
+            except ValueError:
+                pass
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(order_href, headers=get_headers(), params={"expand": "owner"}) as resp:
+                if resp.status != 200:
+                    return manager_info
+                order = await resp.json()
+
+        owner = order.get("owner", {})
+        owner_name = owner.get("name", "")
+        manager_info["name"] = owner_name
+
+        # Ищем telegram_id по имени (частичное совпадение)
+        owner_lower = owner_name.lower()
+        for mapped_name, tg_id in mapping.items():
+            if mapped_name in owner_lower or owner_lower in mapped_name:
+                manager_info["telegram_id"] = tg_id
+                break
+
+    except Exception as e:
+        logger.error(f"get_order_manager: {e}")
+
+    return manager_info
