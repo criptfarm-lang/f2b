@@ -1075,7 +1075,13 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
         # Сообщение в группу с запросом комментария
         if group_chat_id:
-            mgr_mention = f"*{manager_name}*" if manager_name else "Менеджер"
+            contact = MANAGERS_CONTACTS.get(manager_name)
+            if contact:
+                mgr_mention = contact  # @username или телефон
+            elif manager_name:
+                mgr_mention = f"*{manager_name}*"
+            else:
+                mgr_mention = "Менеджер"
             await context.bot.send_message(
                 chat_id=group_chat_id,
                 text=f"{mgr_mention}, дай комментарий по занижению цены.",
@@ -1165,7 +1171,14 @@ def main():
     asyncio.run(run_all())
 
 
-# Кэш для дедупликации webhook — order_id → timestamp последней проверки
+# Маппинг менеджеров МойСклад → Telegram (username или телефон)
+MANAGERS_CONTACTS = {
+    "Леонтьев Алексей Вадимович":      "@EL_Aliexbox",
+    "Мерзлякова Елена Владимировна":   "+79920035102",
+    "Баласанян Карина Владимировна":   "@fatbob183",
+    "Скляр Инесса Ионасовна":          "+79622522903",
+    "Голубева Татьяна":                "@tanya_keratin14",
+}
 _price_check_cache: dict = {}
 
 
