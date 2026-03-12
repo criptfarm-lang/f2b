@@ -1317,3 +1317,87 @@ async def get_counterparties_by_product(product_query: str, period_days: int = 1
         logger.error(f"get_counterparties_by_product: {e}")
 
     return list(found.values())
+
+
+async def get_buyers_by_product(product_query: str, period_days: int = 180) -> list:
+    """
+    Быстрый поиск покупателей через отчёт "Прибыльность по покупателям".
+    Фильтрует по товару и основному складу за указанный период.
+    Возвращает список: [{"id": ..., "name": ..., "href": ...}]
+    """
+    import aiohttp
+    from datetime import datetime, timedelta
+
+    STORE_ID = os.getenv("MS_STORE_ID", "0044d71e-9a9a-11f0-0a80-03a90002743d")
+    STORE_HREF = f"{MS_BASE}/entity/store/{STORE_ID}"
+
+    date_to = datetime.now()
+    date_from = date_to - timedelta(days=period_days)
+    moment_from = date_from.strftime("%Y-%m-%d %H:%M:%S")
+    moment_to = date_to.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. Ищем товар по названию
+    products = await search_products(product_query, limit=5)
+    if not products:
+        logger.warning(f"get_buyers_by_product: товар '{product_query}' не найден")
+        return []
+
+    # Берём первый подходящий товар
+    product = products[0]
+    product_id = product.get("id")
+    product_name = product.get("name", product_query)
+    if not product_id:
+        logger.warning(f"get_buyers_by_product: нет ID у товара '{product_name}'")
+        return []
+
+    product_href = f"{MS_BASE}/entity/product/{product_id}"
+    logger.info(f"get_buyers_by_product: товар '{product_name}' id={product_id}")
+
+    # 2. Запрашиваем отчёт прибыльности по покупателям
+    buyers = []
+    offset = 0
+    limit = 100
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            while True:
+                url = f"{MS_BASE}/report/profit/bycounterparty"
+                params = {
+                    "momentFrom": moment_from,
+                    "momentTo": moment_to,
+                    "filter": f"store={STORE_HREF};product={product_href}",
+                    "limit": limit,
+                    "offset": offset,
+                }
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.error(f"get_buyers_by_product: {resp.status} {text[:200]}")
+                        break
+                    data = await resp.json()
+
+                rows = data.get("rows", [])
+                total = data.get("meta", {}).get("size", 0)
+
+                for row in rows:
+                    cp = row.get("counterparty", {})
+                    cp_name = cp.get("name", "")
+                    cp_href = cp.get("meta", {}).get("href", "")
+                    cp_id = cp_href.split("/")[-1] if cp_href else ""
+                    if cp_name and cp_id:
+                        buyers.append({
+                            "id": cp_id,
+                            "name": cp_name,
+                            "href": cp_href,
+                        })
+
+                offset += limit
+                if offset >= total or len(rows) < limit:
+                    break
+
+        logger.info(f"get_buyers_by_product: '{product_name}' за {period_days} дней → {len(buyers)} покупателей")
+
+    except Exception as e:
+        logger.error(f"get_buyers_by_product: {e}")
+
+    return buyers
