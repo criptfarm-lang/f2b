@@ -1205,7 +1205,7 @@ async def process_ms_webhook(data: dict, bot):
             # Дедупликация — один заказ не чаще раза в 60 секунд
             order_id = order_href.split("/")[-1]
             now = time.time()
-            if now - _price_check_cache.get(order_id, 0) < 60:
+            if now - _price_check_cache.get(order_id, 0) < 10:
                 logger.info(f"Webhook: заказ {order_id} уже проверялся, пропускаем")
                 continue
             _price_check_cache[order_id] = now
