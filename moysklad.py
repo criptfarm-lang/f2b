@@ -1547,3 +1547,88 @@ async def get_order_manager(order_href: str) -> dict:
         logger.error(f"get_order_manager: {e}")
 
     return manager_info
+
+
+async def get_order_positions_snapshot(order_href: str) -> frozenset:
+    """
+    Возвращает frozenset позиций заказа в виде (product_id, price).
+    Используется для отслеживания изменений цен и номенклатуры.
+    """
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                order_href,
+                headers=get_headers(),
+                params={"expand": "positions.assortment"}
+            ) as resp:
+                if resp.status != 200:
+                    return frozenset()
+                order = await resp.json()
+
+        positions = order.get("positions", {})
+        pos_rows = positions.get("rows", []) if isinstance(positions, dict) else []
+
+        snapshot = frozenset(
+            (
+                pos.get("assortment", {}).get("id", ""),
+                pos.get("price", 0),
+                pos.get("quantity", 0),
+            )
+            for pos in pos_rows
+        )
+        return snapshot
+
+    except Exception as e:
+        logger.error(f"get_order_positions_snapshot: {e}")
+        return frozenset()
+
+
+async def get_counterparty_debt(counterparty_id: str) -> dict:
+    """
+    Возвращает просрочку контрагента: debt (сумма) и overdue_days (макс. дней).
+    Использует report/counterparty для получения актуального баланса.
+    """
+    import aiohttp
+    from datetime import date
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/report/counterparty/{counterparty_id}"
+            async with session.get(url, headers=get_headers()) as resp:
+                if resp.status != 200:
+                    return {}
+                data = await resp.json()
+
+        balance = data.get("balance", 0) / 100  # копейки → рубли
+        # balance < 0 означает что нам должны
+        if balance >= 0:
+            return {}
+
+        debt = abs(balance)
+
+        # Считаем дни просрочки через daysOverdue из отчёта
+        overdue_days = 0
+        debt_by_date = data.get("debtByDate", [])
+        today = date.today()
+        for entry in debt_by_date:
+            entry_date_str = entry.get("date", "")
+            entry_sum = entry.get("sum", 0) / 100
+            if entry_sum < 0 and entry_date_str:
+                try:
+                    entry_date = date.fromisoformat(entry_date_str[:10])
+                    days = (today - entry_date).days
+                    if days > overdue_days:
+                        overdue_days = days
+                except Exception:
+                    pass
+
+        # Если debtByDate пустой — берём из daysOverdue напрямую
+        if overdue_days == 0:
+            overdue_days = data.get("daysOverdue", 0)
+
+        return {"debt": debt, "overdue_days": overdue_days}
+
+    except Exception as e:
+        logger.error(f"get_counterparty_debt: {e}")
+        return {}
