@@ -658,15 +658,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-        # 1. Находим контрагентов в МойСклад по товару
-        from moysklad import get_counterparties_by_product
-        counterparty_names = await get_counterparties_by_product(product, period_days=period_days)
+        # 1. Находим покупателей через отчёт прибыльности МойСклад
+        from moysklad import get_buyers_by_product
+        counterparty_names = await get_buyers_by_product(product, period_days=period_days)
 
         if not counterparty_names:
-            await message.reply_text(f"❌ Не найдено клиентов покупавших *{product}* в МойСклад.", parse_mode="Markdown")
+            await message.reply_text(f"❌ Не найдено покупателей *{product}* за последние {period_days} дней.", parse_mode="Markdown")
             return
 
-        await message.reply_text(f"📋 Найдено {len(counterparty_names)} клиентов в МойСклад.\n🔍 Ищу их в amoCRM...", parse_mode="Markdown")
+        await message.reply_text(f"📋 Найдено {len(counterparty_names)} покупателей в МойСклад.\n🔍 Ищу их в amoCRM...", parse_mode="Markdown")
 
         # 2. Находим их в amoCRM
         contacts = await find_contacts_for_broadcast(counterparty_names)
