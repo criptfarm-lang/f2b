@@ -926,7 +926,33 @@ async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Запомнил: *{key.strip()}* → {value.strip()}", parse_mode="Markdown")
 
 
-async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_add_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создаёт вебхуки в МойСклад. /add_webhook"""
+    user = update.message.from_user
+    manager_ids_str = os.getenv("MANAGER_IDS", "")
+    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
+    if user.id not in manager_ids:
+        await update.message.reply_text("⛔ Только для руководителей.")
+        return
+
+    import aiohttp
+    token = os.getenv("MOYSKLAD_TOKEN")
+    webhook_url = "https://f2b-production.up.railway.app/webhook/moysklad"
+    api_url = "https://api.moysklad.ru/api/remap/1.2/entity/webhook"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    results = []
+    async with aiohttp.ClientSession() as session:
+        for action, extra in [("CREATE", {}), ("UPDATE", {"diffType": "NONE"})]:
+            payload = {"url": webhook_url, "action": action, "entityType": "customerorder", **extra}
+            async with session.post(api_url, headers=headers, json=payload) as resp:
+                data = await resp.json()
+                if resp.status in (200, 201):
+                    results.append(f"✅ {action}: id={data.get('id')}")
+                else:
+                    results.append(f"❌ {action}: {data}")
+
+    await update.message.reply_text("Вебхуки МойСклад:\n" + "\n".join(results))
     """Тестовый запуск утренних задач ПДЗ. /pdz_test [имя|all]"""
     user = update.message.from_user
     manager_ids_str = os.getenv("MANAGER_IDS", "")
@@ -997,6 +1023,7 @@ def main():
     app.add_handler(CommandHandler("contact", cmd_contact))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("remember", cmd_remember))
+    app.add_handler(CommandHandler("add_webhook", cmd_add_webhook))
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
