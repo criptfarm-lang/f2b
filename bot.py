@@ -9,11 +9,12 @@ import os
 import re
 from datetime import datetime
 
-from telegram import Update, Message
+from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     TypeHandler,
     ContextTypes,
     filters,
@@ -1037,6 +1038,51 @@ async def cmd_pdz_evening_test(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатия кнопок на алерте о цене."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+
+    # Только руководители могут нажимать
+    manager_ids_str = os.getenv("MANAGER_IDS", "")
+    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
+    if user.id not in manager_ids:
+        await query.answer("⛔ Только для руководителей.", show_alert=True)
+        return
+
+    parts = query.data.split("|")
+    action = parts[0]
+    order_href = parts[1] if len(parts) > 1 else ""
+
+    # Имя менеджера берём из текста сообщения (строка "Менеджер: ...")
+    manager_name = ""
+    for line in query.message.text.split("\n"):
+        if line.startswith("Менеджер:"):
+            manager_name = line.replace("Менеджер:", "").strip()
+            break
+
+    group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
+
+    if action == "price_ok":
+        new_text = query.message.text + f"\n\n✅ *Согласовано* — {user.first_name}"
+        await query.edit_message_text(new_text, parse_mode="Markdown")
+
+    elif action == "price_comment":
+        new_text = query.message.text + f"\n\n💬 *{user.first_name} ждёт комментарий менеджера*"
+        await query.edit_message_text(new_text, parse_mode="Markdown")
+
+        # Сообщение в группу с запросом комментария
+        if group_chat_id:
+            mgr_mention = f"*{manager_name}*" if manager_name else "Менеджер"
+            await context.bot.send_message(
+                chat_id=group_chat_id,
+                text=f"{mgr_mention}, дай комментарий по занижению цены.",
+                parse_mode="Markdown"
+            )
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -1060,6 +1106,7 @@ def main():
     app.add_handler(CommandHandler("add_webhook", cmd_add_webhook))
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
+    app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^price_"))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
 
@@ -1099,7 +1146,7 @@ def main():
         await app.start()
         await app.updater.start_polling(
             drop_pending_updates=True,
-            allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post"]
+            allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post", "callback_query"]
         )
         logger.info("🤖 Бот запущен!")
         # Держим бота запущенным
@@ -1118,8 +1165,13 @@ def main():
     asyncio.run(run_all())
 
 
+# Кэш для дедупликации webhook — order_id → timestamp последней проверки
+_price_check_cache: dict = {}
+
+
 async def process_ms_webhook(data: dict, bot):
     """Обрабатывает webhook от МойСклад — проверяет цены в заказе."""
+    import time
     try:
         from moysklad import check_order_prices
         group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
@@ -1137,15 +1189,30 @@ async def process_ms_webhook(data: dict, bot):
             if not order_href:
                 continue
 
-            logger.info(f"Webhook: новый/обновлённый заказ {order_href}")
+            # Дедупликация — один заказ не чаще раза в 60 секунд
+            order_id = order_href.split("/")[-1]
+            now = time.time()
+            if now - _price_check_cache.get(order_id, 0) < 60:
+                logger.info(f"Webhook: заказ {order_id} уже проверялся, пропускаем")
+                continue
+            _price_check_cache[order_id] = now
+
+            logger.info(f"Webhook: проверяю цены заказа {order_id}")
             alerts = await check_order_prices(order_href)
 
             if alerts:
-                text = "⚠️ *Цена ниже минимальной!*\n\n" + "\n".join(alerts)
+                text = "⚠️ *Цена ниже минимальной!*\n\n" + "\n\n".join(alerts)
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Согласовано", callback_data=f"price_ok|{order_href}"),
+                        InlineKeyboardButton("💬 Требуется комментарий", callback_data=f"price_comment|{order_href}"),
+                    ]
+                ])
                 await bot.send_message(
                     chat_id=group_chat_id,
                     text=text,
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    reply_markup=keyboard
                 )
 
     except Exception as e:
