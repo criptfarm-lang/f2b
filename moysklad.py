@@ -1401,3 +1401,99 @@ async def get_buyers_by_product(product_query: str, period_days: int = 180) -> l
         logger.error(f"get_buyers_by_product: {e}")
 
     return buyers
+
+
+async def check_order_prices(order_href: str) -> list:
+    """
+    Проверяет цены в заказе покупателя.
+    Сравнивает цены позиций с эталонными ценами из карточки товара.
+    Тег контрагента определяет тип цены: хорека → "Цена продажи", опт → "Цена опт"
+    Возвращает список алертов если цена ниже минимальной.
+    """
+    import aiohttp
+    alerts = []
+
+    try:
+        async with aiohttp.ClientSession() as session:
+
+            # 1. Загружаем заказ с позициями и контрагентом
+            async with session.get(
+                order_href,
+                headers=get_headers(),
+                params={"expand": "agent,positions.assortment"}
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"check_order_prices: не удалось загрузить заказ {order_href}")
+                    return []
+                order = await resp.json()
+
+            agent = order.get("agent", {})
+            agent_name = agent.get("name", "неизвестно")
+            agent_id = agent.get("id", "")
+            order_name = order.get("name", "")
+
+            # 2. Определяем тег контрагента (хорека или опт)
+            agent_tags = agent.get("tags", [])
+            tags_lower = [t.lower() for t in agent_tags]
+
+            if "хорека" in tags_lower:
+                price_type_name = "Цена продажи"
+                client_type = "хорека"
+            elif "опт" in tags_lower:
+                price_type_name = "Цена опт"
+                client_type = "опт"
+            else:
+                # Нет тега — не проверяем
+                logger.info(f"check_order_prices: контрагент '{agent_name}' без тега хорека/опт — пропускаем")
+                return []
+
+            logger.info(f"check_order_prices: заказ {order_name}, клиент '{agent_name}' ({client_type}), тип цены: {price_type_name}")
+
+            # 3. Проверяем позиции заказа
+            positions = order.get("positions", {})
+            pos_rows = positions.get("rows", []) if isinstance(positions, dict) else []
+
+            for pos in pos_rows:
+                assortment = pos.get("assortment", {})
+                product_name = assortment.get("name", "")
+                product_id = assortment.get("id", "")
+                order_price = pos.get("price", 0) / 100  # цена в копейках
+
+                if not product_id or order_price <= 0:
+                    continue
+
+                # 4. Загружаем эталонную цену из карточки товара
+                product_url = f"{MS_BASE}/entity/product/{product_id}"
+                async with session.get(product_url, headers=get_headers()) as resp:
+                    if resp.status != 200:
+                        continue
+                    product_data = await resp.json()
+
+                # Ищем нужный тип цены
+                sale_prices = product_data.get("salePrices", [])
+                min_price = None
+                for sp in sale_prices:
+                    pt = sp.get("priceType", {})
+                    if pt.get("name", "") == price_type_name:
+                        min_price = sp.get("value", 0) / 100
+                        break
+
+                if min_price is None or min_price <= 0:
+                    continue  # Цена не установлена — пропускаем
+
+                # 5. Сравниваем
+                if order_price < min_price:
+                    diff = min_price - order_price
+                    alerts.append(
+                        f"📦 *{product_name}*\n"
+                        f"   Цена в заказе: *{order_price:,.0f} руб*\n"
+                        f"   Минимум ({price_type_name}): {min_price:,.0f} руб\n"
+                        f"   Занижена на: {diff:,.0f} руб\n"
+                        f"   Клиент: {agent_name} ({client_type})\n"
+                        f"   Заказ: {order_name}"
+                    )
+
+    except Exception as e:
+        logger.error(f"check_order_prices: {e}")
+
+    return alerts
