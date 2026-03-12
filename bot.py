@@ -643,6 +643,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Не удалось отправить фото из МойСклад: {e}")
 
+    elif action == "find_buyers":
+        product = params.get("product", "")
+        period_days = params.get("period_days", 30)
+        if not product:
+            await message.reply_text("❌ Не указан товар.")
+            return
+        await message.reply_chat_action("typing")
+        await message.reply_text(f"🔍 Ищу покупателей *{product}* за последние {period_days} дней...", parse_mode="Markdown")
+        from moysklad import get_buyers_by_product
+        buyers = await get_buyers_by_product(product, period_days=period_days)
+        if not buyers:
+            await message.reply_text(f"❌ Покупателей *{product}* за последние {period_days} дней не найдено.", parse_mode="Markdown")
+            return
+        lines = [f"👥 *Покупатели {product}* за {period_days} дней ({len(buyers)}):\n"]
+        for b in buyers:
+            lines.append(f"• {b['name']}")
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3900] + "\n\n_...и ещё_"
+        await message.reply_text(text, parse_mode="Markdown")
+
     elif action == "broadcast":
         product = params.get("product", "")
         broadcast_text = params.get("message", "")
