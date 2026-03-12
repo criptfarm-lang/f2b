@@ -995,10 +995,6 @@ def main():
     app.add_handler(CommandHandler("photo", cmd_photo))
     app.add_handler(CommandHandler("price", cmd_price))
     app.add_handler(CommandHandler("contact", cmd_contact))
-
-    # Все сообщения (текст + медиа)
-    app.add_handler(CommandHandler("memory", cmd_memory))
-    app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
@@ -1006,14 +1002,93 @@ def main():
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
 
-    # Планировщик (утренние сводки, напоминания)
+    # Планировщик
     setup_scheduler(app, db)
 
-    logger.info("🤖 Бот запущен!")
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post"]
-    )
+    # Запускаем webhook-сервер и polling параллельно
+    import aiohttp.web as web
+
+    async def handle_ms_webhook(request):
+        """Принимает webhook от МойСклад — новые/обновлённые заказы."""
+        try:
+            data = await request.json()
+            asyncio.create_task(process_ms_webhook(data, app.bot))
+            return web.Response(text="ok")
+        except Exception as e:
+            logger.error(f"Webhook error: {e}")
+            return web.Response(text="error", status=500)
+
+    async def handle_health(request):
+        return web.Response(text="ok")
+
+    async def run_web():
+        web_app = web.Application()
+        web_app.router.add_post("/webhook/moysklad", handle_ms_webhook)
+        web_app.router.add_get("/health", handle_health)
+        port = int(os.getenv("PORT", "8080"))
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info(f"🌐 Webhook сервер запущен на порту {port}")
+
+    async def run_all():
+        await run_web()
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post"]
+        )
+        logger.info("🤖 Бот запущен!")
+        # Держим бота запущенным
+        try:
+            import signal
+            loop = asyncio.get_event_loop()
+            stop = loop.create_future()
+            loop.add_signal_handler(signal.SIGTERM, stop.set_result, None)
+            loop.add_signal_handler(signal.SIGINT, stop.set_result, None)
+            await stop
+        finally:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+
+    asyncio.run(run_all())
+
+
+async def process_ms_webhook(data: dict, bot):
+    """Обрабатывает webhook от МойСклад — проверяет цены в заказе."""
+    try:
+        from moysklad import check_order_prices
+        group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
+        if not group_chat_id:
+            return
+
+        events = data.get("events", [])
+        for event in events:
+            meta = event.get("meta", {})
+            entity_type = meta.get("type", "")
+            if entity_type != "customerorder":
+                continue
+
+            order_href = meta.get("href", "")
+            if not order_href:
+                continue
+
+            logger.info(f"Webhook: новый/обновлённый заказ {order_href}")
+            alerts = await check_order_prices(order_href)
+
+            if alerts:
+                text = "⚠️ *Цена ниже минимальной!*\n\n" + "\n".join(alerts)
+                await bot.send_message(
+                    chat_id=group_chat_id,
+                    text=text,
+                    parse_mode="Markdown"
+                )
+
+    except Exception as e:
+        logger.error(f"process_ms_webhook: {e}")
 
 
 if __name__ == "__main__":
