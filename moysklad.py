@@ -545,12 +545,21 @@ async def search_products_filtered(parsed: dict, limit: int = 20) -> list:
 
 async def get_counterparty_balance(query: str) -> list:
     """Ищет контрагента по имени и возвращает баланс через /report/counterparty."""
+    import re as _re
+
+    def _strip_legal(q: str) -> str:
+        return _re.sub(r'^\s*(ооо|ип|зао|ао|пао|оао|нко|снт)\s+', '', q.strip(), flags=_re.IGNORECASE).strip()
+
     try:
         async with aiohttp.ClientSession() as session:
-            # Шаг 1: найти контрагента по имени — пробуем оригинал и uppercase
             url = f"{MS_BASE}/entity/counterparty"
             rows = []
-            for q in [query, query.upper(), query.lower(), query.capitalize()]:
+            stripped = _strip_legal(query)
+            queries = [query, query.upper(), query.lower(), query.capitalize()]
+            if stripped and stripped.lower() != query.lower():
+                queries += [stripped, stripped.upper(), stripped.lower()]
+
+            for q in queries:
                 params = {"filter": f"name~{q}", "limit": 10}
                 async with session.get(url, headers=get_headers(), params=params) as resp:
                     if resp.status == 200:
@@ -681,11 +690,23 @@ BUYER_TYPE_TAGS = {
 
 async def find_counterparty_info(query: str) -> list:
     """Находит контрагента и возвращает его теги, менеджера, тип покупателя и баланс."""
+    import re as _re
+
+    def _strip_legal(q: str) -> str:
+        """Убирает юр.форму из запроса: ООО, ИП, ЗАО, АО, ПАО и т.д."""
+        return _re.sub(r'^\s*(ооо|ип|зао|ао|пао|оао|нко|снт)\s+', '', q.strip(), flags=_re.IGNORECASE).strip()
+
     try:
         async with aiohttp.ClientSession() as session:
             url = f"{MS_BASE}/entity/counterparty"
             rows = []
-            for q in [query, query.upper(), query.lower(), query.capitalize()]:
+            stripped = _strip_legal(query)
+            queries = [query, query.upper(), query.lower(), query.capitalize()]
+            # Добавляем вариант без юр.формы если он отличается
+            if stripped and stripped.lower() != query.lower():
+                queries += [stripped, stripped.upper(), stripped.lower()]
+
+            for q in queries:
                 params = {"filter": f"name~{q}", "limit": 10}
                 async with session.get(url, headers=get_headers(), params=params) as resp:
                     if resp.status == 200:
