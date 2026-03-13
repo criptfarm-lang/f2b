@@ -1470,8 +1470,11 @@ async def process_ms_webhook(data: dict, bot):
             already_checked = now - last_check < 10
             _price_check_cache[order_id] = now
 
+            action = event.get("action", "")
+            logger.info(f"Webhook: заказ {order_id} action={action} already_checked={already_checked}")
+
             # ПДЗ алерт — только для новых заказов, только один раз
-            if event.get("action") == "CREATE" and not already_checked:
+            if action == "CREATE" and not already_checked:
                 await check_debtor_alert(order_href, bot, group_chat_id)
 
             if already_checked:
