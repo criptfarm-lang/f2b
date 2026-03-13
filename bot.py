@@ -187,26 +187,39 @@ async def cmd_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_all_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Все открытые задачи команды."""
+    """Все открытые и недавно выполненные задачи команды."""
     tasks = db.get_all_open_tasks()
-    if not tasks:
+    done_tasks = db.get_recently_done(hours=24)
+
+    if not tasks and not done_tasks:
         await update.message.reply_text("✅ Нет открытых задач!")
         return
 
-    # Группируем по исполнителю
-    by_user = {}
-    for t in tasks:
-        exe = t.get('executor', 'Неизвестно')
-        by_user.setdefault(exe, []).append(t)
+    lines = []
 
-    lines = ["📋 *Все открытые задачи:*\n"]
-    for user, utasks in by_user.items():
-        lines.append(f"*{user}* ({len(utasks)}):")
-        for t in utasks:
-            icon = "🔴" if t.get('overdue') else "🟡"
-            deadline_str = f" [{t['deadline']}]" if t.get('deadline') else ""
-            lines.append(f"  {icon} {t['text']}{deadline_str}")
-        lines.append("")
+    if tasks:
+        # Группируем открытые по исполнителю
+        by_user = {}
+        for t in tasks:
+            exe = t.get('executor') or 'Неизвестно'
+            by_user.setdefault(exe, []).append(t)
+
+        lines.append("📋 *Открытые задачи:*\n")
+        for user, utasks in by_user.items():
+            lines.append(f"*{user}* ({len(utasks)}):")
+            for t in utasks:
+                icon = "🔴" if t.get('overdue') else "🟡"
+                deadline_str = f" [{t['deadline']}]" if t.get('deadline') else ""
+                lines.append(f"  {icon} {t['text']}{deadline_str}")
+            lines.append("")
+
+    if done_tasks:
+        lines.append("✅ *Выполнено за 24 часа:*\n")
+        for t in done_tasks:
+            exe = t.get('executor') or ''
+            result = t.get('result') or ''
+            result_str = f" — {result}" if result else ""
+            lines.append(f"  ✅ *{exe}*: {t['text']}{result_str}")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -385,20 +398,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines = [f"📌 Зафиксировано задач: {saved_count}\n"] + task_lines
                 await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    # 3. Автозакрытие задач — Claude анализирует контекст без списков слов
+    # 3. Автозакрытие задач — Claude анализирует контекст
     if not is_bot_addressed(text) and len(text) > 5:
         open_tasks = db.get_all_open_tasks()
         if open_tasks:
-            completed_ids = await detect_task_completion(text, open_tasks)
-            if completed_ids:
+            completed_items = await detect_task_completion(text, open_tasks)
+            if completed_items:
                 closed = []
-                for task_id in completed_ids:
+                sender_name = update.effective_user.full_name if update.effective_user else ""
+                for item in completed_items:
+                    task_id = item["id"]
+                    result = item.get("result", "")
                     task = next((t for t in open_tasks if t['id'] == task_id), None)
                     if task:
-                        db.complete_task(task_id)
+                        db.complete_task(task_id, result=result, completed_by=sender_name)
                         executor = task.get('executor', '')
-                        closed.append(f"✅ *{executor}*: {task['text']}")
-                        logger.info(f"Автозакрытие задачи {task_id}: {task['text']}")
+                        result_str = f" — {result}" if result else ""
+                        closed.append(f"✅ *{executor}*: {task['text']}{result_str}")
+                        logger.info(f"Автозакрытие задачи {task_id}: {task['text']} | результат: {result}")
                 if closed:
                     lines = ["🤖 Эф зафиксировал выполнение:\n"] + closed
                     await message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -474,17 +491,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         employee = params.get("employee")
         if employee:
             tasks = db.get_tasks_for_user(employee)
-            if not tasks:
-                await message.reply_text(f"✅ У *{employee}* нет открытых задач.", parse_mode="Markdown")
+            done = [t for t in db.get_recently_done(hours=24)
+                    if employee.lower() in (t.get('executor') or '').lower()]
+            if not tasks and not done:
+                await message.reply_text(f"✅ У *{employee}* нет задач.", parse_mode="Markdown")
             else:
                 lines = [f"📋 *Задачи — {employee}:*\n"]
                 for t in tasks:
                     deadline_str = f" — до {t['deadline']}" if t.get("deadline") else ""
                     icon = "🔴" if t.get("overdue") else "🟡"
                     lines.append(f"{icon} {t['text']}{deadline_str}")
+                if done:
+                    lines.append("")
+                    for t in done:
+                        result_str = f" — {t['result']}" if t.get('result') else ""
+                        lines.append(f"✅ {t['text']}{result_str}")
                 await message.reply_text("\n".join(lines), parse_mode="Markdown")
         else:
-            await cmd_my_tasks(update, context)
+            await cmd_all_tasks(update, context)
 
     elif action == "get_all_tasks":
         await cmd_all_tasks(update, context)
@@ -1065,7 +1089,13 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
 
+    MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
+
     if action == "price_ok":
+        from moysklad import set_order_state
+        order_id = parts[1] if len(parts) > 1 else ""
+        if order_id:
+            await set_order_state(order_id, MS_STATE_AGREED)
         await query.message.delete()
 
     elif action == "price_comment":
@@ -1081,6 +1111,10 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
             )
 
     elif action == "pdz_ok":
+        from moysklad import set_order_state
+        order_id = parts[1] if len(parts) > 1 else ""
+        if order_id:
+            await set_order_state(order_id, MS_STATE_AGREED)
         await query.message.delete()
 
     elif action == "pdz_comment":
