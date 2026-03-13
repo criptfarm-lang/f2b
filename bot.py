@@ -356,6 +356,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message:
         return
 
+    # Команды обрабатываются отдельными CommandHandler — пропускаем
+    if message.text and message.text.startswith("/"):
+        return
+
     chat_id = message.chat_id
     user = message.from_user
     text = message.text or message.caption or ""
