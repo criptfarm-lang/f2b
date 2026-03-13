@@ -1397,12 +1397,91 @@ async def process_ms_webhook(data: dict, bot):
                     reply_markup=keyboard
                 )
 
+            # Проверяем логистику — адрес vs день недели
+            await check_logistics_alert(order_href, bot, group_chat_id)
+
             # Проверяем просрочку клиента только для новых заказов (CREATE)
             if event.get("action") == "CREATE":
                 await check_debtor_alert(order_href, bot, group_chat_id)
 
     except Exception as e:
         logger.error(f"process_ms_webhook: {e}")
+
+
+async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
+    """Проверяет адрес доставки заказа на соответствие расписанию логистики."""
+    try:
+        from moysklad import check_delivery_schedule
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            from moysklad import get_headers, MS_BASE
+            url = order_href.split("?")[0]
+            async with session.get(url, headers=get_headers()) as resp:
+                if resp.status != 200:
+                    return
+                order = await resp.json()
+
+        address = order.get("shipmentAddress", "")
+        delivery_date = order.get("deliveryPlannedMoment", "")
+        order_name = order.get("name", "")
+
+        if not address or not delivery_date:
+            return
+
+        result = check_delivery_schedule(address, delivery_date)
+        if result.get("ok"):
+            return
+
+        # Получаем имя клиента и менеджера
+        agent_href = order.get("agent", {}).get("meta", {}).get("href", "")
+        owner_href = order.get("owner", {}).get("meta", {}).get("href", "")
+        client_name = ""
+        manager_name = ""
+
+        async with aiohttp.ClientSession() as session:
+            from moysklad import get_headers
+            if agent_href:
+                async with session.get(agent_href, headers=get_headers()) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        client_name = d.get("name", "")
+            if owner_href:
+                async with session.get(owner_href, headers=get_headers()) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        manager_name = d.get("name", "")
+
+        city = result["city"].capitalize()
+        weekday = result["weekday"]
+        allowed = ", ".join(result["allowed_days"]) or "не запланирован"
+        from datetime import date
+        MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
+        try:
+            d = date.fromisoformat(result["date"])
+            date_str = f"{d.day} {MONTHS[d.month-1]}"
+        except Exception:
+            date_str = result["date"]
+
+        text = (
+            f"🚛 *Несоответствие логистики*\n\n"
+            f"👤 {client_name} | Заказ №{order_name}\n"
+            f"👔 Менеджер: {manager_name}\n"
+            f"📍 Адрес: {address}\n\n"
+            f"📅 Дата отгрузки: *{date_str} ({weekday})*\n"
+            f"❌ В {city} мы не едем в {weekday}\n"
+            f"✅ {city} доступен: *{allowed}*"
+        )
+
+        await bot.send_message(
+            chat_id=group_chat_id,
+            text=text,
+            parse_mode="Markdown"
+        )
+        logger.info(f"Логистика алерт: заказ {order_name}, {city}, {weekday}")
+
+    except Exception as e:
+        logger.error(f"check_logistics_alert: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
