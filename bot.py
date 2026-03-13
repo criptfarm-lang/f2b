@@ -1404,9 +1404,8 @@ async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
         debt_days = debt_info.get("overdue_days", 0)
         logger.info(f"check_debtor_alert: debt={debt_amount} days={debt_days}")
 
-        # Алертим если долг больше 50 000 руб (независимо от дней просрочки)
-        if debt_amount < 50000:
-            logger.info(f"check_debtor_alert: долг {debt_amount} — ниже порога 50000")
+        if debt_days <= 5 or debt_amount <= 0:
+            logger.info(f"check_debtor_alert: просрочка {debt_days} дней — ниже порога или долга нет")
             return
 
         order_id = order_href.split("/")[-1]
@@ -1418,13 +1417,11 @@ async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
             "debt_days": debt_days,
         }
 
-        debt_str = f"Просрочка: *{debt_days} дней* | Сумма: *{debt_amount:,.0f} руб*" if debt_days > 0 else f"Задолженность: *{debt_amount:,.0f} руб*"
-
         text = (
-            f"🔴 *Новый заказ от клиента с долгом!*\n\n"
+            f"🔴 *Новый заказ от клиента с просрочкой!*\n\n"
             f"*{agent_name}* | Заказ *{order_name}*\n"
             f"Менеджер: {manager_name}\n\n"
-            f"{debt_str}"
+            f"Просрочка: *{debt_days} дней* | Сумма: *{debt_amount:,.0f} руб*"
         )
         keyboard = InlineKeyboardMarkup([
             [
