@@ -48,7 +48,9 @@ class Database:
                 source_message_id BIGINT,
                 created_by TEXT,
                 created_at TIMESTAMP DEFAULT NOW(),
-                completed_at TIMESTAMP
+                completed_at TIMESTAMP,
+                completed_by TEXT,
+                result TEXT
             );
 
             CREATE TABLE IF NOT EXISTS media (
@@ -120,6 +122,21 @@ class Database:
         with self.conn.cursor() as cur:
             cur.execute(sql)
         self.conn.commit()
+        self._migrate()
+
+    def _migrate(self):
+        """Добавляет новые колонки если их нет (для существующих БД)."""
+        migrations = [
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_by TEXT",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS result TEXT",
+        ]
+        with self.conn.cursor() as cur:
+            for m in migrations:
+                try:
+                    cur.execute(m)
+                except Exception:
+                    pass
+        self.conn.commit()
 
     # ─── ЗАДАЧИ ───────────────────────────────────────────────────────────────
 
@@ -136,10 +153,25 @@ class Database:
             self.conn.commit()
             return row['id']
 
-    def complete_task(self, task_id: int):
+    def complete_task(self, task_id: int, result: str = "", completed_by: str = ""):
         self._execute(
-            "UPDATE tasks SET status='done', completed_at=NOW() WHERE id=%s",
-            (task_id,)
+            "UPDATE tasks SET status='done', completed_at=NOW(), result=%s, completed_by=%s WHERE id=%s",
+            (result, completed_by, task_id)
+        )
+
+    def get_recently_done(self, hours: int = 24) -> List[Dict]:
+        """Задачи выполненные за последние N часов."""
+        return self._fetchall(
+            """SELECT * FROM tasks WHERE status='done'
+               AND completed_at >= NOW() - INTERVAL '%s hours'
+               ORDER BY completed_at DESC""",
+            (hours,)
+        )
+
+    def cleanup_done_tasks(self):
+        """Удаляет выполненные задачи старше 24 часов."""
+        self._execute(
+            "DELETE FROM tasks WHERE status='done' AND completed_at < NOW() - INTERVAL '24 hours'"
         )
 
     def get_tasks_for_user(self, name: str) -> List[Dict]:
@@ -221,7 +253,7 @@ class Database:
             if media_type and row.get('media_type') != media_type:
                 continue
             caption = (row.get('caption') or "").lower()
-            if any(w in caption for w in words):
+            if all(w in caption for w in words):
                 results.append(row)
         return results
 
