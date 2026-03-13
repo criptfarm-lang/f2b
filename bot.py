@@ -436,7 +436,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_addressed(text) and len(text) > 5:
         open_tasks = db.get_all_open_tasks()
         if open_tasks:
-            completed_items = await detect_task_completion(text, open_tasks)
+            completed_items = await detect_task_completion(text, open_tasks, author=sender_name)
             if completed_items:
                 closed = []
                 sender_name = update.effective_user.full_name if update.effective_user else ""
@@ -1404,8 +1404,9 @@ async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
         debt_days = debt_info.get("overdue_days", 0)
         logger.info(f"check_debtor_alert: debt={debt_amount} days={debt_days}")
 
-        if debt_days <= 5 or debt_amount <= 0:
-            logger.info(f"check_debtor_alert: просрочка {debt_days} дней — ниже порога или долга нет")
+        # Алертим если долг больше 50 000 руб (независимо от дней просрочки)
+        if debt_amount < 50000:
+            logger.info(f"check_debtor_alert: долг {debt_amount} — ниже порога 50000")
             return
 
         order_id = order_href.split("/")[-1]
@@ -1417,11 +1418,13 @@ async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
             "debt_days": debt_days,
         }
 
+        debt_str = f"Просрочка: *{debt_days} дней* | Сумма: *{debt_amount:,.0f} руб*" if debt_days > 0 else f"Задолженность: *{debt_amount:,.0f} руб*"
+
         text = (
-            f"🔴 *Новый заказ от клиента с просрочкой!*\n\n"
+            f"🔴 *Новый заказ от клиента с долгом!*\n\n"
             f"*{agent_name}* | Заказ *{order_name}*\n"
             f"Менеджер: {manager_name}\n\n"
-            f"Просрочка: *{debt_days} дней* | Сумма: *{debt_amount:,.0f} руб*"
+            f"{debt_str}"
         )
         keyboard = InlineKeyboardMarkup([
             [
