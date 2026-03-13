@@ -15,6 +15,73 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+YANDEX_GEOCODER_KEY = os.getenv("YANDEX_GEOCODER_KEY", "5a133f74-30f1-4296-9dc4-a780332987cc")
+
+# Координаты центров направлений (lat, lon)
+DELIVERY_CITIES_COORDS = {
+    "Звенигород":       (55.7324, 36.8519),
+    "Истра":            (55.9167, 36.8667),
+    "Солнечногорск":    (56.1833, 36.9833),
+    "Королёв":          (55.9167, 37.8333),
+    "Мытищи":           (55.9108, 37.7297),
+    "Одинцово":         (55.6833, 37.2833),
+    "Подольск":         (55.4167, 37.5500),
+    "Серпухов":         (54.9167, 37.4000),
+    "Чехов":            (55.1500, 37.4667),
+    "Щелково":          (55.9167, 38.0167),
+    "Домодедово":       (55.4333, 37.7667),
+    "Орехово-Зуево":    (55.8000, 38.9833),
+    "Павловский Посад": (55.7833, 38.6500),
+    "Сергиев Посад":    (56.3000, 38.1333),
+    "Красноармейск":    (56.1000, 38.1500),
+    "Пушкино":          (56.0167, 37.8500),
+    "Апрелевка":        (55.5500, 37.0667),
+    "Наро-Фоминск":     (55.3833, 36.7333),
+    "Егорьевск":        (55.3833, 39.0333),
+    "Воскресенск":      (55.3167, 38.6667),
+    "Каширское шоссе":  (55.3000, 37.6167),
+}
+
+# Радиус (км) в котором адрес считается относящимся к направлению
+DELIVERY_RADIUS_KM = 25
+
+
+def _haversine(lat1, lon1, lat2, lon2) -> float:
+    """Расстояние между двумя точками в км."""
+    import math
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+async def geocode_address(address: str) -> tuple:
+    """Геокодирует адрес через Яндекс. Возвращает (lat, lon) или None."""
+    try:
+        import urllib.parse
+        params = urllib.parse.urlencode({
+            "apikey": YANDEX_GEOCODER_KEY,
+            "geocode": address,
+            "format": "json",
+            "results": 1,
+            "ll": "37.6173,55.7558",
+            "spn": "2.0,2.0",
+        })
+        url = f"https://geocode-maps.yandex.ru/1.x/?{params}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        pos = (data["response"]["GeoObjectCollection"]
+               ["featureMember"][0]["GeoObject"]["Point"]["pos"])
+        lon, lat = map(float, pos.split())
+        return lat, lon
+    except Exception as e:
+        logger.warning(f"geocode_address error: {e}")
+        return None
+
 def fmt_money(amount: float) -> str:
     """Форматирует сумму в рублях: 192 850,45 руб."""
     return f"{amount:,.2f}".replace(",", " ").replace(".", ",").rstrip("0").rstrip(",") + " руб."
@@ -1739,10 +1806,10 @@ _CITY_INDEX = _build_city_index()
 ALL_MO_CITIES = list(_CITY_INDEX.keys())
 
 
-def check_delivery_schedule(address: str, delivery_date_str: str) -> dict:
+async def check_delivery_schedule(address: str, delivery_date_str: str) -> dict:
     """
     Проверяет соответствие адреса доставки и дня недели расписанию.
-    Возвращает {"ok": True} или {"ok": False, "city": ..., "date": ..., "weekday": ..., "allowed_days": [...]}
+    Сначала текстовый поиск, потом геокодирование через Яндекс.
     Московские адреса всегда OK.
     """
     if not address or not delivery_date_str:
@@ -1754,38 +1821,76 @@ def check_delivery_schedule(address: str, delivery_date_str: str) -> dict:
     if "москва" in address_lower or "moscow" in address_lower:
         return {"ok": True}
 
-    # Ищем город МО в адресе (по всем вариантам написания, длинные сначала)
+    # Определяем день недели даты отгрузки
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(delivery_date_str[:10])
+        weekday = dt.weekday()
+    except Exception:
+        return {"ok": True}
+
+    # Шаг 1: текстовый поиск по известным городам
     found_keyword = None
     for keyword in sorted(_CITY_INDEX.keys(), key=len, reverse=True):
         if keyword in address_lower:
             found_keyword = keyword
             break
 
-    if not found_keyword:
-        return {"ok": True}  # Неизвестный адрес — не проверяем
-
-    city_info = _CITY_INDEX[found_keyword]
-    canonical = city_info["canonical"]
-    allowed_days_nums = city_info["days"]
-
-    # Определяем день недели даты отгрузки
-    try:
-        from datetime import datetime
-        dt = datetime.fromisoformat(delivery_date_str[:10])
-        weekday = dt.weekday()  # 0=пн, 6=вс
-    except Exception:
-        return {"ok": True}
-
-    # Суббота/воскресенье — не возим МО
-    if weekday >= 5 or weekday in allowed_days_nums:
+    if found_keyword:
+        city_info = _CITY_INDEX[found_keyword]
+        canonical = city_info["canonical"]
+        allowed_days_nums = city_info["days"]
         if weekday in allowed_days_nums:
             return {"ok": True}
+        allowed_days = [WEEKDAYS_RU[d] for d in sorted(allowed_days_nums)]
+        return {
+            "ok": False,
+            "city": canonical,
+            "date": delivery_date_str[:10],
+            "weekday": WEEKDAYS_RU[weekday],
+            "allowed_days": allowed_days,
+        }
+
+    # Шаг 2: геокодирование — ищем ближайший город из расписания
+    coords = await geocode_address(address)
+    if not coords:
+        return {"ok": True}  # Не смогли геокодировать — не блокируем
+
+    lat, lon = coords
+
+    # Ищем ближайший город в радиусе DELIVERY_RADIUS_KM
+    nearest_city = None
+    nearest_dist = float("inf")
+    for city, (clat, clon) in DELIVERY_CITIES_COORDS.items():
+        dist = _haversine(lat, lon, clat, clon)
+        if dist < nearest_dist:
+            nearest_dist = dist
+            nearest_city = city
+
+    if nearest_dist > DELIVERY_RADIUS_KM:
+        return {"ok": True}  # Далеко от всех наших направлений
+
+    # Нашли ближайший город — ищем его в индексе
+    found_keyword = None
+    for keyword, info in _CITY_INDEX.items():
+        if info["canonical"] == nearest_city:
+            found_keyword = keyword
+            break
+
+    if not found_keyword:
+        return {"ok": True}
+
+    city_info = _CITY_INDEX[found_keyword]
+    allowed_days_nums = city_info["days"]
+    if weekday in allowed_days_nums:
+        return {"ok": True}
 
     allowed_days = [WEEKDAYS_RU[d] for d in sorted(allowed_days_nums)]
     return {
         "ok": False,
-        "city": canonical,
+        "city": nearest_city,
         "date": delivery_date_str[:10],
         "weekday": WEEKDAYS_RU[weekday],
         "allowed_days": allowed_days,
+        "distance_km": round(nearest_dist, 1),
     }
