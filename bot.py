@@ -403,30 +403,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             saved_count = 0
             task_lines = []
             for task in tasks:
-                if task.get("task"):
-                    db.save_task(
-                        text=task["task"],
-                        executor=task.get("executor", ""),
-                        deadline=task.get("deadline"),
-                        source_chat=chat_id,
-                        source_message_id=message.message_id,
-                        created_by=user.full_name
-                    )
-                    saved_count += 1
-                    executor = task.get("executor", "—")
-                    deadline = task.get("deadline")
-                    if deadline:
-                        from datetime import date
-                        MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-                        try:
-                            d = date.fromisoformat(deadline)
-                            deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
-                        except Exception:
-                            deadline_str = f" · до {deadline}"
-                    else:
-                        deadline_str = ""
-                    task_lines.append(f"👤 *{executor}*{deadline_str}: {task['task']}")
-                    logger.info(f"Задача: {executor} → {task['task']}")
+                executor = task.get("executor", "")
+                if not task.get("task") or not executor:
+                    continue  # пропускаем задачи без исполнителя
+                db.save_task(
+                    text=task["task"],
+                    executor=executor,
+                    deadline=task.get("deadline"),
+                    source_chat=chat_id,
+                    source_message_id=message.message_id,
+                    created_by=user.full_name
+                )
+                saved_count += 1
+                deadline = task.get("deadline")
+                if deadline:
+                    from datetime import date
+                    MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
+                    try:
+                        d = date.fromisoformat(deadline)
+                        deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
+                    except Exception:
+                        deadline_str = f" · до {deadline}"
+                else:
+                    deadline_str = ""
+                task_lines.append(f"👤 *{executor}*{deadline_str}: {task['task']}")
+                logger.info(f"Задача: {executor} → {task['task']}")
 
             if saved_count > 0:
                 lines = [f"📌 Зафиксировано задач: {saved_count}\n"] + task_lines
