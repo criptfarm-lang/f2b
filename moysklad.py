@@ -1693,12 +1693,13 @@ async def get_counterparty_debt(counterparty_id: str) -> dict:
         debt = abs(balance)
         today = date.today()
 
-        # Ищем просроченные заказы — читаем атрибут "Дата планируемой оплаты"
+        # Ищем просроченные заказы — только отгруженные (деньги уже должны)
+        # Статус "Отгружен": 005f383a-9a9a-11f0-0a80-03a900027476
         async with aiohttp.ClientSession() as session:
             orders_url = (
                 f"{MS_BASE}/entity/customerorder"
                 f"?filter=agent=https://api.moysklad.ru/api/remap/1.2/entity/counterparty/{counterparty_id}"
-                f"&filter=state!=https://api.moysklad.ru/api/remap/1.2/entity/customerorder/metadata/states/005f398e-9a9a-11f0-0a80-03a900027479"
+                f"&filter=state=https://api.moysklad.ru/api/remap/1.2/entity/customerorder/metadata/states/005f383a-9a9a-11f0-0a80-03a900027476"
                 f"&expand=attributes&limit=50&order=moment,desc"
             )
             async with session.get(orders_url, headers=get_headers()) as resp:
