@@ -1789,6 +1789,7 @@ DELIVERY_SCHEDULE_RAW = {
 }
 
 WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+WEEKDAYS_RU_IN = ["понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
 
 # Плоский словарь: вариант написания → (канонический город, список дней)
 def _build_city_index():
@@ -1857,6 +1858,11 @@ async def check_delivery_schedule(address: str, delivery_date_str: str) -> dict:
         return {"ok": True}  # Не смогли геокодировать — не блокируем
 
     lat, lon = coords
+
+    # Адреса ближе 35 км от центра Москвы — возим в любой день
+    dist_from_moscow = _haversine(lat, lon, 55.7558, 37.6173)
+    if dist_from_moscow < 35:
+        return {"ok": True}
 
     # Ищем ближайший город в радиусе DELIVERY_RADIUS_KM
     nearest_city = None
