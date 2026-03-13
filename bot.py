@@ -1393,14 +1393,19 @@ async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
 
         # Получаем баланс контрагента
         from moysklad import get_counterparty_debt
+        logger.info(f"check_debtor_alert: запрашиваю долг для {agent_id}")
         debt_info = await get_counterparty_debt(agent_id)
+        logger.info(f"check_debtor_alert: debt_info={debt_info}")
         if not debt_info:
+            logger.info(f"check_debtor_alert: debt_info пустой — нет долга или ошибка")
             return
 
         debt_amount = debt_info.get("debt", 0)
         debt_days = debt_info.get("overdue_days", 0)
+        logger.info(f"check_debtor_alert: debt={debt_amount} days={debt_days}")
 
         if debt_days <= 5 or debt_amount <= 0:
+            logger.info(f"check_debtor_alert: просрочка {debt_days} дней — ниже порога или долга нет")
             return
 
         order_id = order_href.split("/")[-1]
