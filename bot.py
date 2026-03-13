@@ -197,6 +197,9 @@ async def cmd_clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"ID {t['id']}: {t.get('executor','—')} — {t.get('text','')}" for t in tasks]
         lines.append("\nЧтобы оставить только нужные: /cleartasks keep 5 12")
         await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает задачи текущего пользователя."""
     user = update.effective_user
     name = user.full_name
