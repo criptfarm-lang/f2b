@@ -1411,7 +1411,7 @@ async def process_ms_webhook(data: dict, bot):
 async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
     """Проверяет адрес доставки заказа на соответствие расписанию логистики."""
     try:
-        from moysklad import check_delivery_schedule, get_headers, MS_BASE
+        from moysklad import check_delivery_schedule, get_headers, MS_BASE, WEEKDAYS_RU_IN
         import aiohttp
 
         async with aiohttp.ClientSession() as session:
@@ -1468,7 +1468,7 @@ async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
             f"👔 Менеджер: {manager_name}\n"
             f"📍 Адрес: {address}\n\n"
             f"📅 Дата отгрузки: *{date_str} ({weekday})*\n"
-            f"❌ В {city} мы не едем в {weekday}\n"
+            f"❌ В {city} мы не едем в {WEEKDAYS_RU_IN[weekday]}\n"
             f"✅ {city} доступен: *{allowed}*"
         )
 
