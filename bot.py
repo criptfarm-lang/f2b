@@ -167,7 +167,37 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет все открытые задачи кроме указанных ID. Только для руководителя."""
+    user = update.effective_user
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    if user.id not in manager_ids:
+        return
+    # /cleartasks keep 5 12  — оставить только задачи с ID 5 и 12
+    args = context.args
+    if args and args[0] == "keep":
+        keep_ids = [int(x) for x in args[1:] if x.isdigit()]
+        db = Database()
+        conn = db._get_conn()
+        cur = conn.cursor()
+        if keep_ids:
+            placeholders = ",".join(["%s"] * len(keep_ids))
+            cur.execute(f"UPDATE tasks SET done=true, result='Удалено руководителем' WHERE done=false AND id NOT IN ({placeholders})", keep_ids)
+        else:
+            cur.execute("UPDATE tasks SET done=true, result='Удалено руководителем' WHERE done=false")
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(f"✅ Задачи очищены. Оставлены ID: {keep_ids}")
+    else:
+        # Показываем список с ID
+        db = Database()
+        tasks = db.get_all_open_tasks()
+        if not tasks:
+            await update.message.reply_text("Нет открытых задач.")
+            return
+        lines = [f"ID {t['id']}: {t.get('executor','—')} — {t.get('text','')}" for t in tasks]
+        lines.append("\nЧтобы оставить только нужные: /cleartasks keep 5 12")
+        await update.message.reply_text("\n".join(lines))
     """Показывает задачи текущего пользователя."""
     user = update.effective_user
     name = user.full_name
@@ -1279,7 +1309,7 @@ def main():
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("tasks", cmd_my_tasks))
+    app.add_handler(CommandHandler("cleartasks", cmd_clear_tasks))
     app.add_handler(CommandHandler("all_tasks", cmd_all_tasks))
     app.add_handler(CommandHandler("overdue", cmd_overdue))
     app.add_handler(CommandHandler("report", cmd_report))
