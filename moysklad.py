@@ -292,14 +292,13 @@ async def get_image_download_url(url: str) -> Optional[str]:
 
 
 async def download_image(url: str) -> Optional[bytes]:
-    """Скачивает миниатюру фото товара из МойСклад.
-    Использует /miniature endpoint — работает через порт 443, без CDN.
-    """
+    """Скачивает фото товара из МойСклад."""
     try:
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Шаг 1: получаем href первого изображения
-            if "/images" in url and "download" not in url:
+
+            # Шаг 1: получаем href первого изображения если передан /images URL
+            if "/images" in url and "download" not in url and "miniature" not in url:
                 async with session.get(url, headers=get_headers()) as resp:
                     if resp.status != 200:
                         return None
@@ -314,19 +313,19 @@ async def download_image(url: str) -> Optional[bytes]:
             else:
                 img_href = url
 
-            # Шаг 2: miniature — превью через основной API (порт 443, без CDN)
-            miniature_url = img_href + "/miniature"
-            logger.info(f"download_image: fetching {miniature_url}")
-            async with session.get(miniature_url, headers=get_headers(),
-                                   allow_redirects=True) as resp:
-                logger.info(f"download_image: status={resp.status} type={resp.content_type}")
-                if resp.status == 200 and "image" in resp.content_type:
-                    data = await resp.read()
-                    logger.info(f"download_image: got {len(data)} bytes")
-                    return data
-                else:
-                    body = await resp.text()
-                    logger.error(f"download_image: error body={body[:300]}")
+            # Шаг 2: пробуем /download (полный размер)
+            for suffix in ["/download", "/miniature"]:
+                try_url = img_href + suffix
+                logger.info(f"download_image: trying {try_url}")
+                async with session.get(try_url, headers=get_headers(),
+                                       allow_redirects=True) as resp:
+                    logger.info(f"download_image: {suffix} status={resp.status} type={resp.content_type}")
+                    if resp.status == 200 and "image" in (resp.content_type or ""):
+                        data = await resp.read()
+                        logger.info(f"download_image: got {len(data)} bytes via {suffix}")
+                        return data
+
+        logger.error("download_image: все способы не сработали")
         return None
     except asyncio.TimeoutError:
         logger.error(f"download_image: TIMEOUT url={url}")
@@ -1400,7 +1399,7 @@ async def get_buyers_by_product(product_query: str, period_days: int = 180) -> l
     except Exception as e:
         logger.error(f"get_buyers_by_product: {e}")
 
-    return buyers
+    return {"buyers": buyers, "product_name": product_name}
 
 
 async def check_order_prices(order_href: str) -> list:
