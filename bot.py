@@ -696,11 +696,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_chat_action("typing")
         await message.reply_text(f"🔍 Ищу покупателей *{product}* за последние {period_days} дней...", parse_mode="Markdown")
         from moysklad import get_buyers_by_product
-        buyers = await get_buyers_by_product(product, period_days=period_days)
+        result = await get_buyers_by_product(product, period_days=period_days)
+        buyers = result.get("buyers", []) if isinstance(result, dict) else result
+        found_name = result.get("product_name", product) if isinstance(result, dict) else product
         if not buyers:
-            await message.reply_text(f"❌ Покупателей *{product}* за последние {period_days} дней не найдено.", parse_mode="Markdown")
+            await message.reply_text(
+                f"❌ Покупателей *{found_name}* за последние {period_days} дней не найдено.\n"
+                f"_Искал товар: {found_name}_", parse_mode="Markdown")
             return
-        lines = [f"👥 *Покупатели {product}* за {period_days} дней ({len(buyers)}):\n"]
+        lines = [f"👥 *Покупатели {found_name}* за {period_days} дней ({len(buyers)}):\n"]
         for b in buyers:
             lines.append(f"• {b['name']}")
         text = "\n".join(lines)
@@ -725,10 +729,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 1. Находим покупателей через отчёт прибыльности МойСклад
         from moysklad import get_buyers_by_product
-        counterparty_names = await get_buyers_by_product(product, period_days=period_days)
+        result = await get_buyers_by_product(product, period_days=period_days)
+        counterparty_names = result.get("buyers", []) if isinstance(result, dict) else result
+        found_name = result.get("product_name", product) if isinstance(result, dict) else product
 
         if not counterparty_names:
-            await message.reply_text(f"❌ Не найдено покупателей *{product}* за последние {period_days} дней.", parse_mode="Markdown")
+            await message.reply_text(f"❌ Не найдено покупателей *{found_name}* за последние {period_days} дней.", parse_mode="Markdown")
             return
 
         await message.reply_text(f"📋 Найдено {len(counterparty_names)} покупателей в МойСклад.\n🔍 Ищу их в amoCRM...", parse_mode="Markdown")
