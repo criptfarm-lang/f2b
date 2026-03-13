@@ -1674,3 +1674,78 @@ async def set_order_state(order_id: str, state_id: str) -> bool:
     except Exception as e:
         logger.error(f"set_order_state: {e}")
         return False
+
+
+# Расписание доставки по МО
+DELIVERY_SCHEDULE = {
+    0: ["звенигород", "истра", "солнечногорск"],  # Понедельник
+    1: ["королёв", "королев", "мытищи", "одинцово", "подольск", "серпухов", "чехов", "щелково"],  # Вторник
+    2: ["домодедово", "королёв", "королев", "мытищи", "орехово-зуево", "орехово зуево",
+        "павловский посад", "сергиев посад", "щелково", "красноармейск", "пушкино"],  # Среда
+    3: ["апрелевка", "королёв", "королев", "мытищи", "наро-фоминск", "наро фоминск", "щелково"],  # Четверг
+    4: ["егорьевск", "воскресенск", "королёв", "королев", "мытищи", "щелково", "каширское шоссе", "кашира"],  # Пятница
+}
+
+WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+
+# Все города МО из расписания
+ALL_MO_CITIES = set(city for cities in DELIVERY_SCHEDULE.values() for city in cities)
+
+
+def check_delivery_schedule(address: str, delivery_date_str: str) -> dict:
+    """
+    Проверяет соответствие адреса доставки и дня недели расписанию.
+    Возвращает {"ok": True} или {"ok": False, "city": ..., "date": ..., "allowed_days": [...]}
+    Московские адреса всегда OK.
+    """
+    if not address or not delivery_date_str:
+        return {"ok": True}
+
+    address_lower = address.lower()
+
+    # Московские адреса — не проверяем
+    if "москва" in address_lower or "moscow" in address_lower:
+        return {"ok": True}
+
+    # Ищем город МО в адресе
+    found_city = None
+    for city in ALL_MO_CITIES:
+        if city in address_lower:
+            found_city = city
+            break
+
+    if not found_city:
+        return {"ok": True}  # Неизвестный город — не проверяем
+
+    # Определяем день недели даты отгрузки
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(delivery_date_str[:10])
+        weekday = dt.weekday()  # 0=пн, 6=вс
+    except Exception:
+        return {"ok": True}
+
+    # Суббота/воскресенье — не возим МО
+    if weekday >= 5:
+        allowed_days = [WEEKDAYS_RU[d] for d, cities in DELIVERY_SCHEDULE.items() if found_city in cities]
+        return {
+            "ok": False,
+            "city": found_city,
+            "date": delivery_date_str[:10],
+            "weekday": WEEKDAYS_RU[weekday],
+            "allowed_days": allowed_days,
+        }
+
+    # Проверяем входит ли город в этот день
+    if found_city in DELIVERY_SCHEDULE.get(weekday, []):
+        return {"ok": True}
+
+    # Город есть но не в этот день
+    allowed_days = [WEEKDAYS_RU[d] for d, cities in DELIVERY_SCHEDULE.items() if found_city in cities]
+    return {
+        "ok": False,
+        "city": found_city,
+        "date": delivery_date_str[:10],
+        "weekday": WEEKDAYS_RU[weekday],
+        "allowed_days": allowed_days,
+    }
