@@ -382,38 +382,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Message from user.id={user.id}, name={user.full_name}, chat_id={message.chat_id}, manager_ids={manager_ids}")
 
     if user.id in manager_ids and len(text) > 15:
-        tasks = await extract_tasks_from_message(text, user.full_name)
-        saved_count = 0
-        task_lines = []
-        for task in tasks:
-            if task.get("task"):
-                db.save_task(
-                    text=task["task"],
-                    executor=task.get("executor", ""),
-                    deadline=task.get("deadline"),
-                    source_chat=chat_id,
-                    source_message_id=message.message_id,
-                    created_by=user.full_name
-                )
-                saved_count += 1
-                executor = task.get("executor", "—")
-                deadline = task.get("deadline")
-                if deadline:
-                    from datetime import date
-                    MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-                    try:
-                        d = date.fromisoformat(deadline)
-                        deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
-                    except Exception:
-                        deadline_str = f" · до {deadline}"
-                else:
-                    deadline_str = ""
-                task_lines.append(f"👤 *{executor}*{deadline_str}: {task['task']}")
-                logger.info(f"Задача: {executor} → {task['task']}")
+        # Если сообщение адресовано боту — извлекаем задачи только если
+        # в тексте есть имя другого сотрудника (поручение через бота)
+        should_extract = True
+        if is_bot_addressed(text):
+            text_lower = text.lower()
+            has_employee = any(
+                name.lower() in text_lower
+                for name in ["карина", "баласанян", "александра", "белякова", "саша",
+                             "юля", "гераскина", "татьяна", "голубева", "алексей", "дубинин",
+                             "андрей", "иванов", "антон", "кормилицын", "катя", "куревлева",
+                             "леонтьев", "лёша", "маланчук", "малышкин", "елена", "лена",
+                             "мерзлякова", "владимир", "петровский", "самир", "садыгов",
+                             "оксана", "сайгашкина", "инесса", "скляр", "исрафил", "магаммед"]
+            )
+            should_extract = has_employee
 
-        if saved_count > 0:
-            lines = [f"📌 Зафиксировано задач: {saved_count}\n"] + task_lines
-            await message.reply_text("\n".join(lines), parse_mode="Markdown")
+        if should_extract:
+            tasks = await extract_tasks_from_message(text, user.full_name)
+            saved_count = 0
+            task_lines = []
+            for task in tasks:
+                if task.get("task"):
+                    db.save_task(
+                        text=task["task"],
+                        executor=task.get("executor", ""),
+                        deadline=task.get("deadline"),
+                        source_chat=chat_id,
+                        source_message_id=message.message_id,
+                        created_by=user.full_name
+                    )
+                    saved_count += 1
+                    executor = task.get("executor", "—")
+                    deadline = task.get("deadline")
+                    if deadline:
+                        from datetime import date
+                        MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
+                        try:
+                            d = date.fromisoformat(deadline)
+                            deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
+                        except Exception:
+                            deadline_str = f" · до {deadline}"
+                    else:
+                        deadline_str = ""
+                    task_lines.append(f"👤 *{executor}*{deadline_str}: {task['task']}")
+                    logger.info(f"Задача: {executor} → {task['task']}")
+
+            if saved_count > 0:
+                lines = [f"📌 Зафиксировано задач: {saved_count}\n"] + task_lines
+                await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     # 3. Автозакрытие задач — Claude анализирует контекст
     if not is_bot_addressed(text) and len(text) > 5:
