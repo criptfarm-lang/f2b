@@ -65,14 +65,6 @@ def setup_scheduler(app: Application, db):
         id="remind_today"
     )
 
-    # Пн–пт 18:00 — напоминание прислать реестр (для Беляковой)
-    scheduler.add_job(
-        registry_reminder,
-        CronTrigger(day_of_week="mon-fri", hour=18, minute=0),
-        args=[app, db],
-        id="registry_reminder"
-    )
-
     # Пн/Ср — утренние задачи по ПДЗ каждому менеджеру
     for mgr in PDZ_MANAGERS:
         scheduler.add_job(
@@ -88,6 +80,12 @@ def setup_scheduler(app: Application, db):
         CronTrigger(day_of_week="mon,wed", hour=16, minute=0),
         args=[app],
         id="pdz_evening_summary"
+    )
+
+    scheduler.add_job(
+        cleanup_done_tasks,
+        CronTrigger(hour=3, minute=0),
+        id="cleanup_done_tasks"
     )
 
     scheduler.start()
@@ -241,3 +239,14 @@ async def pdz_evening_summary(app: Application):
 
     except Exception as e:
         logger.error(f"Ошибка pdz_evening_summary: {e}", exc_info=True)
+
+
+def cleanup_done_tasks():
+    """Удаляет выполненные задачи старше 24 часов. Запускается в 3:00."""
+    try:
+        from database import Database
+        db = Database()
+        db.cleanup_done_tasks()
+        logger.info("cleanup_done_tasks: старые выполненные задачи удалены")
+    except Exception as e:
+        logger.error(f"cleanup_done_tasks: {e}")
