@@ -1681,9 +1681,12 @@ async def get_counterparty_debt(counterparty_id: str) -> dict:
                     return {}
                 data = await resp.json()
 
-        balance = data.get("balance", 0) / 100  # копейки → рубли
+        balance = data.get("balance", 0) / 100
+        logger.info(f"get_counterparty_debt: full_data={dict(list(data.items())[:10])}")
+        logger.info(f"get_counterparty_debt: id={counterparty_id} balance={balance} daysOverdue={data.get('daysOverdue')} debtByDate={data.get('debtByDate', [])[:3]}")
         # balance < 0 означает что нам должны
         if balance >= 0:
+            logger.info(f"get_counterparty_debt: balance={balance} >= 0, просрочки нет")
             return {}
 
         debt = abs(balance)
