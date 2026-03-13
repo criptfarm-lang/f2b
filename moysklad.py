@@ -1677,25 +1677,72 @@ async def set_order_state(order_id: str, state_id: str) -> bool:
 
 
 # Расписание доставки по МО
-DELIVERY_SCHEDULE = {
-    0: ["звенигород", "истра", "солнечногорск"],  # Понедельник
-    1: ["королёв", "королев", "мытищи", "одинцово", "подольск", "серпухов", "чехов", "щелково"],  # Вторник
-    2: ["домодедово", "королёв", "королев", "мытищи", "орехово-зуево", "орехово зуево",
-        "павловский посад", "сергиев посад", "щелково", "красноармейск", "пушкино"],  # Среда
-    3: ["апрелевка", "королёв", "королев", "мытищи", "наро-фоминск", "наро фоминск", "щелково"],  # Четверг
-    4: ["егорьевск", "воскресенск", "королёв", "королев", "мытищи", "щелково", "каширское шоссе", "кашира"],  # Пятница
+# Каждый город — список вариантов написания (все в нижнем регистре)
+DELIVERY_SCHEDULE_RAW = {
+    0: {  # Понедельник
+        "Звенигород": ["звенигород", "звенигородский"],
+        "Истра": ["истра", "истринский"],
+        "Солнечногорск": ["солнечногорск", "солнечногорский"],
+    },
+    1: {  # Вторник
+        "Королёв": ["королёв", "королев", "королевский"],
+        "Мытищи": ["мытищи", "мытищинский"],
+        "Одинцово": ["одинцово", "одинцовский"],
+        "Подольск": ["подольск", "подольский"],
+        "Серпухов": ["серпухов", "серпуховский"],
+        "Чехов": ["чехов", "чеховский"],
+        "Щелково": ["щелково", "щёлково", "щелковский", "щёлковский"],
+    },
+    2: {  # Среда
+        "Домодедово": ["домодедово", "домодедовский"],
+        "Королёв": ["королёв", "королев", "королевский"],
+        "Мытищи": ["мытищи", "мытищинский"],
+        "Орехово-Зуево": ["орехово-зуево", "орехово зуево", "ореховозуево", "орехово-зуевский"],
+        "Павловский Посад": ["павловский посад", "павлово-посадский", "павловопосадский"],
+        "Сергиев Посад": ["сергиев посад", "сергиево-посадский", "сергиевопосадский"],
+        "Щелково": ["щелково", "щёлково", "щелковский", "щёлковский"],
+        "Красноармейск": ["красноармейск"],
+        "Пушкино": ["пушкино", "пушкинский"],
+    },
+    3: {  # Четверг
+        "Апрелевка": ["апрелевка", "апрелевский"],
+        "Королёв": ["королёв", "королев", "королевский"],
+        "Мытищи": ["мытищи", "мытищинский"],
+        "Наро-Фоминск": ["наро-фоминск", "наро фоминск", "нарофоминск", "наро-фоминский"],
+        "Щелково": ["щелково", "щёлково", "щелковский", "щёлковский"],
+    },
+    4: {  # Пятница
+        "Егорьевск": ["егорьевск", "егорьевский"],
+        "Воскресенск": ["воскресенск", "воскресенский"],
+        "Королёв": ["королёв", "королев", "королевский"],
+        "Мытищи": ["мытищи", "мытищинский"],
+        "Щелково": ["щелково", "щёлково", "щелковский", "щёлковский"],
+        "Каширское шоссе": ["каширское шоссе", "кашира", "каширский"],
+    },
 }
 
 WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
-# Все города МО из расписания
-ALL_MO_CITIES = set(city for cities in DELIVERY_SCHEDULE.values() for city in cities)
+# Плоский словарь: вариант написания → (канонический город, список дней)
+def _build_city_index():
+    index = {}  # keyword → {"canonical": str, "days": set}
+    for day, cities in DELIVERY_SCHEDULE_RAW.items():
+        for canonical, variants in cities.items():
+            for v in variants:
+                if v not in index:
+                    index[v] = {"canonical": canonical, "days": set()}
+                index[v]["days"].add(day)
+    return index
+
+_CITY_INDEX = _build_city_index()
+# Все города МО из расписания (все варианты написания)
+ALL_MO_CITIES = list(_CITY_INDEX.keys())
 
 
 def check_delivery_schedule(address: str, delivery_date_str: str) -> dict:
     """
     Проверяет соответствие адреса доставки и дня недели расписанию.
-    Возвращает {"ok": True} или {"ok": False, "city": ..., "date": ..., "allowed_days": [...]}
+    Возвращает {"ok": True} или {"ok": False, "city": ..., "date": ..., "weekday": ..., "allowed_days": [...]}
     Московские адреса всегда OK.
     """
     if not address or not delivery_date_str:
@@ -1707,15 +1754,19 @@ def check_delivery_schedule(address: str, delivery_date_str: str) -> dict:
     if "москва" in address_lower or "moscow" in address_lower:
         return {"ok": True}
 
-    # Ищем город МО в адресе
-    found_city = None
-    for city in ALL_MO_CITIES:
-        if city in address_lower:
-            found_city = city
+    # Ищем город МО в адресе (по всем вариантам написания, длинные сначала)
+    found_keyword = None
+    for keyword in sorted(_CITY_INDEX.keys(), key=len, reverse=True):
+        if keyword in address_lower:
+            found_keyword = keyword
             break
 
-    if not found_city:
-        return {"ok": True}  # Неизвестный город — не проверяем
+    if not found_keyword:
+        return {"ok": True}  # Неизвестный адрес — не проверяем
+
+    city_info = _CITY_INDEX[found_keyword]
+    canonical = city_info["canonical"]
+    allowed_days_nums = city_info["days"]
 
     # Определяем день недели даты отгрузки
     try:
@@ -1726,25 +1777,14 @@ def check_delivery_schedule(address: str, delivery_date_str: str) -> dict:
         return {"ok": True}
 
     # Суббота/воскресенье — не возим МО
-    if weekday >= 5:
-        allowed_days = [WEEKDAYS_RU[d] for d, cities in DELIVERY_SCHEDULE.items() if found_city in cities]
-        return {
-            "ok": False,
-            "city": found_city,
-            "date": delivery_date_str[:10],
-            "weekday": WEEKDAYS_RU[weekday],
-            "allowed_days": allowed_days,
-        }
+    if weekday >= 5 or weekday in allowed_days_nums:
+        if weekday in allowed_days_nums:
+            return {"ok": True}
 
-    # Проверяем входит ли город в этот день
-    if found_city in DELIVERY_SCHEDULE.get(weekday, []):
-        return {"ok": True}
-
-    # Город есть но не в этот день
-    allowed_days = [WEEKDAYS_RU[d] for d, cities in DELIVERY_SCHEDULE.items() if found_city in cities]
+    allowed_days = [WEEKDAYS_RU[d] for d in sorted(allowed_days_nums)]
     return {
         "ok": False,
-        "city": found_city,
+        "city": canonical,
         "date": delivery_date_str[:10],
         "weekday": WEEKDAYS_RU[weekday],
         "allowed_days": allowed_days,
