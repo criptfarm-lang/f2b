@@ -1675,11 +1675,17 @@ async def get_counterparty_debt(counterparty_id: str) -> dict:
 
     try:
         async with aiohttp.ClientSession() as session:
+            # Отчёт — баланс
             url = f"{MS_BASE}/report/counterparty/{counterparty_id}"
             async with session.get(url, headers=get_headers()) as resp:
                 if resp.status != 200:
                     return {}
                 data = await resp.json()
+
+            # Атрибуты контрагента — дата планируемой оплаты
+            attr_url = f"{MS_BASE}/entity/counterparty/{counterparty_id}?expand=attributes"
+            async with session.get(attr_url, headers=get_headers()) as resp2:
+                attr_data = await resp2.json() if resp2.status == 200 else {}
 
         balance = data.get("balance", 0) / 100
         logger.info(f"get_counterparty_debt: full_data={dict(list(data.items())[:10])}")
@@ -1691,25 +1697,32 @@ async def get_counterparty_debt(counterparty_id: str) -> dict:
 
         debt = abs(balance)
 
-        # Считаем дни просрочки через daysOverdue из отчёта
+        # Считаем дни просрочки через кастомный атрибут "Дата планируемой оплаты"
+        PAYMENT_DATE_ATTR_ID = "327940fd-b54e-11f0-0a80-0066000d5578"
         overdue_days = 0
-        debt_by_date = data.get("debtByDate", [])
         today = date.today()
-        for entry in debt_by_date:
-            entry_date_str = entry.get("date", "")
-            entry_sum = entry.get("sum", 0) / 100
-            if entry_sum < 0 and entry_date_str:
-                try:
-                    entry_date = date.fromisoformat(entry_date_str[:10])
-                    days = (today - entry_date).days
-                    if days > overdue_days:
-                        overdue_days = days
-                except Exception:
-                    pass
 
-        # Если debtByDate пустой — берём из daysOverdue напрямую
+        attributes = attr_data.get("attributes", [])
+        logger.info(f"get_counterparty_debt: attributes={attributes[:3]}")
+        for attr in attributes:
+            attr_id = attr.get("id", "") or attr.get("meta", {}).get("href", "").split("/")[-1]
+            if attr_id == PAYMENT_DATE_ATTR_ID:
+                val = attr.get("value", "")
+                if val:
+                    try:
+                        payment_date = date.fromisoformat(str(val)[:10])
+                        if payment_date < today:
+                            overdue_days = (today - payment_date).days
+                            logger.info(f"get_counterparty_debt: payment_date={payment_date} overdue_days={overdue_days}")
+                    except Exception:
+                        pass
+                break
+
+        # Fallback: daysOverdue из отчёта
         if overdue_days == 0:
-            overdue_days = data.get("daysOverdue", 0)
+            raw_overdue = data.get("daysOverdue")
+            if raw_overdue:
+                overdue_days = int(raw_overdue)
 
         return {"debt": debt, "overdue_days": overdue_days}
 
