@@ -1411,11 +1411,10 @@ async def process_ms_webhook(data: dict, bot):
 async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
     """Проверяет адрес доставки заказа на соответствие расписанию логистики."""
     try:
-        from moysklad import check_delivery_schedule
+        from moysklad import check_delivery_schedule, get_headers, MS_BASE
         import aiohttp
 
         async with aiohttp.ClientSession() as session:
-            from moysklad import get_headers, MS_BASE
             url = order_href.split("?")[0]
             async with session.get(url, headers=get_headers()) as resp:
                 if resp.status != 200:
@@ -1429,7 +1428,7 @@ async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
         if not address or not delivery_date:
             return
 
-        result = check_delivery_schedule(address, delivery_date)
+        result = await check_delivery_schedule(address, delivery_date)
         if result.get("ok"):
             return
 
