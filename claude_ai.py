@@ -486,10 +486,24 @@ async def extract_tasks_from_message(text: str, author: str) -> list:
     Анализирует сообщение руководителя и извлекает задачи.
     Возвращает список: [{"task": "...", "executor": "...", "deadline": "YYYY-MM-DD"}]
     """
+    from datetime import date, timedelta
+    today = date.today()
+    tomorrow = today + timedelta(days=1)
+    # Конец текущей недели (воскресенье)
+    days_to_sunday = 6 - today.weekday()
+    end_of_week = today + timedelta(days=days_to_sunday)
+    # Конец следующей недели
+    end_of_next_week = end_of_week + timedelta(days=7)
+
     try:
         prompt = f"""Ты анализируешь сообщение руководителя компании F2B PRO и извлекаешь из него задачи.
 
 {EMPLOYEES_CONTEXT}
+
+Сегодня: {today.strftime('%d.%m.%Y')} ({['понедельник','вторник','среда','четверг','пятница','суббота','воскресенье'][today.weekday()]})
+Завтра: {tomorrow.strftime('%d.%m.%Y')}
+Конец этой недели (воскресенье): {end_of_week.strftime('%d.%m.%Y')}
+Конец следующей недели: {end_of_next_week.strftime('%d.%m.%Y')}
 
 Сообщение от {author}:
 \"\"\"{text}\"\"\"
@@ -498,8 +512,16 @@ async def extract_tasks_from_message(text: str, author: str) -> list:
 {{
   "task": "краткое чёткое описание задачи",
   "executor": "полное имя исполнителя из списка сотрудников (если упомянут), иначе пустая строка",
-  "deadline": "дата в формате YYYY-MM-DD если указана (учти 'до конца марта' = 2026-03-31, 'до пятницы' = ближайшая пятница), иначе null"
+  "deadline": "дата в формате YYYY-MM-DD если указана, иначе null"
 }}
+
+Перевод сроков в даты:
+- "сегодня" → {today.isoformat()}
+- "завтра" → {tomorrow.isoformat()}
+- "до конца недели" / "до пятницы" → {(today + timedelta(days=4 - today.weekday() if today.weekday() <= 4 else 0)).isoformat()}
+- "до конца следующей недели" → {end_of_next_week.isoformat()}
+- "до конца месяца" → {today.replace(day=1).replace(month=today.month % 12 + 1) - timedelta(days=1) if today.month < 12 else today.replace(day=31)}
+- конкретная дата "15 марта" → 2026-03-15
 
 Правила:
 - Извлекай только конкретные поручения, не общую информацию
