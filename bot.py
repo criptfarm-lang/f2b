@@ -1377,13 +1377,18 @@ async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
                 order = await resp.json()
 
         agent = order.get("agent", {})
-        agent_id = agent.get("id", "")
+        agent_meta = agent.get("meta", {})
+        agent_href = agent_meta.get("href", "")
+        agent_id = agent.get("id") or (agent_href.split("/")[-1] if agent_href else "")
         agent_name = agent.get("name", "")
         order_name = order.get("name", "")
         owner = order.get("owner", {})
         manager_name = owner.get("name", "не указан")
 
+        logger.info(f"check_debtor_alert: agent_id={agent_id} agent_name={agent_name} order={order_name}")
+
         if not agent_id:
+            logger.warning("check_debtor_alert: agent_id пустой, пропускаем")
             return
 
         # Получаем баланс контрагента
@@ -1456,10 +1461,17 @@ async def process_ms_webhook(data: dict, bot):
             # Дедупликация — один заказ не чаще раза в 10 секунд
             order_id = order_href.split("/")[-1]
             now = time.time()
-            if now - _price_check_cache.get(order_id, 0) < 10:
-                logger.info(f"Webhook: заказ {order_id} уже проверялся, пропускаем")
-                continue
+            last_check = _price_check_cache.get(order_id, 0)
+            already_checked = now - last_check < 10
             _price_check_cache[order_id] = now
+
+            # ПДЗ алерт — только для новых заказов, только один раз
+            if event.get("action") == "CREATE" and not already_checked:
+                await check_debtor_alert(order_href, bot, group_chat_id)
+
+            if already_checked:
+                logger.info(f"Webhook: заказ {order_id} уже проверялся, пропускаем цены/логистику")
+                continue
 
             # Получаем снапшот позиций (товар + цена) и сравниваем с предыдущим
             from moysklad import get_order_positions_snapshot
@@ -1492,9 +1504,7 @@ async def process_ms_webhook(data: dict, bot):
             # Проверяем логистику — адрес vs день недели
             await check_logistics_alert(order_href, bot, group_chat_id)
 
-            # Проверяем просрочку клиента только для новых заказов (CREATE)
-            if event.get("action") == "CREATE":
-                await check_debtor_alert(order_href, bot, group_chat_id)
+            # ПДЗ алерт для новых заказов уже отправлен выше
 
     except Exception as e:
         logger.error(f"process_ms_webhook: {e}")
