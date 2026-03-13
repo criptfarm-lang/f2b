@@ -205,11 +205,21 @@ async def cmd_all_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             by_user.setdefault(exe, []).append(t)
 
         lines.append("📋 *Открытые задачи:*\n")
+        MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
         for user, utasks in by_user.items():
             lines.append(f"*{user}* ({len(utasks)}):")
             for t in utasks:
                 icon = "🔴" if t.get('overdue') else "🟡"
-                deadline_str = f" [{t['deadline']}]" if t.get('deadline') else ""
+                dl = t.get('deadline')
+                if dl:
+                    try:
+                        from datetime import date as _date
+                        d = _date.fromisoformat(str(dl)[:10])
+                        deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
+                    except Exception:
+                        deadline_str = f" · до {dl}"
+                else:
+                    deadline_str = ""
                 lines.append(f"  {icon} {t['text']}{deadline_str}")
             lines.append("")
 
@@ -390,7 +400,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     saved_count += 1
                     executor = task.get("executor", "—")
                     deadline = task.get("deadline")
-                    deadline_str = f" · до {deadline}" if deadline else ""
+                    if deadline:
+                        from datetime import date
+                        MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
+                        try:
+                            d = date.fromisoformat(deadline)
+                            deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
+                        except Exception:
+                            deadline_str = f" · до {deadline}"
+                    else:
+                        deadline_str = ""
                     task_lines.append(f"👤 *{executor}*{deadline_str}: {task['task']}")
                     logger.info(f"Задача: {executor} → {task['task']}")
 
