@@ -710,6 +710,81 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = text[:3900] + "\n\n_...и ещё_"
         await message.reply_text(text, parse_mode="Markdown")
 
+    elif action == "get_delivery_days":
+        address = params.get("address", "")
+        if not address:
+            await message.reply_text("❌ Укажи адрес или город.")
+            return
+        await message.reply_chat_action("typing")
+        from moysklad import check_delivery_schedule, DELIVERY_CITIES_COORDS, _CITY_INDEX, WEEKDAYS_RU, geocode_address, _haversine
+
+        # Текстовый поиск по городу
+        address_lower = address.lower()
+        found_keyword = None
+        for keyword in sorted(_CITY_INDEX.keys(), key=len, reverse=True):
+            if keyword in address_lower:
+                found_keyword = keyword
+                break
+
+        if found_keyword:
+            info = _CITY_INDEX[found_keyword]
+            canonical = info["canonical"]
+            days = [WEEKDAYS_RU[d] for d in sorted(info["days"])]
+            days_str = ", ".join(days)
+            await message.reply_text(
+                f"🚛 *{canonical}*\n📅 Дни доставки: *{days_str}*",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Московский адрес?
+        if "москва" in address_lower or "moscow" in address_lower:
+            await message.reply_text("🚛 *Москва* — доставляем в любой рабочий день.", parse_mode="Markdown")
+            return
+
+        # Геокодируем
+        coords = await geocode_address(address)
+        if not coords:
+            await message.reply_text(f"😕 Не удалось определить направление для адреса: {address}")
+            return
+
+        lat, lon = coords
+        dist_from_moscow = _haversine(lat, lon, 55.7558, 37.6173)
+        if dist_from_moscow < 35:
+            await message.reply_text("🚛 Адрес в московской агломерации — доставляем в любой рабочий день.", parse_mode="Markdown")
+            return
+
+        # Ищем ближайший город
+        nearest_city = None
+        nearest_dist = float("inf")
+        for city, (clat, clon) in DELIVERY_CITIES_COORDS.items():
+            dist = _haversine(lat, lon, clat, clon)
+            if dist < nearest_dist:
+                nearest_dist = dist
+                nearest_city = city
+
+        if nearest_dist > 25 or not nearest_city:
+            await message.reply_text(
+                f"😕 Адрес *{address}* не входит ни в одно наше направление МО.\n"
+                f"Уточни у руководителя.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Нашли ближайший город — берём его дни
+        days = []
+        for keyword, info in _CITY_INDEX.items():
+            if info["canonical"] == nearest_city:
+                days = [WEEKDAYS_RU[d] for d in sorted(info["days"])]
+                break
+
+        days_str = ", ".join(days) if days else "уточни у руководителя"
+        await message.reply_text(
+            f"🚛 Адрес близко к *{nearest_city}* ({round(nearest_dist)} км)\n"
+            f"📅 Дни доставки: *{days_str}*",
+            parse_mode="Markdown"
+        )
+
     elif action == "broadcast":
         product = params.get("product", "")
         broadcast_text = params.get("message", "")
