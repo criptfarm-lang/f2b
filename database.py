@@ -1,93 +1,112 @@
 """
 База данных бота F2B PRO
-SQLite — хранит задачи, медиафайлы, контакты, прайсы
+PostgreSQL — хранит задачи, медиафайлы, контакты, прайсы, ПДЗ комментарии
 """
 
-import sqlite3
 import os
+import psycopg2
+import psycopg2.extras
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Optional
 
 
-DB_PATH = os.getenv("DB_PATH", "f2b_bot.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:FOfGvpjobKJPQYPBcuefaHWwtGEmVyte@switchback.proxy.rlwy.net:44165/railway")
 
 
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self.conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        self.conn.autocommit = False
         self._create_tables()
 
+    def _execute(self, sql: str, params=None):
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            self.conn.commit()
+            return cur
+
+    def _fetchall(self, sql: str, params=None) -> List[Dict]:
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            return [dict(r) for r in cur.fetchall()]
+
+    def _fetchone(self, sql: str, params=None) -> Optional[Dict]:
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            row = cur.fetchone()
+            return dict(row) if row else None
+
     def _create_tables(self):
-        self.conn.executescript("""
+        sql = """
             CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 text TEXT NOT NULL,
                 executor TEXT,
                 deadline TEXT,
                 status TEXT DEFAULT 'open',
-                source_chat INTEGER,
-                source_message_id INTEGER,
+                source_chat BIGINT,
+                source_message_id BIGINT,
                 created_by TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                completed_at TEXT
+                created_at TIMESTAMP DEFAULT NOW(),
+                completed_at TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS media (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 file_id TEXT NOT NULL,
                 media_type TEXT,
                 caption TEXT,
-                chat_id INTEGER,
+                chat_id BIGINT,
                 uploader TEXT,
                 date TEXT
             );
 
             CREATE TABLE IF NOT EXISTS prices (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 file_id TEXT NOT NULL,
                 filename TEXT,
-                chat_id INTEGER,
+                chat_id BIGINT,
                 uploader TEXT,
-                uploaded_at TEXT DEFAULT (datetime('now'))
+                uploaded_at TIMESTAMP DEFAULT NOW()
             );
 
             CREATE TABLE IF NOT EXISTS contacts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 phone TEXT,
                 company TEXT,
                 notes TEXT,
-                added_at TEXT DEFAULT (datetime('now'))
+                added_at TIMESTAMP DEFAULT NOW()
             );
 
             CREATE TABLE IF NOT EXISTS debtors (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                client TEXT NOT NULL,
+                id SERIAL PRIMARY KEY,
+                client TEXT NOT NULL UNIQUE,
                 manager TEXT,
                 amount REAL,
                 days INTEGER,
-                updated_at TEXT DEFAULT (datetime('now'))
+                updated_at TIMESTAMP DEFAULT NOW()
             );
 
             CREATE TABLE IF NOT EXISTS chat_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                user_id INTEGER,
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT,
+                user_id BIGINT,
                 user_name TEXT,
                 text TEXT,
                 message_type TEXT DEFAULT 'text',
-                ts TEXT DEFAULT (datetime('now'))
+                ts TIMESTAMP DEFAULT NOW()
             );
 
             CREATE TABLE IF NOT EXISTS memory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 key TEXT UNIQUE NOT NULL,
                 value TEXT,
-                updated_at TEXT DEFAULT (datetime('now'))
+                updated_at TIMESTAMP DEFAULT NOW()
             );
+
             CREATE TABLE IF NOT EXISTS pdz_comments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 client TEXT NOT NULL,
                 manager TEXT,
                 order_name TEXT,
@@ -95,9 +114,11 @@ class Database:
                 debt_days INTEGER,
                 comment TEXT,
                 commented_by TEXT,
-                created_at TEXT DEFAULT (datetime('now'))
+                created_at TIMESTAMP DEFAULT NOW()
             );
-        """)
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql)
         self.conn.commit()
 
     # ─── ЗАДАЧИ ───────────────────────────────────────────────────────────────
@@ -105,88 +126,81 @@ class Database:
     def save_task(self, text: str, executor: str = "", deadline: str = None,
                   source_chat: int = None, source_message_id: int = None,
                   created_by: str = "") -> int:
-        cur = self.conn.execute(
-            """INSERT INTO tasks (text, executor, deadline, source_chat, source_message_id, created_by)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (text, executor, deadline, source_chat, source_message_id, created_by)
-        )
-        self.conn.commit()
-        return cur.lastrowid
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO tasks (text, executor, deadline, source_chat, source_message_id, created_by)
+                   VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+                (text, executor, deadline, source_chat, source_message_id, created_by)
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row['id']
 
     def complete_task(self, task_id: int):
-        self.conn.execute(
-            "UPDATE tasks SET status='done', completed_at=datetime('now') WHERE id=?",
+        self._execute(
+            "UPDATE tasks SET status='done', completed_at=NOW() WHERE id=%s",
             (task_id,)
         )
-        self.conn.commit()
 
     def get_tasks_for_user(self, name: str) -> List[Dict]:
-        """Задачи конкретного сотрудника (нечёткий поиск по имени)."""
         name_parts = name.lower().split()
-        rows = self.conn.execute(
+        rows = self._fetchall(
             "SELECT * FROM tasks WHERE status='open' ORDER BY deadline ASC NULLS LAST"
-        ).fetchall()
-
-        result = []
+        )
         today = date.today().isoformat()
+        result = []
         for row in rows:
-            exe = (row['executor'] or "").lower()
+            exe = (row.get('executor') or "").lower()
             if any(p in exe for p in name_parts):
-                d = dict(row)
-                d['overdue'] = bool(d.get('deadline') and d['deadline'] < today)
-                result.append(d)
+                row['overdue'] = bool(row.get('deadline') and str(row['deadline'])[:10] < today)
+                result.append(row)
         return result
 
     def get_all_open_tasks(self) -> List[Dict]:
         today = date.today().isoformat()
-        rows = self.conn.execute(
+        rows = self._fetchall(
             "SELECT * FROM tasks WHERE status='open' ORDER BY executor, deadline ASC NULLS LAST"
-        ).fetchall()
-        result = []
+        )
         for row in rows:
-            d = dict(row)
-            d['overdue'] = bool(d.get('deadline') and d['deadline'] < today)
-            result.append(d)
-        return result
+            row['overdue'] = bool(row.get('deadline') and str(row['deadline'])[:10] < today)
+        return rows
 
     def get_overdue_tasks(self) -> List[Dict]:
         today = date.today().isoformat()
-        rows = self.conn.execute(
-            "SELECT * FROM tasks WHERE status='open' AND deadline < ? ORDER BY deadline ASC",
+        return self._fetchall(
+            "SELECT * FROM tasks WHERE status='open' AND deadline < %s ORDER BY deadline ASC",
             (today,)
-        ).fetchall()
-        return [dict(r) for r in rows]
+        )
 
     def get_tasks_due_today(self) -> List[Dict]:
         today = date.today().isoformat()
-        rows = self.conn.execute(
-            "SELECT * FROM tasks WHERE status='open' AND deadline = ?",
+        return self._fetchall(
+            "SELECT * FROM tasks WHERE status='open' AND deadline::text = %s",
             (today,)
-        ).fetchall()
-        return [dict(r) for r in rows]
+        )
 
     def get_tasks_due_tomorrow(self) -> List[Dict]:
         tomorrow = (date.today() + timedelta(days=1)).isoformat()
-        rows = self.conn.execute(
-            "SELECT * FROM tasks WHERE status='open' AND deadline = ?",
+        return self._fetchall(
+            "SELECT * FROM tasks WHERE status='open' AND deadline::text = %s",
             (tomorrow,)
-        ).fetchall()
-        return [dict(r) for r in rows]
+        )
 
     def get_weekly_stats(self) -> Dict[str, Dict]:
         week_ago = (date.today() - timedelta(days=7)).isoformat()
-        rows = self.conn.execute("SELECT * FROM tasks WHERE created_at >= ?", (week_ago,)).fetchall()
-
+        rows = self._fetchall(
+            "SELECT * FROM tasks WHERE created_at >= %s", (week_ago,)
+        )
         stats = {}
         today = date.today().isoformat()
         for row in rows:
-            exe = row['executor'] or 'Без исполнителя'
+            exe = row.get('executor') or 'Без исполнителя'
             if exe not in stats:
                 stats[exe] = {'total': 0, 'done': 0, 'overdue': 0}
             stats[exe]['total'] += 1
             if row['status'] == 'done':
                 stats[exe]['done'] += 1
-            elif row['deadline'] and row['deadline'] < today:
+            elif row.get('deadline') and str(row['deadline'])[:10] < today:
                 stats[exe]['overdue'] += 1
         return stats
 
@@ -194,141 +208,119 @@ class Database:
 
     def save_media(self, file_id: str, media_type: str, caption: str,
                    chat_id: int, uploader: str, date: str):
-        self.conn.execute(
-            "INSERT INTO media (file_id, media_type, caption, chat_id, uploader, date) VALUES (?,?,?,?,?,?)",
+        self._execute(
+            "INSERT INTO media (file_id, media_type, caption, chat_id, uploader, date) VALUES (%s,%s,%s,%s,%s,%s)",
             (file_id, media_type, caption, chat_id, uploader, date)
         )
-        self.conn.commit()
 
     def search_media(self, query: str, media_type: str = None) -> List[Dict]:
-        """Ищет медиафайлы по ключевым словам в подписи."""
         words = query.lower().split()
-        rows = self.conn.execute("SELECT * FROM media ORDER BY date DESC").fetchall()
-
+        rows = self._fetchall("SELECT * FROM media ORDER BY date DESC")
         results = []
         for row in rows:
-            if media_type and row['media_type'] != media_type:
+            if media_type and row.get('media_type') != media_type:
                 continue
-            caption = (row['caption'] or "").lower()
+            caption = (row.get('caption') or "").lower()
             if any(w in caption for w in words):
-                results.append(dict(row))
+                results.append(row)
         return results
 
     # ─── ПРАЙСЫ ───────────────────────────────────────────────────────────────
 
     def save_price(self, file_id: str, filename: str, chat_id: int, uploader: str):
-        self.conn.execute(
-            "INSERT INTO prices (file_id, filename, chat_id, uploader) VALUES (?,?,?,?)",
+        self._execute(
+            "INSERT INTO prices (file_id, filename, chat_id, uploader) VALUES (%s,%s,%s,%s)",
             (file_id, filename, chat_id, uploader)
         )
-        self.conn.commit()
 
     def get_latest_price(self) -> Optional[Dict]:
-        row = self.conn.execute(
+        return self._fetchone(
             "SELECT *, uploaded_at as date FROM prices ORDER BY uploaded_at DESC LIMIT 1"
-        ).fetchone()
-        return dict(row) if row else None
+        )
 
     # ─── КОНТАКТЫ ─────────────────────────────────────────────────────────────
 
     def save_contact(self, name: str, phone: str, company: str = "", notes: str = ""):
-        self.conn.execute(
-            "INSERT OR REPLACE INTO contacts (name, phone, company, notes) VALUES (?,?,?,?)",
+        self._execute(
+            "INSERT INTO contacts (name, phone, company, notes) VALUES (%s,%s,%s,%s)",
             (name, phone, company, notes)
         )
-        self.conn.commit()
 
     def search_contacts(self, query: str) -> List[Dict]:
         q = f"%{query.lower()}%"
-        rows = self.conn.execute(
-            "SELECT * FROM contacts WHERE lower(name) LIKE ? OR lower(company) LIKE ?",
+        return self._fetchall(
+            "SELECT * FROM contacts WHERE lower(name) LIKE %s OR lower(company) LIKE %s",
             (q, q)
-        ).fetchall()
-        return [dict(r) for r in rows]
+        )
 
     # ─── ДЕБИТОРКА ────────────────────────────────────────────────────────────
 
     def save_debtor(self, client: str, manager: str, amount: float, days: int):
-        self.conn.execute(
-            """INSERT OR REPLACE INTO debtors (client, manager, amount, days, updated_at)
-               VALUES (?, ?, ?, ?, datetime('now'))""",
-            (client, manager, amount, days)
+        self._execute(
+            """INSERT INTO debtors (client, manager, amount, days, updated_at)
+               VALUES (%s, %s, %s, %s, NOW())
+               ON CONFLICT (client) DO UPDATE SET manager=%s, amount=%s, days=%s, updated_at=NOW()""",
+            (client, manager, amount, days, manager, amount, days)
         )
-        self.conn.commit()
 
     def get_debtors(self) -> List[Dict]:
-        rows = self.conn.execute(
-            "SELECT * FROM debtors ORDER BY days DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
+        return self._fetchall("SELECT * FROM debtors ORDER BY days DESC")
 
     # ─── ИСТОРИЯ СООБЩЕНИЙ ───────────────────────────────────────────────────
 
     def save_message(self, chat_id: int, user_id: int, user_name: str,
                      text: str, message_type: str = 'text'):
-        """Сохраняет сообщение из чата."""
-        self.conn.execute(
+        self._execute(
             """INSERT INTO chat_messages (chat_id, user_id, user_name, text, message_type)
-               VALUES (?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s)""",
             (chat_id, user_id, user_name, text, message_type)
         )
-        # Оставляем только последние 500 сообщений на чат
-        self.conn.execute(
-            """DELETE FROM chat_messages WHERE chat_id = ? AND id NOT IN (
-               SELECT id FROM chat_messages WHERE chat_id = ?
+        self._execute(
+            """DELETE FROM chat_messages WHERE chat_id = %s AND id NOT IN (
+               SELECT id FROM chat_messages WHERE chat_id = %s
                ORDER BY id DESC LIMIT 500)""",
             (chat_id, chat_id)
         )
-        self.conn.commit()
 
     def get_recent_messages(self, chat_id: int, limit: int = 50) -> List[Dict]:
-        """Возвращает последние N сообщений из чата."""
-        rows = self.conn.execute(
+        rows = self._fetchall(
             """SELECT user_name, text, ts, message_type
-               FROM chat_messages WHERE chat_id = ?
-               ORDER BY id DESC LIMIT ?""",
+               FROM chat_messages WHERE chat_id = %s
+               ORDER BY id DESC LIMIT %s""",
             (chat_id, limit)
-        ).fetchall()
-        return [dict(r) for r in reversed(rows)]
+        )
+        return list(reversed(rows))
 
     def format_history(self, chat_id: int, limit: int = 50) -> str:
-        """Форматирует историю сообщений для промпта Claude."""
         messages = self.get_recent_messages(chat_id, limit)
         if not messages:
             return ""
         lines = []
         for m in messages:
-            ts = m['ts'][11:16] if m.get('ts') else ""  # HH:MM
+            ts = str(m.get('ts', ''))
+            ts = ts[11:16] if len(ts) > 11 else ""
             lines.append(f"[{ts}] {m['user_name']}: {m['text']}")
         return "\n".join(lines)
 
     # ─── ДОЛГОСРОЧНАЯ ПАМЯТЬ ──────────────────────────────────────────────────
 
     def remember(self, key: str, value: str):
-        """Сохраняет факт в долгосрочную память."""
-        self.conn.execute(
-            """INSERT OR REPLACE INTO memory (key, value, updated_at)
-               VALUES (?, ?, datetime('now'))""",
-            (key, value)
+        self._execute(
+            """INSERT INTO memory (key, value, updated_at) VALUES (%s, %s, NOW())
+               ON CONFLICT (key) DO UPDATE SET value=%s, updated_at=NOW()""",
+            (key, value, value)
         )
-        self.conn.commit()
 
     def recall(self, key: str) -> Optional[str]:
-        """Извлекает факт из памяти."""
-        row = self.conn.execute(
-            "SELECT value FROM memory WHERE key = ?", (key,)
-        ).fetchone()
+        row = self._fetchone("SELECT value FROM memory WHERE key = %s", (key,))
         return row['value'] if row else None
 
     def get_all_memories(self) -> List[Dict]:
-        """Все сохранённые факты."""
-        rows = self.conn.execute(
+        return self._fetchall(
             "SELECT key, value, updated_at FROM memory ORDER BY updated_at DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
+        )
 
     def format_memories(self) -> str:
-        """Форматирует память для промпта Claude."""
         memories = self.get_all_memories()
         if not memories:
             return ""
@@ -338,12 +330,10 @@ class Database:
     # ─── КОНТЕКСТ ДЛЯ CLAUDE ──────────────────────────────────────────────────
 
     def get_context_summary(self) -> str:
-        """Краткий контекст о компании для Claude."""
         open_tasks = len(self.get_all_open_tasks())
         overdue = len(self.get_overdue_tasks())
         debtors = self.get_debtors()
         debtor_list = ", ".join(d['client'] for d in debtors[:5]) if debtors else "нет"
-
         return (
             f"Компания: F2B PRO (рыба и морепродукты оптом).\n"
             f"Открытых задач: {open_tasks}, просрочено: {overdue}.\n"
@@ -357,18 +347,19 @@ class Database:
     def save_pdz_comment(self, client: str, manager: str, order_name: str,
                          debt_amount: float, debt_days: int, comment: str,
                          commented_by: str) -> int:
-        cur = self.conn.execute(
-            """INSERT INTO pdz_comments
-               (client, manager, order_name, debt_amount, debt_days, comment, commented_by)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (client, manager, order_name, debt_amount, debt_days, comment, commented_by)
-        )
-        self.conn.commit()
-        return cur.lastrowid
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO pdz_comments
+                   (client, manager, order_name, debt_amount, debt_days, comment, commented_by)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                (client, manager, order_name, debt_amount, debt_days, comment, commented_by)
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row['id']
 
     def get_pdz_comments(self, limit: int = 50) -> list:
-        rows = self.conn.execute(
-            """SELECT * FROM pdz_comments ORDER BY created_at DESC LIMIT ?""",
+        return self._fetchall(
+            "SELECT * FROM pdz_comments ORDER BY created_at DESC LIMIT %s",
             (limit,)
-        ).fetchall()
-        return [dict(r) for r in rows]
+        )
