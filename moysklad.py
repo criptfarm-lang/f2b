@@ -1406,10 +1406,19 @@ async def get_buyers_by_product(product_query: str, period_days: int = 180) -> l
 async def check_order_prices(order_href: str) -> list:
     """
     Проверяет цены в заказе покупателя.
-    Сравнивает цены позиций с эталонными ценами из карточки товара.
-    Тег контрагента определяет тип цены: хорека → "Цена продажи", опт → "Цена опт"
-    Возвращает список алертов если цена ниже минимальной.
+    Пропускает заказы в финальных статусах.
     """
+    SKIP_STATES = {
+        "005f3651-9a9a-11f0-0a80-03a900027474",  # Согласован
+        "267fdfbc-a2a7-11f0-0a80-0f640047fcaa",  # Собирается
+        "70999fb0-a2b6-11f0-0a80-1c830049f367",  # Собран без охл
+        "005f376a-9a9a-11f0-0a80-03a900027475",  # Собран
+        "ee088f23-df45-11f0-0a80-1670003a954a",  # ИЗМЕНЕН
+        "6edbfa00-dfdb-11f0-0a80-104e0008a4d4",  # Документы готовы
+        "005f383a-9a9a-11f0-0a80-03a900027476",  # Отгружен
+        "005f3938-9a9a-11f0-0a80-03a900027478",  # Возврат
+        "005f398e-9a9a-11f0-0a80-03a900027479",  # Отменен
+    }
     import aiohttp
     alerts = []
 
@@ -1420,12 +1429,18 @@ async def check_order_prices(order_href: str) -> list:
             async with session.get(
                 order_href,
                 headers=get_headers(),
-                params={"expand": "agent,positions.assortment,owner"}
+                params={"expand": "agent,positions.assortment,owner,state"}
             ) as resp:
                 if resp.status != 200:
                     logger.error(f"check_order_prices: не удалось загрузить заказ {order_href}")
                     return []
                 order = await resp.json()
+
+            # Пропускаем если заказ в финальном статусе
+            state = order.get("state", {})
+            if state.get("id") in SKIP_STATES:
+                logger.info(f"check_order_prices: заказ в статусе '{state.get('name', '')}' — пропускаем")
+                return []
 
             agent = order.get("agent", {})
             agent_name = agent.get("name", "неизвестно")
@@ -1632,3 +1647,31 @@ async def get_counterparty_debt(counterparty_id: str) -> dict:
     except Exception as e:
         logger.error(f"get_counterparty_debt: {e}")
         return {}
+
+
+async def set_order_state(order_id: str, state_id: str) -> bool:
+    """Меняет статус заказа покупателя."""
+    import aiohttp
+    url = f"{MS_BASE}/entity/customerorder/{order_id}"
+    payload = {
+        "state": {
+            "meta": {
+                "href": f"{MS_BASE}/entity/customerorder/metadata/states/{state_id}",
+                "type": "state",
+                "mediaType": "application/json"
+            }
+        }
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(url, headers=get_headers(), json=payload) as resp:
+                if resp.status == 200:
+                    logger.info(f"Статус заказа {order_id} изменён на {state_id}")
+                    return True
+                else:
+                    text = await resp.text()
+                    logger.error(f"set_order_state: {resp.status} {text[:200]}")
+                    return False
+    except Exception as e:
+        logger.error(f"set_order_state: {e}")
+        return False
