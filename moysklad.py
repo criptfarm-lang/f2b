@@ -1668,66 +1668,71 @@ async def get_order_positions_snapshot(order_href: str) -> frozenset:
 async def get_counterparty_debt(counterparty_id: str) -> dict:
     """
     Возвращает просрочку контрагента: debt (сумма) и overdue_days (макс. дней).
-    Использует report/counterparty для получения актуального баланса.
+    Читает кастомный атрибут "Дата планируемой оплаты" из заказов покупателя.
     """
     import aiohttp
     from datetime import date
 
+    PAYMENT_DATE_ATTR_ID = "327940fd-b54e-11f0-0a80-0066000d5578"
+
     try:
         async with aiohttp.ClientSession() as session:
-            # Отчёт — баланс
+            # Баланс контрагента
             url = f"{MS_BASE}/report/counterparty/{counterparty_id}"
             async with session.get(url, headers=get_headers()) as resp:
                 if resp.status != 200:
                     return {}
                 data = await resp.json()
 
-            # Атрибуты контрагента — дата планируемой оплаты
-            attr_url = f"{MS_BASE}/entity/counterparty/{counterparty_id}?expand=attributes"
-            async with session.get(attr_url, headers=get_headers()) as resp2:
-                attr_data = await resp2.json() if resp2.status == 200 else {}
+        balance = (data.get("balance", 0) or 0) / 100
+        logger.info(f"get_counterparty_debt: id={counterparty_id} balance={balance}")
 
-        balance = data.get("balance", 0) / 100
-        logger.info(f"get_counterparty_debt: full_data={dict(list(data.items())[:10])}")
-        logger.info(f"get_counterparty_debt: id={counterparty_id} balance={balance} daysOverdue={data.get('daysOverdue')} debtByDate={data.get('debtByDate', [])[:3]}")
-        # balance < 0 означает что нам должны
         if balance >= 0:
-            logger.info(f"get_counterparty_debt: balance={balance} >= 0, просрочки нет")
             return {}
 
         debt = abs(balance)
-
-        # Считаем дни просрочки через кастомный атрибут "Дата планируемой оплаты"
-        PAYMENT_DATE_ATTR_ID = "327940fd-b54e-11f0-0a80-0066000d5578"
-        overdue_days = 0
         today = date.today()
 
-        attributes = attr_data.get("attributes", [])
-        logger.info(f"get_counterparty_debt: attributes={attributes[:3]}")
-        for attr in attributes:
-            attr_id = attr.get("id", "") or attr.get("meta", {}).get("href", "").split("/")[-1]
-            if attr_id == PAYMENT_DATE_ATTR_ID:
-                val = attr.get("value", "")
-                if val:
-                    try:
-                        payment_date = date.fromisoformat(str(val)[:10])
-                        if payment_date < today:
-                            overdue_days = (today - payment_date).days
-                            logger.info(f"get_counterparty_debt: payment_date={payment_date} overdue_days={overdue_days}")
-                    except Exception:
-                        pass
-                break
+        # Ищем просроченные заказы — читаем атрибут "Дата планируемой оплаты"
+        async with aiohttp.ClientSession() as session:
+            orders_url = (
+                f"{MS_BASE}/entity/customerorder"
+                f"?filter=agent=https://api.moysklad.ru/api/remap/1.2/entity/counterparty/{counterparty_id}"
+                f"&filter=state!=https://api.moysklad.ru/api/remap/1.2/entity/customerorder/metadata/states/005f398e-9a9a-11f0-0a80-03a900027479"
+                f"&expand=attributes&limit=50&order=moment,desc"
+            )
+            async with session.get(orders_url, headers=get_headers()) as resp:
+                if resp.status != 200:
+                    logger.warning(f"get_counterparty_debt: orders status={resp.status}")
+                    return {"debt": debt, "overdue_days": 0}
+                orders_data = await resp.json()
 
-        # Fallback: daysOverdue из отчёта
-        if overdue_days == 0:
-            raw_overdue = data.get("daysOverdue")
-            if raw_overdue:
-                overdue_days = int(raw_overdue)
+        overdue_days = 0
+        rows = orders_data.get("rows", [])
+        logger.info(f"get_counterparty_debt: найдено заказов={len(rows)}")
 
+        for order in rows:
+            attrs = order.get("attributes", [])
+            for attr in attrs:
+                if attr.get("id") == PAYMENT_DATE_ATTR_ID:
+                    val = attr.get("value", "")
+                    if val:
+                        try:
+                            payment_date = date.fromisoformat(str(val)[:10])
+                            if payment_date < today:
+                                days = (today - payment_date).days
+                                if days > overdue_days:
+                                    overdue_days = days
+                                    logger.info(f"get_counterparty_debt: заказ {order.get('name')} payment_date={payment_date} days={days}")
+                        except Exception:
+                            pass
+                    break
+
+        logger.info(f"get_counterparty_debt: итого debt={debt} overdue_days={overdue_days}")
         return {"debt": debt, "overdue_days": overdue_days}
 
     except Exception as e:
-        logger.error(f"get_counterparty_debt: {e}")
+        logger.error(f"get_counterparty_debt: {e}", exc_info=True)
         return {}
 
 
