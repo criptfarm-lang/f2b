@@ -1228,8 +1228,11 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
     elif action == "pdz_ok":
         from moysklad import set_order_state
         order_id = parts[1] if len(parts) > 1 else ""
+        logger.info(f"pdz_ok: order_id={order_id}")
         if order_id:
-            await set_order_state(order_id, MS_STATE_AGREED)
+            success = await set_order_state(order_id, MS_STATE_AGREED)
+            logger.info(f"pdz_ok: set_order_state result={success}")
+        await query.answer("✅ Принято")
         await query.message.delete()
 
     elif action == "pdz_comment":
@@ -1366,8 +1369,10 @@ async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
     try:
         import aiohttp
         from moysklad import get_headers, MS_BASE
+        from datetime import date
 
         async with aiohttp.ClientSession() as session:
+            # Заказ с агентом и владельцем
             async with session.get(
                 order_href, headers=get_headers(),
                 params={"expand": "agent,owner"}
@@ -1375,6 +1380,12 @@ async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
                 if resp.status != 200:
                     return
                 order = await resp.json()
+
+            # Атрибуты заказа — отдельный запрос
+            order_id = order_href.split("/")[-1]
+            attr_url = f"{MS_BASE}/entity/customerorder/{order_id}/attributes"
+            async with session.get(attr_url, headers=get_headers()) as resp2:
+                attributes = (await resp2.json()).get("rows", []) if resp2.status == 200 else []
 
         agent = order.get("agent", {})
         agent_meta = agent.get("meta", {})
@@ -1391,21 +1402,41 @@ async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
             logger.warning("check_debtor_alert: agent_id пустой, пропускаем")
             return
 
-        # Получаем баланс контрагента
-        from moysklad import get_counterparty_debt
-        logger.info(f"check_debtor_alert: запрашиваю долг для {agent_id}")
-        debt_info = await get_counterparty_debt(agent_id)
-        logger.info(f"check_debtor_alert: debt_info={debt_info}")
-        if not debt_info:
-            logger.info(f"check_debtor_alert: debt_info пустой — нет долга или ошибка")
+        # Ищем "Дату планируемой оплаты" в атрибутах заказа
+        PAYMENT_DATE_ATTR_ID = "327940fd-b54e-11f0-0a80-0066000d5578"
+        payment_date_val = None
+        logger.info(f"check_debtor_alert: attributes={attributes[:3]}")
+        for attr in attributes:
+            if attr.get("id") == PAYMENT_DATE_ATTR_ID or attr.get("name") == "Дата планируемой оплаты":
+                payment_date_val = attr.get("value")
+                break
+
+        logger.info(f"check_debtor_alert: payment_date_val={payment_date_val}")
+
+        # Считаем дни просрочки
+        debt_days = 0
+        if payment_date_val:
+            try:
+                payment_date = date.fromisoformat(str(payment_date_val)[:10])
+                today = date.today()
+                if payment_date < today:
+                    debt_days = (today - payment_date).days
+            except Exception as e:
+                logger.warning(f"check_debtor_alert: ошибка парсинга даты {e}")
+
+        logger.info(f"check_debtor_alert: debt_days={debt_days}")
+
+        if debt_days <= 5:
+            logger.info(f"check_debtor_alert: просрочка {debt_days} дней — ниже порога")
             return
 
-        debt_amount = debt_info.get("debt", 0)
-        debt_days = debt_info.get("overdue_days", 0)
-        logger.info(f"check_debtor_alert: debt={debt_amount} days={debt_days}")
+        # Получаем сумму долга
+        from moysklad import get_counterparty_debt
+        debt_info = await get_counterparty_debt(agent_id)
+        debt_amount = debt_info.get("debt", 0) if debt_info else 0
 
-        if debt_days <= 5 or debt_amount <= 0:
-            logger.info(f"check_debtor_alert: просрочка {debt_days} дней — ниже порога или долга нет")
+        if debt_amount <= 0:
+            logger.info(f"check_debtor_alert: долга нет")
             return
 
         order_id = order_href.split("/")[-1]
