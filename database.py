@@ -158,14 +158,14 @@ class Database:
                 sent_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
-            """CREATE TABLE IF NOT EXISTS wazzup_contacts (
+            """CREATE TABLE IF NOT EXISTS wazzup_contact_map (
                 id SERIAL PRIMARY KEY,
-                contact_name TEXT NOT NULL,
-                chat_id TEXT NOT NULL,
+                chat_id TEXT UNIQUE NOT NULL,
                 chat_type TEXT,
                 channel_id TEXT,
-                updated_at TIMESTAMP DEFAULT NOW(),
-                UNIQUE(contact_name, chat_type)
+                company_name TEXT,
+                wazzup_name TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
             )""",
         ]
         with self.conn.cursor() as cur:
@@ -504,11 +504,58 @@ class Database:
             logger.warning(f"save_wazzup_contact error: {e}")
 
     def get_wazzup_contacts(self, contact_name: str) -> list:
-        """Возвращает все известные каналы для контакта."""
+        """Возвращает все известные каналы для контакта по имени или компании."""
+        # Сначала ищем по привязке company_name
+        rows = self._fetchall(
+            "SELECT * FROM wazzup_contact_map WHERE LOWER(company_name) LIKE LOWER(%s) ORDER BY created_at DESC",
+            (f"%{contact_name}%",)
+        )
+        if rows:
+            return [{"chat_id": r["chat_id"], "chat_type": r["chat_type"],
+                     "channel_id": r["channel_id"]} for r in rows]
+        # Fallback — по имени в wazzup_contacts
         return self._fetchall(
             "SELECT * FROM wazzup_contacts WHERE LOWER(contact_name) LIKE LOWER(%s) ORDER BY updated_at DESC",
             (f"%{contact_name}%",)
         )
+
+    def is_wazzup_contact_known(self, chat_id: str) -> bool:
+        """Проверяет есть ли уже привязка для этого chatId."""
+        row = self._fetchone(
+            "SELECT id FROM wazzup_contact_map WHERE chat_id = %s", (chat_id,)
+        )
+        return row is not None
+
+    def link_wazzup_contact(self, chat_id: str, chat_type: str,
+                            channel_id: str, company_name: str,
+                            wazzup_name: str = "") -> bool:
+        """Привязывает chatId к названию компании."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wazzup_contact_map
+                       (chat_id, chat_type, channel_id, company_name, wazzup_name)
+                       VALUES (%s, %s, %s, %s, %s)
+                       ON CONFLICT (chat_id) DO UPDATE
+                       SET company_name=EXCLUDED.company_name, wazzup_name=EXCLUDED.wazzup_name""",
+                    (chat_id, chat_type, channel_id, company_name, wazzup_name)
+                )
+            self.conn.commit()
+            # Обновляем и в wazzup_contacts
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wazzup_contacts (contact_name, chat_id, chat_type, channel_id, updated_at)
+                       VALUES (%s, %s, %s, %s, NOW())
+                       ON CONFLICT (contact_name, chat_type)
+                       DO UPDATE SET chat_id=EXCLUDED.chat_id, channel_id=EXCLUDED.channel_id, updated_at=NOW()""",
+                    (company_name, chat_id, chat_type, channel_id)
+                )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"link_wazzup_contact error: {e}")
+            return False
 
     def get_wazzup_stats(self, days: int = 7) -> dict:
         """Статистика сообщений по менеджерам за период."""
