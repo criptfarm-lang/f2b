@@ -2024,7 +2024,7 @@ def main():
                         manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
                         for mgr_id in manager_ids:
                             try:
-                        import uuid as _uuid2
+                                import uuid as _uuid2
                                 link_key = str(_uuid2.uuid4())[:8]
                                 _pending_links[link_key] = {
                                     "chat_id": chat_id_val,
