@@ -165,6 +165,7 @@ class Database:
                 channel_id TEXT,
                 company_name TEXT,
                 wazzup_name TEXT,
+                role TEXT DEFAULT 'закупщик',
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
         ]
@@ -528,17 +529,18 @@ class Database:
 
     def link_wazzup_contact(self, chat_id: str, chat_type: str,
                             channel_id: str, company_name: str,
-                            wazzup_name: str = "") -> bool:
-        """Привязывает chatId к названию компании."""
+                            wazzup_name: str = "", role: str = "закупщик") -> bool:
+        """Привязывает chatId к названию компании и роли."""
         try:
             with self.conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO wazzup_contact_map
-                       (chat_id, chat_type, channel_id, company_name, wazzup_name)
-                       VALUES (%s, %s, %s, %s, %s)
+                       (chat_id, chat_type, channel_id, company_name, wazzup_name, role)
+                       VALUES (%s, %s, %s, %s, %s, %s)
                        ON CONFLICT (chat_id) DO UPDATE
-                       SET company_name=EXCLUDED.company_name, wazzup_name=EXCLUDED.wazzup_name""",
-                    (chat_id, chat_type, channel_id, company_name, wazzup_name)
+                       SET company_name=EXCLUDED.company_name, wazzup_name=EXCLUDED.wazzup_name,
+                           role=EXCLUDED.role""",
+                    (chat_id, chat_type, channel_id, company_name, wazzup_name, role)
                 )
             self.conn.commit()
             # Обновляем и в wazzup_contacts
@@ -556,6 +558,20 @@ class Database:
             self.conn.rollback()
             logger.warning(f"link_wazzup_contact error: {e}")
             return False
+
+    def get_wazzup_broadcast_contacts(self, company_name: str,
+                                       roles: list = None) -> list:
+        """Возвращает контакты компании подходящие для рассылки (закупщики/директора)."""
+        if roles is None:
+            roles = ["закупщик", "директор"]
+        placeholders = ",".join(["%s"] * len(roles))
+        return self._fetchall(
+            f"""SELECT * FROM wazzup_contact_map
+               WHERE LOWER(company_name) LIKE LOWER(%s)
+               AND LOWER(role) IN ({placeholders})
+               ORDER BY created_at DESC""",
+            [f"%{company_name}%"] + roles
+        )
 
     def get_wazzup_stats(self, days: int = 7) -> dict:
         """Статистика сообщений по менеджерам за период."""
