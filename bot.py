@@ -177,12 +177,35 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
     await query.answer()
 
     parts = query.data.split("|")
-    if len(parts) < 4:
+
+    # Выбор роли после ввода компании
+    if parts[0] == "wazzup_role":
+        _, role, pending_key = parts[0], parts[1], parts[2]
+        pending = _pending_links.get(int(pending_key))
+        if not pending:
+            await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
+            return
+        _pending_links.pop(int(pending_key), None)
+        ok = db.link_wazzup_contact(
+            chat_id=pending["chat_id"],
+            chat_type=pending["chat_type"],
+            channel_id=pending["channel_id"],
+            company_name=pending["company_name"],
+            wazzup_name=pending["wazzup_name"],
+            role=role,
+        )
+        if ok:
+            await query.message.edit_text(
+                f"✅ *{pending['wazzup_name']}* → *{pending['company_name']}* ({role})\nЭф запомнил!",
+                parse_mode="Markdown"
+            )
         return
 
+    # Первое нажатие — запрашиваем название компании
+    if len(parts) < 4:
+        return
     _, chat_id_val, channel_id_val, wazzup_name = parts[0], parts[1], parts[2], parts[3]
 
-    # Сохраняем ожидание ввода названия компании
     _pending_links[query.from_user.id] = {
         "chat_id": chat_id_val,
         "channel_id": channel_id_val,
@@ -191,7 +214,7 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
     }
 
     await query.message.edit_text(
-        f"📩 Контакт: `{wazzup_name}` (chatId: `{chat_id_val}`)\n\n"
+        f"📩 Контакт: *{wazzup_name}*\n\n"
         f"Напиши название компании из МойСклад:",
         parse_mode="Markdown"
     )
@@ -740,23 +763,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Проверяем ожидание привязки Wazzup контакта
     if user and user.id in _pending_links and not is_bot_addressed(text):
-        pending_link = _pending_links.pop(user.id)
-        company_name = text.strip()
-        ok = db.link_wazzup_contact(
-            chat_id=pending_link["chat_id"],
-            chat_type=pending_link["chat_type"],
-            channel_id=pending_link["channel_id"],
-            company_name=company_name,
-            wazzup_name=pending_link["wazzup_name"],
-        )
-        if ok:
+        pending_link = _pending_links[user.id]
+        if "company_name" not in pending_link:
+            # Первый шаг — сохраняем название компании, просим роль
+            pending_link["company_name"] = text.strip()
+            user_id_key = str(user.id)
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🛒 Закупщик", callback_data=f"wazzup_role|закупщик|{user.id}"),
+                    InlineKeyboardButton("👔 Директор", callback_data=f"wazzup_role|директор|{user.id}"),
+                ],
+                [
+                    InlineKeyboardButton("💰 Бухгалтер", callback_data=f"wazzup_role|бухгалтер|{user.id}"),
+                    InlineKeyboardButton("👤 Другое", callback_data=f"wazzup_role|другое|{user.id}"),
+                ]
+            ])
             await message.reply_text(
-                f"✅ Контакт `{pending_link['wazzup_name']}` привязан к *{company_name}*\n"
-                f"Теперь Эф будет писать им через Telegram.",
-                parse_mode="Markdown"
+                f"Компания: *{text.strip()}*\n\nКакая роль у этого контакта?",
+                parse_mode="Markdown",
+                reply_markup=keyboard
             )
-        else:
-            await message.reply_text("❌ Ошибка сохранения. Попробуй снова.")
+            return
+        # Если company_name уже есть — это не тот ввод
+        _pending_links.pop(user.id, None)
         return
 
     if not is_bot_addressed(text):
