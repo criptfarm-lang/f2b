@@ -2063,7 +2063,9 @@ def main():
                         channel_id=channel_id_val,
                     )
                     # Для Telegram — уведомляем руководителя если контакт неизвестен
-                    if chat_type in ("telegram", "tgapi") and not db.is_wazzup_contact_known(chat_id_val):
+                    is_known = db.is_wazzup_contact_known(chat_id_val)
+                    logger.info(f"Wazzup: chat_id={chat_id_val} is_known={is_known}")
+                    if chat_type in ("telegram", "tgapi") and not is_known:
                         # Проверяем что контакт не помечен как игнорируемый
                         ignored = db._fetchone(
                             "SELECT id FROM wazzup_contact_map WHERE chat_id=%s AND company_name='__ignore__'",
