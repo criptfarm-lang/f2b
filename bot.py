@@ -2029,7 +2029,7 @@ def main():
                         )
                         if ignored:
                             continue
-                        group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
+                        group_chat_id = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
                         if group_chat_id:
                             try:
                                 import uuid as _uuid2
