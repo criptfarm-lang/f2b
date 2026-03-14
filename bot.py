@@ -2029,8 +2029,8 @@ def main():
                         )
                         if ignored:
                             continue
-                        manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-                        for mgr_id in manager_ids:
+                        group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
+                        if group_chat_id:
                             try:
                                 import uuid as _uuid2
                                 link_key = str(_uuid2.uuid4())[:8]
@@ -2041,33 +2041,25 @@ def main():
                                     "chat_type": chat_type,
                                 }
                                 keyboard = InlineKeyboardMarkup([[
-                                    InlineKeyboardButton(
-                                        "🏢 Привязать компанию",
-                                        callback_data=f"wazzup_link|{link_key}"
-                                    )
-                                ],[
-                                    InlineKeyboardButton(
-                                        "🚫 Не привязывать",
-                                        callback_data=f"wazzup_ignore|{chat_id_val}"
-                                    )
+                                    InlineKeyboardButton("🏢 Привязать компанию", callback_data=f"wazzup_link|{link_key}"),
+                                    InlineKeyboardButton("🚫 Не привязывать", callback_data=f"wazzup_ignore|{chat_id_val}")
                                 ]])
-                                # Обрезаем текст до 2 строк / 120 символов
-                                preview = text.replace("\n", " ").strip()
+                                preview = (text or "").replace("\n", " ").strip()
                                 if len(preview) > 120:
                                     preview = preview[:120] + "..."
                                 await app.bot.send_message(
-                                    chat_id=mgr_id,
+                                    chat_id=group_chat_id,
                                     text=(
                                         f"📩 *Новый неизвестный контакт в Telegram*\n\n"
                                         f"👤 Имя в TG: *{contact_name}*\n"
                                         f"💬 _{preview}_\n\n"
-                                        f"Нажми кнопку и напиши как этот клиент называется в МойСклад"
+                                        f"Чей клиент? Нажми и напиши как он называется в МойСклад"
                                     ),
                                     parse_mode="Markdown",
                                     reply_markup=keyboard
                                 )
                             except Exception as e:
-                                logger.warning(f"Не удалось отправить уведомление руководителю: {e}")
+                                logger.warning(f"Не удалось отправить уведомление в группу: {e}")
 
                 if not text:
                     continue
