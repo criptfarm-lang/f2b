@@ -310,6 +310,26 @@ async def cmd_clear_wazzup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+async def cmd_wazzup_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сбрасывает привязку Wazzup контакта. /wazzup_reset <chat_id>"""
+    user = update.effective_user
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    if user.id not in manager_ids:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Использование: /wazzup_reset <chat_id>")
+        return
+    chat_id_val = args[0]
+    try:
+        with db.conn.cursor() as cur:
+            cur.execute("DELETE FROM wazzup_contact_map WHERE chat_id = %s", (chat_id_val,))
+        db.conn.commit()
+        await update.message.reply_text(f"✅ Привязка для `{chat_id_val}` сброшена.", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 async def cmd_wazzup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список каналов Wazzup с их ID."""
     user = update.effective_user
@@ -1983,6 +2003,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("clearwazzup", cmd_clear_wazzup))
+    app.add_handler(CommandHandler("wazzup_reset", cmd_wazzup_reset))
     app.add_handler(CommandHandler("wazzup_channels", cmd_wazzup_channels))
     app.add_handler(CommandHandler("wazzup_setup", cmd_wazzup_setup))
     app.add_handler(CommandHandler("clearall", cmd_clear_all))
