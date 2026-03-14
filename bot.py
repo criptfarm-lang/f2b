@@ -1490,11 +1490,11 @@ async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     api_key = os.getenv("WAZZUP_API_KEY", "")
     import aiohttp, uuid as _uuid
 
-    # Каналы в порядке приоритета: Telegram → Max → WhatsApp
+    # Каналы в порядке приоритета: WhatsApp → Max → Telegram
     CHANNEL_PRIORITY = [
-        {"id": "ddd24a95-9304-4098-a320-3e47fcd1020a", "type": "telegram"},
-        {"id": "1d5bc70a-7ca6-4895-8d1f-9690cf448214", "type": "max"},
         {"id": "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03", "type": "whatsapp"},
+        {"id": "1d5bc70a-7ca6-4895-8d1f-9690cf448214", "type": "max"},
+        {"id": "ddd24a95-9304-4098-a320-3e47fcd1020a", "type": "telegram"},
     ]
 
     # Рассылка (несколько клиентов)
