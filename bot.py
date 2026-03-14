@@ -273,6 +273,7 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
 
     # Помечаем что ждём ввода от этого пользователя
     _pending_links[query.from_user.id] = {**pending, "link_key": link_key}
+    _pending_links[link_key] = _pending_links[query.from_user.id]
 
     await query.message.edit_text(
         f"👤 Контакт в TG: *{pending['wazzup_name']}*\n\n"
