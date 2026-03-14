@@ -290,6 +290,26 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
     )
 
 
+async def cmd_clear_wazzup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет запись из wazzup_contact_map по chat_id. Только для руководителя."""
+    user = update.effective_user
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    if user.id not in manager_ids:
+        return
+    chat_id_val = context.args[0] if context.args else ""
+    if not chat_id_val:
+        await update.message.reply_text("Укажи chat_id: /clearwazzup 360092495")
+        return
+    try:
+        with db.conn.cursor() as cur:
+            cur.execute("DELETE FROM wazzup_contact_map WHERE chat_id=%s", (chat_id_val,))
+            cur.execute("DELETE FROM wazzup_contacts WHERE chat_id=%s", (chat_id_val,))
+        db.conn.commit()
+        await update.message.reply_text(f"✅ Запись {chat_id_val} удалена.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 async def cmd_wazzup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список каналов Wazzup с их ID."""
     user = update.effective_user
@@ -1962,6 +1982,7 @@ def main():
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("clearwazzup", cmd_clear_wazzup))
     app.add_handler(CommandHandler("wazzup_channels", cmd_wazzup_channels))
     app.add_handler(CommandHandler("wazzup_setup", cmd_wazzup_setup))
     app.add_handler(CommandHandler("clearall", cmd_clear_all))
