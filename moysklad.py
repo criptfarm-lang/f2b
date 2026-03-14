@@ -595,6 +595,7 @@ async def get_counterparty_balance(query: str) -> list:
                     "name": c.get("name", ""),
                     "balance": balance,
                     "debt": debt,
+                    "href": c.get("meta", {}).get("href", f"{MS_BASE}/entity/counterparty/{cid}"),
                 })
             return result
 
@@ -1516,6 +1517,7 @@ async def get_counterparty_phones(buyers: list) -> list:
                         phones = data.get("phones", [])
                         if phones:
                             phone = phones[0].get("value", "")
+                    logger.info(f"get_counterparty_phones: {data.get('name')} raw_phone='{phone}'")
                     # Нормализуем — оставляем только цифры, добавляем 7 если нужно
                     phone_clean = "".join(c for c in phone if c.isdigit())
                     if phone_clean and len(phone_clean) == 10:
