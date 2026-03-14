@@ -167,6 +167,22 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет ВСЕ открытые задачи. Только для руководителя."""
+    user = update.effective_user
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    if user.id not in manager_ids:
+        return
+    try:
+        with db.conn.cursor() as cur:
+            cur.execute("UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE status='open'")
+        db.conn.commit()
+        await update.message.reply_text("✅ Все открытые задачи очищены.")
+    except Exception as e:
+        logger.error(f"cmd_clear_all error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Проверяет все основные функции Эфа. Только для руководителя."""
     user = update.effective_user
@@ -1428,6 +1444,7 @@ def main():
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("clearall", cmd_clear_all))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("cleartasks", cmd_clear_tasks))
     app.add_handler(CommandHandler("all_tasks", cmd_all_tasks))
