@@ -23,7 +23,7 @@ from telegram.ext import (
 from database import Database
 from scheduler import setup_scheduler, record_group_message, PDZ_MANAGERS, get_group_chat_id
 from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion, parse_product_query
-from amocrm import check_connection as amo_check
+from amocrm import check_connection as amo_check  # оставляем для совместимости
 from moysklad import (search_products, search_products_filtered, get_price_list, format_products,
     format_price_list, get_product_image, download_image, get_image_download_url,
     get_counterparty_balance, get_all_debtors, format_debtors_ms, format_counterparty_balance,
@@ -499,13 +499,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return coords is not None
     await check("Яндекс геокодер", test_geocoder())
 
-    # 9. amoCRM
-    async def test_amo():
-        from amocrm import check_connection
-        return await check_connection()
-    await check("amoCRM API", test_amo(), timeout=10)
-
-    # 10. Webhook сервер
+    # 9. Webhook сервер
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
