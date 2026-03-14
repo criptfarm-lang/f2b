@@ -1519,7 +1519,8 @@ async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     logger.info(f"Wazzup: отправлено {pending['name']} ({pending['phone']})")
                 else:
                     body = await resp.text()
-                    await query.message.edit_text(f"❌ Ошибка отправки: {resp.status} {body[:100]}")
+                    logger.error(f"Wazzup send error {resp.status}: {body}")
+                    await query.message.edit_text(f"❌ Ошибка отправки: {resp.status}\n{body[:300]}")
     except Exception as e:
         await query.message.edit_text(f"❌ Ошибка: {e}")
 
