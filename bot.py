@@ -213,12 +213,10 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
         _pending_links[query.from_user.id] = {**pending, "link_key": link_key}
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("🛒 Закупщик", callback_data=f"wazzup_role|закупщик|{link_key}"),
-                InlineKeyboardButton("👔 Директор", callback_data=f"wazzup_role|директор|{link_key}"),
+                InlineKeyboardButton("📢 Для рассылки", callback_data=f"wazzup_role|рассылка|{link_key}"),
+                InlineKeyboardButton("👤 Иной контакт", callback_data=f"wazzup_role|иной|{link_key}"),
             ],
             [
-                InlineKeyboardButton("💰 Бухгалтер", callback_data=f"wazzup_role|бухгалтер|{link_key}"),
-                InlineKeyboardButton("👤 Другое", callback_data=f"wazzup_role|другое|{link_key}"),
             ]
         ])
         await query.message.edit_text(
@@ -885,12 +883,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("🛒 Закупщик", callback_data=f"wazzup_role|закупщик|{link_key}"),
-                    InlineKeyboardButton("👔 Директор", callback_data=f"wazzup_role|директор|{link_key}"),
+                    InlineKeyboardButton("📢 Для рассылки", callback_data=f"wazzup_role|рассылка|{link_key}"),
+                    InlineKeyboardButton("👤 Иной контакт", callback_data=f"wazzup_role|иной|{link_key}"),
                 ],
                 [
-                    InlineKeyboardButton("💰 Бухгалтер", callback_data=f"wazzup_role|бухгалтер|{link_key}"),
-                    InlineKeyboardButton("👤 Другое", callback_data=f"wazzup_role|другое|{link_key}"),
                 ]
             ])
             await message.reply_text(
