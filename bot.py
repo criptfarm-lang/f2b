@@ -271,8 +271,8 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     warn = sum(1 for r in results if r.startswith("⚠️"))
     err = sum(1 for r in results if r.startswith("❌"))
 
-    header = f"📊 *Диагностика Эфа*\n✅ {ok} ок  ⚠️ {warn} предупреждений  ❌ {err} ошибок\n\n"
-    await update.message.reply_text(header + "\n".join(results), parse_mode="Markdown")
+    header = f"📊 Диагностика Эфа\n✅ {ok} ок  ⚠️ {warn} предупреждений  ❌ {err} ошибок\n\n"
+    await update.message.reply_text(header + "\n".join(results))
 
 
 async def cmd_clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
