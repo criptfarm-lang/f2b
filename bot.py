@@ -1675,7 +1675,7 @@ async def process_ms_webhook(data: dict, bot):
 async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
     """Проверяет адрес доставки заказа на соответствие расписанию логистики."""
     try:
-        from moysklad import check_delivery_schedule, get_headers, MS_BASE, WEEKDAYS_RU_IN
+        from moysklad import check_delivery_schedule, get_headers, MS_BASE
         import aiohttp
 
         async with aiohttp.ClientSession() as session:
@@ -1716,8 +1716,20 @@ async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
                         manager_name = d.get("name", "")
 
         city = result["city"].capitalize()
-        weekday = result["weekday"]
+        weekday = result["weekday"]  # строка: "среда", "пятница" и т.д.
         allowed = ", ".join(result["allowed_days"]) or "не запланирован"
+
+        # Винительный падеж для "не едем в ..."
+        WEEKDAY_ACCUSATIVE = {
+            "понедельник": "понедельник",
+            "вторник": "вторник",
+            "среда": "среду",
+            "четверг": "четверг",
+            "пятница": "пятницу",
+            "суббота": "субботу",
+            "воскресенье": "воскресенье",
+        }
+        weekday_acc = WEEKDAY_ACCUSATIVE.get(weekday.lower(), weekday)
         from datetime import date
         MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
         try:
@@ -1732,7 +1744,7 @@ async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
             f"👔 Менеджер: {manager_name}\n"
             f"📍 Адрес: {address}\n\n"
             f"📅 Дата отгрузки: *{date_str} ({weekday})*\n"
-            f"❌ В {city} мы не едем в {WEEKDAYS_RU_IN[weekday]}\n"
+            f"❌ В {city} мы не едем в {weekday_acc}\n"
             f"✅ {city} доступен: *{allowed}*"
         )
 
