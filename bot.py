@@ -982,7 +982,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_chat_action("typing")
 
         # Находим контрагента в МойСклад
-        from moysklad import get_counterparty_balance, get_counterparty_phones
+        from moysklad import get_counterparty_phones
         counterparties = await get_counterparty_balance(client_query)
         if not counterparties:
             await message.reply_text(f"❌ Клиент *{client_query}* не найден в МойСклад.", parse_mode="Markdown")
