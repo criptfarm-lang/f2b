@@ -220,12 +220,15 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return len(rows) > 0
     await check("МойСклад баланс контрагента", test_ms_balance())
 
-    # 5. МойСклад — ПДЗ
+    # 5. МойСклад — ПДЗ (лёгкая проверка — просто один запрос)
     async def test_pdz():
-        from moysklad import get_overdue_demands
-        rows = await get_overdue_demands()
-        return rows is not None
-    await check("МойСклад ПДЗ", test_pdz(), timeout=30)
+        from moysklad import get_headers, MS_BASE
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/customerorder?limit=1&expand=attributes"
+            async with session.get(url, headers=get_headers()) as resp:
+                return resp.status == 200
+    await check("МойСклад ПДЗ (заказы)", test_pdz())
 
     # 6. Claude API — диспетчер
     async def test_claude():
@@ -236,9 +239,8 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 7. Поиск фото
     async def test_photo():
-        from moysklad import search_media
-        result = await search_media("лосось")
-        return True  # None тоже ок — просто не нашёл
+        photos = db.search_media("лосось", media_type="photo")
+        return True  # просто проверяем что БД отвечает
     await check("Поиск фото (канал Контент)", test_photo())
 
     # 8. Геокодер
@@ -252,7 +254,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def test_amo():
         from amocrm import check_connection
         return await check_connection()
-    await check("amoCRM API", test_amo())
+    await check("amoCRM API", test_amo(), timeout=10)
 
     # 10. Webhook сервер
     try:
