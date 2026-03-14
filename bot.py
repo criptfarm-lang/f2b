@@ -171,6 +171,24 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _pending_links: dict = {}
 
 
+async def handle_wazzup_ignore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Помечает контакт как 'не наш клиент' — больше не присылать уведомления."""
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split("|")
+    chat_id_val = parts[1] if len(parts) > 1 else ""
+    if chat_id_val:
+        db.link_wazzup_contact(
+            chat_id=chat_id_val,
+            chat_type="telegram",
+            channel_id="",
+            company_name="__ignore__",
+            wazzup_name="",
+            role="игнор",
+        )
+    await query.message.edit_text("🚫 Контакт помечен как 'не наш клиент'. Уведомления больше не придут.")
+
+
 async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает нажатие кнопки привязки Telegram контакта к компании."""
     query = update.callback_query
@@ -835,7 +853,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             callback_data=f"wazzup_pick|{i}|{link_key}"
                         )])
                     buttons.append([InlineKeyboardButton(
-                        "❌ Отменить привязку",
+                        "🚫 Не привязывать",
                         callback_data=f"wazzup_role|отмена|{link_key}"
                     )])
                     await message.reply_text(
@@ -845,7 +863,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 else:
                     keyboard = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("❌ Отменить привязку", callback_data=f"wazzup_role|отмена|{pending_link.get('link_key', str(user.id))}")
+                        InlineKeyboardButton("🚫 Не привязывать", callback_data=f"wazzup_role|отмена|{pending_link.get('link_key', str(user.id))}")
                     ]])
                     await message.reply_text(
                         f"❌ Компания *{company_query}* не найдена в МойСклад.\n"
@@ -1956,6 +1974,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick)"))
+    app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
 
@@ -1995,10 +2014,17 @@ def main():
                     )
                     # Для Telegram — уведомляем руководителя если контакт неизвестен
                     if chat_type in ("telegram", "tgapi") and not db.is_wazzup_contact_known(chat_id_val):
+                        # Проверяем что контакт не помечен как игнорируемый
+                        ignored = db._fetchone(
+                            "SELECT id FROM wazzup_contact_map WHERE chat_id=%s AND company_name='__ignore__'",
+                            (chat_id_val,)
+                        )
+                        if ignored:
+                            continue
                         manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
                         for mgr_id in manager_ids:
                             try:
-                                import uuid as _uuid2
+                        import uuid as _uuid2
                                 link_key = str(_uuid2.uuid4())[:8]
                                 _pending_links[link_key] = {
                                     "chat_id": chat_id_val,
@@ -2011,14 +2037,22 @@ def main():
                                         "🏢 Привязать компанию",
                                         callback_data=f"wazzup_link|{link_key}"
                                     )
+                                ],[
+                                    InlineKeyboardButton(
+                                        "🚫 Не наш клиент",
+                                        callback_data=f"wazzup_ignore|{chat_id_val}"
+                                    )
                                 ]])
-                                last_text = text[:100] if text else "—"
+                                # Обрезаем текст до 2 строк / 120 символов
+                                preview = text.replace("\n", " ").strip()
+                                if len(preview) > 120:
+                                    preview = preview[:120] + "..."
                                 await app.bot.send_message(
                                     chat_id=mgr_id,
                                     text=(
                                         f"📩 *Новый неизвестный контакт в Telegram*\n\n"
                                         f"👤 Имя в TG: *{contact_name}*\n"
-                                        f"💬 Написал: _{last_text}_\n\n"
+                                        f"💬 _{preview}_\n\n"
                                         f"Нажми кнопку и напиши как этот клиент называется в МойСклад"
                                     ),
                                     parse_mode="Markdown",
