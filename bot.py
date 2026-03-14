@@ -167,6 +167,36 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# Ожидающие привязки контактов — user_id → {chat_id, channel_id, wazzup_name, chat_type}
+_pending_links: dict = {}
+
+
+async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатие кнопки привязки Telegram контакта к компании."""
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split("|")
+    if len(parts) < 4:
+        return
+
+    _, chat_id_val, channel_id_val, wazzup_name = parts[0], parts[1], parts[2], parts[3]
+
+    # Сохраняем ожидание ввода названия компании
+    _pending_links[query.from_user.id] = {
+        "chat_id": chat_id_val,
+        "channel_id": channel_id_val,
+        "wazzup_name": wazzup_name,
+        "chat_type": "telegram",
+    }
+
+    await query.message.edit_text(
+        f"📩 Контакт: `{wazzup_name}` (chatId: `{chat_id_val}`)\n\n"
+        f"Напиши название компании из МойСклад:",
+        parse_mode="Markdown"
+    )
+
+
 async def cmd_wazzup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список каналов Wazzup с их ID."""
     user = update.effective_user
@@ -706,6 +736,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "пишите в группу **IT8 & ОП ФИШ ТУ БИЗНЕС** 🛠",
             parse_mode="Markdown"
         )
+        return
+
+    # Проверяем ожидание привязки Wazzup контакта
+    if user and user.id in _pending_links and not is_bot_addressed(text):
+        pending_link = _pending_links.pop(user.id)
+        company_name = text.strip()
+        ok = db.link_wazzup_contact(
+            chat_id=pending_link["chat_id"],
+            chat_type=pending_link["chat_type"],
+            channel_id=pending_link["channel_id"],
+            company_name=company_name,
+            wazzup_name=pending_link["wazzup_name"],
+        )
+        if ok:
+            await message.reply_text(
+                f"✅ Контакт `{pending_link['wazzup_name']}` привязан к *{company_name}*\n"
+                f"Теперь Эф будет писать им через Telegram.",
+                parse_mode="Markdown"
+            )
+        else:
+            await message.reply_text("❌ Ошибка сохранения. Попробуй снова.")
         return
 
     if not is_bot_addressed(text):
@@ -1784,6 +1835,7 @@ def main():
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
+    app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^wazzup_link"))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
 
@@ -1821,6 +1873,30 @@ def main():
                         chat_type=chat_type,
                         channel_id=channel_id_val,
                     )
+                    # Для Telegram — уведомляем руководителя если контакт неизвестен
+                    if chat_type in ("telegram", "tgapi") and not db.is_wazzup_contact_known(chat_id_val):
+                        manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+                        for mgr_id in manager_ids:
+                            try:
+                                keyboard = InlineKeyboardMarkup([[
+                                    InlineKeyboardButton(
+                                        "🏢 Привязать компанию",
+                                        callback_data=f"wazzup_link|{chat_id_val}|{channel_id_val}|{contact_name[:30]}"
+                                    )
+                                ]])
+                                await app.bot.send_message(
+                                    chat_id=mgr_id,
+                                    text=(
+                                        f"📩 *Новый контакт в Telegram*\n\n"
+                                        f"Имя в Wazzup: `{contact_name}`\n"
+                                        f"chatId: `{chat_id_val}`\n\n"
+                                        f"Нажми кнопку и напиши название компании из МойСклад"
+                                    ),
+                                    parse_mode="Markdown",
+                                    reply_markup=keyboard
+                                )
+                            except Exception as e:
+                                logger.warning(f"Не удалось отправить уведомление руководителю: {e}")
 
                 if not text:
                     continue
