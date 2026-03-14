@@ -563,7 +563,7 @@ class Database:
                                        roles: list = None) -> list:
         """Возвращает контакты компании подходящие для рассылки (закупщики/директора)."""
         if roles is None:
-            roles = ["закупщик", "директор"]
+            roles = ["рассылка"]
         placeholders = ",".join(["%s"] * len(roles))
         return self._fetchall(
             f"""SELECT * FROM wazzup_contact_map
