@@ -158,6 +158,15 @@ class Database:
                 sent_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
+            """CREATE TABLE IF NOT EXISTS wazzup_contacts (
+                id SERIAL PRIMARY KEY,
+                contact_name TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                chat_type TEXT,
+                channel_id TEXT,
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(contact_name, chat_type)
+            )""",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:
@@ -476,6 +485,30 @@ class Database:
             ORDER BY manager_name, sent_at DESC
         """
         return self._fetchall(sql, params)
+
+    def save_wazzup_contact(self, contact_name: str, chat_id: str,
+                            chat_type: str, channel_id: str):
+        """Сохраняет или обновляет chatId клиента по каналу."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wazzup_contacts (contact_name, chat_id, chat_type, channel_id, updated_at)
+                       VALUES (%s, %s, %s, %s, NOW())
+                       ON CONFLICT (contact_name, chat_type)
+                       DO UPDATE SET chat_id=EXCLUDED.chat_id, channel_id=EXCLUDED.channel_id, updated_at=NOW()""",
+                    (contact_name, chat_id, chat_type, channel_id)
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"save_wazzup_contact error: {e}")
+
+    def get_wazzup_contacts(self, contact_name: str) -> list:
+        """Возвращает все известные каналы для контакта."""
+        return self._fetchall(
+            "SELECT * FROM wazzup_contacts WHERE LOWER(contact_name) LIKE LOWER(%s) ORDER BY updated_at DESC",
+            (f"%{contact_name}%",)
+        )
 
     def get_wazzup_stats(self, days: int = 7) -> dict:
         """Статистика сообщений по менеджерам за период."""
