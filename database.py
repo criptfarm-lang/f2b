@@ -144,6 +144,20 @@ class Database:
         migrations = [
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_by TEXT",
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS result TEXT",
+            """CREATE TABLE IF NOT EXISTS wazzup_messages (
+                id SERIAL PRIMARY KEY,
+                message_id TEXT UNIQUE,
+                channel_id TEXT,
+                chat_type TEXT,
+                chat_id TEXT,
+                contact_name TEXT,
+                manager_id TEXT,
+                manager_name TEXT,
+                text TEXT,
+                is_outbound BOOLEAN DEFAULT FALSE,
+                sent_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:
