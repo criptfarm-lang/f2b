@@ -580,13 +580,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     # 3. Автозакрытие задач — Claude анализирует контекст
+    sender_name = update.effective_user.full_name if update.effective_user else ""
     if not is_bot_addressed(text) and len(text) > 5:
         open_tasks = db.get_all_open_tasks()
         if open_tasks:
             completed_items = await detect_task_completion(text, open_tasks, author=sender_name)
             if completed_items:
                 closed = []
-                sender_name = update.effective_user.full_name if update.effective_user else ""
                 for item in completed_items:
                     task_id = item["id"]
                     result = item.get("result", "")
