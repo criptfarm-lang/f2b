@@ -1049,11 +1049,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Показываем превью с кнопками — ждём подтверждения
         import uuid as _uuid
         msg_key = str(_uuid.uuid4())[:8]
+
+        # Определяем канал и тип чата по номеру телефона (WhatsApp)
+        wazzup_wa_channel = os.getenv("WAZZUP_WA_CHANNEL_ID", "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03")
+
         _pending_sends[msg_key] = {
             "phone": phone,
             "name": cp_name,
             "text": msg_text,
             "chat_type": "whatsapp",
+            "channel_id": wazzup_wa_channel,
         }
 
         group_chat_id = get_group_chat_id()
@@ -1483,7 +1488,7 @@ async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     api_key = os.getenv("WAZZUP_API_KEY", "")
-    channel_id = os.getenv("WAZZUP_CHANNEL_ID", "")
+    channel_id = pending.get("channel_id") or os.getenv("WAZZUP_WA_CHANNEL_ID", "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03")
     import aiohttp, uuid as _uuid
 
     # Рассылка (несколько клиентов)
