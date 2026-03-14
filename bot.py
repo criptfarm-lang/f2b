@@ -241,10 +241,19 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
             await query.message.edit_text("❌ Привязка отменена. Контакт пока не идентифицирован.")
             return
         pending = _pending_links.get(link_key)
+        # Если не нашли по link_key — ищем по user_id среди всех pending
+        if not pending or "company_name" not in pending:
+            for uid, v in _pending_links.items():
+                if isinstance(uid, int) and v.get("link_key") == link_key and "company_name" in v:
+                    pending = v
+                    break
         if not pending or "company_name" not in pending:
             await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
             return
+        # Очищаем
         _pending_links.pop(link_key, None)
+        for uid in [k for k, v in _pending_links.items() if isinstance(k, int) and v.get("link_key") == link_key]:
+            _pending_links.pop(uid, None)
         ok = db.link_wazzup_contact(
             chat_id=pending["chat_id"],
             chat_type=pending["chat_type"],
@@ -885,8 +894,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [
                     InlineKeyboardButton("📢 Для рассылки", callback_data=f"wazzup_role|рассылка|{link_key}"),
                     InlineKeyboardButton("👤 Иной контакт", callback_data=f"wazzup_role|иной|{link_key}"),
-                ],
-                [
                 ]
             ])
             await message.reply_text(
