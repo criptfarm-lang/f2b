@@ -167,6 +167,40 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_wazzup_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настраивает вебхук Wazzup. /wazzup_setup"""
+    user = update.effective_user
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    if user.id not in manager_ids:
+        return
+
+    api_key = os.getenv("WAZZUP_API_KEY", "")
+    if not api_key:
+        await update.message.reply_text("❌ WAZZUP_API_KEY не задан в Railway.")
+        return
+
+    import aiohttp
+    webhook_url = "https://f2b-production.up.railway.app/webhook/wazzup"
+
+    async with aiohttp.ClientSession() as session:
+        # Устанавливаем вебхук
+        async with session.patch(
+            "https://api.wazzup24.com/v3/webhooks",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"webhooksUri": webhook_url, "subscriptions": {"messagesAndStatuses": True}}
+        ) as resp:
+            if resp.status == 200:
+                await update.message.reply_text(
+                    f"✅ Wazzup вебхук настроен!\n"
+                    f"📡 URL: `{webhook_url}`\n\n"
+                    f"Теперь все сообщения менеджеров будут сохраняться автоматически.",
+                    parse_mode="Markdown"
+                )
+            else:
+                text = await resp.text()
+                await update.message.reply_text(f"❌ Ошибка: {resp.status} {text[:200]}")
+
+
 async def cmd_clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаляет ВСЕ открытые задачи. Только для руководителя."""
     user = update.effective_user
@@ -968,6 +1002,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
+    elif action == "search_mentions":
+        product = params.get("product", "")
+        days = int(params.get("days", 7))
+        manager_filter = params.get("manager", "")
+
+        if not product:
+            await message.reply_text("❌ Укажи товар для поиска.")
+            return
+
+        await message.reply_chat_action("typing")
+
+        # Разбиваем на несколько товаров если через запятую
+        keywords = [p.strip().lower() for p in product.replace(" и ", ",").split(",") if p.strip()]
+
+        rows = db.search_wazzup_mentions(keywords, days=days, manager_name=manager_filter or None)
+
+        if not rows:
+            await message.reply_text(
+                f"😕 Упоминаний *{product}* за последние {days} дней не найдено.\n"
+                f"_Данные накапливаются с момента подключения Wazzup._",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Группируем по менеджеру
+        by_manager = {}
+        for row in rows:
+            mgr = row.get("manager_name") or "Неизвестно"
+            by_manager.setdefault(mgr, []).append(row)
+
+        lines = [f"🔍 *Упоминания «{product}»* за {days} дней\n"]
+        for mgr, msgs in sorted(by_manager.items()):
+            clients = list({r.get("contact_name", "") for r in msgs if r.get("contact_name")})
+            lines.append(f"👤 *{mgr}* — {len(msgs)} сообщений, {len(clients)} клиентов:")
+            for c in clients[:10]:
+                lines.append(f"  • {c}")
+            if len(clients) > 10:
+                lines.append(f"  _...и ещё {len(clients)-10}_")
+            lines.append("")
+
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3900] + "\n\n_...уточни запрос_"
+        await message.reply_text(text, parse_mode="Markdown")
+
     elif action == "broadcast":
         product = params.get("product", "")
         broadcast_text = params.get("message", "")
@@ -1444,6 +1523,7 @@ def main():
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("wazzup_setup", cmd_wazzup_setup))
     app.add_handler(CommandHandler("clearall", cmd_clear_all))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("cleartasks", cmd_clear_tasks))
@@ -1469,6 +1549,43 @@ def main():
     # Запускаем webhook-сервер и polling параллельно
     import aiohttp.web as web
 
+    async def handle_wazzup_webhook(request):
+        """Принимает webhook от Wazzup — сохраняет сообщения менеджеров."""
+        try:
+            data = await request.json()
+            messages = data.get("messages", [])
+            saved = 0
+            for msg in messages:
+                text = msg.get("text", "")
+                if not text:
+                    continue
+                is_outbound = msg.get("isEcho", False)  # isEcho=True = сообщение менеджера
+                contact = msg.get("contact", {})
+                contact_name = contact.get("name", msg.get("chatId", ""))
+                manager_id = msg.get("crmUserId", "")
+                # Имя менеджера ищем по crmUserId в нашем маппинге
+                manager_name = WAZZUP_MANAGERS.get(manager_id, manager_id)
+                sent_at = msg.get("dateTime", "")
+                ok = db.save_wazzup_message(
+                    message_id=msg.get("messageId", ""),
+                    channel_id=msg.get("channelId", ""),
+                    chat_type=msg.get("chatType", ""),
+                    chat_id=msg.get("chatId", ""),
+                    contact_name=contact_name,
+                    manager_id=manager_id,
+                    manager_name=manager_name,
+                    text=text,
+                    is_outbound=is_outbound,
+                    sent_at=sent_at,
+                )
+                if ok:
+                    saved += 1
+            logger.info(f"Wazzup webhook: получено {len(messages)} сообщений, сохранено {saved}")
+            return web.Response(text="ok")
+        except Exception as e:
+            logger.error(f"Wazzup webhook error: {e}")
+            return web.Response(text="error", status=500)
+
     async def handle_ms_webhook(request):
         """Принимает webhook от МойСклад — новые/обновлённые заказы."""
         try:
@@ -1485,6 +1602,7 @@ def main():
     async def run_web():
         web_app = web.Application()
         web_app.router.add_post("/webhook/moysklad", handle_ms_webhook)
+        web_app.router.add_post("/webhook/wazzup", handle_wazzup_webhook)
         web_app.router.add_get("/health", handle_health)
         port = int(os.getenv("PORT", "8080"))
         runner = web.AppRunner(web_app)
@@ -1526,6 +1644,9 @@ MANAGERS_CONTACTS = {
     "Скляр Инесса Ионасовна":          "+79622522903",
     "Голубева Татьяна":                "@tanya_keratin14",
 }
+
+# Маппинг crmUserId Wazzup → имя менеджера (заполним после первых вебхуков)
+WAZZUP_MANAGERS: dict = {}
 # Кэш для дедупликации webhook — order_id → timestamp последней проверки
 _price_check_cache: dict = {}
 # Хранилище данных алертов ПДЗ — order_id → {client, manager, debt_amount, debt_days, order_name}
