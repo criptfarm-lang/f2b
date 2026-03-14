@@ -1559,13 +1559,14 @@ def main():
                 text = msg.get("text", "")
                 if not text:
                     continue
+                logger.info(f"Wazzup msg: isEcho={msg.get('isEcho')} crmUserId={msg.get('crmUserId')} contact={msg.get('contact',{}).get('name')} chatType={msg.get('chatType')} text={text[:50]}")
                 is_outbound = msg.get("isEcho", False)  # isEcho=True = сообщение менеджера
                 contact = msg.get("contact", {})
                 contact_name = contact.get("name", msg.get("chatId", ""))
                 manager_id = msg.get("crmUserId", "")
-                # Имя менеджера ищем по crmUserId в нашем маппинге
                 manager_name = WAZZUP_MANAGERS.get(manager_id, manager_id)
                 sent_at = msg.get("dateTime", "")
+                logger.info(f"Wazzup msg: isEcho={is_outbound} manager_id='{manager_id}' contact='{contact_name}' text='{text[:60]}'")
                 ok = db.save_wazzup_message(
                     message_id=msg.get("messageId", ""),
                     channel_id=msg.get("channelId", ""),
