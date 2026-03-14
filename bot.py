@@ -178,6 +178,34 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
 
     parts = query.data.split("|")
 
+    # Выбор компании из списка похожих: wazzup_pick|company_name|link_key
+    if parts[0] == "wazzup_pick":
+        cp_name = parts[1]
+        link_key = parts[2]
+        pending = _pending_links.get(link_key) or _pending_links.get(query.from_user.id)
+        if not pending:
+            await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
+            return
+        pending["company_name"] = cp_name
+        # Переносим в user_id ключ
+        _pending_links[query.from_user.id] = {**pending, "link_key": link_key}
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🛒 Закупщик", callback_data=f"wazzup_role|закупщик|{link_key}"),
+                InlineKeyboardButton("👔 Директор", callback_data=f"wazzup_role|директор|{link_key}"),
+            ],
+            [
+                InlineKeyboardButton("💰 Бухгалтер", callback_data=f"wazzup_role|бухгалтер|{link_key}"),
+                InlineKeyboardButton("👤 Другое", callback_data=f"wazzup_role|другое|{link_key}"),
+            ]
+        ])
+        await query.message.edit_text(
+            f"✅ Нашёл: *{cp_name}*\n\nКакая роль у этого контакта?",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+        return
+
     # Выбор роли: wazzup_role|роль|link_key
     if parts[0] == "wazzup_role":
         role = parts[1]
@@ -781,15 +809,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             company_query = text.strip()
             counterparties = await get_counterparty_balance(company_query)
             if not counterparties:
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ Отменить привязку", callback_data=f"wazzup_role|отмена|{pending_link.get('link_key', str(user.id))}")
-                ]])
-                await message.reply_text(
-                    f"❌ Компания *{company_query}* не найдена в МойСклад.\n"
-                    f"Попробуй написать название точнее или отмени привязку.",
-                    parse_mode="Markdown",
-                    reply_markup=keyboard
-                )
+                # Пробуем найти по каждому слову отдельно
+                words = company_query.split()
+                suggestions = []
+                for word in words:
+                    if len(word) >= 3:
+                        found = await get_counterparty_balance(word)
+                        for c in found:
+                            if c not in suggestions:
+                                suggestions.append(c)
+
+                if suggestions:
+                    # Показываем кнопки с вариантами
+                    link_key = pending_link.get("link_key", str(user.id))
+                    buttons = []
+                    for c in suggestions[:5]:
+                        cp_name = c.get("name", "")
+                        buttons.append([InlineKeyboardButton(
+                            cp_name,
+                            callback_data=f"wazzup_pick|{cp_name[:40]}|{link_key}"
+                        )])
+                    buttons.append([InlineKeyboardButton(
+                        "❌ Отменить привязку",
+                        callback_data=f"wazzup_role|отмена|{link_key}"
+                    )])
+                    await message.reply_text(
+                        f"❓ *{company_query}* не найдена точно.\n\nВозможно имеется в виду:",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(buttons)
+                    )
+                else:
+                    keyboard = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("❌ Отменить привязку", callback_data=f"wazzup_role|отмена|{pending_link.get('link_key', str(user.id))}")
+                    ]])
+                    await message.reply_text(
+                        f"❌ Компания *{company_query}* не найдена в МойСклад.\n"
+                        f"Попробуй написать название точнее или отмени привязку.",
+                        parse_mode="Markdown",
+                        reply_markup=keyboard
+                    )
                 return
 
             cp = counterparties[0]
@@ -1892,7 +1950,7 @@ def main():
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
-    app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^wazzup_link"))
+    app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick)"))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
 
