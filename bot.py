@@ -178,14 +178,15 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
 
     parts = query.data.split("|")
 
-    # Выбор роли после ввода компании
+    # Выбор роли: wazzup_role|роль|link_key
     if parts[0] == "wazzup_role":
-        _, role, pending_key = parts[0], parts[1], parts[2]
-        pending = _pending_links.get(int(pending_key))
-        if not pending:
+        role = parts[1]
+        link_key = parts[2]
+        pending = _pending_links.get(link_key)
+        if not pending or "company_name" not in pending:
             await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
             return
-        _pending_links.pop(int(pending_key), None)
+        _pending_links.pop(link_key, None)
         ok = db.link_wazzup_contact(
             chat_id=pending["chat_id"],
             chat_type=pending["chat_type"],
@@ -201,20 +202,20 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
             )
         return
 
-    # Первое нажатие — запрашиваем название компании
-    if len(parts) < 4:
+    # Первое нажатие — запрашиваем название компании: wazzup_link|link_key
+    if len(parts) < 2:
         return
-    _, chat_id_val, channel_id_val, wazzup_name = parts[0], parts[1], parts[2], parts[3]
+    link_key = parts[1]
+    pending = _pending_links.get(link_key)
+    if not pending:
+        await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
+        return
 
-    _pending_links[query.from_user.id] = {
-        "chat_id": chat_id_val,
-        "channel_id": channel_id_val,
-        "wazzup_name": wazzup_name,
-        "chat_type": "telegram",
-    }
+    # Помечаем что ждём ввода от этого пользователя
+    _pending_links[query.from_user.id] = {**pending, "link_key": link_key}
 
     await query.message.edit_text(
-        f"📩 Контакт: *{wazzup_name}*\n\n"
+        f"📩 Контакт: *{pending['wazzup_name']}*\n\n"
         f"Напиши название компании из МойСклад:",
         parse_mode="Markdown"
     )
@@ -767,15 +768,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "company_name" not in pending_link:
             # Первый шаг — сохраняем название компании, просим роль
             pending_link["company_name"] = text.strip()
-            user_id_key = str(user.id)
+            link_key = pending_link.get("link_key", str(user.id))
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("🛒 Закупщик", callback_data=f"wazzup_role|закупщик|{user.id}"),
-                    InlineKeyboardButton("👔 Директор", callback_data=f"wazzup_role|директор|{user.id}"),
+                    InlineKeyboardButton("🛒 Закупщик", callback_data=f"wazzup_role|закупщик|{link_key}"),
+                    InlineKeyboardButton("👔 Директор", callback_data=f"wazzup_role|директор|{link_key}"),
                 ],
                 [
-                    InlineKeyboardButton("💰 Бухгалтер", callback_data=f"wazzup_role|бухгалтер|{user.id}"),
-                    InlineKeyboardButton("👤 Другое", callback_data=f"wazzup_role|другое|{user.id}"),
+                    InlineKeyboardButton("💰 Бухгалтер", callback_data=f"wazzup_role|бухгалтер|{link_key}"),
+                    InlineKeyboardButton("👤 Другое", callback_data=f"wazzup_role|другое|{link_key}"),
                 ]
             ])
             await message.reply_text(
@@ -784,7 +785,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=keyboard
             )
             return
-        # Если company_name уже есть — это не тот ввод
         _pending_links.pop(user.id, None)
         return
 
@@ -1907,10 +1907,18 @@ def main():
                         manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
                         for mgr_id in manager_ids:
                             try:
+                                import uuid as _uuid2
+                                link_key = str(_uuid2.uuid4())[:8]
+                                _pending_links[link_key] = {
+                                    "chat_id": chat_id_val,
+                                    "channel_id": channel_id_val,
+                                    "wazzup_name": contact_name,
+                                    "chat_type": chat_type,
+                                }
                                 keyboard = InlineKeyboardMarkup([[
                                     InlineKeyboardButton(
                                         "🏢 Привязать компанию",
-                                        callback_data=f"wazzup_link|{chat_id_val}|{channel_id_val}|{contact_name[:30]}"
+                                        callback_data=f"wazzup_link|{link_key}"
                                     )
                                 ]])
                                 last_text = text[:100] if text else "—"
