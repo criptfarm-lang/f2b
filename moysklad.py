@@ -1518,10 +1518,16 @@ async def get_counterparty_phones(buyers: list) -> list:
                         if phones:
                             phone = phones[0].get("value", "")
                     logger.info(f"get_counterparty_phones: {data.get('name')} raw_phone='{phone}'")
-                    # Нормализуем — оставляем только цифры, добавляем 7 если нужно
+                    # Нормализуем — оставляем только цифры
                     phone_clean = "".join(c for c in phone if c.isdigit())
-                    if phone_clean and len(phone_clean) == 10:
+                    if len(phone_clean) == 11 and phone_clean.startswith("8"):
+                        phone_clean = "7" + phone_clean[1:]
+                    elif len(phone_clean) == 10:
                         phone_clean = "7" + phone_clean
+                    elif len(phone_clean) == 11 and phone_clean.startswith("7"):
+                        pass  # уже правильный формат
+                    else:
+                        phone_clean = None  # неизвестный формат
                     result.append({
                         "name": data.get("name", b.get("name", "")),
                         "phone": phone_clean if phone_clean else None,
