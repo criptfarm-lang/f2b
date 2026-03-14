@@ -195,9 +195,10 @@ async def cmd_wazzup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines = ["📡 *Каналы Wazzup:*\n"]
     for ch in channels if isinstance(channels, list) else [channels]:
         ch_id = ch.get("id", ch.get("channelId", "?"))
-        name = ch.get("name", ch.get("transport", "?"))
+        name = ch.get("name", "")
+        transport = ch.get("transport", "")
         status = ch.get("state", ch.get("status", ""))
-        lines.append(f"• *{name}* `{ch_id}` {status}")
+        lines.append(f"• `{ch_id}`\n  transport: *{transport}* name: {name} status: {status}\n")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
