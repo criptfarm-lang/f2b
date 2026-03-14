@@ -1884,12 +1884,13 @@ def main():
                                         callback_data=f"wazzup_link|{chat_id_val}|{channel_id_val}|{contact_name[:30]}"
                                     )
                                 ]])
+                                last_text = text[:100] if text else "—"
                                 await app.bot.send_message(
                                     chat_id=mgr_id,
                                     text=(
-                                        f"📩 *Новый контакт в Telegram*\n\n"
-                                        f"Имя в Wazzup: `{contact_name}`\n"
-                                        f"chatId: `{chat_id_val}`\n\n"
+                                        f"📩 *Новый неизвестный контакт в Telegram*\n\n"
+                                        f"👤 Имя в TG: *{contact_name}*\n"
+                                        f"💬 Написал: _{last_text}_\n\n"
                                         f"Нажми кнопку и напиши название компании из МойСклад"
                                     ),
                                     parse_mode="Markdown",
