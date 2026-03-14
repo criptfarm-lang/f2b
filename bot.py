@@ -1488,8 +1488,14 @@ async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     api_key = os.getenv("WAZZUP_API_KEY", "")
-    channel_id = pending.get("channel_id") or os.getenv("WAZZUP_WA_CHANNEL_ID", "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03")
     import aiohttp, uuid as _uuid
+
+    # Каналы в порядке приоритета: Telegram → Max → WhatsApp
+    CHANNEL_PRIORITY = [
+        {"id": "ddd24a95-9304-4098-a320-3e47fcd1020a", "type": "telegram"},
+        {"id": "1d5bc70a-7ca6-4895-8d1f-9690cf448214", "type": "max"},
+        {"id": "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03", "type": "whatsapp"},
+    ]
 
     # Рассылка (несколько клиентов)
     if pending.get("is_broadcast"):
@@ -1541,27 +1547,40 @@ async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.wazzup24.com/v3/message",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "channelId": channel_id,
-                    "chatType": pending.get("chat_type", "whatsapp"),
-                    "chatId": pending["phone"],
-                    "crmMessageId": str(_uuid.uuid4()),
-                    "text": pending["text"],
-                }
-            ) as resp:
-                if resp.status in (200, 201):
-                    await query.message.edit_text(
-                        f"✅ Сообщение отправлено *{pending['name']}*",
-                        parse_mode="Markdown"
-                    )
-                    logger.info(f"Wazzup: отправлено {pending['name']} ({pending['phone']})")
-                else:
-                    body = await resp.text()
-                    logger.error(f"Wazzup send error {resp.status}: {body}")
-                    await query.message.edit_text(f"❌ Ошибка отправки: {resp.status}\n{body[:300]}")
+            sent_channel = None
+            last_error = ""
+            for ch in CHANNEL_PRIORITY:
+                try:
+                    async with session.post(
+                        "https://api.wazzup24.com/v3/message",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json={
+                            "channelId": ch["id"],
+                            "chatType": ch["type"],
+                            "chatId": pending["phone"],
+                            "crmMessageId": str(_uuid.uuid4()),
+                            "text": pending["text"],
+                        }
+                    ) as resp:
+                        if resp.status in (200, 201):
+                            sent_channel = ch["type"]
+                            break
+                        else:
+                            body = await resp.text()
+                            last_error = f"{resp.status}: {body[:100]}"
+                            logger.warning(f"Wazzup {ch['type']} failed: {last_error}")
+                except Exception as e:
+                    last_error = str(e)
+                    logger.warning(f"Wazzup {ch['type']} exception: {e}")
+
+            if sent_channel:
+                await query.message.edit_text(
+                    f"✅ Сообщение отправлено *{pending['name']}* через {sent_channel}",
+                    parse_mode="Markdown"
+                )
+                logger.info(f"Wazzup: отправлено {pending['name']} ({pending['phone']}) через {sent_channel}")
+            else:
+                await query.message.edit_text(f"❌ Не удалось отправить ни через один канал.\nПоследняя ошибка: {last_error}")
     except Exception as e:
         await query.message.edit_text(f"❌ Ошибка: {e}")
 
