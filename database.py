@@ -169,6 +169,11 @@ class Database:
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'закупщик'",
+            "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS tags TEXT",
+            "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS manager TEXT",
+            "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS segment TEXT",
+            "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS segment TEXT",
+            "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS manager TEXT",
             """CREATE TABLE IF NOT EXISTS wazzup_contacts (
                 id SERIAL PRIMARY KEY,
                 contact_name TEXT NOT NULL,
@@ -539,18 +544,19 @@ class Database:
 
     def link_wazzup_contact(self, chat_id: str, chat_type: str,
                             channel_id: str, company_name: str,
-                            wazzup_name: str = "", role: str = "закупщик") -> bool:
+                            wazzup_name: str = "", role: str = "закупщик",
+                            segment: str = "", manager: str = "") -> bool:
         """Привязывает chatId к названию компании и роли."""
         try:
             with self.conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO wazzup_contact_map
-                       (chat_id, chat_type, channel_id, company_name, wazzup_name, role)
-                       VALUES (%s, %s, %s, %s, %s, %s)
+                       (chat_id, chat_type, channel_id, company_name, wazzup_name, role, segment, manager)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                        ON CONFLICT (chat_id) DO UPDATE
                        SET company_name=EXCLUDED.company_name, wazzup_name=EXCLUDED.wazzup_name,
-                           role=EXCLUDED.role""",
-                    (chat_id, chat_type, channel_id, company_name, wazzup_name, role)
+                           role=EXCLUDED.role, segment=EXCLUDED.segment, manager=EXCLUDED.manager""",
+                    (chat_id, chat_type, channel_id, company_name, wazzup_name, role, segment, manager)
                 )
             self.conn.commit()
             # Обновляем и в wazzup_contacts
@@ -568,6 +574,23 @@ class Database:
             self.conn.rollback()
             logger.warning(f"link_wazzup_contact error: {e}")
             return False
+
+    def update_wazzup_contact_tags(self, chat_id: str, tags: list,
+                                    manager: str = "", segment: str = ""):
+        """Обновляет теги, менеджера и сегмент контакта из МойСклад."""
+        try:
+            tags_str = ", ".join(tags) if tags else ""
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE wazzup_contact_map
+                       SET tags=%s, manager=%s, segment=%s
+                       WHERE chat_id=%s""",
+                    (tags_str, manager, segment, chat_id)
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"update_wazzup_contact_tags error: {e}")
 
     def get_wazzup_broadcast_contacts(self, company_name: str,
                                        roles: list = None) -> list:
