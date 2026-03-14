@@ -672,69 +672,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Проверяем подтверждение рассылки через Wazzup
-    if text.lower().strip() in ("да, рассылай", "да рассылай", "рассылай", "подтверждаю"):
-        pending = context.user_data.get("pending_broadcast")
-        if pending:
-            contacts = pending["contacts"]
-            broadcast_text = pending["text"]
-            product = pending["product"]
-            count = len(contacts)
-            context.user_data.pop("pending_broadcast", None)
-
-            await message.reply_text(
-                f"🚀 Начинаю рассылку по *{product}*\n"
-                f"📨 {count} получателей · ~{count} мин\n"
-                f"Отчёт пришлю по завершении.",
-                parse_mode="Markdown"
-            )
-
-            async def run_wazzup_broadcast():
-                api_key = os.getenv("WAZZUP_API_KEY", "")
-                channel_id = os.getenv("WAZZUP_CHANNEL_ID", "")
-                sent, failed = 0, 0
-                import aiohttp, uuid as _uuid
-                async with aiohttp.ClientSession() as session:
-                    for c in contacts:
-                        phone = c.get("phone", "").strip().replace("+", "").replace(" ", "").replace("-", "")
-                        if not phone:
-                            failed += 1
-                            continue
-                        chat_type = c.get("chat_type", "whatsapp")
-                        try:
-                            async with session.post(
-                                "https://api.wazzup24.com/v3/message",
-                                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                                json={
-                                    "channelId": channel_id,
-                                    "chatType": chat_type,
-                                    "chatId": phone,
-                                    "crmMessageId": str(_uuid.uuid4()),
-                                    "text": broadcast_text,
-                                }
-                            ) as resp:
-                                if resp.status in (200, 201):
-                                    sent += 1
-                                else:
-                                    body = await resp.text()
-                                    logger.warning(f"Wazzup send error {resp.status}: {body[:100]}")
-                                    failed += 1
-                        except Exception as e:
-                            logger.error(f"Wazzup send exception: {e}")
-                            failed += 1
-                        await asyncio.sleep(60)  # 1 сообщение в минуту
-
-                result_text = (
-                    f"✅ *Рассылка завершена!*\n"
-                    f"📨 Отправлено: {sent}/{count}\n"
-                )
-                if failed:
-                    result_text += f"❌ Не отправлено: {failed} (нет телефона или ошибка)\n"
-                await context.bot.send_message(chat_id=chat_id, text=result_text, parse_mode="Markdown")
-
-            asyncio.create_task(run_wazzup_broadcast())
-            return
-
     if not is_bot_addressed(text):
         return
 
@@ -1034,6 +971,74 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
+    elif action == "send_message_to_client":
+        client_query = params.get("client", "")
+        msg_text = params.get("message", "")
+
+        if not client_query:
+            await message.reply_text("❌ Укажи клиента.")
+            return
+
+        await message.reply_chat_action("typing")
+
+        # Находим контрагента в МойСклад
+        from moysklad import get_counterparty_balance, get_counterparty_phones
+        counterparties = await get_counterparty_balance(client_query)
+        if not counterparties:
+            await message.reply_text(f"❌ Клиент *{client_query}* не найден в МойСклад.", parse_mode="Markdown")
+            return
+
+        cp = counterparties[0]
+        cp_name = cp.get("name", client_query)
+
+        # Берём телефон
+        phones = await get_counterparty_phones([{"id": cp.get("id",""), "name": cp_name, "href": cp.get("href","")}])
+        phone = phones[0].get("phone") if phones else None
+
+        if not phone:
+            await message.reply_text(f"❌ У клиента *{cp_name}* нет телефона в МойСклад.", parse_mode="Markdown")
+            return
+
+        # Если текст не задан — формируем напоминание об оплате
+        if not msg_text:
+            balance = cp.get("balance", 0)
+            debt = abs(balance) if balance < 0 else 0
+            if debt > 0:
+                from moysklad import fmt_money
+                msg_text = f"Добрый день! Напоминаем о задолженности перед компанией F2B в размере {fmt_money(debt)}. Просьба произвести оплату. Спасибо!"
+            else:
+                await message.reply_text(f"❌ У *{cp_name}* нет долга. Укажи текст сообщения явно.", parse_mode="Markdown")
+                return
+
+        # Показываем превью с кнопками — ждём подтверждения
+        import uuid as _uuid
+        msg_key = str(_uuid.uuid4())[:8]
+        _pending_sends[msg_key] = {
+            "phone": phone,
+            "name": cp_name,
+            "text": msg_text,
+            "chat_type": "whatsapp",
+        }
+
+        group_chat_id = get_group_chat_id()
+        target_chat = group_chat_id or chat_id
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Отправить", callback_data=f"send_confirm|{msg_key}"),
+            InlineKeyboardButton("❌ Отменить", callback_data=f"send_cancel|{msg_key}"),
+        ]])
+        await context.bot.send_message(
+            chat_id=target_chat,
+            text=(
+                f"📤 *Сообщение клиенту*\n\n"
+                f"👤 *{cp_name}*\n"
+                f"📱 {phone}\n\n"
+                f"💬 _{msg_text}_"
+            ),
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+
     elif action == "search_mentions":
         product = params.get("product", "")
         days = int(params.get("days", 7))
@@ -1134,11 +1139,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await message.reply_text(confirm_text, parse_mode="Markdown")
 
-        context.user_data["pending_broadcast"] = {
+        # Сохраняем и показываем кнопку подтверждения
+        import uuid as _uuid
+        broadcast_key = str(_uuid.uuid4())[:8]
+        _pending_sends[f"broadcast_{broadcast_key}"] = {
             "contacts": with_phone,
             "text": broadcast_text,
             "product": found_name,
+            "is_broadcast": True,
         }
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Начать рассылку", callback_data=f"send_confirm|broadcast_{broadcast_key}"),
+            InlineKeyboardButton("❌ Отменить", callback_data=f"send_cancel|broadcast_{broadcast_key}"),
+        ]])
+        await message.reply_text(confirm_text, parse_mode="Markdown", reply_markup=keyboard)
 
     elif action == "find_contact":
         contact_query = params.get("query", "")
@@ -1399,6 +1414,116 @@ async def cmd_add_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Ошибка для {mgr['name']}: {e}")
 
 
+# Хранилище ожидающих отправки сообщений — message_key → {phone, name, text, chat_type}
+_pending_sends: dict = {}
+
+
+async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатие кнопки Отправить / Отменить для сообщений клиентам."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    if user.id not in manager_ids:
+        await query.answer("⛔ Только для руководителей.", show_alert=True)
+        return
+
+    parts = query.data.split("|")
+    action = parts[0]
+    msg_key = parts[1] if len(parts) > 1 else ""
+
+    if action == "send_cancel":
+        _pending_sends.pop(msg_key, None)
+        await query.message.edit_text("❌ Отправка отменена.")
+        return
+
+    if action != "send_confirm":
+        return
+
+    pending = _pending_sends.pop(msg_key, None)
+    if not pending:
+        await query.message.edit_text("❌ Сообщение устарело — попробуй снова.")
+        return
+
+    api_key = os.getenv("WAZZUP_API_KEY", "")
+    channel_id = os.getenv("WAZZUP_CHANNEL_ID", "")
+    import aiohttp, uuid as _uuid
+
+    # Рассылка (несколько клиентов)
+    if pending.get("is_broadcast"):
+        contacts = pending["contacts"]
+        product = pending["product"]
+        broadcast_text = pending["text"]
+        count = len(contacts)
+        await query.message.edit_text(
+            f"🚀 Начинаю рассылку по *{product}*\n📨 {count} получателей · ~{count} мин",
+            parse_mode="Markdown"
+        )
+
+        async def run_wazzup_broadcast():
+            sent, failed = 0, 0
+            async with aiohttp.ClientSession() as session:
+                for c in contacts:
+                    phone = c.get("phone", "")
+                    if not phone:
+                        failed += 1
+                        continue
+                    try:
+                        async with session.post(
+                            "https://api.wazzup24.com/v3/message",
+                            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                            json={
+                                "channelId": channel_id,
+                                "chatType": c.get("chat_type", "whatsapp"),
+                                "chatId": phone,
+                                "crmMessageId": str(_uuid.uuid4()),
+                                "text": broadcast_text,
+                            }
+                        ) as resp:
+                            if resp.status in (200, 201):
+                                sent += 1
+                            else:
+                                failed += 1
+                    except Exception:
+                        failed += 1
+                    await asyncio.sleep(60)
+
+            result_text = f"✅ *Рассылка завершена!*\n📨 Отправлено: {sent}/{count}\n"
+            if failed:
+                result_text += f"❌ Не отправлено: {failed}\n"
+            group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
+            await context.bot.send_message(chat_id=group_chat_id or query.message.chat_id, text=result_text, parse_mode="Markdown")
+
+        asyncio.create_task(run_wazzup_broadcast())
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.wazzup24.com/v3/message",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "channelId": channel_id,
+                    "chatType": pending.get("chat_type", "whatsapp"),
+                    "chatId": pending["phone"],
+                    "crmMessageId": str(_uuid.uuid4()),
+                    "text": pending["text"],
+                }
+            ) as resp:
+                if resp.status in (200, 201):
+                    await query.message.edit_text(
+                        f"✅ Сообщение отправлено *{pending['name']}*",
+                        parse_mode="Markdown"
+                    )
+                    logger.info(f"Wazzup: отправлено {pending['name']} ({pending['phone']})")
+                else:
+                    body = await resp.text()
+                    await query.message.edit_text(f"❌ Ошибка отправки: {resp.status} {body[:100]}")
+    except Exception as e:
+        await query.message.edit_text(f"❌ Ошибка: {e}")
+
+
 async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тестовый запуск утренних задач ПДЗ. /pdz_test [имя|all]"""
     user = update.message.from_user
@@ -1568,6 +1693,7 @@ def main():
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
+    app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
 
