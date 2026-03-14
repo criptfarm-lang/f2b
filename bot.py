@@ -169,34 +169,37 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаляет все открытые задачи кроме указанных ID. Только для руководителя."""
+    logger.info(f"cmd_clear_tasks вызван от {update.effective_user.id} args={context.args}")
     user = update.effective_user
     manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
     if user.id not in manager_ids:
         return
-    # /cleartasks keep 5 12  — оставить только задачи с ID 5 и 12
-    args = context.args
-    if args and args[0] == "keep":
-        keep_ids = [int(x) for x in args[1:] if x.isdigit()]
-        db = Database()
-        with db.conn.cursor() as cur:
-            if keep_ids:
-                placeholders = ",".join(["%s"] * len(keep_ids))
-                cur.execute(f"UPDATE tasks SET done=true, result='Удалено руководителем' WHERE done=false AND id NOT IN ({placeholders})", keep_ids)
-            else:
-                cur.execute("UPDATE tasks SET done=true, result='Удалено руководителем' WHERE done=false")
-        db.conn.commit()
-        db.conn.close()
-        await update.message.reply_text(f"✅ Все задачи очищены." if not keep_ids else f"✅ Задачи очищены. Оставлены ID: {keep_ids}")
-    else:
-        # Показываем список с ID
-        db = Database()
-        tasks = db.get_all_open_tasks()
-        if not tasks:
-            await update.message.reply_text("Нет открытых задач.")
-            return
-        lines = [f"ID {t['id']}: {t.get('executor','—')} — {t.get('text','')}" for t in tasks]
-        lines.append("\nЧтобы оставить только нужные: /cleartasks keep 5 12")
-        await update.message.reply_text("\n".join(lines))
+    try:
+        args = context.args
+        if args and args[0] == "keep":
+            keep_ids = [int(x) for x in args[1:] if x.isdigit()]
+            db = Database()
+            with db.conn.cursor() as cur:
+                if keep_ids:
+                    placeholders = ",".join(["%s"] * len(keep_ids))
+                    cur.execute(f"UPDATE tasks SET done=true, result='Удалено руководителем' WHERE done=false AND id NOT IN ({placeholders})", keep_ids)
+                else:
+                    cur.execute("UPDATE tasks SET done=true, result='Удалено руководителем' WHERE done=false")
+            db.conn.commit()
+            db.conn.close()
+            await update.message.reply_text(f"✅ Все задачи очищены." if not keep_ids else f"✅ Задачи очищены. Оставлены ID: {keep_ids}")
+        else:
+            db = Database()
+            tasks = db.get_all_open_tasks()
+            if not tasks:
+                await update.message.reply_text("Нет открытых задач.")
+                return
+            lines = [f"ID {t['id']}: {t.get('executor','—')} — {t.get('text','')}" for t in tasks]
+            lines.append("\nЧтобы оставить только нужные: /cleartasks keep 5 12")
+            await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.error(f"cmd_clear_tasks error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 async def cmd_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
