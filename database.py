@@ -118,6 +118,21 @@ class Database:
                 commented_by TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
             );
+
+            CREATE TABLE IF NOT EXISTS wazzup_messages (
+                id SERIAL PRIMARY KEY,
+                message_id TEXT UNIQUE,
+                channel_id TEXT,
+                chat_type TEXT,
+                chat_id TEXT,
+                contact_name TEXT,
+                manager_id TEXT,
+                manager_name TEXT,
+                text TEXT,
+                is_outbound BOOLEAN DEFAULT FALSE,
+                sent_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
         """
         with self.conn.cursor() as cur:
             cur.execute(sql)
@@ -395,3 +410,69 @@ class Database:
             "SELECT * FROM pdz_comments ORDER BY created_at DESC LIMIT %s",
             (limit,)
         )
+
+    # ─── WAZZUP СООБЩЕНИЯ ─────────────────────────────────────────────────────
+
+    def save_wazzup_message(self, message_id: str, channel_id: str, chat_type: str,
+                            chat_id: str, contact_name: str, manager_id: str,
+                            manager_name: str, text: str, is_outbound: bool,
+                            sent_at: str) -> bool:
+        """Сохраняет сообщение из Wazzup. Возвращает True если новое."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wazzup_messages
+                       (message_id, channel_id, chat_type, chat_id, contact_name,
+                        manager_id, manager_name, text, is_outbound, sent_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (message_id) DO NOTHING RETURNING id""",
+                    (message_id, channel_id, chat_type, chat_id, contact_name,
+                     manager_id, manager_name, text, is_outbound, sent_at)
+                )
+                row = cur.fetchone()
+                self.conn.commit()
+                return row is not None
+        except Exception:
+            self.conn.rollback()
+            return False
+
+    def search_wazzup_mentions(self, keywords: list, days: int = 7,
+                               manager_name: str = None) -> list:
+        """Ищет исходящие сообщения менеджеров с упоминанием ключевых слов."""
+        from datetime import datetime, timedelta
+        since = datetime.now() - timedelta(days=days)
+
+        conditions = ["is_outbound = TRUE", "sent_at >= %s", "text IS NOT NULL"]
+        params = [since]
+
+        if manager_name:
+            conditions.append("LOWER(manager_name) LIKE %s")
+            params.append(f"%{manager_name.lower()}%")
+
+        # Фильтр по ключевым словам (любое из них)
+        kw_conditions = " OR ".join(["LOWER(text) LIKE %s"] * len(keywords))
+        conditions.append(f"({kw_conditions})")
+        for kw in keywords:
+            params.append(f"%{kw.lower()}%")
+
+        sql = f"""
+            SELECT manager_name, contact_name, chat_type, text, sent_at
+            FROM wazzup_messages
+            WHERE {' AND '.join(conditions)}
+            ORDER BY manager_name, sent_at DESC
+        """
+        return self._fetchall(sql, params)
+
+    def get_wazzup_stats(self, days: int = 7) -> dict:
+        """Статистика сообщений по менеджерам за период."""
+        from datetime import datetime, timedelta
+        since = datetime.now() - timedelta(days=days)
+        rows = self._fetchall(
+            """SELECT manager_name, COUNT(*) as msg_count,
+               COUNT(DISTINCT chat_id) as client_count
+               FROM wazzup_messages
+               WHERE is_outbound = TRUE AND sent_at >= %s AND manager_name IS NOT NULL
+               GROUP BY manager_name ORDER BY msg_count DESC""",
+            (since,)
+        )
+        return {r['manager_name']: r for r in rows}
