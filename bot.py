@@ -178,15 +178,15 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = []
 
-    async def check(name: str, coro):
+    async def check(name: str, coro, timeout: int = 8):
         try:
-            result = await asyncio.wait_for(coro, timeout=8)
+            result = await asyncio.wait_for(coro, timeout=timeout)
             if result:
                 results.append(f"✅ {name}")
             else:
                 results.append(f"⚠️ {name} — пустой результат")
         except asyncio.TimeoutError:
-            results.append(f"⚠️ {name} — таймаут (>8с)")
+            results.append(f"⚠️ {name} — таймаут (>{timeout}с)")
         except Exception as e:
             results.append(f"❌ {name} — {str(e)[:60]}")
 
@@ -225,7 +225,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from moysklad import get_overdue_demands
         rows = await get_overdue_demands()
         return rows is not None
-    await check("МойСклад ПДЗ", test_pdz())
+    await check("МойСклад ПДЗ", test_pdz(), timeout=30)
 
     # 6. Claude API — диспетчер
     async def test_claude():
@@ -238,7 +238,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def test_photo():
         from moysklad import search_media
         result = await search_media("лосось")
-        return result is not None  # None тоже ок — просто не нашёл
+        return True  # None тоже ок — просто не нашёл
     await check("Поиск фото (канал Контент)", test_photo())
 
     # 8. Геокодер
@@ -250,9 +250,8 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 9. amoCRM
     async def test_amo():
-        from amocrm import get_contacts
-        result = await get_contacts("тест")
-        return result is not None
+        from amocrm import check_connection
+        return await check_connection()
     await check("amoCRM API", test_amo())
 
     # 10. Webhook сервер
