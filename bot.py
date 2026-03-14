@@ -827,6 +827,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user and user.id in _pending_links and not is_bot_addressed(text):
         pending_link = _pending_links[user.id]
         if "company_name" not in pending_link:
+            # Если уже показали варианты — просим нажать кнопку
+            if pending_link.get("suggestions"):
+                await message.reply_text("👆 Выбери компанию из списка выше или нажми «Не привязывать».")
+                return
             # Ищем компанию в МойСклад
             company_query = text.strip()
             counterparties = await get_counterparty_balance(company_query)
