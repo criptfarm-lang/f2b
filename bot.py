@@ -167,6 +167,113 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет все основные функции Эфа. Только для руководителя."""
+    user = update.effective_user
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    if user.id not in manager_ids:
+        return
+
+    await update.message.reply_text("🔍 Запускаю диагностику...", parse_mode="Markdown")
+
+    results = []
+
+    async def check(name: str, coro):
+        try:
+            result = await coro
+            if result:
+                results.append(f"✅ {name}")
+            else:
+                results.append(f"⚠️ {name} — пустой результат")
+        except Exception as e:
+            results.append(f"❌ {name} — {str(e)[:60]}")
+
+    # 1. БД — задачи
+    try:
+        tasks = db.get_all_open_tasks()
+        results.append(f"✅ База данных — {len(tasks)} открытых задач")
+    except Exception as e:
+        results.append(f"❌ База данных — {e}")
+
+    # 2. МойСклад — токен и базовый запрос
+    async def test_ms():
+        from moysklad import get_headers, MS_BASE
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{MS_BASE}/entity/organization", headers=get_headers()) as resp:
+                return resp.status == 200
+    await check("МойСклад API", test_ms())
+
+    # 3. МойСклад — поиск товара
+    async def test_ms_search():
+        from moysklad import search_products
+        rows = await search_products("лосось")
+        return len(rows) > 0
+    await check("МойСклад поиск товаров", test_ms_search())
+
+    # 4. МойСклад — баланс контрагента
+    async def test_ms_balance():
+        from moysklad import get_counterparty_balance
+        rows = await get_counterparty_balance("джи")
+        return len(rows) > 0
+    await check("МойСклад баланс контрагента", test_ms_balance())
+
+    # 5. МойСклад — ПДЗ
+    async def test_pdz():
+        from moysklad import get_overdue_demands
+        rows = await get_overdue_demands()
+        return rows is not None
+    await check("МойСклад ПДЗ", test_pdz())
+
+    # 6. Claude API — диспетчер
+    async def test_claude():
+        from claude_ai import dispatch
+        result = await dispatch("привет", "Test")
+        return result.get("action") is not None
+    await check("Claude AI диспетчер", test_claude())
+
+    # 7. Поиск фото
+    async def test_photo():
+        from moysklad import search_media
+        result = await search_media("лосось")
+        return result is not None  # None тоже ок — просто не нашёл
+    await check("Поиск фото (канал Контент)", test_photo())
+
+    # 8. Геокодер
+    async def test_geocoder():
+        from moysklad import geocode_address
+        coords = await geocode_address("Истра, Московская область")
+        return coords is not None
+    await check("Яндекс геокодер", test_geocoder())
+
+    # 9. amoCRM
+    async def test_amo():
+        from amocrm import get_contacts
+        result = await get_contacts("тест")
+        return result is not None
+    await check("amoCRM API", test_amo())
+
+    # 10. Webhook сервер
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://f2b-production.up.railway.app/health") as resp:
+                if resp.status == 200:
+                    results.append("✅ Webhook сервер")
+                else:
+                    results.append(f"⚠️ Webhook сервер — статус {resp.status}")
+    except Exception as e:
+        results.append(f"❌ Webhook сервер — {e}")
+
+    # Итог
+    ok = sum(1 for r in results if r.startswith("✅"))
+    warn = sum(1 for r in results if r.startswith("⚠️"))
+    err = sum(1 for r in results if r.startswith("❌"))
+
+    header = f"📊 *Диагностика Эфа*\n✅ {ok} ок  ⚠️ {warn} предупреждений  ❌ {err} ошибок\n\n"
+    await update.message.reply_text(header + "\n".join(results), parse_mode="Markdown")
+
+
 async def cmd_clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаляет все открытые задачи кроме указанных ID. Только для руководителя."""
     logger.info(f"cmd_clear_tasks вызван от {update.effective_user.id} args={context.args}")
@@ -1318,6 +1425,7 @@ def main():
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("cleartasks", cmd_clear_tasks))
     app.add_handler(CommandHandler("all_tasks", cmd_all_tasks))
     app.add_handler(CommandHandler("overdue", cmd_overdue))
