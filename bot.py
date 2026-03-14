@@ -234,11 +234,9 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
         # Отмена
         if role == "отмена":
             _pending_links.pop(link_key, None)
-            # Убираем и из user_id если есть
-            for uid, v in list(_pending_links.items()):
-                if v.get("link_key") == link_key:
-                    _pending_links.pop(uid, None)
-            await query.message.edit_text("❌ Привязка отменена. Контакт пока не идентифицирован.")
+            for uid in [k for k, v in list(_pending_links.items()) if v.get("link_key") == link_key]:
+                _pending_links.pop(uid, None)
+            await query.message.delete()
             return
         pending = _pending_links.get(link_key)
         # Если не нашли по link_key — ищем по user_id среди всех pending
@@ -267,6 +265,12 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
                 f"✅ *{pending['wazzup_name']}* → *{pending['company_name']}* ({role})\nЭф запомнил!",
                 parse_mode="Markdown"
             )
+            # Удаляем сообщение через 3 секунды
+            await asyncio.sleep(3)
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
         return
 
     # Первое нажатие — запрашиваем название компании: wazzup_link|link_key
