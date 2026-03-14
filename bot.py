@@ -729,6 +729,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = message.from_user
     text = message.text or message.caption or ""
 
+    # В группе ИДЕНТИФИКАЦИЯ — только кнопки, текст игнорируем
+    wazzup_id_chat = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
+    if wazzup_id_chat and chat_id == wazzup_id_chat:
+        # Обрабатываем только ввод названия компании (pending_links)
+        if user and user.id in _pending_links and text and not text.startswith("/"):
+            pass  # продолжаем — это ввод названия компании
+        else:
+            return
+
     # Сохраняем все сообщения в историю чата
     if text and user:
         db.save_message(
