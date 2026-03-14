@@ -182,6 +182,16 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
     if parts[0] == "wazzup_role":
         role = parts[1]
         link_key = parts[2]
+
+        # Отмена
+        if role == "отмена":
+            _pending_links.pop(link_key, None)
+            # Убираем и из user_id если есть
+            for uid, v in list(_pending_links.items()):
+                if v.get("link_key") == link_key:
+                    _pending_links.pop(uid, None)
+            await query.message.edit_text("❌ Привязка отменена. Контакт пока не идентифицирован.")
+            return
         pending = _pending_links.get(link_key)
         if not pending or "company_name" not in pending:
             await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
@@ -766,9 +776,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user and user.id in _pending_links and not is_bot_addressed(text):
         pending_link = _pending_links[user.id]
         if "company_name" not in pending_link:
-            # Первый шаг — сохраняем название компании, просим роль
-            pending_link["company_name"] = text.strip()
+            # Ищем компанию в МойСклад
+            company_query = text.strip()
+            counterparties = await get_counterparty_balance(company_query)
+            if not counterparties:
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отменить привязку", callback_data=f"wazzup_role|отмена|{pending_link.get('link_key', str(user.id))}")
+                ]])
+                await message.reply_text(
+                    f"❌ Компания *{company_query}* не найдена в МойСклад.\n"
+                    f"Попробуй написать название точнее или отмени привязку.",
+                    parse_mode="Markdown",
+                    reply_markup=keyboard
+                )
+                return
+
+            cp = counterparties[0]
+            cp_name = cp.get("name", company_query)
+            pending_link["company_name"] = cp_name
             link_key = pending_link.get("link_key", str(user.id))
+
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("🛒 Закупщик", callback_data=f"wazzup_role|закупщик|{link_key}"),
@@ -780,7 +807,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]
             ])
             await message.reply_text(
-                f"Компания: *{text.strip()}*\n\nКакая роль у этого контакта?",
+                f"✅ Нашёл: *{cp_name}*\n\nКакая роль у этого контакта?",
                 parse_mode="Markdown",
                 reply_markup=keyboard
             )
