@@ -168,6 +168,16 @@ class Database:
                 role TEXT DEFAULT 'закупщик',
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
+            "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'закупщик'",
+            """CREATE TABLE IF NOT EXISTS wazzup_contacts (
+                id SERIAL PRIMARY KEY,
+                contact_name TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                chat_type TEXT,
+                channel_id TEXT,
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(contact_name, chat_type)
+            )""",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:
