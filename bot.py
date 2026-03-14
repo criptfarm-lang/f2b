@@ -1055,8 +1055,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         PRIORITY = ["telegram", "tgapi", "max", "whatsapp"]
 
-        # Ищем известные каналы клиента из вебхуков
+        # Ищем известные каналы клиента из вебхуков — по имени или телефону
         known = db.get_wazzup_contacts(cp_name)
+        # Также ищем по номеру телефона
+        if phone and not known:
+            known = db.get_wazzup_contacts(phone[-10:])  # последние 10 цифр
         channels_to_try = []
         for p in PRIORITY:
             for k in known:
@@ -1573,7 +1576,7 @@ async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         async with aiohttp.ClientSession() as session:
             sent_channel = None
             last_error = ""
-            channels = pending.get("channels") or [{"channel_id": "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03", "chat_type": "whatsapp", "chat_id": pending.get("phone","")}]
+            channels = pending.get("channels") or []
             for ch in channels:
                 try:
                     async with session.post(
