@@ -180,11 +180,13 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async def check(name: str, coro):
         try:
-            result = await coro
+            result = await asyncio.wait_for(coro, timeout=8)
             if result:
                 results.append(f"✅ {name}")
             else:
                 results.append(f"⚠️ {name} — пустой результат")
+        except asyncio.TimeoutError:
+            results.append(f"⚠️ {name} — таймаут (>8с)")
         except Exception as e:
             results.append(f"❌ {name} — {str(e)[:60]}")
 
