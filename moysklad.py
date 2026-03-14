@@ -1490,6 +1490,50 @@ async def get_buyers_by_product(product_query: str, period_days: int = 180) -> l
     return {"buyers": buyers, "product_name": product_name}
 
 
+async def get_counterparty_phones(buyers: list) -> list:
+    """
+    Получает телефоны контрагентов из МойСклад.
+    buyers — список dict с полями id, name, href.
+    Возвращает список {name, phone, id}.
+    """
+    result = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            for b in buyers:
+                href = b.get("href", "")
+                if not href:
+                    result.append({"name": b.get("name", ""), "phone": None, "id": b.get("id", "")})
+                    continue
+                try:
+                    async with session.get(href, headers=get_headers()) as resp:
+                        if resp.status != 200:
+                            result.append({"name": b.get("name", ""), "phone": None, "id": b.get("id", "")})
+                            continue
+                        data = await resp.json()
+                    # Телефон в поле phone (строка) или в массиве phones
+                    phone = data.get("phone", "") or ""
+                    if not phone:
+                        phones = data.get("phones", [])
+                        if phones:
+                            phone = phones[0].get("value", "")
+                    # Нормализуем — оставляем только цифры, добавляем 7 если нужно
+                    phone_clean = "".join(c for c in phone if c.isdigit())
+                    if phone_clean and len(phone_clean) == 10:
+                        phone_clean = "7" + phone_clean
+                    result.append({
+                        "name": data.get("name", b.get("name", "")),
+                        "phone": phone_clean if phone_clean else None,
+                        "id": b.get("id", ""),
+                        "chat_type": "whatsapp",
+                    })
+                except Exception as e:
+                    logger.warning(f"get_counterparty_phones: {b.get('name')} error: {e}")
+                    result.append({"name": b.get("name", ""), "phone": None, "id": b.get("id", "")})
+    except Exception as e:
+        logger.error(f"get_counterparty_phones: {e}")
+    return result
+
+
 async def check_order_prices(order_href: str) -> list:
     """
     Проверяет цены в заказе покупателя.
