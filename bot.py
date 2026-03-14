@@ -1046,19 +1046,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await message.reply_text(f"❌ У *{cp_name}* нет долга. Укажи текст сообщения явно.", parse_mode="Markdown")
                 return
 
+        # Определяем каналы в порядке приоритета TG → Max → WhatsApp
+        CHANNEL_MAP = {
+            "telegram": "ddd24a95-9304-4098-a320-3e47fcd1020a",
+            "tgapi":    "ddd24a95-9304-4098-a320-3e47fcd1020a",
+            "max":      "1d5bc70a-7ca6-4895-8d1f-9690cf448214",
+            "whatsapp": "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03",
+        }
+        PRIORITY = ["telegram", "tgapi", "max", "whatsapp"]
+
+        # Ищем известные каналы клиента из вебхуков
+        known = db.get_wazzup_contacts(cp_name)
+        channels_to_try = []
+        for p in PRIORITY:
+            for k in known:
+                if k.get("chat_type") in (p,):
+                    channels_to_try.append({
+                        "channel_id": k["channel_id"],
+                        "chat_type": k["chat_type"],
+                        "chat_id": k["chat_id"],
+                    })
+                    break
+
+        # Fallback — WhatsApp по номеру телефона если нет известных каналов
+        if not any(c["chat_type"] in ("whatsapp",) for c in channels_to_try):
+            channels_to_try.append({
+                "channel_id": CHANNEL_MAP["whatsapp"],
+                "chat_type": "whatsapp",
+                "chat_id": phone,
+            })
+
         # Показываем превью с кнопками — ждём подтверждения
         import uuid as _uuid
         msg_key = str(_uuid.uuid4())[:8]
-
-        # Определяем канал и тип чата по номеру телефона (WhatsApp)
-        wazzup_wa_channel = os.getenv("WAZZUP_WA_CHANNEL_ID", "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03")
-
         _pending_sends[msg_key] = {
-            "phone": phone,
+            "channels": channels_to_try,
             "name": cp_name,
             "text": msg_text,
-            "chat_type": "whatsapp",
-            "channel_id": wazzup_wa_channel,
         }
 
         group_chat_id = get_group_chat_id()
@@ -1549,29 +1573,30 @@ async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         async with aiohttp.ClientSession() as session:
             sent_channel = None
             last_error = ""
-            for ch in CHANNEL_PRIORITY:
+            channels = pending.get("channels") or [{"channel_id": "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03", "chat_type": "whatsapp", "chat_id": pending.get("phone","")}]
+            for ch in channels:
                 try:
                     async with session.post(
                         "https://api.wazzup24.com/v3/message",
                         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                         json={
-                            "channelId": ch["id"],
-                            "chatType": ch["type"],
-                            "chatId": pending["phone"],
+                            "channelId": ch["channel_id"],
+                            "chatType": ch["chat_type"],
+                            "chatId": ch["chat_id"],
                             "crmMessageId": str(_uuid.uuid4()),
                             "text": pending["text"],
                         }
                     ) as resp:
                         if resp.status in (200, 201):
-                            sent_channel = ch["type"]
+                            sent_channel = ch["chat_type"]
                             break
                         else:
                             body = await resp.text()
                             last_error = f"{resp.status}: {body[:100]}"
-                            logger.warning(f"Wazzup {ch['type']} failed: {last_error}")
+                            logger.warning(f"Wazzup {ch['chat_type']} failed: {last_error}")
                 except Exception as e:
                     last_error = str(e)
-                    logger.warning(f"Wazzup {ch['type']} exception: {e}")
+                    logger.warning(f"Wazzup {ch['chat_type']} exception: {e}")
 
             if sent_channel:
                 await query.message.edit_text(
@@ -1766,28 +1791,41 @@ def main():
     import aiohttp.web as web
 
     async def handle_wazzup_webhook(request):
-        """Принимает webhook от Wazzup — сохраняет сообщения менеджеров."""
+        """Принимает webhook от Wazzup — сохраняет сообщения и chatId клиентов."""
         try:
             data = await request.json()
             messages = data.get("messages", [])
             saved = 0
             for msg in messages:
                 text = msg.get("text", "")
-                if not text:
-                    continue
-                logger.info(f"Wazzup msg: isEcho={msg.get('isEcho')} crmUserId={msg.get('crmUserId')} contact={msg.get('contact',{}).get('name')} chatType={msg.get('chatType')} text={text[:50]}")
-                is_outbound = msg.get("isEcho", False)  # isEcho=True = сообщение менеджера
+                chat_type = msg.get("chatType", "")
+                chat_id_val = msg.get("chatId", "")
+                channel_id_val = msg.get("channelId", "")
                 contact = msg.get("contact", {})
-                contact_name = contact.get("name", msg.get("chatId", ""))
+                contact_name = contact.get("name", chat_id_val)
+                is_outbound = msg.get("isEcho", False)
                 manager_id = msg.get("crmUserId", "")
                 manager_name = WAZZUP_MANAGERS.get(manager_id, manager_id)
                 sent_at = msg.get("dateTime", "")
-                logger.info(f"Wazzup msg: isEcho={is_outbound} manager_id='{manager_id}' contact='{contact_name}' text='{text[:60]}'")
+
+                logger.info(f"Wazzup msg: isEcho={is_outbound} channel={channel_id_val} chatType={chat_type} chatId={chat_id_val} contact='{contact_name}' text='{text[:60]}'")
+
+                # Сохраняем маппинг контакта → chatId/channel для последующей отправки
+                if chat_id_val and contact_name and not is_outbound:
+                    db.save_wazzup_contact(
+                        contact_name=contact_name,
+                        chat_id=chat_id_val,
+                        chat_type=chat_type,
+                        channel_id=channel_id_val,
+                    )
+
+                if not text:
+                    continue
                 ok = db.save_wazzup_message(
                     message_id=msg.get("messageId", ""),
-                    channel_id=msg.get("channelId", ""),
-                    chat_type=msg.get("chatType", ""),
-                    chat_id=msg.get("chatId", ""),
+                    channel_id=channel_id_val,
+                    chat_type=chat_type,
+                    chat_id=chat_id_val,
                     contact_name=contact_name,
                     manager_id=manager_id,
                     manager_name=manager_name,
