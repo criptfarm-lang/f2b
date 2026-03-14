@@ -2074,6 +2074,7 @@ def main():
                         if ignored:
                             continue
                         group_chat_id = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
+                        logger.info(f"Wazzup: отправляю уведомление в группу {group_chat_id}")
                         if group_chat_id:
                             try:
                                 import uuid as _uuid2
@@ -2103,7 +2104,7 @@ def main():
                                     reply_markup=keyboard
                                 )
                             except Exception as e:
-                                logger.warning(f"Не удалось отправить уведомление в группу: {e}")
+                                logger.error(f"Не удалось отправить уведомление в группу: {e}", exc_info=True)
 
                 if not text:
                     continue
