@@ -23,7 +23,7 @@ from telegram.ext import (
 from database import Database
 from scheduler import setup_scheduler, record_group_message, PDZ_MANAGERS, get_group_chat_id
 from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion, parse_product_query
-from amocrm import find_contacts_for_broadcast, broadcast_to_leads, check_connection as amo_check
+from amocrm import check_connection as amo_check
 from moysklad import (search_products, search_products_filtered, get_price_list, format_products,
     format_price_list, get_product_image, download_image, get_image_download_url,
     get_counterparty_balance, get_all_debtors, format_debtors_ms, format_counterparty_balance,
@@ -672,14 +672,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Проверяем подтверждение рассылки
+    # Проверяем подтверждение рассылки через Wazzup
     if text.lower().strip() in ("да, рассылай", "да рассылай", "рассылай", "подтверждаю"):
         pending = context.user_data.get("pending_broadcast")
         if pending:
-            lead_ids = pending["lead_ids"]
+            contacts = pending["contacts"]
             broadcast_text = pending["text"]
             product = pending["product"]
-            count = pending["count"]
+            count = len(contacts)
             context.user_data.pop("pending_broadcast", None)
 
             await message.reply_text(
@@ -689,18 +689,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
 
-            async def run_broadcast():
-                from amocrm import broadcast_to_leads as _broadcast
-                stats = await _broadcast(lead_ids, broadcast_text, delay_seconds=60)
+            async def run_wazzup_broadcast():
+                api_key = os.getenv("WAZZUP_API_KEY", "")
+                channel_id = os.getenv("WAZZUP_CHANNEL_ID", "")
+                sent, failed = 0, 0
+                import aiohttp, uuid as _uuid
+                async with aiohttp.ClientSession() as session:
+                    for c in contacts:
+                        phone = c.get("phone", "").strip().replace("+", "").replace(" ", "").replace("-", "")
+                        if not phone:
+                            failed += 1
+                            continue
+                        chat_type = c.get("chat_type", "whatsapp")
+                        try:
+                            async with session.post(
+                                "https://api.wazzup24.com/v3/message",
+                                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                                json={
+                                    "channelId": channel_id,
+                                    "chatType": chat_type,
+                                    "chatId": phone,
+                                    "crmMessageId": str(_uuid.uuid4()),
+                                    "text": broadcast_text,
+                                }
+                            ) as resp:
+                                if resp.status in (200, 201):
+                                    sent += 1
+                                else:
+                                    body = await resp.text()
+                                    logger.warning(f"Wazzup send error {resp.status}: {body[:100]}")
+                                    failed += 1
+                        except Exception as e:
+                            logger.error(f"Wazzup send exception: {e}")
+                            failed += 1
+                        await asyncio.sleep(60)  # 1 сообщение в минуту
+
                 result_text = (
                     f"✅ *Рассылка завершена!*\n"
-                    f"📨 Отправлено: {stats['sent']}/{count}\n"
+                    f"📨 Отправлено: {sent}/{count}\n"
                 )
-                if stats["failed"]:
-                    result_text += f"❌ Ошибок: {stats['failed']}\n"
+                if failed:
+                    result_text += f"❌ Не отправлено: {failed} (нет телефона или ошибка)\n"
                 await context.bot.send_message(chat_id=chat_id, text=result_text, parse_mode="Markdown")
 
-            asyncio.create_task(run_broadcast())
+            asyncio.create_task(run_wazzup_broadcast())
             return
 
     if not is_bot_addressed(text):
@@ -1050,6 +1082,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "broadcast":
         product = params.get("product", "")
         broadcast_text = params.get("message", "")
+        manager_filter = params.get("manager", "")
 
         if not product or not broadcast_text:
             await message.reply_text("❌ Не указан товар или текст сообщения.")
@@ -1062,54 +1095,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-        # 1. Находим покупателей через отчёт прибыльности МойСклад
-        from moysklad import get_buyers_by_product
+        # 1. Находим покупателей через МойСклад
+        from moysklad import get_buyers_by_product, get_counterparty_phones
         result = await get_buyers_by_product(product, period_days=period_days)
-        counterparty_names = result.get("buyers", []) if isinstance(result, dict) else result
+        buyers = result.get("buyers", []) if isinstance(result, dict) else result
         found_name = result.get("product_name", product) if isinstance(result, dict) else product
 
-        if not counterparty_names:
+        if not buyers:
             await message.reply_text(f"❌ Не найдено покупателей *{found_name}* за последние {period_days} дней.", parse_mode="Markdown")
             return
 
-        await message.reply_text(f"📋 Найдено {len(counterparty_names)} покупателей в МойСклад.\n🔍 Ищу их в amoCRM...", parse_mode="Markdown")
+        await message.reply_text(f"📋 Найдено {len(buyers)} покупателей. Получаю телефоны...", parse_mode="Markdown")
 
-        # 2. Находим их в amoCRM
-        contacts = await find_contacts_for_broadcast(counterparty_names)
+        # 2. Получаем телефоны из МойСклад
+        contacts = await get_counterparty_phones(buyers)
+        with_phone = [c for c in contacts if c.get("phone")]
+        no_phone = [c for c in contacts if not c.get("phone")]
 
-        if not contacts:
-            await message.reply_text(
-                f"❌ Клиенты найдены в МойСклад, но не найдены в amoCRM.\n"
-                f"Клиенты МойСклад: {', '.join(counterparty_names[:5])}{'...' if len(counterparty_names) > 5 else ''}",
-                parse_mode="Markdown"
-            )
+        if not with_phone:
+            await message.reply_text("❌ Ни у одного клиента нет телефона в МойСклад.")
             return
 
-        lead_ids = [c["lead_id"] for c in contacts]
-        duration_min = len(lead_ids)
-
         # 3. Показываем список и просим подтверждение
-        names_preview = "\n".join(f"• {c['amo_name']}" for c in contacts[:10])
-        if len(contacts) > 10:
-            names_preview += f"\n_...и ещё {len(contacts) - 10}_"
+        duration_min = len(with_phone)
+        names_preview = "\n".join(f"• {c['name']} ({c['phone']})" for c in with_phone[:10])
+        if len(with_phone) > 10:
+            names_preview += f"\n_...и ещё {len(with_phone) - 10}_"
+
+        no_phone_note = f"\n⚠️ Без телефона ({len(no_phone)}): {', '.join(c['name'] for c in no_phone[:5])}" if no_phone else ""
 
         confirm_text = (
             f"📣 *Рассылка готова*\n\n"
-            f"*Товар:* {product}\n"
-            f"*Период анализа:* последние {period_days} дней\n"
+            f"*Товар:* {found_name}\n"
             f"*Текст:* _{broadcast_text}_\n\n"
-            f"*Получатели ({len(contacts)}):*\n{names_preview}\n\n"
+            f"*Получатели ({len(with_phone)}):*\n{names_preview}{no_phone_note}\n\n"
             f"⏱ Рассылка займёт ~{duration_min} мин (1 сообщение в минуту)\n\n"
             f"Для подтверждения напиши: *да, рассылай*"
         )
         await message.reply_text(confirm_text, parse_mode="Markdown")
 
-        # Сохраняем данные рассылки в память бота для подтверждения
         context.user_data["pending_broadcast"] = {
-            "lead_ids": lead_ids,
+            "contacts": with_phone,
             "text": broadcast_text,
-            "product": product,
-            "count": len(lead_ids),
+            "product": found_name,
         }
 
     elif action == "find_contact":
