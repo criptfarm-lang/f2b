@@ -178,16 +178,20 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
 
     parts = query.data.split("|")
 
-    # Выбор компании из списка похожих: wazzup_pick|company_name|link_key
+    # Выбор компании из списка похожих: wazzup_pick|index|link_key
     if parts[0] == "wazzup_pick":
-        cp_name = parts[1]
+        idx = int(parts[1])
         link_key = parts[2]
         pending = _pending_links.get(link_key) or _pending_links.get(query.from_user.id)
         if not pending:
             await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
             return
+        suggestions = pending.get("suggestions", [])
+        if idx >= len(suggestions):
+            await query.message.edit_text("❌ Ошибка выбора, попробуй снова.")
+            return
+        cp_name = suggestions[idx]
         pending["company_name"] = cp_name
-        # Переносим в user_id ключ
         _pending_links[query.from_user.id] = {**pending, "link_key": link_key}
         keyboard = InlineKeyboardMarkup([
             [
@@ -820,14 +824,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 suggestions.append(c)
 
                 if suggestions:
-                    # Показываем кнопки с вариантами
                     link_key = pending_link.get("link_key", str(user.id))
+                    # Сохраняем варианты в pending_link
+                    pending_link["suggestions"] = [c.get("name","") for c in suggestions[:5]]
                     buttons = []
-                    for c in suggestions[:5]:
+                    for i, c in enumerate(suggestions[:5]):
                         cp_name = c.get("name", "")
                         buttons.append([InlineKeyboardButton(
-                            cp_name,
-                            callback_data=f"wazzup_pick|{cp_name[:40]}|{link_key}"
+                            cp_name[:40],
+                            callback_data=f"wazzup_pick|{i}|{link_key}"
                         )])
                     buttons.append([InlineKeyboardButton(
                         "❌ Отменить привязку",
