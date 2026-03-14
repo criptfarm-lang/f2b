@@ -167,6 +167,41 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_wazzup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список каналов Wazzup с их ID."""
+    user = update.effective_user
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    if user.id not in manager_ids:
+        return
+
+    api_key = os.getenv("WAZZUP_API_KEY", "")
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://api.wazzup24.com/v3/channels",
+            headers={"Authorization": f"Bearer {api_key}"}
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                await update.message.reply_text(f"❌ Ошибка: {resp.status} {text[:200]}")
+                return
+            data = await resp.json()
+
+    channels = data.get("channels", data) if isinstance(data, dict) else data
+    if not channels:
+        await update.message.reply_text("Каналов не найдено.")
+        return
+
+    lines = ["📡 *Каналы Wazzup:*\n"]
+    for ch in channels if isinstance(channels, list) else [channels]:
+        ch_id = ch.get("id", ch.get("channelId", "?"))
+        name = ch.get("name", ch.get("transport", "?"))
+        status = ch.get("state", ch.get("status", ""))
+        lines.append(f"• *{name}* `{ch_id}` {status}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_wazzup_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Настраивает вебхук Wazzup. /wazzup_setup"""
     user = update.effective_user
@@ -1677,6 +1712,7 @@ def main():
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("wazzup_channels", cmd_wazzup_channels))
     app.add_handler(CommandHandler("wazzup_setup", cmd_wazzup_setup))
     app.add_handler(CommandHandler("clearall", cmd_clear_all))
     app.add_handler(CommandHandler("test", cmd_test))
