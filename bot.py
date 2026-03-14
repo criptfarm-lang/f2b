@@ -2039,7 +2039,7 @@ def main():
                                     )
                                 ],[
                                     InlineKeyboardButton(
-                                        "🚫 Не наш клиент",
+                                        "🚫 Не привязывать",
                                         callback_data=f"wazzup_ignore|{chat_id_val}"
                                     )
                                 ]])
