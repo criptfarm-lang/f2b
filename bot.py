@@ -182,9 +182,9 @@ async def cmd_clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with db.conn.cursor() as cur:
                 if keep_ids:
                     placeholders = ",".join(["%s"] * len(keep_ids))
-                    cur.execute(f"UPDATE tasks SET done=true, result='Удалено руководителем' WHERE done=false AND id NOT IN ({placeholders})", keep_ids)
+                    cur.execute(f"UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE status='open' AND id NOT IN ({placeholders})", keep_ids)
                 else:
-                    cur.execute("UPDATE tasks SET done=true, result='Удалено руководителем' WHERE done=false")
+                    cur.execute("UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE status='open'")
             db.conn.commit()
             db.conn.close()
             await update.message.reply_text(f"✅ Все задачи очищены." if not keep_ids else f"✅ Задачи очищены. Оставлены ID: {keep_ids}")
