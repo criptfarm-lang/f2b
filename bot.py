@@ -225,8 +225,9 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
     _pending_links[query.from_user.id] = {**pending, "link_key": link_key}
 
     await query.message.edit_text(
-        f"📩 Контакт: *{pending['wazzup_name']}*\n\n"
-        f"Напиши название компании из МойСклад:",
+        f"👤 Контакт в TG: *{pending['wazzup_name']}*\n\n"
+        f"Как этот клиент называется в МойСклад?\n"
+        f"_(напиши название или часть названия)_",
         parse_mode="Markdown"
     )
 
@@ -1955,7 +1956,7 @@ def main():
                                         f"📩 *Новый неизвестный контакт в Telegram*\n\n"
                                         f"👤 Имя в TG: *{contact_name}*\n"
                                         f"💬 Написал: _{last_text}_\n\n"
-                                        f"Нажми кнопку и напиши название компании из МойСклад"
+                                        f"Нажми кнопку и напиши как этот клиент называется в МойСклад"
                                     ),
                                     parse_mode="Markdown",
                                     reply_markup=keyboard
