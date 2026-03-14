@@ -226,6 +226,87 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
         )
         return
 
+    # Выбор сегмента: wazzup_seg|сегмент|link_key
+    if parts[0] == "wazzup_seg":
+        segment = parts[1]
+        link_key = parts[2]
+        pending = _pending_links.get(link_key)
+        if not pending:
+            for uid, v in _pending_links.items():
+                if isinstance(uid, int) and v.get("link_key") == link_key:
+                    pending = v
+                    break
+        if not pending:
+            await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
+            return
+        pending["segment"] = segment
+        # Спрашиваем менеджера
+        MANAGERS = ["Баласанян К.", "Голубева Т.", "Леонтьев А.", "Мерзлякова Е.", "Скляр И.", "Иванов А."]
+        buttons = [[InlineKeyboardButton(m, callback_data=f"wazzup_mgr|{m}|{link_key}")] for m in MANAGERS]
+        await query.message.edit_text(
+            f"✅ Сегмент: *{segment}*\n\nОтветственный менеджер?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # Выбор менеджера: wazzup_mgr|менеджер|link_key
+    if parts[0] == "wazzup_mgr":
+        manager = parts[1]
+        link_key = parts[2]
+        pending = _pending_links.get(link_key)
+        if not pending:
+            for uid, v in _pending_links.items():
+                if isinstance(uid, int) and v.get("link_key") == link_key:
+                    pending = v
+                    break
+        if not pending or "company_name" not in pending:
+            await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
+            return
+        # Очищаем
+        _pending_links.pop(link_key, None)
+        for uid in [k for k, v in list(_pending_links.items()) if isinstance(k, int) and v.get("link_key") == link_key]:
+            _pending_links.pop(uid, None)
+        ok = db.link_wazzup_contact(
+            chat_id=pending["chat_id"],
+            chat_type=pending["chat_type"],
+            channel_id=pending["channel_id"],
+            company_name=pending["company_name"],
+            wazzup_name=pending["wazzup_name"],
+            role=role,
+        )
+        if ok:
+            # Подтягиваем теги из МойСклад
+            try:
+                from moysklad import find_counterparty_info
+                cp_list = await find_counterparty_info(pending["company_name"])
+                if cp_list:
+                    cp = cp_list[0]
+                    tags = cp.get("tags", [])
+                    manager_tag = cp.get("manager", "")
+                    buyer_type = cp.get("buyer_type", "")
+                    db.update_wazzup_contact_tags(
+                        chat_id=pending["chat_id"],
+                        tags=tags,
+                        manager=manager_tag,
+                        segment=buyer_type,
+                    )
+            except Exception as e:
+                logger.warning(f"Не удалось подтянуть теги из МойСклад: {e}")
+        if ok:
+            await query.message.edit_text(
+                f"✅ *{pending['company_name']}*\n"
+                f"Роль: {pending.get('role')} · Сегмент: {pending.get('segment')} · Менеджер: {manager}\n"
+                f"Эф запомнил!",
+                parse_mode="Markdown"
+            )
+            await asyncio.sleep(3)
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+        return
+
     # Выбор роли: wazzup_role|роль|link_key
     if parts[0] == "wazzup_role":
         role = parts[1]
@@ -248,29 +329,18 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
         if not pending or "company_name" not in pending:
             await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
             return
-        # Очищаем
-        _pending_links.pop(link_key, None)
-        for uid in [k for k, v in _pending_links.items() if isinstance(k, int) and v.get("link_key") == link_key]:
-            _pending_links.pop(uid, None)
-        ok = db.link_wazzup_contact(
-            chat_id=pending["chat_id"],
-            chat_type=pending["chat_type"],
-            channel_id=pending["channel_id"],
-            company_name=pending["company_name"],
-            wazzup_name=pending["wazzup_name"],
-            role=role,
+        # После выбора роли — спрашиваем сегмент
+        pending["role"] = role
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🍣 Хорека", callback_data=f"wazzup_seg|хорека|{link_key}"),
+            InlineKeyboardButton("📦 Опт", callback_data=f"wazzup_seg|опт|{link_key}"),
+            InlineKeyboardButton("🚚 Поставщик", callback_data=f"wazzup_seg|поставщик|{link_key}"),
+        ]])
+        await query.message.edit_text(
+            f"✅ Роль: *{role}*\n\nСегмент клиента?",
+            parse_mode="Markdown",
+            reply_markup=keyboard
         )
-        if ok:
-            await query.message.edit_text(
-                f"✅ *{pending['wazzup_name']}* → *{pending['company_name']}* ({role})\nЭф запомнил!",
-                parse_mode="Markdown"
-            )
-            # Удаляем сообщение через 3 секунды
-            await asyncio.sleep(3)
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
         return
 
     # Первое нажатие — запрашиваем название компании: wazzup_link|link_key
@@ -2030,7 +2100,7 @@ def main():
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
-    app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick)"))
+    app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr)"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
