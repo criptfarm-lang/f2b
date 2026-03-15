@@ -735,7 +735,6 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
             active_ids = set()
             orders_url = f"{MS_BASE}/entity/customerorder"
 
-            # Берём заказы за период пачками
             offset = 0
             sample_logged = False
             while True:
@@ -743,26 +742,26 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
                     "filter": f"moment>{since}",
                     "limit": 100,
                     "offset": offset,
-                    "fields": "agent",
+                    "expand": "agent",
                 }
                 async with session.get(orders_url, headers=get_headers(), params=params) as resp:
                     if resp.status != 200:
+                        logger.warning(f"get_manager_stats_ms orders: {resp.status}")
                         break
                     data = await resp.json()
                     rows = data.get("rows", [])
                     for r in rows:
-                        agent_href = r.get("agent", {}).get("meta", {}).get("href", "")
-                        agent_id = agent_href.split("/")[-1] if agent_href else ""
+                        agent = r.get("agent", {})
+                        agent_id = agent.get("id", "") if isinstance(agent, dict) else ""
                         if not sample_logged and agent_id:
                             logger.info(f"get_manager_stats_ms sample agent_id={agent_id} in_cp_ids={agent_id in cp_ids}")
-                            logger.info(f"get_manager_stats_ms sample cp_ids sample={list(cp_ids)[:3]}")
                             sample_logged = True
                         if agent_id in cp_ids:
                             active_ids.add(agent_id)
                     if len(rows) < 100:
                         break
                     offset += 100
-                    if offset > 2000:
+                    if offset > 3000:
                         break
 
             logger.info(f"get_manager_stats_ms: active={len(active_ids)}")
