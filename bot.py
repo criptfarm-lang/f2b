@@ -213,21 +213,40 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
             await query.message.edit_text("❌ Ошибка выбора, попробуй снова.")
             return
         cp_name = suggestions[idx]
-        pending["company_name"] = cp_name
-        _pending_links[query.from_user.id] = {**pending, "link_key": link_key}
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📢 Для рассылки", callback_data=f"wazzup_role|рассылка|{link_key}"),
-                InlineKeyboardButton("👤 Иной контакт", callback_data=f"wazzup_role|иной|{link_key}"),
-            ],
-            [
-            ]
-        ])
-        await query.message.edit_text(
-            f"✅ Нашёл: *{cp_name}*\n\nКакая роль у этого контакта?",
-            parse_mode="Markdown",
-            reply_markup=keyboard
+        _pending_links.pop(link_key, None)
+        _pending_links.pop(query.from_user.id, None)
+        ok = db.link_wazzup_contact(
+            chat_id=pending["chat_id"],
+            chat_type=pending["chat_type"],
+            channel_id=pending["channel_id"],
+            company_name=cp_name,
+            wazzup_name=pending["wazzup_name"],
+            role="рассылка",
         )
+        if ok:
+            _wazzup_notified.discard(pending["chat_id"])
+            try:
+                from moysklad import find_counterparty_info
+                cp_list = await find_counterparty_info(cp_name)
+                if cp_list:
+                    cp_data = cp_list[0]
+                    db.update_wazzup_contact_tags(
+                        chat_id=pending["chat_id"],
+                        tags=cp_data.get("tags", []),
+                        manager=cp_data.get("manager", ""),
+                        segment=cp_data.get("buyer_type", ""),
+                    )
+            except Exception as e:
+                logger.warning(f"Теги МойСклад: {e}")
+            await query.message.edit_text(
+                f"✅ *{pending['wazzup_name']}* → *{cp_name}*\nЭф запомнил!",
+                parse_mode="Markdown"
+            )
+            await asyncio.sleep(3)
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
         return
 
     # Выбор сегмента: wazzup_seg|сегмент|link_key
@@ -1040,17 +1059,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending_link["company_name"] = cp_name
             link_key = pending_link.get("link_key", str(user.id))
 
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("📢 Для рассылки", callback_data=f"wazzup_role|рассылка|{link_key}"),
-                    InlineKeyboardButton("👤 Иной контакт", callback_data=f"wazzup_role|иной|{link_key}"),
-                ]
-            ])
-            await message.reply_text(
-                f"✅ Нашёл: *{cp_name}*\n\nКакая роль у этого контакта?",
-                parse_mode="Markdown",
-                reply_markup=keyboard
+            # Сразу сохраняем без выбора роли
+            _pending_links.pop(user.id, None)
+            _pending_links.pop(link_key, None)
+            ok = db.link_wazzup_contact(
+                chat_id=pending_link["chat_id"],
+                chat_type=pending_link["chat_type"],
+                channel_id=pending_link["channel_id"],
+                company_name=cp_name,
+                wazzup_name=pending_link["wazzup_name"],
+                role="рассылка",
             )
+            if ok:
+                _wazzup_notified.discard(pending_link["chat_id"])
+                # Подтягиваем теги из МойСклад
+                try:
+                    from moysklad import find_counterparty_info
+                    cp_list = await find_counterparty_info(cp_name)
+                    if cp_list:
+                        cp_data = cp_list[0]
+                        db.update_wazzup_contact_tags(
+                            chat_id=pending_link["chat_id"],
+                            tags=cp_data.get("tags", []),
+                            manager=cp_data.get("manager", ""),
+                            segment=cp_data.get("buyer_type", ""),
+                        )
+                except Exception as e:
+                    logger.warning(f"Теги МойСклад: {e}")
+                await message.reply_text(
+                    f"✅ *{pending_link['wazzup_name']}* → *{cp_name}*\nЭф запомнил!",
+                    parse_mode="Markdown"
+                )
             return
         _pending_links.pop(user.id, None)
         return
