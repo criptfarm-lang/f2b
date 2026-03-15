@@ -728,6 +728,8 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
                         break
                     offset += 100
 
+            logger.info(f"get_manager_stats_ms: tag={manager_tag} total={total} cp_ids={len(cp_ids)}")
+
             # 3. Считаем активных через заказы за period
             since = (datetime.now() - timedelta(days=active_days)).strftime("%Y-%m-%d %H:%M:%S")
             active_ids = set()
@@ -735,6 +737,7 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
 
             # Берём заказы за период пачками
             offset = 0
+            sample_logged = False
             while True:
                 params = {
                     "filter": f"moment>{since}",
@@ -750,14 +753,19 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
                     for r in rows:
                         agent_href = r.get("agent", {}).get("meta", {}).get("href", "")
                         agent_id = agent_href.split("/")[-1] if agent_href else ""
+                        if not sample_logged and agent_id:
+                            logger.info(f"get_manager_stats_ms sample agent_id={agent_id} in_cp_ids={agent_id in cp_ids}")
+                            logger.info(f"get_manager_stats_ms sample cp_ids sample={list(cp_ids)[:3]}")
+                            sample_logged = True
                         if agent_id in cp_ids:
                             active_ids.add(agent_id)
                     if len(rows) < 100:
                         break
                     offset += 100
-                    if offset > 2000:  # защита от бесконечного цикла
+                    if offset > 2000:
                         break
 
+            logger.info(f"get_manager_stats_ms: active={len(active_ids)}")
             return {"total": total, "active": len(active_ids)}
 
     except Exception as e:
