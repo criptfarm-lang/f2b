@@ -599,6 +599,34 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(header + "\n".join(results))
 
 
+async def cmd_del_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет задачу по ID. /deltask 5"""
+    user = update.effective_user
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    if user.id not in manager_ids:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /deltask <ID>\nСписок ID: /cleartasks")
+        return
+    try:
+        task_id = int(context.args[0])
+        with db.conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE id=%s AND status='open'",
+                (task_id,)
+            )
+            deleted = cur.rowcount
+        db.conn.commit()
+        if deleted:
+            await update.message.reply_text(f"✅ Задача #{task_id} удалена.")
+        else:
+            await update.message.reply_text(f"❌ Задача #{task_id} не найдена или уже закрыта.")
+    except ValueError:
+        await update.message.reply_text("❌ Укажи числовой ID задачи.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 async def cmd_clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаляет все открытые задачи кроме указанных ID. Только для руководителя."""
     logger.info(f"cmd_clear_tasks вызван от {update.effective_user.id} args={context.args}")
@@ -2090,6 +2118,7 @@ def main():
     app.add_handler(CommandHandler("wazzup_setup", cmd_wazzup_setup))
     app.add_handler(CommandHandler("clearall", cmd_clear_all))
     app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(CommandHandler("deltask", cmd_del_task))
     app.add_handler(CommandHandler("cleartasks", cmd_clear_tasks))
     app.add_handler(CommandHandler("all_tasks", cmd_all_tasks))
     app.add_handler(CommandHandler("overdue", cmd_overdue))
