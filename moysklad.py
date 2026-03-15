@@ -693,7 +693,7 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
     """
     Статистика менеджера из МойСклад:
     - total: всего компаний с тегом менеджера
-    - active: компании с продажами за active_days дней (через отчёт прибыльности)
+    - active: уникальные компании с заказами за active_days дней
     """
     import aiohttp
     from datetime import datetime, timedelta
@@ -709,28 +709,56 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
                 data = await resp.json()
                 total = data.get("meta", {}).get("size", 0)
 
-            # 2. Активные — через отчёт прибыльности по покупателям с фильтром по группе
-            date_from = (datetime.now() - timedelta(days=active_days)).strftime("%Y-%m-%d %H:%M:%S")
-            date_to = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if not total:
+                return {"total": 0, "active": 0}
 
-            report_url = f"{MS_BASE}/report/profit/byvariant"
-            # Используем отчёт по контрагентам
-            report_url = f"{MS_BASE}/report/profit/bycounterparty"
-            params = {
-                "momentFrom": date_from,
-                "momentTo": date_to,
-                "filter": f"counterparty.tags={manager_tag}",
-                "limit": 1,
-            }
-            async with session.get(report_url, headers=get_headers(), params=params) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.warning(f"get_manager_stats_ms profit report: {resp.status} {body[:100]}")
-                    return {"total": total, "active": 0}
-                data = await resp.json()
-                active = data.get("meta", {}).get("size", 0)
+            # 2. Получаем ID всех контрагентов с тегом
+            cp_ids = set()
+            offset = 0
+            while True:
+                async with session.get(url, headers=get_headers(),
+                                       params={"filter": f"tags={manager_tag}", "limit": 100, "offset": offset}) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+                    rows = data.get("rows", [])
+                    for r in rows:
+                        cp_ids.add(r["id"])
+                    if len(rows) < 100:
+                        break
+                    offset += 100
 
-            return {"total": total, "active": active}
+            # 3. Считаем активных через заказы за period
+            since = (datetime.now() - timedelta(days=active_days)).strftime("%Y-%m-%d %H:%M:%S")
+            active_ids = set()
+            orders_url = f"{MS_BASE}/entity/customerorder"
+
+            # Берём заказы за период пачками
+            offset = 0
+            while True:
+                params = {
+                    "filter": f"moment>{since}",
+                    "limit": 100,
+                    "offset": offset,
+                    "fields": "agent",
+                }
+                async with session.get(orders_url, headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+                    rows = data.get("rows", [])
+                    for r in rows:
+                        agent_href = r.get("agent", {}).get("meta", {}).get("href", "")
+                        agent_id = agent_href.split("/")[-1] if agent_href else ""
+                        if agent_id in cp_ids:
+                            active_ids.add(agent_id)
+                    if len(rows) < 100:
+                        break
+                    offset += 100
+                    if offset > 2000:  # защита от бесконечного цикла
+                        break
+
+            return {"total": total, "active": len(active_ids)}
 
     except Exception as e:
         logger.error(f"get_manager_stats_ms: {e}")
