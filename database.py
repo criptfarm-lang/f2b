@@ -677,22 +677,23 @@ class Database:
         from datetime import datetime, timedelta
         since = datetime.now() - timedelta(days=days)
 
-        # Сообщения из Wazzup
-        msg_filter = "AND LOWER(manager_name) LIKE %s" if manager_name else ""
-        msg_params = [since] + ([f"%{manager_name.lower()}%"] if manager_name else [])
+        # Сообщения — берём менеджера из contact_map если в сообщении пустой
+        mgr_filter = "AND LOWER(COALESCE(NULLIF(m.manager_name,''), cm.manager, '')) LIKE %s" if manager_name else ""
+        mgr_params = [since] + ([f"%{manager_name.lower()}%"] if manager_name else [])
         msg_rows = self._fetchall(
-            f"""SELECT manager_name,
+            f"""SELECT
+                COALESCE(NULLIF(m.manager_name,''), cm.manager, 'Неизвестно') AS manager_name,
                 COUNT(*) as msg_count,
-                COUNT(DISTINCT chat_id) as client_count
-                FROM wazzup_messages
-                WHERE is_outbound = TRUE AND sent_at >= %s
-                AND manager_name IS NOT NULL AND manager_name != ''
-                {msg_filter}
-                GROUP BY manager_name""",
-            msg_params
+                COUNT(DISTINCT m.chat_id) as client_count
+                FROM wazzup_messages m
+                LEFT JOIN wazzup_contact_map cm ON m.chat_id = cm.chat_id
+                WHERE m.is_outbound = TRUE AND m.sent_at >= %s
+                {mgr_filter}
+                GROUP BY COALESCE(NULLIF(m.manager_name,''), cm.manager, 'Неизвестно')""",
+            mgr_params
         )
 
-        # Звонки из Sipuni
+        # Звонки
         call_filter = "AND LOWER(manager_name) LIKE %s" if manager_name else ""
         call_params = [since] + ([f"%{manager_name.lower()}%"] if manager_name else [])
         call_rows = self._fetchall(
@@ -708,10 +709,12 @@ class Database:
             call_params
         )
 
-        # Объединяем по имени менеджера
+        # Объединяем
         result = {}
         for r in msg_rows:
             mgr = r["manager_name"]
+            if mgr == "Неизвестно":
+                continue
             result[mgr] = {
                 "manager": mgr,
                 "msg_count": r["msg_count"],
