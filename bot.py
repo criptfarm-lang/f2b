@@ -1650,7 +1650,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines = [f"🔍 *Упоминания «{product}»* за {days} дней\n"]
         for mgr, msgs in sorted(by_manager.items()):
-            clients = list({r.get("contact_name", "") for r in msgs if r.get("contact_name")})
+            clients = list({r.get("client_name") or r.get("contact_name", "") for r in msgs if r.get("client_name") or r.get("contact_name")})
             lines.append(f"👤 *{mgr}* — {len(msgs)} сообщений, {len(clients)} клиентов:")
             for c in clients[:10]:
                 lines.append(f"  • {c}")
