@@ -750,6 +750,9 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
                         break
                     data = await resp.json()
                     rows = data.get("rows", [])
+                    total_orders = data.get("meta", {}).get("size", 0)
+                    if not sample_logged:
+                        logger.info(f"get_manager_stats_ms: orders total={total_orders} offset={offset} rows={len(rows)}")
                     for r in rows:
                         agent = r.get("agent", {})
                         agent_id = agent.get("id", "") if isinstance(agent, dict) else ""
