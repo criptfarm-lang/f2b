@@ -1782,6 +1782,7 @@ async def get_counterparty_debt(counterparty_id: str) -> dict:
                 orders_data = await resp.json()
 
         overdue_days = 0
+        overdue_dates = []
         rows = orders_data.get("rows", [])
         logger.info(f"get_counterparty_debt: найдено заказов={len(rows)}")
 
@@ -1795,14 +1796,18 @@ async def get_counterparty_debt(counterparty_id: str) -> dict:
                             payment_date = date.fromisoformat(str(val)[:10])
                             if payment_date < today:
                                 days = (today - payment_date).days
-                                if days > overdue_days:
-                                    overdue_days = days
-                                    logger.info(f"get_counterparty_debt: заказ {order.get('name')} payment_date={payment_date} days={days}")
+                                overdue_dates.append(days)
+                                logger.info(f"get_counterparty_debt: заказ {order.get('name')} payment_date={payment_date} days={days}")
                         except Exception:
                             pass
                     break
 
-        logger.info(f"get_counterparty_debt: итого debt={debt} overdue_days={overdue_days}")
+        # Берём минимум — самый свежий просроченный заказ
+        # Это честнее чем максимум, т.к. старые долги могли быть частично погашены
+        if overdue_dates:
+            overdue_days = min(overdue_dates)
+
+        logger.info(f"get_counterparty_debt: итого debt={debt} overdue_days={overdue_days} (из {len(overdue_dates)} просроченных заказов)")
         return {"debt": debt, "overdue_days": overdue_days}
 
     except Exception as e:
