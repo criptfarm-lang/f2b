@@ -689,6 +689,54 @@ BUYER_TYPE_TAGS = {
 }
 
 
+async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
+    """
+    Статистика менеджера из МойСклад:
+    - total: всего компаний с тегом менеджера
+    - active: компании с продажами за active_days дней (через отчёт прибыльности)
+    """
+    import aiohttp
+    from datetime import datetime, timedelta
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 1. Всего компаний с тегом менеджера
+            url = f"{MS_BASE}/entity/counterparty"
+            async with session.get(url, headers=get_headers(),
+                                   params={"filter": f"tags={manager_tag}", "limit": 1}) as resp:
+                if resp.status != 200:
+                    return {"total": 0, "active": 0}
+                data = await resp.json()
+                total = data.get("meta", {}).get("size", 0)
+
+            # 2. Активные — через отчёт прибыльности по покупателям с фильтром по группе
+            date_from = (datetime.now() - timedelta(days=active_days)).strftime("%Y-%m-%d %H:%M:%S")
+            date_to = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            report_url = f"{MS_BASE}/report/profit/byvariant"
+            # Используем отчёт по контрагентам
+            report_url = f"{MS_BASE}/report/profit/bycounterparty"
+            params = {
+                "momentFrom": date_from,
+                "momentTo": date_to,
+                "filter": f"counterparty.tags={manager_tag}",
+                "limit": 1,
+            }
+            async with session.get(report_url, headers=get_headers(), params=params) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(f"get_manager_stats_ms profit report: {resp.status} {body[:100]}")
+                    return {"total": total, "active": 0}
+                data = await resp.json()
+                active = data.get("meta", {}).get("size", 0)
+
+            return {"total": total, "active": active}
+
+    except Exception as e:
+        logger.error(f"get_manager_stats_ms: {e}")
+        return {"total": 0, "active": 0}
+
+
 async def find_counterparty_info(query: str) -> list:
     """Находит контрагента и возвращает его теги, менеджера, тип покупателя и баланс."""
     import re as _re
