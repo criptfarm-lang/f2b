@@ -730,42 +730,36 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
 
             logger.info(f"get_manager_stats_ms: tag={manager_tag} total={total} cp_ids={len(cp_ids)}")
 
-            # 3. Считаем активных через заказы за period
+            # 3. Для каждого клиента проверяем был ли заказ за period
             since = (datetime.now() - timedelta(days=active_days)).strftime("%Y-%m-%d %H:%M:%S")
             active_ids = set()
             orders_url = f"{MS_BASE}/entity/customerorder"
 
-            offset = 0
-            sample_logged = False
-            while True:
-                params = {
-                    "filter": f"moment>{since}",
-                    "limit": 100,
-                    "offset": offset,
-                    "expand": "agent",
-                }
-                async with session.get(orders_url, headers=get_headers(), params=params) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"get_manager_stats_ms orders: {resp.status}")
-                        break
-                    data = await resp.json()
-                    rows = data.get("rows", [])
-                    total_orders = data.get("meta", {}).get("size", 0)
-                    if not sample_logged:
-                        logger.info(f"get_manager_stats_ms: orders total={total_orders} offset={offset} rows={len(rows)}")
-                    for r in rows:
-                        agent = r.get("agent", {})
-                        agent_id = agent.get("id", "") if isinstance(agent, dict) else ""
-                        if not sample_logged and agent_id:
-                            logger.info(f"get_manager_stats_ms sample agent_id={agent_id} in_cp_ids={agent_id in cp_ids}")
-                            sample_logged = True
-                        if agent_id in cp_ids:
-                            active_ids.add(agent_id)
-                    if len(rows) < 100:
-                        break
-                    offset += 100
-                    if offset > 3000:
-                        break
+            # Батчами по 5 параллельных запросов
+            import asyncio as _asyncio
+            cp_list = list(cp_ids)
+
+            async def check_cp(cp_id):
+                filter_str = (
+                    f"agent=https://api.moysklad.ru/api/remap/1.2/entity/counterparty/{cp_id}"
+                    f";moment>{since}"
+                )
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(orders_url, headers=get_headers(),
+                                     params={"filter": filter_str, "limit": 1}) as r:
+                        if r.status == 200:
+                            d = await r.json()
+                            if d.get("meta", {}).get("size", 0) > 0:
+                                return cp_id
+                return None
+
+            # Запускаем батчами по 10
+            for i in range(0, len(cp_list), 10):
+                batch = cp_list[i:i+10]
+                results = await _asyncio.gather(*[check_cp(cp_id) for cp_id in batch])
+                for r in results:
+                    if r:
+                        active_ids.add(r)
 
             logger.info(f"get_manager_stats_ms: active={len(active_ids)}")
             return {"total": total, "active": len(active_ids)}
