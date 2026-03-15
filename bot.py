@@ -904,6 +904,90 @@ async def cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Обработка обычных сообщений ──────────────────────────────────────────────
 
+async def process_sipuni_call(call_id: str, src_num: str, dst_num: str,
+                              short_dst: str, tree_name: str, record_link: str,
+                              call_start: str, call_answer: str, bot):
+    """Скачивает запись звонка и транскрибирует через Whisper. Сохраняет в БД."""
+    import aiohttp, tempfile, os as _os
+
+    openai_key = _os.getenv("OPENAI_API_KEY", "")
+    if not openai_key:
+        logger.warning("process_sipuni_call: OPENAI_API_KEY не задан")
+        return
+
+    try:
+        manager_name = tree_name or short_dst or dst_num
+
+        # Длительность
+        duration_sec = 0
+        try:
+            if call_start and call_answer and call_answer != "0":
+                duration_sec = int(call_answer) - int(call_start)
+                if duration_sec < 0:
+                    duration_sec = 0
+        except Exception:
+            pass
+
+        logger.info(f"Sipuni: транскрибирую звонок {call_id} от {src_num} ({duration_sec}с)")
+
+        # 1. Скачиваем запись
+        async with aiohttp.ClientSession() as session:
+            async with session.get(record_link) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Sipuni: не удалось скачать запись {resp.status}")
+                    return
+                audio_data = await resp.read()
+
+        if len(audio_data) < 1000:
+            logger.warning(f"Sipuni: запись слишком короткая ({len(audio_data)} байт)")
+            return
+
+        # 2. Транскрипция через OpenAI Whisper
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp.write(audio_data)
+            tmp_path = tmp.name
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                with open(tmp_path, "rb") as f:
+                    form = aiohttp.FormData()
+                    form.add_field("file", f, filename="call.mp3", content_type="audio/mpeg")
+                    form.add_field("model", "whisper-1")
+                    form.add_field("language", "ru")
+                    async with session.post(
+                        "https://api.openai.com/v1/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {openai_key}"},
+                        data=form
+                    ) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            logger.warning(f"Whisper error {resp.status}: {body[:200]}")
+                            return
+                        result = await resp.json()
+                        transcript = result.get("text", "")
+        finally:
+            _os.unlink(tmp_path)
+
+        if not transcript:
+            logger.warning("Sipuni: транскрипция пустая")
+            return
+
+        # 3. Сохраняем в БД
+        saved = db.save_call_transcript(
+            call_id=call_id,
+            src_num=src_num,
+            dst_num=dst_num,
+            manager_name=manager_name,
+            tree_name=tree_name,
+            transcript=transcript,
+            duration_sec=duration_sec,
+        )
+        logger.info(f"Sipuni: транскрипция сохранена call_id={call_id} saved={saved} ({len(transcript)} символов)")
+
+    except Exception as e:
+        logger.error(f"process_sipuni_call: {e}", exc_info=True)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главный обработчик всех сообщений."""
     message = update.message
@@ -1633,30 +1717,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keywords = [p.strip().lower() for p in product.replace(" и ", ",").split(",") if p.strip()]
 
         rows = db.search_wazzup_mentions(keywords, days=days, manager_name=manager_filter or None)
+        call_rows = db.search_call_mentions(keywords, days=days, manager_name=manager_filter or None)
 
-        if not rows:
+        if not rows and not call_rows:
             await message.reply_text(
                 f"😕 Упоминаний *{product}* за последние {days} дней не найдено.\n"
-                f"_Данные накапливаются с момента подключения Wazzup._",
+                f"_Данные накапливаются с момента подключения._",
                 parse_mode="Markdown"
             )
             return
 
-        # Группируем по менеджеру
-        by_manager = {}
-        for row in rows:
-            mgr = row.get("manager_name") or "Неизвестно"
-            by_manager.setdefault(mgr, []).append(row)
-
         lines = [f"🔍 *Упоминания «{product}»* за {days} дней\n"]
-        for mgr, msgs in sorted(by_manager.items()):
-            clients = list({r.get("client_name") or r.get("contact_name", "") for r in msgs if r.get("client_name") or r.get("contact_name")})
-            lines.append(f"👤 *{mgr}* — {len(msgs)} сообщений, {len(clients)} клиентов:")
-            for c in clients[:10]:
-                lines.append(f"  • {c}")
-            if len(clients) > 10:
-                lines.append(f"  _...и ещё {len(clients)-10}_")
-            lines.append("")
+
+        # Переписки
+        if rows:
+            by_manager = {}
+            for row in rows:
+                mgr = row.get("manager_name") or "Неизвестно"
+                by_manager.setdefault(mgr, []).append(row)
+
+            lines.append("💬 *Переписки:*")
+            for mgr, msgs in sorted(by_manager.items()):
+                clients = list({r.get("client_name") or r.get("contact_name", "") for r in msgs if r.get("client_name") or r.get("contact_name")})
+                lines.append(f"👤 *{mgr}* — {len(msgs)} сообщений, {len(clients)} клиентов:")
+                for c in clients[:10]:
+                    lines.append(f"  • {c}")
+                if len(clients) > 10:
+                    lines.append(f"  _...и ещё {len(clients)-10}_")
+                lines.append("")
+
+        # Звонки
+        if call_rows:
+            by_manager_calls = {}
+            for row in call_rows:
+                mgr = row.get("manager_name") or "Неизвестно"
+                by_manager_calls.setdefault(mgr, []).append(row)
+
+            lines.append("📞 *Звонки:*")
+            for mgr, calls in sorted(by_manager_calls.items()):
+                clients = list({r.get("src_num", "") for r in calls if r.get("src_num")})
+                lines.append(f"👤 *{mgr}* — {len(calls)} звонков, {len(clients)} клиентов:")
+                for c in clients[:10]:
+                    lines.append(f"  • {c}")
+                if len(clients) > 10:
+                    lines.append(f"  _...и ещё {len(clients)-10}_")
+                lines.append("")
 
         text = "\n".join(lines)
         if len(text) > 4000:
@@ -2311,6 +2416,42 @@ def main():
     # Запускаем webhook-сервер и polling параллельно
     import aiohttp.web as web
 
+    async def handle_sipuni_webhook(request):
+        """Принимает события от Sipuni АТС."""
+        try:
+            params = dict(request.rel_url.query)
+            event = params.get("event", "")
+            call_id = params.get("call_id", "")
+            src_num = params.get("src_num", "")
+            dst_num = params.get("dst_num", "")
+            short_dst = params.get("short_dst_num", "")
+            tree_name = params.get("treeName", "")
+            status = params.get("status", "")
+            record_link = params.get("call_record_link", "")
+            call_start = params.get("call_start_timestamp", "")
+            call_answer = params.get("call_answer_timestamp", "0")
+
+            logger.info(f"Sipuni event={event} call_id={call_id} src={src_num} dst={dst_num} tree={tree_name} status={status}")
+
+            # event=2 — звонок завершён
+            if event == "2" and record_link and status == "ANSWER":
+                asyncio.create_task(process_sipuni_call(
+                    call_id=call_id,
+                    src_num=src_num,
+                    dst_num=dst_num,
+                    short_dst=short_dst,
+                    tree_name=tree_name,
+                    record_link=record_link,
+                    call_start=call_start,
+                    call_answer=call_answer,
+                    bot=app.bot,
+                ))
+
+            return web.Response(text="ok")
+        except Exception as e:
+            logger.error(f"Sipuni webhook error: {e}")
+            return web.Response(text="error", status=500)
+
     async def handle_wazzup_webhook(request):
         """Принимает webhook от Wazzup — сохраняет сообщения и chatId клиентов."""
         try:
@@ -2425,6 +2566,8 @@ def main():
         web_app = web.Application()
         web_app.router.add_post("/webhook/moysklad", handle_ms_webhook)
         web_app.router.add_post("/webhook/wazzup", handle_wazzup_webhook)
+        web_app.router.add_get("/webhook/sipuni", handle_sipuni_webhook)
+        web_app.router.add_post("/webhook/sipuni", handle_sipuni_webhook)
         web_app.router.add_get("/health", handle_health)
         port = int(os.getenv("PORT", "8080"))
         runner = web.AppRunner(web_app)
