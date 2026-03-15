@@ -706,3 +706,35 @@ async def analyze_pdz_responses(results: dict) -> str:
             for c in data["items"]:
                 lines.append(f"• {c['name']} — нет ответа от менеджера")
         return "\n".join(lines) if lines else "Нет данных."
+
+
+async def analyze_call(transcript: str, manager: str, client_phone: str) -> str:
+    """Анализирует транскрипцию звонка через Claude."""
+    try:
+        prompt = f"""Ты анализируешь звонок менеджера отдела продаж рыбной компании F2B PRO.
+
+Менеджер: {manager}
+Клиент (телефон): {client_phone}
+
+Транскрипция звонка:
+{transcript[:3000]}
+
+Дай краткий анализ по пунктам:
+1. 🎯 Цель звонка — зачем звонили
+2. 🐟 Товары — какие продукты обсуждались (если есть)
+3. 💰 Договорённости — что решили, следующий шаг
+4. ⚠️ Проблемы — жалобы, возражения, сложные моменты (если есть)
+5. ✅ Итог — одной строкой результат звонка
+
+Будь краток. Если что-то не упоминалось — не пиши этот пункт."""
+
+        response = await get_client().messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+
+    except Exception as e:
+        logger.error(f"analyze_call error: {e}")
+        return f"_Анализ недоступен: {e}_"
