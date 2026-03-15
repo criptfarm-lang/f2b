@@ -918,45 +918,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = message.from_user
     text = message.text or message.caption or ""
 
-    # Обработка пересланного сообщения — идентификация контакта
-    # Работает только в личке с ботом
-    if message.forward_origin and chat_id == user.id if user else False:
+    if message.forward_origin and chat_id == (user.id if user else None):
         origin = message.forward_origin
         logger.info(f"forward_origin type={type(origin).__name__} data={origin}")
-        # Извлекаем данные отправителя
-        fwd_user = getattr(origin, "sender_user", None)
-        fwd_chat = getattr(origin, "sender_chat", None) or getattr(origin, "chat", None)
 
         fwd_id = None
         fwd_name = None
+        chat_type = "telegram"
 
+        # Обычный пользователь с открытым профилем
+        fwd_user = getattr(origin, "sender_user", None)
         if fwd_user:
             fwd_id = str(fwd_user.id)
-            fwd_name = fwd_user.full_name or fwd_user.username or str(fwd_user.id)
-        elif fwd_chat:
+            fwd_name = fwd_user.full_name or str(fwd_user.id)
+
+        # Скрытый пользователь — нет ID, писать нельзя
+        if not fwd_id:
+            fwd_name = getattr(origin, "sender_user_name", None)
+            if fwd_name:
+                await message.reply_text(
+                    f"😕 У контакта *{fwd_name}* закрыт профиль в Telegram.\n"
+                    f"Написать ему через бота не получится.",
+                    parse_mode="Markdown"
+                )
+            return
+
+        # Канал или чат
+        fwd_chat = getattr(origin, "sender_chat", None) or getattr(origin, "chat", None)
+        if not fwd_id and fwd_chat:
             fwd_id = str(fwd_chat.id)
             fwd_name = fwd_chat.title or fwd_chat.username or str(fwd_chat.id)
 
-        if fwd_id and not db.is_wazzup_contact_known(fwd_id):
-            import uuid as _uuid_fwd
-            link_key = str(_uuid_fwd.uuid4())[:8]
-            _pending_links[link_key] = {
-                "chat_id": fwd_id,
-                "channel_id": os.getenv("WAZZUP_TG_CHANNEL_ID", "ddd24a95-9304-4098-a320-3e47fcd1020a"),
-                "wazzup_name": fwd_name,
-                "chat_type": "telegram",
-            }
-            _pending_links[user.id] = {**_pending_links[link_key], "link_key": link_key}
-            await message.reply_text(
-                f"👤 Контакт: *{fwd_name}*\n\nКак этот клиент называется в МойСклад?\n_(напиши название или часть названия)_",
-                parse_mode="Markdown"
-            )
+        if not fwd_id or not fwd_name:
+            await message.reply_text("😕 Не удалось определить контакт — возможно у него закрыта приватность.")
             return
-        elif fwd_id and db.is_wazzup_contact_known(fwd_id):
+
+        if db.is_wazzup_contact_known(fwd_id):
             rows = db._fetchall("SELECT company_name FROM wazzup_contact_map WHERE chat_id=%s", (fwd_id,))
             if rows:
-                await message.reply_text(f"✅ Этот контакт уже привязан к *{rows[0]['company_name']}*", parse_mode="Markdown")
+                await message.reply_text(f"✅ Контакт *{fwd_name}* уже привязан к *{rows[0]['company_name']}*", parse_mode="Markdown")
             return
+
+        import uuid as _uuid_fwd
+        link_key = str(_uuid_fwd.uuid4())[:8]
+        _pending_links[link_key] = {
+            "chat_id": fwd_id,
+            "channel_id": "ddd24a95-9304-4098-a320-3e47fcd1020a",
+            "wazzup_name": fwd_name,
+            "chat_type": chat_type,
+        }
+        _pending_links[user.id] = {**_pending_links[link_key], "link_key": link_key}
+        await message.reply_text(
+            f"👤 Контакт: *{fwd_name}*\n\nКак этот клиент называется в МойСклад?\n_(напиши название или часть названия)_",
+            parse_mode="Markdown"
+        )
+        return
 
     # В группе ИДЕНТИФИКАЦИЯ — только кнопки, текст игнорируем
     wazzup_id_chat = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
