@@ -1702,6 +1702,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard
         )
 
+    elif action == "manager_activity":
+        days = int(params.get("days", 7))
+        manager_filter = params.get("manager", "")
+        if manager_filter.lower() in ("все", "all", ""):
+            manager_filter = None
+
+        await message.reply_chat_action("typing")
+        rows = db.get_manager_activity(days=days, manager_name=manager_filter)
+
+        if not rows:
+            await message.reply_text(f"😕 Нет данных за последние {days} дней.")
+            return
+
+        lines = [f"📊 *Активность менеджеров за {days} дней*\n"]
+        for r in rows:
+            mgr = r["manager"]
+            msg_count = r.get("msg_count", 0)
+            msg_clients = r.get("msg_clients", 0)
+            call_count = r.get("call_count", 0)
+            call_clients = r.get("call_clients", 0)
+            avg_dur = r.get("avg_duration", 0)
+            avg_str = f" · ср. {avg_dur//60}:{avg_dur%60:02d}" if avg_dur else ""
+
+            lines.append(f"👤 *{mgr}*")
+            if msg_count:
+                lines.append(f"  💬 Сообщений: {msg_count} ({msg_clients} клиентов)")
+            if call_count:
+                lines.append(f"  📞 Звонков: {call_count} ({call_clients} клиентов){avg_str}")
+            lines.append("")
+
+        await message.reply_text("\n".join(lines), parse_mode="Markdown")
+
     elif action == "search_mentions":
         product = params.get("product", "")
         days = int(params.get("days", 7))
