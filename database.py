@@ -672,6 +672,64 @@ class Database:
         """
         return self._fetchall(sql, params)
 
+    def get_manager_activity(self, days: int = 7, manager_name: str = None) -> list:
+        """Отчёт по активности менеджеров: звонки + сообщения за период."""
+        from datetime import datetime, timedelta
+        since = datetime.now() - timedelta(days=days)
+
+        # Сообщения из Wazzup
+        msg_filter = "AND LOWER(manager_name) LIKE %s" if manager_name else ""
+        msg_params = [since] + ([f"%{manager_name.lower()}%"] if manager_name else [])
+        msg_rows = self._fetchall(
+            f"""SELECT manager_name,
+                COUNT(*) as msg_count,
+                COUNT(DISTINCT chat_id) as client_count
+                FROM wazzup_messages
+                WHERE is_outbound = TRUE AND sent_at >= %s
+                AND manager_name IS NOT NULL AND manager_name != ''
+                {msg_filter}
+                GROUP BY manager_name""",
+            msg_params
+        )
+
+        # Звонки из Sipuni
+        call_filter = "AND LOWER(manager_name) LIKE %s" if manager_name else ""
+        call_params = [since] + ([f"%{manager_name.lower()}%"] if manager_name else [])
+        call_rows = self._fetchall(
+            f"""SELECT manager_name,
+                COUNT(*) as call_count,
+                COUNT(DISTINCT src_num) as caller_count,
+                ROUND(AVG(duration_sec)) as avg_duration
+                FROM call_transcripts
+                WHERE called_at >= %s
+                AND manager_name IS NOT NULL AND manager_name != ''
+                {call_filter}
+                GROUP BY manager_name""",
+            call_params
+        )
+
+        # Объединяем по имени менеджера
+        result = {}
+        for r in msg_rows:
+            mgr = r["manager_name"]
+            result[mgr] = {
+                "manager": mgr,
+                "msg_count": r["msg_count"],
+                "msg_clients": r["client_count"],
+                "call_count": 0,
+                "call_clients": 0,
+                "avg_duration": 0,
+            }
+        for r in call_rows:
+            mgr = r["manager_name"]
+            if mgr not in result:
+                result[mgr] = {"manager": mgr, "msg_count": 0, "msg_clients": 0}
+            result[mgr]["call_count"] = r["call_count"]
+            result[mgr]["call_clients"] = r["caller_count"]
+            result[mgr]["avg_duration"] = int(r["avg_duration"] or 0)
+
+        return sorted(result.values(), key=lambda x: x.get("msg_count", 0) + x.get("call_count", 0), reverse=True)
+
     def get_wazzup_stats(self, days: int = 7) -> dict:
         """Статистика сообщений по менеджерам за период."""
         from datetime import datetime, timedelta
