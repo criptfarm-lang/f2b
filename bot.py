@@ -408,6 +408,39 @@ async def cmd_clear_wazzup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+async def cmd_wazzup_enrich(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обогащает базу контактов тегами из МойСклад. /wazzup_enrich"""
+    user = update.effective_user
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    if user.id not in manager_ids:
+        return
+
+    rows = db._fetchall("SELECT chat_id, company_name FROM wazzup_contact_map WHERE company_name IS NOT NULL AND company_name != '__ignore__'")
+    if not rows:
+        await update.message.reply_text("База контактов пуста.")
+        return
+
+    await update.message.reply_text(f"🔍 Обогащаю {len(rows)} контактов из МойСклад...")
+    from moysklad import find_counterparty_info
+    updated = 0
+    for r in rows:
+        try:
+            cp_list = await find_counterparty_info(r["company_name"])
+            if cp_list:
+                cp = cp_list[0]
+                db.update_wazzup_contact_tags(
+                    chat_id=r["chat_id"],
+                    tags=cp.get("tags", []),
+                    manager=cp.get("manager", ""),
+                    segment=cp.get("buyer_type", ""),
+                )
+                updated += 1
+        except Exception as e:
+            logger.warning(f"wazzup_enrich {r['company_name']}: {e}")
+
+    await update.message.reply_text(f"✅ Обновлено: {updated}/{len(rows)} контактов.")
+
+
 async def cmd_wazzup_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выгружает базу идентифицированных контактов в Excel. /wazzup_export"""
     user = update.effective_user
@@ -2188,6 +2221,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("clearwazzup", cmd_clear_wazzup))
+    app.add_handler(CommandHandler("wazzup_enrich", cmd_wazzup_enrich))
     app.add_handler(CommandHandler("wazzup_export", cmd_wazzup_export))
     app.add_handler(CommandHandler("wazzup_reset", cmd_wazzup_reset))
     app.add_handler(CommandHandler("wazzup_channels", cmd_wazzup_channels))
