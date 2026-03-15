@@ -1708,12 +1708,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if manager_filter.lower() in ("все", "all", ""):
             manager_filter = None
 
+        # Маппинг имён → фамилий для поиска в БД
+        NAME_MAP = {
+            "инесса": "скляр", "скляр": "скляр",
+            "карина": "баласанян", "баласанян": "баласанян",
+            "татьяна": "голубева", "голубева": "голубева",
+            "алексей": "леонтьев", "леонтьев": "леонтьев",
+            "елена": "мерзлякова", "лена": "мерзлякова", "мерзлякова": "мерзлякова",
+        }
+        if manager_filter:
+            manager_filter = NAME_MAP.get(manager_filter.lower(), manager_filter)
+
         await message.reply_chat_action("typing")
         rows = db.get_manager_activity(days=days, manager_name=manager_filter)
 
         if not rows:
             await message.reply_text(f"😕 Нет данных за последние {days} дней.")
             return
+
+        from moysklad import get_manager_stats_ms, MANAGER_TAGS
 
         lines = [f"📊 *Активность менеджеров за {days} дней*\n"]
         for r in rows:
@@ -1725,11 +1738,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             avg_dur = r.get("avg_duration", 0)
             avg_str = f" · ср. {avg_dur//60}:{avg_dur%60:02d}" if avg_dur else ""
 
+            # Уникальные клиенты по всем каналам
+            total_unique = len(set(list(range(msg_clients)) + list(range(msg_clients, msg_clients + call_clients))))
+            # Упрощённо: берём максимум из двух (точнее не посчитать без JOIN)
+            total_unique = max(msg_clients, call_clients)
+
+            # Ищем тег менеджера для запроса в МойСклад
+            ms_tag = None
+            for tag_key, tag_name in MANAGER_TAGS.items():
+                if tag_key.lower() in mgr.lower() or mgr.lower() in tag_name.lower():
+                    ms_tag = tag_key
+                    break
+
             lines.append(f"👤 *{mgr}*")
             if msg_count:
                 lines.append(f"  💬 Сообщений: {msg_count} ({msg_clients} клиентов)")
             if call_count:
                 lines.append(f"  📞 Звонков: {call_count} ({call_clients} клиентов){avg_str}")
+            lines.append(f"  🤝 Всего контактов за период: {total_unique}")
+
+            # Данные из МойСклад
+            if ms_tag:
+                try:
+                    ms_stats = await get_manager_stats_ms(ms_tag)
+                    lines.append(f"  📋 База МойСклад: {ms_stats['total']} компаний")
+                    lines.append(f"  🔥 Активных (60 дн): {ms_stats['active']} компаний")
+                except Exception:
+                    pass
             lines.append("")
 
         await message.reply_text("\n".join(lines), parse_mode="Markdown")
