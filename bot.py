@@ -167,7 +167,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# Ожидающие привязки контактов — user_id → {chat_id, channel_id, wazzup_name, chat_type}
+# Кэш уже отправленных уведомлений об идентификации — chat_id → True
+_wazzup_notified: set = set()
+
+
+
 _pending_links: dict = {}
 
 
@@ -294,10 +298,9 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
             except Exception as e:
                 logger.warning(f"Не удалось подтянуть теги из МойСклад: {e}")
         if ok:
+            _wazzup_notified.discard(pending["chat_id"])
             await query.message.edit_text(
-                f"✅ *{pending['company_name']}*\n"
-                f"Роль: {pending.get('role')} · Сегмент: {pending.get('segment')} · Менеджер: {manager}\n"
-                f"Эф запомнил!",
+                f"✅ *{pending['wazzup_name']}* → *{pending['company_name']}* ({role})\nЭф запомнил!",
                 parse_mode="Markdown"
             )
             await asyncio.sleep(3)
@@ -314,6 +317,8 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
 
         # Отмена
         if role == "отмена":
+            pending_data = _pending_links.get(link_key, {})
+            _wazzup_notified.discard(pending_data.get("chat_id", ""))
             _pending_links.pop(link_key, None)
             for uid in [k for k, v in list(_pending_links.items()) if v.get("link_key") == link_key]:
                 _pending_links.pop(uid, None)
@@ -2142,7 +2147,7 @@ def main():
                     # Для Telegram — уведомляем руководителя если контакт неизвестен
                     is_known = db.is_wazzup_contact_known(chat_id_val)
                     logger.info(f"Wazzup: chat_id={chat_id_val} is_known={is_known}")
-                    if chat_type in ("telegram", "tgapi") and not is_known:
+                    if chat_type in ("telegram", "tgapi") and not is_known and chat_id_val not in _wazzup_notified:
                         # Проверяем что контакт не помечен как игнорируемый
                         ignored = db._fetchone(
                             "SELECT id FROM wazzup_contact_map WHERE chat_id=%s AND company_name='__ignore__'",
@@ -2180,6 +2185,7 @@ def main():
                                     parse_mode="Markdown",
                                     reply_markup=keyboard
                                 )
+                                _wazzup_notified.add(chat_id_val)
                             except Exception as e:
                                 logger.error(f"Не удалось отправить уведомление в группу: {e}", exc_info=True)
 
