@@ -495,10 +495,17 @@ class Database:
             params.append(f"%{kw.lower()}%")
 
         sql = f"""
-            SELECT manager_name, contact_name, chat_type, text, sent_at
-            FROM wazzup_messages
+            SELECT
+                COALESCE(NULLIF(m.manager_name, ''), cm.manager, 'Неизвестно') AS manager_name,
+                m.contact_name,
+                COALESCE(cm.company_name, m.contact_name) AS client_name,
+                m.chat_type,
+                m.text,
+                m.sent_at
+            FROM wazzup_messages m
+            LEFT JOIN wazzup_contact_map cm ON m.chat_id = cm.chat_id
             WHERE {' AND '.join(conditions)}
-            ORDER BY manager_name, sent_at DESC
+            ORDER BY manager_name, m.sent_at DESC
         """
         return self._fetchall(sql, params)
 
