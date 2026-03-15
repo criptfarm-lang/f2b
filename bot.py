@@ -922,6 +922,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Работает только в личке с ботом
     if message.forward_origin and chat_id == user.id if user else False:
         origin = message.forward_origin
+        logger.info(f"forward_origin type={type(origin).__name__} data={origin}")
         # Извлекаем данные отправителя
         fwd_user = getattr(origin, "sender_user", None)
         fwd_chat = getattr(origin, "sender_chat", None) or getattr(origin, "chat", None)
