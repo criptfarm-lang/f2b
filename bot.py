@@ -2147,7 +2147,7 @@ def main():
                     # Для Telegram — уведомляем руководителя если контакт неизвестен
                     is_known = db.is_wazzup_contact_known(chat_id_val)
                     logger.info(f"Wazzup: chat_id={chat_id_val} is_known={is_known}")
-                    if chat_type in ("telegram", "tgapi") and not is_known and chat_id_val not in _wazzup_notified:
+                    if chat_type in ("telegram", "tgapi", "max") and not is_known and chat_id_val not in _wazzup_notified:
                         # Проверяем что контакт не помечен как игнорируемый
                         ignored = db._fetchone(
                             "SELECT id FROM wazzup_contact_map WHERE chat_id=%s AND company_name='__ignore__'",
@@ -2174,11 +2174,13 @@ def main():
                                 preview = (text or "").replace("\n", " ").strip()
                                 if len(preview) > 120:
                                     preview = preview[:120] + "..."
+                                CHANNEL_NAMES = {"telegram": "Telegram", "tgapi": "Telegram", "max": "Max", "whatsapp": "WhatsApp"}
+                                channel_label = CHANNEL_NAMES.get(chat_type, chat_type)
                                 await app.bot.send_message(
                                     chat_id=group_chat_id,
                                     text=(
-                                        f"📩 *Новый неизвестный контакт в Telegram*\n\n"
-                                        f"👤 Имя в TG: *{contact_name}*\n"
+                                        f"📩 *Новый неизвестный контакт — {channel_label}*\n\n"
+                                        f"👤 Имя: *{contact_name}*\n"
                                         f"💬 _{preview}_\n\n"
                                         f"Чей клиент? Нажми и напиши как он называется в МойСклад"
                                     ),
