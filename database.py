@@ -172,6 +172,17 @@ class Database:
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS tags TEXT",
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS manager TEXT",
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS segment TEXT",
+            """CREATE TABLE IF NOT EXISTS call_transcripts (
+                id SERIAL PRIMARY KEY,
+                call_id TEXT UNIQUE,
+                src_num TEXT,
+                dst_num TEXT,
+                manager_name TEXT,
+                tree_name TEXT,
+                transcript TEXT,
+                duration_sec INTEGER DEFAULT 0,
+                called_at TIMESTAMP DEFAULT NOW()
+            )""",
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS segment TEXT",
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS manager TEXT",
             """CREATE TABLE IF NOT EXISTS wazzup_contacts (
@@ -612,6 +623,54 @@ class Database:
                ORDER BY created_at DESC""",
             [f"%{company_name}%"] + roles
         )
+
+    def save_call_transcript(self, call_id: str, src_num: str, dst_num: str,
+                             manager_name: str, tree_name: str, transcript: str,
+                             duration_sec: int = 0, called_at: str = None) -> bool:
+        """Сохраняет транскрипцию звонка."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO call_transcripts
+                       (call_id, src_num, dst_num, manager_name, tree_name, transcript, duration_sec, called_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, COALESCE(%s::timestamp, NOW()))
+                       ON CONFLICT (call_id) DO NOTHING RETURNING id""",
+                    (call_id, src_num, dst_num, manager_name, tree_name,
+                     transcript, duration_sec, called_at)
+                )
+                row = cur.fetchone()
+                self.conn.commit()
+                return row is not None
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"save_call_transcript error: {e}")
+            return False
+
+    def search_call_mentions(self, keywords: list, days: int = 7,
+                             manager_name: str = None) -> list:
+        """Ищет упоминания ключевых слов в транскрипциях звонков."""
+        from datetime import datetime, timedelta
+        since = datetime.now() - timedelta(days=days)
+
+        conditions = ["called_at >= %s", "transcript IS NOT NULL"]
+        params = [since]
+
+        if manager_name:
+            conditions.append("LOWER(manager_name) LIKE %s")
+            params.append(f"%{manager_name.lower()}%")
+
+        kw_conditions = " OR ".join(["LOWER(transcript) LIKE %s"] * len(keywords))
+        conditions.append(f"({kw_conditions})")
+        for kw in keywords:
+            params.append(f"%{kw.lower()}%")
+
+        sql = f"""
+            SELECT manager_name, src_num, tree_name, transcript, called_at
+            FROM call_transcripts
+            WHERE {' AND '.join(conditions)}
+            ORDER BY manager_name, called_at DESC
+        """
+        return self._fetchall(sql, params)
 
     def get_wazzup_stats(self, days: int = 7) -> dict:
         """Статистика сообщений по менеджерам за период."""
