@@ -21,15 +21,62 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, HRFlowable
 )
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib import colors
 
+import glob
+
+# Автопоиск шрифтов DejaVu
+def _find_font(name):
+    patterns = [
+        f"/usr/share/fonts/**/{name}",
+        f"/usr/local/share/fonts/**/{name}",
+        f"/app/.fonts/{name}",
+        f"/home/**/{name}",
+    ]
+    for p in patterns:
+        found = glob.glob(p, recursive=True)
+        if found:
+            return found[0]
+    return None
+
+_FONT = _find_font("DejaVuSans.ttf")
+_FONT_BOLD = _find_font("DejaVuSans-Bold.ttf")
+_FONT_ITALIC = _find_font("DejaVuSans-Oblique.ttf")
+
+# Если не найдены — скачиваем
+if not _FONT:
+    import urllib.request, zipfile, io as _io
+    url = "https://downloads.sourceforge.net/project/dejavu/dejavu/2.37/dejavu-fonts-ttf-2.37.zip"
+    try:
+        os.makedirs("/tmp/dejavu", exist_ok=True)
+        data = urllib.request.urlopen(url, timeout=30).read()
+        with zipfile.ZipFile(_io.BytesIO(data)) as z:
+            for name in z.namelist():
+                if name.endswith(".ttf") and "DejaVuSans" in name and "/" not in name.replace("dejavu-fonts-ttf-2.37/ttf/", ""):
+                    fname = os.path.basename(name)
+                    with open(f"/tmp/dejavu/{fname}", "wb") as f:
+                        f.write(z.read(name))
+        _FONT = "/tmp/dejavu/DejaVuSans.ttf"
+        _FONT_BOLD = "/tmp/dejavu/DejaVuSans-Bold.ttf"
+        _FONT_ITALIC = "/tmp/dejavu/DejaVuSans-Oblique.ttf"
+    except Exception as e:
+        # Fallback — используем встроенные шрифты reportlab без кириллицы
+        _FONT = None
+
 # Регистрируем шрифты
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/"
-pdfmetrics.registerFont(TTFont("DejaVu", FONT_PATH + "DejaVuSans.ttf"))
-pdfmetrics.registerFont(TTFont("DejaVuBold", FONT_PATH + "DejaVuSans-Bold.ttf"))
-pdfmetrics.registerFont(TTFont("DejaVuItalic", FONT_PATH + "DejaVuSans-Oblique.ttf"))
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+if _FONT and os.path.exists(_FONT):
+    pdfmetrics.registerFont(TTFont("DejaVu", _FONT))
+    pdfmetrics.registerFont(TTFont("DejaVuBold", _FONT_BOLD or _FONT))
+    pdfmetrics.registerFont(TTFont("DejaVuItalic", _FONT_ITALIC or _FONT))
+    FONT_NORMAL = "DejaVu"
+    FONT_BOLD = "DejaVuBold"
+else:
+    # Встроенный шрифт (без кириллицы — крайний случай)
+    FONT_NORMAL = "Helvetica"
+    FONT_BOLD = "Helvetica-Bold"
 
 # Пути к ресурсам (будут подставлены при деплое)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -39,20 +86,15 @@ STAMP_PATH = os.path.join(BASE_DIR, "assets", "pechat.png")
 
 # Стили
 def make_styles():
-    normal = ParagraphStyle("normal", fontName="DejaVu", fontSize=9,
-                            leading=13, spaceAfter=4, alignment=TA_JUSTIFY)
-    bold = ParagraphStyle("bold", fontName="DejaVuBold", fontSize=9,
-                          leading=13, spaceAfter=4)
-    title = ParagraphStyle("title", fontName="DejaVuBold", fontSize=13,
-                           leading=18, spaceAfter=6, alignment=TA_CENTER)
-    subtitle = ParagraphStyle("subtitle", fontName="DejaVuBold", fontSize=10,
-                              leading=14, spaceAfter=4, alignment=TA_CENTER)
-    heading = ParagraphStyle("heading", fontName="DejaVuBold", fontSize=9,
-                             leading=13, spaceAfter=4, alignment=TA_CENTER)
-    small = ParagraphStyle("small", fontName="DejaVu", fontSize=8,
-                           leading=11, spaceAfter=2)
-    small_bold = ParagraphStyle("small_bold", fontName="DejaVuBold", fontSize=8,
-                                leading=11, spaceAfter=2)
+    F = FONT_NORMAL
+    FB = FONT_BOLD
+    normal = ParagraphStyle("normal", fontName=F, fontSize=9, leading=13, spaceAfter=4, alignment=TA_JUSTIFY)
+    bold = ParagraphStyle("bold", fontName=FB, fontSize=9, leading=13, spaceAfter=4)
+    title = ParagraphStyle("title", fontName=FB, fontSize=13, leading=18, spaceAfter=6, alignment=TA_CENTER)
+    subtitle = ParagraphStyle("subtitle", fontName=FB, fontSize=10, leading=14, spaceAfter=4, alignment=TA_CENTER)
+    heading = ParagraphStyle("heading", fontName=FB, fontSize=9, leading=13, spaceAfter=4, alignment=TA_CENTER)
+    small = ParagraphStyle("small", fontName=F, fontSize=8, leading=11, spaceAfter=2)
+    small_bold = ParagraphStyle("small_bold", fontName=FB, fontSize=8, leading=11, spaceAfter=2)
     return normal, bold, title, subtitle, heading, small, small_bold
 
 
