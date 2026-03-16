@@ -1882,7 +1882,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buyer_query = params.get("buyer", "")
         await message.reply_chat_action("typing")
 
-        from moysklad import get_counterparty_balance, get_counterparty_requisites
+        from moysklad import get_counterparty_requisites
 
         # Ищем контрагента
         counterparties = await get_counterparty_balance(buyer_query)
