@@ -1293,6 +1293,43 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                     "days": days_overdue,
                 })
 
+            # Дополнительно — для каждого агента собираем сумму непросроченных заказов
+            # чтобы корректно вычесть из реального долга
+            agent_not_overdue = {}
+            for order in all_orders:
+                ppm = ""
+                customer_order = order.get("customerOrder", {})
+                if customer_order and isinstance(customer_order, dict):
+                    for attr in customer_order.get("attributes", []):
+                        if attr.get("name") == "Дата планируемой оплаты":
+                            ppm = attr.get("value", "")
+                            break
+                if not ppm:
+                    continue
+                try:
+                    due_dt2 = datetime.fromisoformat(ppm.replace(".000","").replace("Z",""))
+                    if due_dt2.tzinfo is None:
+                        due_dt2 = due_dt2.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                if due_dt2 < today_dt:
+                    continue  # просроченные уже в demands
+                agent2 = order.get("agent", {})
+                aid2 = agent2.get("id", "")
+                if not aid2:
+                    continue
+                total_s = (order.get("sum", 0) or 0) / 100
+                co = order.get("customerOrder", {})
+                if co and isinstance(co, dict):
+                    ps = (co.get("payedSum", 0) or 0) / 100
+                    os2 = (co.get("sum", 0) or 0) / 100
+                    unpaid2 = max(0, os2 - ps)
+                else:
+                    unpaid2 = total_s
+                if unpaid2 <= 0:
+                    continue
+                agent_not_overdue[aid2] = agent_not_overdue.get(aid2, 0) + total_s
+
             result = list(by_agent.values())
 
             # Пересчитываем просрочку с учётом реального баланса
@@ -1313,23 +1350,33 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                         logger.info(f"Excluding {agent['name']}: no real debt")
                         continue
 
-                    # Сортируем заказы от свежих к старым — оплаты покрывают свежие первыми
-                    demands_sorted = sorted(agent["demands"],
-                                           key=lambda x: x.get("due", ""), reverse=True)
+                    # Правильная логика:
+                    # просрочка = реальный долг - сумма НЕпросроченных заказов
+                    # Непросроченные заказы уже "зарезервированы" под будущие оплаты
+                    not_overdue_sum = agent_not_overdue.get(agent["id"], 0)
+                    # Из просроченных берём только то что покрыто реальным долгом
+                    # после вычета непросроченных
+                    effective_overdue = max(0, real_debt - not_overdue_sum)
 
-                    remaining = real_debt
+                    if effective_overdue <= 0:
+                        logger.info(f"Excluding {agent['name']}: covered by non-overdue {not_overdue_sum:.2f}")
+                        continue
+
+                    # Распределяем effective_overdue по просроченным заказам (старые первые)
+                    overdue_only = sorted(
+                        [d for d in agent["demands"] if d.get("days", 0) > 0],
+                        key=lambda x: x.get("due", "")
+                    )
+                    remaining = effective_overdue
                     overdue_demands = []
                     overdue_sum = 0
-
-                    for d in demands_sorted:
+                    for d in overdue_only:
                         if remaining <= 0:
                             break
-                        covered = min(remaining, d["unpaid"])
-                        remaining -= covered
-                        uncovered = round(d["unpaid"] - covered, 2)
-                        if uncovered > 0:
-                            overdue_demands.append({**d, "unpaid": uncovered})
-                            overdue_sum += uncovered
+                        amount = min(remaining, d["unpaid"])
+                        remaining -= amount
+                        overdue_demands.append({**d, "unpaid": round(amount, 2)})
+                        overdue_sum += amount
 
                     overdue_sum = round(overdue_sum, 2)
                     if overdue_sum <= 0:
