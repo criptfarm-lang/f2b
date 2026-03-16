@@ -773,8 +773,37 @@ async def cmd_del_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Задача #{task_id} не найдена или уже закрыта.")
     except ValueError:
         await update.message.reply_text("❌ Укажи числовой ID задачи.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+async def cmd_deltask_by_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удалить задачу ответом 'удали' на сообщение бота с задачей."""
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return
+    user = msg.from_user
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    if not user or user.id not in manager_ids:
+        return
+    replied = msg.reply_to_message
+    # Проверяем что это сообщение бота
+    if not replied.from_user or not replied.from_user.is_bot:
+        return
+    bot_msg_id = replied.message_id
+    chat_id = msg.chat_id
+    deleted = db.delete_tasks_by_bot_message_id(bot_msg_id, chat_id)
+    if deleted:
+        names = [f"• *{t['executor']}*: {t['text']}" for t in deleted]
+        await msg.reply_text(
+            f"🗑 Задач удалено: {len(deleted)}\n" + "\n".join(names),
+            parse_mode="Markdown"
+        )
+        # Удаляем само сообщение бота о задачах
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=bot_msg_id)
+        except Exception:
+            pass
+    else:
+        await msg.reply_text("Задачи не найдены или уже закрыты.")
 
 
 async def cmd_clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1257,7 +1286,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if saved_count > 0:
                 lines = [f"📌 Зафиксировано задач: {saved_count}\n"] + task_lines
-                await message.reply_text("\n".join(lines), parse_mode="Markdown")
+                sent = await message.reply_text("\n".join(lines), parse_mode="Markdown")
+                # Сохраняем message_id сообщения бота для всех задач из этого сообщения
+                if sent:
+                    tasks_from_this_msg = db._fetchall(
+                        "SELECT id FROM tasks WHERE source_message_id=%s AND source_chat=%s AND bot_message_id IS NULL",
+                        (message.message_id, chat_id)
+                    )
+                    for t in tasks_from_this_msg:
+                        db.set_task_bot_message_id(t['id'], sent.message_id)
 
     # 3. Автозакрытие задач — Claude анализирует контекст
     sender_name = update.effective_user.full_name if update.effective_user else ""
@@ -2688,6 +2725,11 @@ def main():
     app.add_handler(CommandHandler("clearall", cmd_clear_all))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("deltask", cmd_del_task))
+    app.add_handler(MessageHandler(
+        filters.REPLY & filters.Regex(r"(?i)^(удали|удалить|отмени|отменить|убери)"),
+        cmd_deltask_by_reply
+    ))
+    app.add_handler(MessageHandler(filters.StatusUpdate.MESSAGE_AUTO_DELETE_TIMER_CHANGED, handle_message))
     app.add_handler(CommandHandler("cleartasks", cmd_clear_tasks))
     app.add_handler(CommandHandler("all_tasks", cmd_all_tasks))
     app.add_handler(CommandHandler("overdue", cmd_overdue))
