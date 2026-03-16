@@ -1088,6 +1088,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message:
         return
 
+    async def safe_reply(text, **kwargs):
+        """Отправляет ответ, при ошибке цитаты — без неё."""
+        try:
+            return await message.reply_text(text, **kwargs)
+        except Exception:
+            try:
+                return await context.bot.send_message(
+                    chat_id=message.chat_id, text=text,
+                    parse_mode=kwargs.get("parse_mode"),
+                    reply_markup=kwargs.get("reply_markup")
+                )
+            except Exception as e:
+                logger.warning(f"safe_reply failed: {e}")
+
     # Команды обрабатываются отдельными CommandHandler — пропускаем
     if message.text and message.text.startswith("/"):
         return
@@ -1350,7 +1364,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if "company_name" not in pending_link:
                 # Если уже показали варианты — просим нажать кнопку
                 if pending_link.get("suggestions") and text.strip() == pending_link.get("last_query", ""):
-                    await message.reply_text("👆 Выбери компанию из списка выше или нажми «Не привязывать».")
+                    await safe_reply("👆 Выбери компанию из списка выше или нажми «Не привязывать».")
                     return
                 # Сбрасываем старые варианты при новом вводе
                 pending_link.pop("suggestions", None)
@@ -1381,7 +1395,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "🚫 Не привязывать",
                             callback_data=f"wazzup_role|отмена|{link_key}"
                         )])
-                        await message.reply_text(
+                        await safe_reply(
                             f"❓ *{company_query}* не найдена точно.\n\nВозможно имеется в виду:",
                             parse_mode="Markdown",
                             reply_markup=InlineKeyboardMarkup(buttons)
@@ -1390,7 +1404,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         keyboard = InlineKeyboardMarkup([[
                             InlineKeyboardButton("🚫 Не привязывать", callback_data=f"wazzup_role|отмена|{pending_link.get('link_key', str(user.id))}")
                         ]])
-                        await message.reply_text(
+                        await safe_reply(
                             f"❌ Компания *{company_query}* не найдена в МойСклад.\n"
                             f"Попробуй написать название точнее или отмени привязку.",
                             parse_mode="Markdown",
@@ -1433,7 +1447,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                     except Exception as e:
                         logger.warning(f"Теги МойСклад: {e}")
-                    await message.reply_text(
+                    await safe_reply(
                         f"✅ *{pending_link['wazzup_name']}* → *{cp_name}*\nЭф запомнил!",
                         parse_mode="Markdown"
                     )
@@ -1441,7 +1455,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 next_pl = _pending_links.get(user.id)
                 next_pending = next_pl[0] if isinstance(next_pl, list) and next_pl else None
                 if next_pending:
-                    await message.reply_text(
+                    await safe_reply(
                         f"👤 Следующий контакт: *{next_pending['wazzup_name']}*\n\n"
                         f"Как этот клиент называется в МойСклад?\n"
                         f"_(напиши название или часть названия)_",
