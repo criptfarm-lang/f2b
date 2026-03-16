@@ -408,6 +408,56 @@ async def cmd_clear_wazzup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+# Ожидающие данные для создания договора — user_id → {data, missing, missing_idx}
+_pending_contracts: dict = {}
+
+
+async def _create_and_send_contract(contract_data: dict, created_by: str, message, context):
+    """Генерирует договор PDF и отправляет в группу."""
+    import io, sys, os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+    try:
+        from contract_generator import generate_contract_pdf, get_contract_number
+        from datetime import datetime
+
+        today = datetime.now()
+        contract_number = get_contract_number(today, db)
+
+        MONTHS_RU = ["января","февраля","марта","апреля","мая","июня",
+                     "июля","августа","сентября","октября","ноября","декабря"]
+        contract_data["contract_number"] = contract_number
+        contract_data["contract_date"] = f"{today.day} {MONTHS_RU[today.month-1]} {today.year} г."
+
+        pdf_bytes = generate_contract_pdf(contract_data)
+
+        # Сохраняем в БД
+        db.save_contract(contract_number, contract_data["buyer_name"], created_by)
+
+        # Отправляем в группу
+        group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
+        target = group_chat_id or message.chat_id
+        caption = (
+            f"📄 *Договор поставки № {contract_number}*\n"
+            f"📅 {contract_data['contract_date']}\n"
+            f"🏢 {contract_data['buyer_name']}\n"
+            f"👤 Создал: {created_by}"
+        )
+        await context.bot.send_document(
+            chat_id=target,
+            document=io.BytesIO(pdf_bytes),
+            filename=f"Договор_{contract_number}_{contract_data['buyer_name'][:30]}.pdf",
+            caption=caption,
+            parse_mode="Markdown"
+        )
+        if target != message.chat_id:
+            await message.reply_text(f"✅ Договор № {contract_number} отправлен в группу.", parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"_create_and_send_contract: {e}", exc_info=True)
+        await message.reply_text(f"❌ Ошибка генерации договора: {e}")
+
+
 async def cmd_wazzup_enrich(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обогащает базу контактов тегами из МойСклад. /wazzup_enrich"""
     user = update.effective_user
@@ -1209,6 +1259,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Проверяем ожидание данных для договора
+    if user and user.id in _pending_contracts and not is_bot_addressed(text):
+        pending_c = _pending_contracts[user.id]
+        missing = pending_c["missing"]
+        idx = pending_c["missing_idx"]
+        field = missing[idx]
+        data = pending_c["data"]
+
+        # Маппинг вопросов → поля
+        FIELD_MAP = {
+            "ИНН": "buyer_inn",
+            "ОГРН": "buyer_ogrn",
+            "юридический адрес": "buyer_address",
+            "расчётный счёт р/с": "buyer_rs",
+            "БИК банка": "buyer_bik",
+            "название банка": "buyer_bank",
+            "корреспондентский счёт к/с": "buyer_ks",
+            "ФИО директора и должность (напр. 'генерального директора Иванова И.И.')": "buyer_representative",
+        }
+        field_key = FIELD_MAP.get(field)
+        if field_key:
+            data[field_key] = text.strip()
+            # Для ФИО директора — также сохраняем краткую форму для подписи
+            if field_key == "buyer_representative":
+                parts = text.strip().split()
+                if len(parts) >= 2:
+                    data["buyer_director_name"] = " ".join(parts[-2:])
+
+        idx += 1
+        if idx < len(missing):
+            pending_c["missing_idx"] = idx
+            await message.reply_text(f"✅ Принято.\n\n*{missing[idx]}*?", parse_mode="Markdown")
+            return
+        else:
+            # Все данные собраны
+            _pending_contracts.pop(user.id, None)
+            await message.reply_text("✅ Все данные получены. Генерирую договор...")
+            await _create_and_send_contract(data, user.full_name, message, context)
+            return
+
     # Проверяем ожидание привязки Wazzup контакта
     if user and user.id in _pending_links and not is_bot_addressed(text):
         pending_link = _pending_links[user.id]
@@ -1701,6 +1791,84 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=keyboard
         )
+
+    elif action == "generate_contract":
+        buyer_query = params.get("buyer", "")
+        await message.reply_chat_action("typing")
+
+        # Ищем контрагента в МойСклад
+        from moysklad import find_counterparty_info, get_counterparty_phones
+        cp_list = []
+        if buyer_query:
+            cp_list = await find_counterparty_info(buyer_query)
+
+        if not cp_list:
+            await message.reply_text(
+                f"❌ Компания *{buyer_query}* не найдена в МойСклад.\n"
+                f"Напиши название точнее.",
+                parse_mode="Markdown"
+            )
+            return
+
+        cp = cp_list[0]
+
+        # Собираем данные из МойСклад
+        phones_list = await get_counterparty_phones([{
+            "id": cp.get("id",""), "name": cp.get("name",""), "href": cp.get("href","")
+        }])
+        phone = phones_list[0].get("phone","") if phones_list else ""
+
+        contract_data = {
+            "buyer_name": cp.get("name",""),
+            "buyer_inn": cp.get("inn",""),
+            "buyer_ogrn": cp.get("ogrn",""),
+            "buyer_address": cp.get("legalAddress","") or cp.get("actualAddress",""),
+            "buyer_bank": "",
+            "buyer_rs": "",
+            "buyer_bik": "",
+            "buyer_ks": "",
+            "buyer_phone": phone or "",
+            "buyer_email": cp.get("email",""),
+            "buyer_representative": "",
+            "buyer_director_name": "",
+        }
+
+        # Проверяем чего не хватает
+        missing = []
+        if not contract_data["buyer_inn"]:
+            missing.append("ИНН")
+        if not contract_data["buyer_ogrn"]:
+            missing.append("ОГРН")
+        if not contract_data["buyer_address"]:
+            missing.append("юридический адрес")
+        if not contract_data["buyer_rs"]:
+            missing.append("расчётный счёт р/с")
+        if not contract_data["buyer_bik"]:
+            missing.append("БИК банка")
+        if not contract_data["buyer_bank"]:
+            missing.append("название банка")
+        if not contract_data["buyer_ks"]:
+            missing.append("корреспондентский счёт к/с")
+        if not contract_data["buyer_representative"]:
+            missing.append("ФИО директора и должность (напр. 'генерального директора Иванова И.И.')")
+
+        if missing:
+            # Сохраняем неполные данные и просим дополнить
+            _pending_contracts[user.id] = {
+                "data": contract_data,
+                "missing": missing,
+                "missing_idx": 0,
+            }
+            await message.reply_text(
+                f"📄 Нашёл компанию: *{contract_data['buyer_name']}*\n\n"
+                f"Не хватает данных. Ответь на вопросы:\n\n"
+                f"*{missing[0]}*?",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Все данные есть — генерируем
+        await _create_and_send_contract(contract_data, user.full_name, message, context)
 
     elif action == "manager_activity":
         days = int(params.get("days", 7))
