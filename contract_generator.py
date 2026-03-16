@@ -1,10 +1,17 @@
 """
 Генератор договора поставки АО «ФИШ ТУ БИЗНЕС» в PDF.
-Подставляет данные покупателя, номер и дату договора.
-Вставляет подпись и печать поставщика.
 """
 
 import os
+import sys
+import subprocess
+
+# Автоустановка если нет
+try:
+    import reportlab
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "reportlab", "--break-system-packages", "-q"])
+
 import io
 from datetime import datetime
 from reportlab.lib.pagesizes import A4
