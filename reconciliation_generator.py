@@ -162,7 +162,7 @@ def generate_reconciliation_pdf(data: dict) -> bytes:
             cv.drawImage(sign, lx-65*mm, by-22*mm-10*mm, width=151*mm, height=65*mm,
                          mask="auto", preserveAspectRatio=True)
         if stamp and os.path.exists(stamp):
-            cv.drawImage(stamp, lx+2*mm, by-22*mm, width=55*mm, height=55*mm,
+            cv.drawImage(stamp, lx+2*mm, by-22*mm - 55*mm, width=110*mm, height=110*mm,
                          mask="auto", preserveAspectRatio=True)
         cv.setFont(FB,8); cv.drawString(lx, by, "/Маланчук А.В./")
         cv.setFont(FB,8); cv.drawString(rx, by+16*mm, f"От {cp_name[:40]}:")
