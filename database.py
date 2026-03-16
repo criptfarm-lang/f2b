@@ -172,6 +172,13 @@ class Database:
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS tags TEXT",
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS manager TEXT",
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS segment TEXT",
+            """CREATE TABLE IF NOT EXISTS contracts (
+                id SERIAL PRIMARY KEY,
+                contract_number TEXT UNIQUE NOT NULL,
+                buyer_name TEXT,
+                created_by TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
             """CREATE TABLE IF NOT EXISTS call_transcripts (
                 id SERIAL PRIMARY KEY,
                 call_id TEXT UNIQUE,
@@ -622,6 +629,24 @@ class Database:
                AND LOWER(role) IN ({placeholders})
                ORDER BY created_at DESC""",
             [f"%{company_name}%"] + roles
+        )
+
+    def save_contract(self, contract_number: str, buyer_name: str, created_by: str):
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO contracts (contract_number, buyer_name, created_by) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                    (contract_number, buyer_name, created_by)
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"save_contract error: {e}")
+
+    def get_contracts_by_date(self, date_str: str) -> list:
+        return self._fetchall(
+            "SELECT * FROM contracts WHERE contract_number LIKE %s ORDER BY id",
+            (f"{date_str}%",)
         )
 
     def save_call_transcript(self, call_id: str, src_num: str, dst_num: str,
