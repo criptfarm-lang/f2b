@@ -1130,19 +1130,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if wazzup_id_chat and chat_id == wazzup_id_chat:
         if not text or text.startswith("/"):
             return
+        # Удаляем сообщение менеджера чтобы не засорять группу
+        try:
+            await message.delete()
+        except Exception:
+            pass
         # Если у этого пользователя нет pending — ищем любой активный pending в группе
         if user and user.id not in _pending_links:
-            # Берём первый активный pending от любого пользователя
             for uid, pl in list(_pending_links.items()):
                 if isinstance(uid, int) and isinstance(pl, list) and pl:
-                    # Переносим на текущего пользователя
                     _pending_links[user.id] = pl
                     break
                 elif isinstance(uid, int) and isinstance(pl, dict) and "wazzup_name" in pl:
                     _pending_links[user.id] = [pl]
                     break
         if user and user.id not in _pending_links:
-            return  # нет активных ожиданий — игнорируем
+            return
 
     # Сохраняем все сообщения в историю чата
     if text and user:
@@ -1353,6 +1356,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     _pending_links.pop(user.id, None)
                 _pending_links.pop(link_key, None)
+                db.delete_pending_ident(link_key)
                 ok = db.link_wazzup_contact(
                     chat_id=pending_link["chat_id"],
                     chat_type=pending_link["chat_type"],
@@ -2639,6 +2643,23 @@ def main():
 
     app = Application.builder().token(token).build()
 
+    # Восстанавливаем ожидающие идентификации из БД после рестарта
+    try:
+        pending_rows = db.get_pending_idents()
+        for row in pending_rows:
+            lk = row["link_key"]
+            _pending_links[lk] = {
+                "chat_id": row["chat_id"],
+                "channel_id": row["channel_id"],
+                "wazzup_name": row["wazzup_name"],
+                "chat_type": row["chat_type"],
+                "link_key": lk,
+            }
+        if pending_rows:
+            logger.info(f"Восстановлено {len(pending_rows)} ожидающих идентификаций из БД")
+    except Exception as e:
+        logger.warning(f"Не удалось восстановить pending_idents: {e}")
+
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -2764,6 +2785,14 @@ def main():
                                     "wazzup_name": contact_name,
                                     "chat_type": chat_type,
                                 }
+                                # Сохраняем в БД чтобы пережить рестарт
+                                db.save_pending_ident(
+                                    link_key=link_key,
+                                    chat_id=chat_id_val,
+                                    channel_id=channel_id_val,
+                                    wazzup_name=contact_name,
+                                    chat_type=chat_type,
+                                )
                                 keyboard = InlineKeyboardMarkup([[
                                     InlineKeyboardButton("🏢 Привязать компанию", callback_data=f"wazzup_link|{link_key}"),
                                     InlineKeyboardButton("🚫 Не привязывать", callback_data=f"wazzup_ignore|{chat_id_val}")
@@ -2846,6 +2875,23 @@ def main():
             allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post", "callback_query"]
         )
         logger.info("🤖 Бот запущен!")
+        # Восстанавливаем pending_links из БД после рестарта
+        try:
+            pending_rows = db.load_pending_links()
+            for row in pending_rows:
+                lk = row["link_key"]
+                entry = {
+                    "link_key": lk,
+                    "chat_id": row["chat_id"],
+                    "channel_id": row["channel_id"],
+                    "wazzup_name": row["wazzup_name"],
+                    "chat_type": row["chat_type"],
+                }
+                _pending_links[lk] = entry
+            if pending_rows:
+                logger.info(f"Восстановлено {len(pending_rows)} pending_links из БД")
+        except Exception as e:
+            logger.warning(f"load_pending_links: {e}")
         # Держим бота запущенным
         try:
             import signal
