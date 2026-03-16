@@ -1295,8 +1295,8 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
 
             result = list(by_agent.values())
 
-            # Сверяем с реальным балансом из report/counterparty
-            # Клиент в ПДЗ только если реальный долг >= сумме просроченных заказов
+            # Пересчитываем просрочку с учётом реального баланса
+            # Логика: оплаты покрывают свежие заказы первыми
             filtered = []
             for agent in result:
                 try:
@@ -1305,17 +1305,46 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                         if rr.status == 200:
                             rdata = await rr.json()
                             real_balance = (rdata.get("balance", 0) or 0) / 100
-                            real_debt = -real_balance if real_balance < 0 else 0
-                            # Если реальный долг меньше просрочки — старые заказы фактически закрыты
-                            if real_debt >= agent["overdue_sum"]:
-                                filtered.append(agent)
-                            else:
-                                logger.info(f"Excluding {agent['name']}: real_debt={real_debt:.2f} < overdue={agent['overdue_sum']:.2f}")
+                            real_debt = abs(min(real_balance, 0))
                         else:
-                            filtered.append(agent)  # не смогли проверить — оставляем
+                            real_debt = agent["overdue_sum"]
+
+                    if real_debt <= 0:
+                        logger.info(f"Excluding {agent['name']}: no real debt")
+                        continue
+
+                    # Сортируем заказы от свежих к старым — оплаты покрывают свежие первыми
+                    demands_sorted = sorted(agent["demands"],
+                                           key=lambda x: x.get("due", ""), reverse=True)
+
+                    remaining = real_debt
+                    overdue_demands = []
+                    overdue_sum = 0
+
+                    for d in demands_sorted:
+                        if remaining <= 0:
+                            break
+                        covered = min(remaining, d["unpaid"])
+                        remaining -= covered
+                        uncovered = round(d["unpaid"] - covered, 2)
+                        if uncovered > 0:
+                            overdue_demands.append({**d, "unpaid": uncovered})
+                            overdue_sum += uncovered
+
+                    overdue_sum = round(overdue_sum, 2)
+                    if overdue_sum <= 0:
+                        logger.info(f"Excluding {agent['name']}: overdue covered by payments real_debt={real_debt:.2f}")
+                        continue
+
+                    agent["overdue_sum"] = overdue_sum
+                    agent["demands"] = overdue_demands
+                    agent["max_days"] = max((d["days"] for d in overdue_demands), default=0)
+                    filtered.append(agent)
+                    logger.info(f"{agent['name']}: real_debt={real_debt:.2f} overdue={overdue_sum:.2f}")
+
                 except Exception as e:
                     logger.warning(f"balance check failed for {agent.get('name')}: {e}")
-                    filtered.append(agent)  # не смогли проверить — оставляем
+                    filtered.append(agent)
 
             filtered.sort(key=lambda x: x["overdue_sum"], reverse=True)
             logger.info(f"get_overdue_demands: {len(filtered)} agents with overdue debt (after balance check)")
