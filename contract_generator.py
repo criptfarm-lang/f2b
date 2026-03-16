@@ -91,19 +91,41 @@ def _find_asset(name):
     for p in candidates:
         if os.path.exists(p):
             return p
-    # Не нашли — ищем по всему /app рекурсивно
     import glob
-    patterns = [f"/app/**/{name}", f"/app/**/{name.lower()}"]
-    for pat in patterns:
+    for pat in [f"/app/**/{name}", f"/app/**/{name.lower()}"]:
         found = glob.glob(pat, recursive=True)
         if found:
             return found[0]
     return None
 
+
+def _asset_or_txt(png_names, txt_names):
+    """Ищет PNG файл, в том числе переименованный в .txt."""
+    for name in png_names:
+        p = _find_asset(name)
+        if p:
+            return p
+    # Файл может лежать как .txt (бинарный PNG переименованный)
+    for name in txt_names:
+        p = _find_asset(name)
+        if p:
+            # Копируем как .png во временную папку
+            import shutil, tempfile
+            tmp = tempfile.mktemp(suffix=".png")
+            shutil.copy(p, tmp)
+            return tmp
+    return None
+
+
 LOGO_PATH  = _find_asset("logo.png")
-SIGN_PATH  = _find_asset("podpis.png") or _find_asset("Подпись.txt")
-STAMP_PATH = (_find_asset("pechat.png") or _find_asset("pechat_clean.png")
-              or _find_asset("Печать.txt"))
+SIGN_PATH  = _asset_or_txt(
+    ["podpis.png", "podpis.PNG", "sign.png", "signature.png"],
+    ["Подпись.txt", "podpis.txt"]
+)
+STAMP_PATH = _asset_or_txt(
+    ["pechat.png", "pechat_clean.png", "pechat.PNG", "stamp.png"],
+    ["Печать.txt", "pechat.txt"]
+)
 COMM_PATH  = (_find_asset("image2.PNG") or _find_asset("image2.png")
               or _find_asset("comm_secret.png"))
 
@@ -112,8 +134,9 @@ _log = _logging.getLogger(__name__)
 
 # Диагностика — показываем что нашли и что есть в /app
 import glob as _glob
-_app_pngs = _glob.glob("/app/**/*.png", recursive=True) + _glob.glob("/app/**/*.PNG", recursive=True)
-_log.info(f"contract_generator: PNG files in /app: {_app_pngs[:20]}")
+_app_all = _glob.glob("/app/**/*", recursive=True)
+_app_files = [f for f in _app_all if os.path.isfile(f) and not f.endswith('.py') and not f.endswith('.pyc')]
+_log.info(f"contract_generator: files in /app (non-py): {_app_files[:30]}")
 _log.info(f"contract_generator assets: logo={LOGO_PATH} sign={SIGN_PATH} stamp={STAMP_PATH} comm={COMM_PATH}")
 
 # Стили
@@ -280,7 +303,7 @@ def generate_contract_pdf(data: dict) -> bytes:
     story.append(Spacer(1, 4*mm))
 
     # ── Подписи через canvas (абсолютное позиционирование) ───────────────────
-    story.append(Spacer(1, 100*mm))  # резервируем место для подписей + печати
+    story.append(Spacer(1, 60*mm))  # резервируем место для подписей + печати
 
     # Запоминаем общее число страниц через multiBuild
     _page_count = [0]
@@ -298,7 +321,7 @@ def generate_contract_pdf(data: dict) -> bytes:
 
         # ── Подписи — только на ПОСЛЕДНЕЙ странице ───────────────────────────
         if canvas_obj.getPageNumber() == _page_count[0]:
-            base_y = 95 * mm  # поднимаем выше
+            base_y = 95 * mm
 
             fn, fb = FONT_NORMAL, FONT_BOLD
             lx = doc_obj.leftMargin
@@ -320,7 +343,7 @@ def generate_contract_pdf(data: dict) -> bytes:
 
             # Подпись — ещё левее и выше напротив фамилии
             if SIGN_PATH and os.path.exists(SIGN_PATH):
-                canvas_obj.drawImage(SIGN_PATH, lx - 65*mm, base_y - 22*mm - 10*mm,
+                canvas_obj.drawImage(SIGN_PATH, lx - 65*mm, base_y - 22*mm - 110*mm,
                                      width=151*mm, height=65*mm,
                                      mask="auto", preserveAspectRatio=True)
 
