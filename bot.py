@@ -1988,38 +1988,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            from reconciliation_generator import (
-                get_reconciliation_data, generate_reconciliation_pdf
-            )
-            from moysklad import get_counterparty_requisites
+            from reconciliation_generator import generate_reconciliation_pdf
+            from moysklad import get_reconciliation_data
 
             # Получаем данные
-            reqs = await get_counterparty_requisites(cp_id)
             rec_data = await get_reconciliation_data(cp_id, date_from, date_to)
 
-            buyer_info = {
-                "name": reqs.get("buyer_legal_title") or cp_name,
-                "inn": reqs.get("buyer_inn", ""),
-                "ogrn": reqs.get("buyer_ogrn", ""),
-            }
+            if not rec_data or not rec_data.get("rows"):
+                await message.reply_text(
+                    f"😕 За период {date_from} — {date_to} операций с *{cp_name}* не найдено.",
+                    parse_mode="Markdown"
+                )
+                return
 
-            pdf_bytes = generate_reconciliation_pdf(
-                supplier_data={},
-                buyer_data=buyer_info,
-                rec_data=rec_data,
-                date_from=date_from,
-                date_to=date_to,
-            )
+            pdf_bytes = generate_reconciliation_pdf(rec_data)
 
             # Отправляем в группу
             group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
             target = group_chat_id or message.chat_id
-            ops_count = len(rec_data["operations"])
+            closing = rec_data.get("closing_balance", 0)
+            if closing > 0:
+                balance_str = f"💰 Долг клиента: *{closing:,.2f} руб.*"
+            elif closing < 0:
+                balance_str = f"💰 Переплата: *{abs(closing):,.2f} руб.*"
+            else:
+                balance_str = "✅ Взаиморасчёты согласованы"
             caption = (
                 f"📊 *Акт сверки — {cp_name}*\n"
                 f"📅 {date_from} — {date_to}\n"
-                f"📋 Операций: {ops_count}\n"
-                f"💰 Сальдо на конец: {rec_data['balance_end']:,.0f} руб."
+                f"{balance_str}"
             )
             await context.bot.send_document(
                 chat_id=target,
