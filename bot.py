@@ -1655,6 +1655,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tag = resolve_tag(raw_tag) if raw_tag else None
         await message.reply_chat_action("typing")
         items = await get_overdue_demands(tag=tag, query=raw_query)
+
+        # None означает что клиент не найден в МойСклад
+        if items is None:
+            await message.reply_text(
+                f"❌ Клиент *{raw_query}* не найден в МойСклад.\n"
+                f"Уточни название — например, часть названия компании.",
+                parse_mode="Markdown"
+            )
+            return
+
         label = raw_query or (tag or None)
         if brief and not raw_query:
             text = format_overdue_summary(items)
