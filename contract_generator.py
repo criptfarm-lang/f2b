@@ -82,24 +82,38 @@ else:
 def _find_asset(name):
     candidates = [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", name),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), name),
         os.path.join("/app/assets", name),
         os.path.join("/app", name),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), name),
+        os.path.join("/app/assets", name.lower()),
+        os.path.join("/home/claude", name),
     ]
     for p in candidates:
         if os.path.exists(p):
             return p
+    # Не нашли — ищем по всему /app рекурсивно
+    import glob
+    patterns = [f"/app/**/{name}", f"/app/**/{name.lower()}"]
+    for pat in patterns:
+        found = glob.glob(pat, recursive=True)
+        if found:
+            return found[0]
     return None
 
-LOGO_PATH = _find_asset("logo.png")
-SIGN_PATH = _find_asset("podpis.png")
+LOGO_PATH  = _find_asset("logo.png")
+SIGN_PATH  = _find_asset("podpis.png")
 STAMP_PATH = _find_asset("pechat.png")
-# Коммерческая тайна — image2.PNG из оригинального договора
-COMM_PATH = _find_asset("image2.PNG") or _find_asset("image2.png") or _find_asset("comm_secret.png")
+COMM_PATH  = (_find_asset("image2.PNG") or _find_asset("image2.png")
+              or _find_asset("comm_secret.png"))
 
 import logging as _logging
 _log = _logging.getLogger(__name__)
-_log.info(f"contract_generator assets: logo={LOGO_PATH} sign={SIGN_PATH} stamp={STAMP_PATH}")
+
+# Диагностика — показываем что нашли и что есть в /app
+import glob as _glob
+_app_pngs = _glob.glob("/app/**/*.png", recursive=True) + _glob.glob("/app/**/*.PNG", recursive=True)
+_log.info(f"contract_generator: PNG files in /app: {_app_pngs[:20]}")
+_log.info(f"contract_generator assets: logo={LOGO_PATH} sign={SIGN_PATH} stamp={STAMP_PATH} comm={COMM_PATH}")
 
 # Стили
 def make_styles():
