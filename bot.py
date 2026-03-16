@@ -1815,6 +1815,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "buyer_email": reqs.get("buyer_email", ""),
             "buyer_representative": reqs.get("buyer_representative", ""),
             "buyer_director_name": reqs.get("buyer_director_name", ""),
+            "buyer_basis": "Устава",  # по умолчанию
         }
 
         # Проверяем чего не хватает
@@ -1827,6 +1828,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "buyer_bank": "название банка",
             "buyer_ks": "корреспондентский счёт (к/с)",
             "buyer_representative": "ФИО директора и должность (напр. 'генерального директора Иванова И.И.')",
+            "buyer_basis": "основание полномочий (напр. 'Устава' или 'доверенности № 1 от 01.01.2026')",
         }
         missing = [(k, v) for k, v in REQUIRED.items() if not contract_data.get(k)]
 
