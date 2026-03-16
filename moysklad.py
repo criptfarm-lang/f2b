@@ -555,9 +555,14 @@ async def get_counterparty_balance(query: str) -> list:
             url = f"{MS_BASE}/entity/counterparty"
             rows = []
             stripped = _strip_legal(query)
-            queries = [query, query.upper(), query.lower(), query.capitalize()]
+            queries = [query, query.upper(), query.lower(), query.capitalize(),
+                       query.replace(" ", "-"), query.replace(" ", "-").upper()]
             if stripped and stripped.lower() != query.lower():
-                queries += [stripped, stripped.upper(), stripped.lower()]
+                queries += [stripped, stripped.upper(), stripped.lower(),
+                            stripped.replace(" ", "-"), stripped.replace(" ", "-").upper()]
+            # Также пробуем по первому значимому слову
+            words = [w for w in query.split() if len(w) >= 4]
+            queries += words
 
             for q in queries:
                 params = {"filter": f"name~{q}", "limit": 10}
