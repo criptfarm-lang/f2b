@@ -2335,14 +2335,22 @@ async def get_reconciliation_data(counterparty_id: str, date_from: str, date_to:
             credit_total = sum(r["amount"] for r in rows if r["is_payment"])
             closing = round(debit_total - credit_total, 2)
 
+            # ИНН и адрес контрагента
+            cp_inn = cp.get("inn", "")
+            legal_addr = cp.get("legalAddress", "") or ""
+            actual_addr = cp.get("actualAddress", "") or ""
+            cp_address = legal_addr or actual_addr
+
             return {
                 "counterparty_name": cp_name,
+                "buyer_inn": cp_inn,
+                "buyer_address": cp_address,
                 "date_from": date_from,
                 "date_to": date_to,
                 "rows": rows,
                 "debit_total": debit_total,
                 "credit_total": credit_total,
-                "closing_balance": closing,  # >0 = долг клиента, <0 = переплата
+                "closing_balance": closing,
             }
 
     except Exception as e:
