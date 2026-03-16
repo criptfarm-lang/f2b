@@ -1939,74 +1939,78 @@ async def get_order_positions_snapshot(order_href: str) -> frozenset:
 async def get_counterparty_debt(counterparty_id: str) -> dict:
     """
     Возвращает просрочку контрагента: debt (сумма) и overdue_days (макс. дней).
-    Читает кастомный атрибут "Дата планируемой оплаты" из заказов покупателя.
+    Ищет в заказах покупателя кастомный атрибут 'Дата планируемой оплаты'.
     """
     import aiohttp
-    from datetime import date
+    from datetime import datetime, timezone
 
-    PAYMENT_DATE_ATTR_ID = "327940fd-b54e-11f0-0a80-0066000d5578"
+    today_dt = datetime.now(timezone.utc)
 
     try:
         async with aiohttp.ClientSession() as session:
-            # Баланс контрагента
-            url = f"{MS_BASE}/report/counterparty/{counterparty_id}"
-            async with session.get(url, headers=get_headers()) as resp:
+            cp_href = f"{MS_BASE}/entity/counterparty/{counterparty_id}"
+
+            # Берём все заказы контрагента с атрибутами
+            url = f"{MS_BASE}/entity/customerorder"
+            params = {
+                "filter": f"agent={cp_href}",
+                "expand": "agent,attributes",
+                "limit": 200,
+                "order": "moment,desc",
+            }
+            async with session.get(url, headers=get_headers(), params=params) as resp:
                 if resp.status != 200:
+                    logger.warning(f"get_counterparty_debt: orders {resp.status}")
                     return {}
                 data = await resp.json()
 
-        balance = (data.get("balance", 0) or 0) / 100
-        logger.info(f"get_counterparty_debt: id={counterparty_id} balance={balance}")
+        orders = data.get("rows", [])
+        logger.info(f"get_counterparty_debt: id={counterparty_id} orders={len(orders)}")
 
-        if balance >= 0:
+        total_debt = 0
+        max_days = 0
+
+        for order in orders:
+            # Дата планируемой оплаты из кастомного атрибута
+            ppm = ""
+            for attr in order.get("attributes", []):
+                if attr.get("name") == "Дата планируемой оплаты":
+                    ppm = attr.get("value", "")
+                    break
+            if not ppm:
+                continue
+
+            try:
+                due_dt = datetime.fromisoformat(ppm.replace(".000", "").replace("Z", ""))
+                if due_dt.tzinfo is None:
+                    due_dt = due_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+            # Просрочена?
+            if due_dt >= today_dt:
+                continue
+
+            # Не оплачена?
+            total_sum = (order.get("sum", 0) or 0) / 100
+            payed_sum = (order.get("payedSum", 0) or 0) / 100
+            unpaid = round(total_sum - payed_sum, 2)
+            if unpaid <= 0:
+                continue
+
+            days = (today_dt - due_dt).days
+            total_debt += unpaid
+            if days > max_days:
+                max_days = days
+            logger.info(f"get_counterparty_debt: заказ {order.get('name')} due={ppm[:10]} unpaid={unpaid} days={days}")
+
+        total_debt = round(total_debt, 2)
+        logger.info(f"get_counterparty_debt: итого debt={total_debt} max_days={max_days}")
+
+        if total_debt <= 0:
             return {}
 
-        debt = abs(balance)
-        today = date.today()
-
-        # Ищем просроченные заказы — только отгруженные (деньги уже должны)
-        # Статус "Отгружен": 005f383a-9a9a-11f0-0a80-03a900027476
-        async with aiohttp.ClientSession() as session:
-            orders_url = (
-                f"{MS_BASE}/entity/customerorder"
-                f"?filter=agent=https://api.moysklad.ru/api/remap/1.2/entity/counterparty/{counterparty_id}"
-                f"&filter=state=https://api.moysklad.ru/api/remap/1.2/entity/customerorder/metadata/states/005f383a-9a9a-11f0-0a80-03a900027476"
-                f"&expand=attributes&limit=50&order=moment,desc"
-            )
-            async with session.get(orders_url, headers=get_headers()) as resp:
-                if resp.status != 200:
-                    logger.warning(f"get_counterparty_debt: orders status={resp.status}")
-                    return {"debt": debt, "overdue_days": 0}
-                orders_data = await resp.json()
-
-        overdue_days = 0
-        overdue_dates = []
-        rows = orders_data.get("rows", [])
-        logger.info(f"get_counterparty_debt: найдено заказов={len(rows)}")
-
-        for order in rows:
-            attrs = order.get("attributes", [])
-            for attr in attrs:
-                if attr.get("id") == PAYMENT_DATE_ATTR_ID:
-                    val = attr.get("value", "")
-                    if val:
-                        try:
-                            payment_date = date.fromisoformat(str(val)[:10])
-                            if payment_date < today:
-                                days = (today - payment_date).days
-                                overdue_dates.append(days)
-                                logger.info(f"get_counterparty_debt: заказ {order.get('name')} payment_date={payment_date} days={days}")
-                        except Exception:
-                            pass
-                    break
-
-        # Берём минимум — самый свежий просроченный заказ
-        # Это честнее чем максимум, т.к. старые долги могли быть частично погашены
-        if overdue_dates:
-            overdue_days = min(overdue_dates)
-
-        logger.info(f"get_counterparty_debt: итого debt={debt} overdue_days={overdue_days} (из {len(overdue_dates)} просроченных заказов)")
-        return {"debt": debt, "overdue_days": overdue_days}
+        return {"debt": total_debt, "overdue_days": max_days}
 
     except Exception as e:
         logger.error(f"get_counterparty_debt: {e}", exc_info=True)
