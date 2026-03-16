@@ -1134,28 +1134,51 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
 
             # Если query — найдём href контрагента для фильтра
             agent_filter = ""
-            agent_name_filter = ""
             if query:
                 cp_url = f"{MS_BASE}/entity/counterparty"
-                for q in [query, query.upper(), query.lower(), query.capitalize()]:
-                    async with session.get(cp_url, headers=get_headers(), params={"filter": f"name~{q}", "limit": 5}) as cr:
+                found_cp = False
+                # Варианты запроса: оригинал, с дефисом, без пробелов, части слов
+                queries = [query, query.upper(), query.lower(), query.capitalize(),
+                           query.replace(" ", "-"), query.replace(" ", "")]
+                # Добавляем отдельные слова для поиска
+                words = [w for w in query.split() if len(w) >= 3]
+                queries.extend(words)
+
+                for q in queries:
+                    async with session.get(cp_url, headers=get_headers(),
+                                           params={"filter": f"name~{q}", "limit": 5}) as cr:
                         if cr.status == 200:
                             cp_rows = (await cr.json()).get("rows", [])
                             if cp_rows:
                                 agent_href = cp_rows[0].get("meta", {}).get("href", "")
+                                agent_name_found = cp_rows[0].get("name", "")
                                 if agent_href:
                                     agent_filter = f";agent={agent_href}"
-                                break
+                                    found_cp = True
+                                    logger.info(f"get_overdue_demands: найден контрагент '{agent_name_found}' по запросу '{q}'")
+                                    break
+                    if found_cp:
+                        break
+
+                if not found_cp:
+                    logger.info(f"get_overdue_demands: контрагент '{query}' не найден")
+                    return None
 
             # Грузим заказы покупателей постранично
             url = f"{MS_BASE}/entity/customerorder"
             all_orders = []
             offset = 0
+
+            # Если query задан но контрагент не найден — возвращаем None
+            if query and not agent_filter:
+                logger.info(f"get_overdue_demands: '{query}' не найден, прерываем")
+                return None
+
             while True:
                 params = {
                     "limit": 100,
                     "offset": offset,
-                    "expand": "agent",
+                    "expand": "agent,attributes",
                     "order": "moment,asc",
                 }
                 if agent_filter:
@@ -2165,3 +2188,83 @@ async def check_delivery_schedule(address: str, delivery_date_str: str) -> dict:
         "allowed_days": allowed_days,
         "distance_km": round(nearest_dist, 1),
     }
+
+
+async def get_reconciliation_data(counterparty_id: str, date_from: str, date_to: str) -> dict:
+    """
+    Получает данные для акта сверки по контрагенту за период.
+    date_from, date_to: 'YYYY-MM-DD'
+    Возвращает: {
+        counterparty_name, opening_balance,
+        rows: [{date, doc_type, doc_number, debit, credit}],
+        closing_balance
+    }
+    """
+    import aiohttp
+    from datetime import datetime
+
+    dt_from = f"{date_from} 00:00:00"
+    dt_to   = f"{date_to} 23:59:59"
+    cp_href = f"{MS_BASE}/entity/counterparty/{counterparty_id}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Имя контрагента
+            async with session.get(f"{cp_href}", headers=get_headers()) as r:
+                cp = await r.json() if r.status == 200 else {}
+            cp_name = cp.get("name", "")
+
+            rows = []
+
+            async def fetch_docs(entity, label, amount_field="sum"):
+                url = f"{MS_BASE}/entity/{entity}"
+                params = {
+                    "filter": f"agent={cp_href};moment>={dt_from};moment<={dt_to}",
+                    "limit": 200,
+                    "order": "moment,asc",
+                }
+                async with session.get(url, headers=get_headers(), params=params) as r:
+                    if r.status != 200:
+                        return
+                    data = await r.json()
+                    for doc in data.get("rows", []):
+                        date_str = doc.get("moment", "")[:10]
+                        num = doc.get("name", doc.get("id", ""))
+                        amount = round(doc.get(amount_field, 0) / 100, 2)
+                        rows.append({
+                            "date": date_str,
+                            "doc_type": label,
+                            "doc_number": num,
+                            "amount": amount,
+                            "is_payment": entity in ("cashin", "paymentin"),
+                        })
+
+            # Отгрузки (дебет покупателя)
+            await fetch_docs("demand", "Отгрузка")
+            # Входящие оплаты (кредит покупателя)
+            await fetch_docs("paymentin", "Оплата")
+            await fetch_docs("cashin", "Оплата нал.")
+            # Счета-фактуры (информационно)
+            await fetch_docs("invoiceout", "Счёт")
+
+            # Сортируем по дате
+            rows.sort(key=lambda x: x["date"])
+
+            # Считаем сальдо
+            debit_total  = sum(r["amount"] for r in rows if not r["is_payment"])
+            credit_total = sum(r["amount"] for r in rows if r["is_payment"])
+            closing = round(debit_total - credit_total, 2)
+
+            return {
+                "counterparty_name": cp_name,
+                "date_from": date_from,
+                "date_to": date_to,
+                "rows": rows,
+                "debit_total": debit_total,
+                "credit_total": credit_total,
+                "closing_balance": closing,  # >0 = долг клиента, <0 = переплата
+            }
+
+    except Exception as e:
+        logger.error(f"get_reconciliation_data: {e}", exc_info=True)
+        return {}
