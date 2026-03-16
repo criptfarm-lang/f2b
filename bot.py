@@ -1198,11 +1198,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Message from user.id={user.id}, name={user.full_name}, chat_id={message.chat_id}, manager_ids={manager_ids}")
 
     if user.id in manager_ids and len(text) > 15:
-        # Если сообщение адресовано боту — извлекаем задачи только если
-        # в тексте есть имя другого сотрудника (поручение через бота)
         should_extract = True
-        if is_bot_addressed(text):
-            text_lower = text.lower()
+        text_lower = text.lower()
+
+        # Слова которые всегда означают запрос данных — никогда не задача
+        DATA_QUERY_KEYWORDS = [
+            "пдз", "долг", "дебитор", "остатк", "отчёт", "отчет",
+            "сводк", "покажи", "дай", "сколько", "кто",
+            "активност", "упоминани", "договор", "баланс", "прайс",
+            "задолженност", "статистик", "аналитик", "кратко", "итог",
+            "просрочка", "просроченн", "должник",
+        ]
+
+        if any(kw in text_lower for kw in DATA_QUERY_KEYWORDS):
+            should_extract = False
+        elif is_bot_addressed(text):
             has_employee = any(
                 name.lower() in text_lower
                 for name in ["карина", "баласанян", "александра", "белякова", "саша",
@@ -1424,7 +1434,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not is_bot_addressed(text):
-        return
+        # Автореакция на ПДЗ-запросы без обращения "Эф,"
+        text_lower_pdz = text.lower().strip()
+        PDZ_TRIGGER = ["просрочка", "пдз", "должник", "дебиторка"]
+        if any(kw in text_lower_pdz for kw in PDZ_TRIGGER) and user and user.id in manager_ids:
+            pass  # продолжаем — обработаем как PDZ запрос
+        else:
+            return
 
     query = clean_query(text)
 
