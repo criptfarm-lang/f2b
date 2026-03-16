@@ -78,11 +78,28 @@ else:
     FONT_NORMAL = "Helvetica"
     FONT_BOLD = "Helvetica-Bold"
 
-# Пути к ресурсам (будут подставлены при деплое)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOGO_PATH = os.path.join(BASE_DIR, "assets", "logo.png")
-SIGN_PATH = os.path.join(BASE_DIR, "assets", "podpis.png")
-STAMP_PATH = os.path.join(BASE_DIR, "assets", "pechat.png")
+# Пути к ресурсам — ищем в нескольких местах
+def _find_asset(name):
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", name),
+        os.path.join("/app/assets", name),
+        os.path.join("/app", name),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), name),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+LOGO_PATH = _find_asset("logo.png")
+SIGN_PATH = _find_asset("podpis.png")
+STAMP_PATH = _find_asset("pechat.png")
+# Коммерческая тайна — image2.PNG из оригинального договора
+COMM_PATH = _find_asset("image2.PNG") or _find_asset("image2.png") or _find_asset("comm_secret.png")
+
+import logging as _logging
+_log = _logging.getLogger(__name__)
+_log.info(f"contract_generator assets: logo={LOGO_PATH} sign={SIGN_PATH} stamp={STAMP_PATH}")
 
 # Стили
 def make_styles():
@@ -99,31 +116,30 @@ def make_styles():
 
 
 def generate_contract_pdf(data: dict) -> bytes:
-    """
-    Генерирует PDF договора поставки.
+    """Генерирует PDF договора поставки."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate
+    from reportlab.pdfgen import canvas as _canvas_module
+    import io as _io
 
-    data: {
-        contract_number: str,     # номер договора (напр. "25032601")
-        contract_date: str,       # дата (напр. "26 марта 2025 г.")
-        buyer_name: str,          # полное наим. (напр. "ООО «Ромашка»")
-        buyer_representative: str, # "генерального директора Иванова И.И."
-        buyer_inn: str,
-        buyer_ogrn: str,
-        buyer_address: str,
-        buyer_bank: str,
-        buyer_rs: str,
-        buyer_bik: str,
-        buyer_ks: str,
-        buyer_phone: str,
-        buyer_email: str,
-        buyer_director_name: str,  # "Иванов И.И." для подписи
-    }
-    """
-    buf = io.BytesIO()
+    buf = _io.BytesIO()
+
+    # Водяной знак на каждой странице
+    def add_watermark(canvas, doc):
+        canvas.saveState()
+        canvas.setFont(FONT_BOLD if FONT_BOLD != "Helvetica-Bold" else "Helvetica-Bold", 28)
+        canvas.setFillColorRGB(0.85, 0.90, 0.95, alpha=0.35)
+        canvas.translate(A4[0]/2, A4[1]/2)
+        canvas.rotate(45)
+        canvas.drawCentredString(0, 30, "КОММЕРЧЕСКАЯ ТАЙНА")
+        canvas.drawCentredString(0, -10, "АО «ФИШ ТУ БИЗНЕС»")
+        canvas.drawCentredString(0, -50, "ИНН 9713025854")
+        canvas.restoreState()
+
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         leftMargin=20*mm, rightMargin=15*mm,
-        topMargin=15*mm, bottomMargin=15*mm
+        topMargin=15*mm, bottomMargin=30*mm,
     )
 
     normal, bold, title, subtitle, heading, small, small_bold = make_styles()
@@ -131,9 +147,13 @@ def generate_contract_pdf(data: dict) -> bytes:
     W = A4[0] - 35*mm  # ширина контента
 
     # ── Логотип ─────────────────────────────────────────────────────────────
-    if os.path.exists(LOGO_PATH):
+    _log.info(f"LOGO_PATH={LOGO_PATH} exists={LOGO_PATH and os.path.exists(LOGO_PATH)}")
+    if LOGO_PATH and os.path.exists(LOGO_PATH):
         img = Image(LOGO_PATH, width=120*mm, height=33*mm)
         story.append(img)
+        story.append(Spacer(1, 4*mm))
+    else:
+        story.append(Paragraph("АО «ФИШ ТУ БИЗНЕС»", title))
         story.append(Spacer(1, 4*mm))
 
     # ── Заголовок ────────────────────────────────────────────────────────────
@@ -145,12 +165,13 @@ def generate_contract_pdf(data: dict) -> bytes:
     # ── Вводный абзац ────────────────────────────────────────────────────────
     buyer_short = data["buyer_name"]
     buyer_rep = data.get("buyer_representative", "")
+    buyer_basis = data.get("buyer_basis", "Устава")
     intro = (
         f"Акционерное Общество «ФИШ ТУ БИЗНЕС», именуемое в дальнейшем «Поставщик», "
         f"в лице Генерального Директора Маланчука Александра Владимировича, "
         f"действующего на основании Устава, с одной стороны, и "
         f"{buyer_short}, именуемый в дальнейшем «Покупатель», "
-        f"в лице {buyer_rep}, с другой стороны, "
+        f"в лице {buyer_rep}, действующего на основании {buyer_basis}, с другой стороны, "
         f"вместе именуемые стороны, заключили настоящий договор о нижеследующем:"
     )
     story.append(Paragraph(intro, normal))
@@ -247,39 +268,43 @@ def generate_contract_pdf(data: dict) -> bytes:
     story.append(Paragraph("Генеральный Директор", small_bold))
     story.append(Spacer(1, 1*mm))
 
-    # Строка с подписями
-    sign_supplier_items = [Paragraph("АО «ФИШ ТУ БИЗНЕС»", small)]
-    sign_buyer_items = [Paragraph(data.get("buyer_name", ""), small)]
-
-    # Подпись поставщика
-    if os.path.exists(SIGN_PATH):
-        sign_img = Image(SIGN_PATH, width=35*mm, height=15*mm)
-        sign_supplier_items.append(sign_img)
+    # Левая колонка — подпись + печать поставщика вместе
+    supplier_cell_items = [Paragraph("АО «ФИШ ТУ БИЗНЕС»", small)]
+    if SIGN_PATH and os.path.exists(SIGN_PATH):
+        # Подпись и печать в одной строке
+        sign_img = Image(SIGN_PATH, width=32*mm, height=14*mm)
+        if STAMP_PATH and os.path.exists(STAMP_PATH):
+            stamp_img = Image(STAMP_PATH, width=32*mm, height=32*mm)
+            # Таблица: подпись слева, печать справа
+            sp_row = Table([[sign_img, stamp_img]],
+                           colWidths=[34*mm, 34*mm])
+            sp_row.setStyle(TableStyle([
+                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+                ("LEFTPADDING", (0,0), (-1,-1), 0),
+                ("RIGHTPADDING", (0,0), (-1,-1), 0),
+                ("TOPPADDING", (0,0), (-1,-1), 0),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+            ]))
+            supplier_cell_items.append(sp_row)
+        else:
+            supplier_cell_items.append(sign_img)
     else:
-        sign_supplier_items.append(Paragraph("_____________", small))
+        supplier_cell_items.append(Paragraph("_____________", small))
 
-    sign_supplier_items.append(Paragraph("/Маланчук А.В./", small_bold))
+    supplier_cell_items.append(Paragraph("/Маланчук А.В./", small_bold))
 
-    # Печать поставщика
-    if os.path.exists(STAMP_PATH):
-        stamp_img = Image(STAMP_PATH, width=28*mm, height=28*mm)
-    else:
-        stamp_img = Paragraph("", small)
-
-    sign_buyer_items.append(Paragraph("_____________", small))
-    sign_buyer_items.append(Paragraph(f"/{data.get('buyer_director_name','')}/", small_bold))
-
-    sign_data = [
-        [
-            Table([[x] for x in sign_supplier_items],
-                  colWidths=[col_w - 5*mm]),
-            stamp_img,
-            Table([[x] for x in sign_buyer_items],
-                  colWidths=[col_w - 15*mm]),
-        ]
+    # Правая колонка — место для подписи покупателя
+    buyer_cell_items = [
+        Paragraph(data.get("buyer_name", ""), small),
+        Paragraph("_____________", small),
+        Paragraph(f"/{data.get('buyer_director_name','')}/", small_bold),
     ]
 
-    sign_table = Table(sign_data, colWidths=[col_w - 5*mm, 30*mm, col_w - 10*mm])
+    sign_data = [[
+        Table([[x] for x in supplier_cell_items], colWidths=[col_w - 4*mm]),
+        Table([[x] for x in buyer_cell_items], colWidths=[col_w - 4*mm]),
+    ]]
+    sign_table = Table(sign_data, colWidths=[col_w, col_w])
     sign_table.setStyle(TableStyle([
         ("VALIGN", (0,0), (-1,-1), "TOP"),
         ("TOPPADDING", (0,0), (-1,-1), 0),
@@ -288,7 +313,19 @@ def generate_contract_pdf(data: dict) -> bytes:
     ]))
     story.append(sign_table)
 
-    doc.build(story)
+    # ── Коммерческая тайна на каждой странице через canvas callback ──────────
+    def _add_comm_secret(canvas_obj, doc_obj):
+        if COMM_PATH and os.path.exists(COMM_PATH):
+            canvas_obj.saveState()
+            w_page, h_page = A4
+            img_w, img_h = 42*mm, 21*mm
+            x = w_page - img_w - 10*mm
+            y = 10*mm  # выше нижнего края, не перекрывает текст
+            canvas_obj.drawImage(COMM_PATH, x, y, width=img_w, height=img_h,
+                                 mask="auto", preserveAspectRatio=True)
+            canvas_obj.restoreState()
+
+    doc.build(story, onFirstPage=_add_comm_secret, onLaterPages=_add_comm_secret)
     return buf.getvalue()
 
 
