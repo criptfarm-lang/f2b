@@ -1349,9 +1349,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"pending_links: user={user.id} contact={pending_link.get('wazzup_name')} text={text[:30]}")
             if "company_name" not in pending_link:
                 # Если уже показали варианты — просим нажать кнопку
-                if pending_link.get("suggestions"):
+                if pending_link.get("suggestions") and text.strip() == pending_link.get("last_query", ""):
                     await message.reply_text("👆 Выбери компанию из списка выше или нажми «Не привязывать».")
                     return
+                # Сбрасываем старые варианты при новом вводе
+                pending_link.pop("suggestions", None)
+                pending_link["last_query"] = text.strip()
                 # Ищем компанию в МойСклад
                 company_query = text.strip()
                 counterparties = await get_counterparty_balance(company_query)
