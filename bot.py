@@ -1262,42 +1262,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверяем ожидание данных для договора
     if user and user.id in _pending_contracts and not is_bot_addressed(text):
         pending_c = _pending_contracts[user.id]
-        missing = pending_c["missing"]
+        keys = pending_c["missing_keys"]
+        labels = pending_c["missing_labels"]
         idx = pending_c["missing_idx"]
-        field = missing[idx]
         data = pending_c["data"]
 
-        # Маппинг вопросов → поля
-        FIELD_MAP = {
-            "ИНН": "buyer_inn",
-            "ОГРН": "buyer_ogrn",
-            "юридический адрес": "buyer_address",
-            "расчётный счёт р/с": "buyer_rs",
-            "БИК банка": "buyer_bik",
-            "название банка": "buyer_bank",
-            "корреспондентский счёт к/с": "buyer_ks",
-            "ФИО директора и должность (напр. 'генерального директора Иванова И.И.')": "buyer_representative",
-        }
-        field_key = FIELD_MAP.get(field)
-        if field_key:
-            data[field_key] = text.strip()
-            # Для ФИО директора — также сохраняем краткую форму для подписи
-            if field_key == "buyer_representative":
-                parts = text.strip().split()
-                if len(parts) >= 2:
-                    data["buyer_director_name"] = " ".join(parts[-2:])
+        field_key = keys[idx]
+        data[field_key] = text.strip()
+
+        # Для представителя — извлекаем краткое ФИО для подписи
+        if field_key == "buyer_representative":
+            parts = text.strip().split()
+            if len(parts) >= 2:
+                data["buyer_director_name"] = " ".join(parts[-2:])
 
         idx += 1
-        if idx < len(missing):
-            pending_c["missing_idx"] = idx
-            await message.reply_text(f"✅ Принято.\n\n*{missing[idx]}*?", parse_mode="Markdown")
-            return
+        pending_c["missing_idx"] = idx
+
+        if idx < len(keys):
+            await message.reply_text(f"✅ Принято.\n\n*{labels[idx]}*?", parse_mode="Markdown")
         else:
-            # Все данные собраны
             _pending_contracts.pop(user.id, None)
             await message.reply_text("✅ Все данные получены. Генерирую договор...")
             await _create_and_send_contract(data, user.full_name, message, context)
-            return
+        return
 
     # Проверяем ожидание привязки Wazzup контакта
     if user and user.id in _pending_links and not is_bot_addressed(text):
@@ -1796,78 +1784,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buyer_query = params.get("buyer", "")
         await message.reply_chat_action("typing")
 
-        # Ищем контрагента в МойСклад
-        from moysklad import find_counterparty_info, get_counterparty_phones
-        cp_list = []
-        if buyer_query:
-            cp_list = await find_counterparty_info(buyer_query)
+        from moysklad import get_counterparty_balance, get_counterparty_requisites
 
-        if not cp_list:
+        # Ищем контрагента
+        counterparties = await get_counterparty_balance(buyer_query)
+        if not counterparties:
             await message.reply_text(
-                f"❌ Компания *{buyer_query}* не найдена в МойСклад.\n"
-                f"Напиши название точнее.",
+                f"❌ Компания *{buyer_query}* не найдена в МойСклад.",
                 parse_mode="Markdown"
             )
             return
 
-        cp = cp_list[0]
+        cp = counterparties[0]
+        cp_id = cp.get("id", "")
 
-        # Собираем данные из МойСклад
-        phones_list = await get_counterparty_phones([{
-            "id": cp.get("id",""), "name": cp.get("name",""), "href": cp.get("href","")
-        }])
-        phone = phones_list[0].get("phone","") if phones_list else ""
+        # Читаем полные реквизиты
+        await message.reply_text(f"🔍 Читаю реквизиты *{cp.get('name','')}*...", parse_mode="Markdown")
+        reqs = await get_counterparty_requisites(cp_id)
 
         contract_data = {
-            "buyer_name": cp.get("name",""),
-            "buyer_inn": cp.get("inn",""),
-            "buyer_ogrn": cp.get("ogrn",""),
-            "buyer_address": cp.get("legalAddress","") or cp.get("actualAddress",""),
-            "buyer_bank": "",
-            "buyer_rs": "",
-            "buyer_bik": "",
-            "buyer_ks": "",
-            "buyer_phone": phone or "",
-            "buyer_email": cp.get("email",""),
-            "buyer_representative": "",
-            "buyer_director_name": "",
+            "buyer_name": reqs.get("buyer_legal_title") or reqs.get("buyer_name", buyer_query),
+            "buyer_inn": reqs.get("buyer_inn", ""),
+            "buyer_ogrn": reqs.get("buyer_ogrn", ""),
+            "buyer_address": reqs.get("buyer_address", ""),
+            "buyer_bank": reqs.get("buyer_bank", ""),
+            "buyer_rs": reqs.get("buyer_rs", ""),
+            "buyer_bik": reqs.get("buyer_bik", ""),
+            "buyer_ks": reqs.get("buyer_ks", ""),
+            "buyer_phone": reqs.get("buyer_phone", ""),
+            "buyer_email": reqs.get("buyer_email", ""),
+            "buyer_representative": reqs.get("buyer_representative", ""),
+            "buyer_director_name": reqs.get("buyer_director_name", ""),
         }
 
         # Проверяем чего не хватает
-        missing = []
-        if not contract_data["buyer_inn"]:
-            missing.append("ИНН")
-        if not contract_data["buyer_ogrn"]:
-            missing.append("ОГРН")
-        if not contract_data["buyer_address"]:
-            missing.append("юридический адрес")
-        if not contract_data["buyer_rs"]:
-            missing.append("расчётный счёт р/с")
-        if not contract_data["buyer_bik"]:
-            missing.append("БИК банка")
-        if not contract_data["buyer_bank"]:
-            missing.append("название банка")
-        if not contract_data["buyer_ks"]:
-            missing.append("корреспондентский счёт к/с")
-        if not contract_data["buyer_representative"]:
-            missing.append("ФИО директора и должность (напр. 'генерального директора Иванова И.И.')")
+        REQUIRED = {
+            "buyer_inn": "ИНН",
+            "buyer_ogrn": "ОГРН",
+            "buyer_address": "юридический адрес",
+            "buyer_rs": "расчётный счёт (р/с)",
+            "buyer_bik": "БИК банка",
+            "buyer_bank": "название банка",
+            "buyer_ks": "корреспондентский счёт (к/с)",
+            "buyer_representative": "ФИО директора и должность (напр. 'генерального директора Иванова И.И.')",
+        }
+        missing = [(k, v) for k, v in REQUIRED.items() if not contract_data.get(k)]
 
         if missing:
-            # Сохраняем неполные данные и просим дополнить
             _pending_contracts[user.id] = {
                 "data": contract_data,
-                "missing": missing,
+                "missing_keys": [m[0] for m in missing],
+                "missing_labels": [m[1] for m in missing],
                 "missing_idx": 0,
             }
+            found_info = []
+            if contract_data["buyer_inn"]: found_info.append(f"ИНН: {contract_data['buyer_inn']}")
+            if contract_data["buyer_ogrn"]: found_info.append(f"ОГРН: {contract_data['buyer_ogrn']}")
+            if contract_data["buyer_bank"]: found_info.append(f"Банк: {contract_data['buyer_bank']}")
+            found_str = " · ".join(found_info) if found_info else "реквизиты не найдены"
+
             await message.reply_text(
-                f"📄 Нашёл компанию: *{contract_data['buyer_name']}*\n\n"
-                f"Не хватает данных. Ответь на вопросы:\n\n"
-                f"*{missing[0]}*?",
+                f"📄 *{contract_data['buyer_name']}*\n"
+                f"_{found_str}_\n\n"
+                f"Не хватает данных. Отвечай по одному:\n\n"
+                f"*{missing[0][1]}*?",
                 parse_mode="Markdown"
             )
             return
 
-        # Все данные есть — генерируем
+        # Все данные есть — генерируем сразу
+        await message.reply_text("✅ Все реквизиты найдены. Генерирую договор...")
         await _create_and_send_contract(contract_data, user.full_name, message, context)
 
     elif action == "manager_activity":
