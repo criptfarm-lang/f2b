@@ -376,12 +376,24 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
         await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
         return
 
-    # Помечаем что ждём ввода от этого пользователя
-    _pending_links[query.from_user.id] = {**pending, "link_key": link_key}
-    _pending_links[link_key] = _pending_links[query.from_user.id]
+    # Помечаем что ждём ввода от этого пользователя — добавляем в стек
+    if query.from_user.id not in _pending_links:
+        _pending_links[query.from_user.id] = []
+    # Если уже есть такой link_key — не дублируем
+    existing_keys = [p.get("link_key") for p in _pending_links[query.from_user.id]] if isinstance(_pending_links.get(query.from_user.id), list) else []
+    if link_key not in existing_keys:
+        entry = {**pending, "link_key": link_key}
+        if isinstance(_pending_links[query.from_user.id], list):
+            _pending_links[query.from_user.id].append(entry)
+        else:
+            _pending_links[query.from_user.id] = [entry]
+    _pending_links[link_key] = {**pending, "link_key": link_key}
+
+    # Берём последний ожидающий контакт
+    current = _pending_links[query.from_user.id][-1] if isinstance(_pending_links[query.from_user.id], list) else _pending_links[query.from_user.id]
 
     await query.message.edit_text(
-        f"👤 Контакт в TG: *{pending['wazzup_name']}*\n\n"
+        f"👤 Контакт: *{current['wazzup_name']}*\n\n"
         f"Как этот клиент называется в МойСклад?\n"
         f"_(напиши название или часть названия)_",
         parse_mode="Markdown"
@@ -1259,100 +1271,111 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Проверяем ожидание данных для договора
     # Проверяем ожидание привязки Wazzup контакта (ПЕРВЫМ — приоритет над договором)
     if user and user.id in _pending_links and not is_bot_addressed(text):
-        pending_link = _pending_links[user.id]
-        if "company_name" not in pending_link:
-            # Если уже показали варианты — просим нажать кнопку
-            if pending_link.get("suggestions"):
-                await message.reply_text("👆 Выбери компанию из списка выше или нажми «Не привязывать».")
-                return
-            # Ищем компанию в МойСклад
-            company_query = text.strip()
-            counterparties = await get_counterparty_balance(company_query)
-            if not counterparties:
-                # Пробуем найти по каждому слову отдельно
-                words = company_query.split()
-                suggestions = []
-                for word in words:
-                    if len(word) >= 3:
-                        found = await get_counterparty_balance(word)
-                        for c in found:
-                            if c not in suggestions:
-                                suggestions.append(c)
-
-                if suggestions:
-                    link_key = pending_link.get("link_key", str(user.id))
-                    # Сохраняем варианты в pending_link
-                    pending_link["suggestions"] = [c.get("name","") for c in suggestions[:5]]
-                    buttons = []
-                    for i, c in enumerate(suggestions[:5]):
-                        cp_name = c.get("name", "")
-                        buttons.append([InlineKeyboardButton(
-                            cp_name[:40],
-                            callback_data=f"wazzup_pick|{i}|{link_key}"
-                        )])
-                    buttons.append([InlineKeyboardButton(
-                        "🚫 Не привязывать",
-                        callback_data=f"wazzup_role|отмена|{link_key}"
-                    )])
-                    await message.reply_text(
-                        f"❓ *{company_query}* не найдена точно.\n\nВозможно имеется в виду:",
-                        parse_mode="Markdown",
-                        reply_markup=InlineKeyboardMarkup(buttons)
-                    )
-                else:
-                    keyboard = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🚫 Не привязывать", callback_data=f"wazzup_role|отмена|{pending_link.get('link_key', str(user.id))}")
-                    ]])
-                    await message.reply_text(
-                        f"❌ Компания *{company_query}* не найдена в МойСклад.\n"
-                        f"Попробуй написать название точнее или отмени привязку.",
-                        parse_mode="Markdown",
-                        reply_markup=keyboard
-                    )
-                return
-
-            cp = counterparties[0]
-            cp_name = cp.get("name", company_query)
-            pending_link["company_name"] = cp_name
-            link_key = pending_link.get("link_key", str(user.id))
-
-            # Сразу сохраняем без выбора роли
+        _pl = _pending_links[user.id]
+        pending_link = _pl[0] if isinstance(_pl, list) and _pl else (_pl if isinstance(_pl, dict) else None)
+        if not pending_link:
             _pending_links.pop(user.id, None)
-            _pending_links.pop(link_key, None)
-            ok = db.link_wazzup_contact(
-                chat_id=pending_link["chat_id"],
-                chat_type=pending_link["chat_type"],
-                channel_id=pending_link["channel_id"],
-                company_name=cp_name,
-                wazzup_name=pending_link["wazzup_name"],
-                role="рассылка",
-            )
-            if ok:
-                _wazzup_notified.discard(pending_link["chat_id"])
-                # Подтягиваем теги из МойСклад
-                try:
-                    from moysklad import find_counterparty_info
-                    cp_list = await find_counterparty_info(cp_name)
-                    if cp_list:
-                        cp_data = cp_list[0]
-                        db.update_wazzup_contact_tags(
-                            chat_id=pending_link["chat_id"],
-                            tags=cp_data.get("tags", []),
-                            manager=cp_data.get("manager", ""),
-                            segment=cp_data.get("buyer_type", ""),
+        else:
+            logger.info(f"pending_links: user={user.id} contact={pending_link.get('wazzup_name')} text={text[:30]}")
+            if "company_name" not in pending_link:
+                # Если уже показали варианты — просим нажать кнопку
+                if pending_link.get("suggestions"):
+                    await message.reply_text("👆 Выбери компанию из списка выше или нажми «Не привязывать».")
+                    return
+                # Ищем компанию в МойСклад
+                company_query = text.strip()
+                counterparties = await get_counterparty_balance(company_query)
+                if not counterparties:
+                    words = company_query.split()
+                    suggestions = []
+                    for word in words:
+                        if len(word) >= 3:
+                            found = await get_counterparty_balance(word)
+                            for c in found:
+                                if c not in suggestions:
+                                    suggestions.append(c)
+                    if suggestions:
+                        link_key = pending_link.get("link_key", str(user.id))
+                        pending_link["suggestions"] = [c.get("name","") for c in suggestions[:5]]
+                        buttons = []
+                        for i, c in enumerate(suggestions[:5]):
+                            cp_name = c.get("name", "")
+                            buttons.append([InlineKeyboardButton(
+                                cp_name[:40],
+                                callback_data=f"wazzup_pick|{i}|{link_key}"
+                            )])
+                        buttons.append([InlineKeyboardButton(
+                            "🚫 Не привязывать",
+                            callback_data=f"wazzup_role|отмена|{link_key}"
+                        )])
+                        await message.reply_text(
+                            f"❓ *{company_query}* не найдена точно.\n\nВозможно имеется в виду:",
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup(buttons)
                         )
-                except Exception as e:
-                    logger.warning(f"Теги МойСклад: {e}")
-                await message.reply_text(
-                    f"✅ *{pending_link['wazzup_name']}* → *{cp_name}*\nЭф запомнил!",
-                    parse_mode="Markdown"
+                    else:
+                        keyboard = InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🚫 Не привязывать", callback_data=f"wazzup_role|отмена|{pending_link.get('link_key', str(user.id))}")
+                        ]])
+                        await message.reply_text(
+                            f"❌ Компания *{company_query}* не найдена в МойСклад.\n"
+                            f"Попробуй написать название точнее или отмени привязку.",
+                            parse_mode="Markdown",
+                            reply_markup=keyboard
+                        )
+                    return
+                cp = counterparties[0]
+                cp_name = cp.get("name", company_query)
+                pending_link["company_name"] = cp_name
+                link_key = pending_link.get("link_key", str(user.id))
+                # Удаляем из стека
+                if isinstance(_pending_links.get(user.id), list):
+                    _pending_links[user.id] = [p for p in _pending_links[user.id] if p.get("link_key") != link_key]
+                    if not _pending_links[user.id]:
+                        _pending_links.pop(user.id, None)
+                else:
+                    _pending_links.pop(user.id, None)
+                _pending_links.pop(link_key, None)
+                ok = db.link_wazzup_contact(
+                    chat_id=pending_link["chat_id"],
+                    chat_type=pending_link["chat_type"],
+                    channel_id=pending_link["channel_id"],
+                    company_name=cp_name,
+                    wazzup_name=pending_link["wazzup_name"],
+                    role="рассылка",
                 )
+                if ok:
+                    _wazzup_notified.discard(pending_link["chat_id"])
+                    try:
+                        from moysklad import find_counterparty_info
+                        cp_list = await find_counterparty_info(cp_name)
+                        if cp_list:
+                            cp_data = cp_list[0]
+                            db.update_wazzup_contact_tags(
+                                chat_id=pending_link["chat_id"],
+                                tags=cp_data.get("tags", []),
+                                manager=cp_data.get("manager", ""),
+                                segment=cp_data.get("buyer_type", ""),
+                            )
+                    except Exception as e:
+                        logger.warning(f"Теги МойСклад: {e}")
+                    await message.reply_text(
+                        f"✅ *{pending_link['wazzup_name']}* → *{cp_name}*\nЭф запомнил!",
+                        parse_mode="Markdown"
+                    )
+                # Если есть ещё ожидающие в стеке — спрашиваем следующего
+                next_pl = _pending_links.get(user.id)
+                next_pending = next_pl[0] if isinstance(next_pl, list) and next_pl else None
+                if next_pending:
+                    await message.reply_text(
+                        f"👤 Следующий контакт: *{next_pending['wazzup_name']}*\n\n"
+                        f"Как этот клиент называется в МойСклад?\n"
+                        f"_(напиши название или часть названия)_",
+                        parse_mode="Markdown"
+                    )
             return
-        _pending_links.pop(user.id, None)
-        return
 
     # Проверяем ожидание данных для договора (ПОСЛЕ идентификации)
     if user and user.id in _pending_contracts and not is_bot_addressed(text):
