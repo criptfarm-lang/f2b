@@ -1164,8 +1164,9 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                     logger.info(f"get_overdue_demands: контрагент '{query}' не найден")
                     return None
 
-            # Грузим заказы покупателей постранично
-            url = f"{MS_BASE}/entity/customerorder"
+            # Грузим ОТГРУЗКИ (demand) — именно они определяют реальный долг
+            # Дата оплаты берётся из связанного заказа (через customerOrder)
+            url = f"{MS_BASE}/entity/demand"
             all_orders = []
             offset = 0
 
@@ -1178,7 +1179,7 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                 params = {
                     "limit": 100,
                     "offset": offset,
-                    "expand": "agent,attributes",
+                    "expand": "agent,customerOrder,customerOrder.attributes",
                     "order": "moment,asc",
                 }
                 if agent_filter:
@@ -1196,18 +1197,18 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                         break
                     offset += 100
 
-            logger.info(f"get_overdue_demands: {len(all_orders)} total orders loaded")
-
-
+            logger.info(f"get_overdue_demands: {len(all_orders)} отгрузок загружено")
 
             by_agent = {}
             for order in all_orders:
-                # Дата планируемой оплаты — кастомный атрибут
+                # Дата планируемой оплаты — из связанного заказа покупателя
                 ppm = ""
-                for attr in order.get("attributes", []):
-                    if attr.get("name") == "Дата планируемой оплаты":
-                        ppm = attr.get("value", "")
-                        break
+                customer_order = order.get("customerOrder", {})
+                if customer_order and isinstance(customer_order, dict):
+                    for attr in customer_order.get("attributes", []):
+                        if attr.get("name") == "Дата планируемой оплаты":
+                            ppm = attr.get("value", "")
+                            break
                 if not ppm:
                     continue
 
@@ -1223,10 +1224,19 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                 if due_dt >= today_dt:
                     continue
 
-                # Не оплачена?
+                # Не оплачена? Берём сумму отгрузки минус оплаченная сумма из заказа
                 total_sum = (order.get("sum", 0) or 0) / 100
-                payed_sum = (order.get("payedSum", 0) or 0) / 100
-                unpaid = total_sum - payed_sum
+                # payedSum есть в заказе
+                if customer_order and isinstance(customer_order, dict):
+                    payed_sum = (customer_order.get("payedSum", 0) or 0) / 100
+                    order_sum = (customer_order.get("sum", 0) or 0) / 100
+                    # Неоплаченная часть = сумма заказа - оплачено
+                    unpaid = max(0, order_sum - payed_sum)
+                    # Но показываем сумму отгрузки как сумму долга
+                    debt_sum = total_sum
+                else:
+                    unpaid = total_sum
+                    debt_sum = total_sum
                 if unpaid <= 0:
                     continue
 
@@ -1274,12 +1284,12 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                         "demands": [],
                         "manager": manager_name,
                     }
-                by_agent[agent_id]["overdue_sum"] += unpaid
+                by_agent[agent_id]["overdue_sum"] += debt_sum
                 by_agent[agent_id]["max_days"] = max(by_agent[agent_id]["max_days"], days_overdue)
                 by_agent[agent_id]["demands"].append({
                     "name": order.get("name", ""),
                     "due": ppm[:10],
-                    "unpaid": unpaid,
+                    "unpaid": debt_sum,
                     "days": days_overdue,
                 })
 
