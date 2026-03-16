@@ -214,6 +214,7 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
             return
         cp_name = suggestions[idx]
         _pending_links.pop(link_key, None)
+        db.delete_pending_link(link_key)
         _pending_links.pop(query.from_user.id, None)
         ok = db.link_wazzup_contact(
             chat_id=pending["chat_id"],
@@ -288,6 +289,7 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
             return
         # Очищаем
         _pending_links.pop(link_key, None)
+        db.delete_pending_link(link_key)
         for uid in [k for k, v in list(_pending_links.items()) if isinstance(k, int) and v.get("link_key") == link_key]:
             _pending_links.pop(uid, None)
         ok = db.link_wazzup_contact(
@@ -339,6 +341,7 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
             pending_data = _pending_links.get(link_key, {})
             _wazzup_notified.discard(pending_data.get("chat_id", ""))
             _pending_links.pop(link_key, None)
+            db.delete_pending_link(link_key)
             for uid in [k for k, v in list(_pending_links.items()) if v.get("link_key") == link_key]:
                 _pending_links.pop(uid, None)
             await query.message.delete()
@@ -1403,7 +1406,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     _pending_links.pop(user.id, None)
                 _pending_links.pop(link_key, None)
-                db.delete_pending_ident(link_key)
+                db.delete_pending_link(link_key)
                 ok = db.link_wazzup_contact(
                     chat_id=pending_link["chat_id"],
                     chat_type=pending_link["chat_type"],
@@ -2844,7 +2847,7 @@ def main():
                                     "chat_type": chat_type,
                                 }
                                 # Сохраняем в БД чтобы пережить рестарт
-                                db.save_pending_ident(
+                                db.save_pending_link(
                                     link_key=link_key,
                                     chat_id=chat_id_val,
                                     channel_id=channel_id_val,
