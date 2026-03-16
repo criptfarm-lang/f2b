@@ -1260,34 +1260,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Проверяем ожидание данных для договора
-    if user and user.id in _pending_contracts and not is_bot_addressed(text):
-        pending_c = _pending_contracts[user.id]
-        keys = pending_c["missing_keys"]
-        labels = pending_c["missing_labels"]
-        idx = pending_c["missing_idx"]
-        data = pending_c["data"]
-
-        field_key = keys[idx]
-        data[field_key] = text.strip()
-
-        # Для представителя — извлекаем краткое ФИО для подписи
-        if field_key == "buyer_representative":
-            parts = text.strip().split()
-            if len(parts) >= 2:
-                data["buyer_director_name"] = " ".join(parts[-2:])
-
-        idx += 1
-        pending_c["missing_idx"] = idx
-
-        if idx < len(keys):
-            await message.reply_text(f"✅ Принято.\n\n*{labels[idx]}*?", parse_mode="Markdown")
-        else:
-            _pending_contracts.pop(user.id, None)
-            await message.reply_text("✅ Все данные получены. Генерирую договор...")
-            await _create_and_send_contract(data, user.full_name, message, context)
-        return
-
-    # Проверяем ожидание привязки Wazzup контакта
+    # Проверяем ожидание привязки Wazzup контакта (ПЕРВЫМ — приоритет над договором)
     if user and user.id in _pending_links and not is_bot_addressed(text):
         pending_link = _pending_links[user.id]
         if "company_name" not in pending_link:
@@ -1379,6 +1352,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
         _pending_links.pop(user.id, None)
+        return
+
+    # Проверяем ожидание данных для договора (ПОСЛЕ идентификации)
+    if user and user.id in _pending_contracts and not is_bot_addressed(text):
+        pending_c = _pending_contracts[user.id]
+        keys = pending_c["missing_keys"]
+        labels = pending_c["missing_labels"]
+        idx = pending_c["missing_idx"]
+        data = pending_c["data"]
+
+        field_key = keys[idx]
+        data[field_key] = text.strip()
+
+        if field_key == "buyer_representative":
+            parts = text.strip().split()
+            if len(parts) >= 2:
+                data["buyer_director_name"] = " ".join(parts[-2:])
+
+        idx += 1
+        pending_c["missing_idx"] = idx
+
+        if idx < len(keys):
+            await message.reply_text(f"✅ Принято.\n\n*{labels[idx]}*?", parse_mode="Markdown")
+        else:
+            _pending_contracts.pop(user.id, None)
+            await message.reply_text("✅ Все данные получены. Генерирую договор...")
+            await _create_and_send_contract(data, user.full_name, message, context)
         return
 
     if not is_bot_addressed(text):
