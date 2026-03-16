@@ -769,6 +769,91 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
         return {"total": 0, "active": 0}
 
 
+async def get_counterparty_requisites(counterparty_id: str) -> dict:
+    """
+    Читает полные реквизиты контрагента из МойСклад:
+    ИНН, ОГРН, адрес, банковские реквизиты, телефон, email, директор.
+    """
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Основные реквизиты
+            url = f"{MS_BASE}/entity/counterparty/{counterparty_id}"
+            async with session.get(url, headers=get_headers()) as resp:
+                if resp.status != 200:
+                    return {}
+                cp = await resp.json()
+
+            # Банковские реквизиты
+            accounts_url = f"{MS_BASE}/entity/counterparty/{counterparty_id}/accounts"
+            accounts = []
+            async with session.get(accounts_url, headers=get_headers()) as resp:
+                if resp.status == 200:
+                    adata = await resp.json()
+                    accounts = adata.get("rows", [])
+
+        # Основной банковский счёт
+        bank_data = {}
+        for acc in accounts:
+            if acc.get("isDefault") or not bank_data:
+                bank_data = {
+                    "buyer_rs": acc.get("accountNumber", ""),
+                    "buyer_bank": acc.get("bankName", ""),
+                    "buyer_bik": acc.get("bic", ""),
+                    "buyer_ks": acc.get("correspondentAccount", ""),
+                }
+                if acc.get("isDefault"):
+                    break
+
+        # Адрес — сначала юридический, потом фактический
+        legal = cp.get("legalAddress", "") or ""
+        actual = cp.get("actualAddress", "") or ""
+
+        # Директор из legalFirstName + legalLastName или contactPersons
+        director = ""
+        lf = cp.get("legalFirstName", "") or ""
+        lm = cp.get("legalMiddleName", "") or ""
+        ll = cp.get("legalLastName", "") or ""
+        if ll:
+            # Формируем "Иванов И.И."
+            initials = ""
+            if lf:
+                initials += lf[0] + "."
+            if lm:
+                initials += lm[0] + "."
+            director = f"{ll} {initials}".strip()
+
+        result = {
+            "buyer_inn": cp.get("inn", "") or "",
+            "buyer_ogrn": cp.get("ogrn", "") or cp.get("ogrnip", "") or "",
+            "buyer_address": legal or actual,
+            "buyer_phone": cp.get("phone", "") or "",
+            "buyer_email": cp.get("email", "") or "",
+            "buyer_director_name": director,
+            "buyer_name": cp.get("name", ""),
+            "buyer_legal_title": cp.get("legalTitle", "") or cp.get("name", ""),
+            "href": f"{MS_BASE}/entity/counterparty/{counterparty_id}",
+            "id": counterparty_id,
+        }
+        result.update(bank_data)
+
+        # Представитель для договора
+        if director:
+            # Определяем должность по типу контрагента
+            cp_type = cp.get("companyType", "")
+            if cp_type == "entrepreneur":
+                result["buyer_representative"] = f"индивидуального предпринимателя {director}"
+            else:
+                result["buyer_representative"] = f"генерального директора {director}"
+
+        logger.info(f"get_counterparty_requisites: {cp.get('name')} inn={result['buyer_inn']} bank={result.get('buyer_bank','')[:20]}")
+        return result
+
+    except Exception as e:
+        logger.error(f"get_counterparty_requisites: {e}", exc_info=True)
+        return {}
+
+
 async def find_counterparty_info(query: str) -> list:
     """Находит контрагента и возвращает его теги, менеджера, тип покупателя и баланс."""
     import re as _re
