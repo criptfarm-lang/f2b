@@ -264,68 +264,96 @@ def generate_contract_pdf(data: dict) -> bytes:
     story.append(req_table)
     story.append(Spacer(1, 4*mm))
 
-    # ── Подписи ──────────────────────────────────────────────────────────────
-    story.append(Paragraph("Генеральный Директор", small_bold))
-    story.append(Spacer(1, 1*mm))
+    # ── Подписи через canvas (абсолютное позиционирование) ───────────────────
+    story.append(Spacer(1, 100*mm))  # резервируем место для подписей + печати
 
-    # Левая колонка — подпись + печать поставщика вместе
-    supplier_cell_items = [Paragraph("АО «ФИШ ТУ БИЗНЕС»", small)]
-    if SIGN_PATH and os.path.exists(SIGN_PATH):
-        # Подпись и печать в одной строке
-        sign_img = Image(SIGN_PATH, width=32*mm, height=14*mm)
-        if STAMP_PATH and os.path.exists(STAMP_PATH):
-            stamp_img = Image(STAMP_PATH, width=32*mm, height=32*mm)
-            # Таблица: подпись слева, печать справа
-            sp_row = Table([[sign_img, stamp_img]],
-                           colWidths=[34*mm, 34*mm])
-            sp_row.setStyle(TableStyle([
-                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-                ("LEFTPADDING", (0,0), (-1,-1), 0),
-                ("RIGHTPADDING", (0,0), (-1,-1), 0),
-                ("TOPPADDING", (0,0), (-1,-1), 0),
-                ("BOTTOMPADDING", (0,0), (-1,-1), 0),
-            ]))
-            supplier_cell_items.append(sp_row)
-        else:
-            supplier_cell_items.append(sign_img)
-    else:
-        supplier_cell_items.append(Paragraph("_____________", small))
+    # Запоминаем общее число страниц через multiBuild
+    _page_count = [0]
 
-    supplier_cell_items.append(Paragraph("/Маланчук А.В./", small_bold))
+    def _add_page_elements(canvas_obj, doc_obj):
+        canvas_obj.saveState()
 
-    # Правая колонка — место для подписи покупателя
-    buyer_cell_items = [
-        Paragraph(data.get("buyer_name", ""), small),
-        Paragraph("_____________", small),
-        Paragraph(f"/{data.get('buyer_director_name','')}/", small_bold),
-    ]
-
-    sign_data = [[
-        Table([[x] for x in supplier_cell_items], colWidths=[col_w - 4*mm]),
-        Table([[x] for x in buyer_cell_items], colWidths=[col_w - 4*mm]),
-    ]]
-    sign_table = Table(sign_data, colWidths=[col_w, col_w])
-    sign_table.setStyle(TableStyle([
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("TOPPADDING", (0,0), (-1,-1), 0),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 0),
-        ("LEFTPADDING", (0,0), (-1,-1), 2),
-    ]))
-    story.append(sign_table)
-
-    # ── Коммерческая тайна на каждой странице через canvas callback ──────────
-    def _add_comm_secret(canvas_obj, doc_obj):
+        # ── Коммерческая тайна — правый нижний угол на каждой странице ───────
         if COMM_PATH and os.path.exists(COMM_PATH):
-            canvas_obj.saveState()
-            w_page, h_page = A4
-            img_w, img_h = 42*mm, 21*mm
-            x = w_page - img_w - 10*mm
-            y = 10*mm  # выше нижнего края, не перекрывает текст
-            canvas_obj.drawImage(COMM_PATH, x, y, width=img_w, height=img_h,
+            iw, ih = 42*mm, 21*mm
+            canvas_obj.drawImage(COMM_PATH,
+                                 A4[0] - iw - 10*mm, 10*mm,
+                                 width=iw, height=ih,
                                  mask="auto", preserveAspectRatio=True)
-            canvas_obj.restoreState()
 
-    doc.build(story, onFirstPage=_add_comm_secret, onLaterPages=_add_comm_secret)
+        # ── Подписи — только на ПОСЛЕДНЕЙ странице ───────────────────────────
+        if canvas_obj.getPageNumber() == _page_count[0]:
+            base_y = 95 * mm  # поднимаем выше
+
+            fn, fb = FONT_NORMAL, FONT_BOLD
+            lx = doc_obj.leftMargin
+            rx = lx + (A4[0] - lx - doc_obj.rightMargin) / 2
+
+            # Поставщик
+            canvas_obj.setFont(fb, 8)
+            canvas_obj.drawString(lx, base_y, "ПОСТАВЩИК:")
+            canvas_obj.setFont(fn, 8)
+            canvas_obj.drawString(lx, base_y - 5*mm, "АО «ФИШ ТУ БИЗНЕС»")
+            canvas_obj.drawString(lx, base_y - 10*mm, "Генеральный Директор")
+
+            # Линия
+            canvas_obj.line(lx, base_y - 16*mm, lx + 60*mm, base_y - 16*mm)
+
+            # Фамилия
+            canvas_obj.setFont(fb, 8)
+            canvas_obj.drawString(lx, base_y - 22*mm, "/Маланчук А.В./")
+
+            # Подпись — ещё левее и выше напротив фамилии
+            if SIGN_PATH and os.path.exists(SIGN_PATH):
+                canvas_obj.drawImage(SIGN_PATH, lx - 65*mm, base_y - 22*mm - 10*mm,
+                                     width=151*mm, height=65*mm,
+                                     mask="auto", preserveAspectRatio=True)
+
+            # Печать под фамилией +10% от 68мм
+            if STAMP_PATH and os.path.exists(STAMP_PATH):
+                sz = 75*mm
+                canvas_obj.drawImage(STAMP_PATH,
+                                     lx + 2*mm,
+                                     base_y - 22*mm - sz,
+                                     width=sz, height=sz,
+                                     mask="auto", preserveAspectRatio=True)
+
+            # Покупатель (правая колонка — симметрично поставщику)
+            canvas_obj.setFont(fb, 8)
+            canvas_obj.drawString(rx, base_y, "ПОКУПАТЕЛЬ:")
+            canvas_obj.setFont(fn, 8)
+            bname = data.get("buyer_name", "")
+            if len(bname) > 38:
+                canvas_obj.drawString(rx, base_y - 5*mm, bname[:38])
+                canvas_obj.drawString(rx, base_y - 10*mm, bname[38:])
+                canvas_obj.drawString(rx, base_y - 15*mm, "Генеральный директор")
+            else:
+                canvas_obj.drawString(rx, base_y - 5*mm, bname)
+                canvas_obj.drawString(rx, base_y - 10*mm, "Генеральный директор")
+            canvas_obj.line(rx, base_y - 16*mm, rx + 60*mm, base_y - 16*mm)
+            canvas_obj.setFont(fb, 8)
+            canvas_obj.drawString(rx, base_y - 22*mm, f"/{data.get('buyer_director_name', '')}/")
+
+        canvas_obj.restoreState()
+
+    # Первый проход — считаем страницы
+    from reportlab.platypus import SimpleDocTemplate as _SDT
+    import io as _io, copy as _copy
+    _buf2 = _io.BytesIO()
+    _doc2 = _SDT(_buf2, pagesize=A4,
+                 leftMargin=doc.leftMargin, rightMargin=doc.rightMargin,
+                 topMargin=doc.topMargin, bottomMargin=doc.bottomMargin)
+
+    class _Counter:
+        def __init__(self): self.n = 0
+        def __call__(self, c, d): self.n = c.getPageNumber()
+
+    _counter = _Counter()
+    import copy
+    _doc2.build(copy.deepcopy(story), onFirstPage=_counter, onLaterPages=_counter)
+    _page_count[0] = _counter.n
+
+    doc.build(story, onFirstPage=_add_page_elements, onLaterPages=_add_page_elements)
     return buf.getvalue()
 
 
