@@ -155,6 +155,20 @@ def make_styles():
 
 def generate_contract_pdf(data: dict) -> bytes:
     """Генерирует PDF договора поставки."""
+    # Перечитываем пути при каждом вызове — файлы могли появиться после старта
+    global LOGO_PATH, SIGN_PATH, STAMP_PATH, COMM_PATH
+    LOGO_PATH  = _find_asset("logo.png")
+    SIGN_PATH  = _asset_or_txt(
+        ["podpis.png", "podpis.PNG", "sign.png"],
+        ["Подпись.txt", "podpis.txt"]
+    )
+    STAMP_PATH = _asset_or_txt(
+        ["pechat.png", "pechat_clean.png", "pechat.PNG"],
+        ["Печать.txt", "pechat.txt"]
+    )
+    COMM_PATH  = (_find_asset("image2.PNG") or _find_asset("image2.png")
+                  or _find_asset("comm_secret.png"))
+    _log.info(f"generate_contract_pdf: logo={LOGO_PATH} sign={SIGN_PATH} stamp={STAMP_PATH}")
     from reportlab.lib.pagesizes import A4
     from reportlab.platypus import SimpleDocTemplate
     from reportlab.pdfgen import canvas as _canvas_module
