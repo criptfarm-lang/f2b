@@ -101,8 +101,9 @@ def _find_asset(name):
     return None
 
 LOGO_PATH  = _find_asset("logo.png")
-SIGN_PATH  = _find_asset("podpis.png")
-STAMP_PATH = _find_asset("pechat.png")
+SIGN_PATH  = _find_asset("podpis.png") or _find_asset("Подпись.txt")
+STAMP_PATH = (_find_asset("pechat.png") or _find_asset("pechat_clean.png")
+              or _find_asset("Печать.txt"))
 COMM_PATH  = (_find_asset("image2.PNG") or _find_asset("image2.png")
               or _find_asset("comm_secret.png"))
 
