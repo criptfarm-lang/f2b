@@ -168,10 +168,18 @@ class Database:
                 role TEXT DEFAULT 'закупщик',
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
-            "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'закупщик'",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS bot_message_id BIGINT",
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS tags TEXT",
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS manager TEXT",
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS segment TEXT",
+            """CREATE TABLE IF NOT EXISTS wazzup_pending (
+                link_key TEXT PRIMARY KEY,
+                chat_id TEXT,
+                channel_id TEXT,
+                wazzup_name TEXT,
+                chat_type TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
             """CREATE TABLE IF NOT EXISTS contracts (
                 id SERIAL PRIMARY KEY,
                 contract_number TEXT UNIQUE NOT NULL,
@@ -192,6 +200,15 @@ class Database:
             )""",
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS segment TEXT",
             "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS manager TEXT",
+            """CREATE TABLE IF NOT EXISTS wazzup_pending_ident (
+                id SERIAL PRIMARY KEY,
+                link_key TEXT UNIQUE NOT NULL,
+                chat_id TEXT NOT NULL,
+                channel_id TEXT,
+                wazzup_name TEXT,
+                chat_type TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
             """CREATE TABLE IF NOT EXISTS wazzup_contacts (
                 id SERIAL PRIMARY KEY,
                 contact_name TEXT NOT NULL,
@@ -224,6 +241,26 @@ class Database:
             row = cur.fetchone()
             self.conn.commit()
             return row['id']
+
+    def set_task_bot_message_id(self, task_id: int, bot_message_id: int):
+        """Сохраняет message_id сообщения бота о задаче."""
+        self._execute(
+            "UPDATE tasks SET bot_message_id=%s WHERE id=%s",
+            (bot_message_id, task_id)
+        )
+
+    def delete_tasks_by_bot_message_id(self, bot_message_id: int, chat_id: int) -> list:
+        """Удаляет задачи привязанные к сообщению бота. Возвращает удалённые задачи."""
+        rows = self._fetchall(
+            "SELECT * FROM tasks WHERE bot_message_id=%s AND source_chat=%s AND status='open'",
+            (bot_message_id, chat_id)
+        )
+        if rows:
+            self._execute(
+                "DELETE FROM tasks WHERE bot_message_id=%s AND source_chat=%s AND status='open'",
+                (bot_message_id, chat_id)
+            )
+        return rows
 
     def complete_task(self, task_id: int, result: str = "", completed_by: str = ""):
         self._execute(
@@ -527,6 +564,38 @@ class Database:
         """
         return self._fetchall(sql, params)
 
+    def save_pending_ident(self, link_key: str, chat_id: str, channel_id: str,
+                           wazzup_name: str, chat_type: str):
+        """Сохраняет ожидающую идентификацию в БД (выживает перезапуск)."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wazzup_pending_ident (link_key, chat_id, channel_id, wazzup_name, chat_type)
+                       VALUES (%s,%s,%s,%s,%s) ON CONFLICT (link_key) DO NOTHING""",
+                    (link_key, chat_id, channel_id, wazzup_name, chat_type)
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"save_pending_ident: {e}")
+
+    def get_pending_idents(self) -> list:
+        """Возвращает все ожидающие идентификации."""
+        return self._fetchall(
+            "SELECT * FROM wazzup_pending_ident ORDER BY created_at",
+            []
+        )
+
+    def delete_pending_ident(self, link_key: str):
+        """Удаляет идентификацию после завершения."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("DELETE FROM wazzup_pending_ident WHERE link_key=%s", (link_key,))
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"delete_pending_ident: {e}")
+
     def save_wazzup_contact(self, contact_name: str, chat_id: str,
                             chat_type: str, channel_id: str):
         """Сохраняет или обновляет chatId клиента по каналу."""
@@ -630,6 +699,33 @@ class Database:
                ORDER BY created_at DESC""",
             [f"%{company_name}%"] + roles
         )
+
+    def save_pending_link(self, link_key: str, chat_id: str, channel_id: str,
+                          wazzup_name: str, chat_type: str):
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wazzup_pending (link_key, chat_id, channel_id, wazzup_name, chat_type)
+                       VALUES (%s,%s,%s,%s,%s) ON CONFLICT (link_key) DO NOTHING""",
+                    (link_key, chat_id, channel_id, wazzup_name, chat_type)
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"save_pending_link: {e}")
+
+    def load_pending_links(self) -> list:
+        return self._fetchall(
+            "SELECT link_key, chat_id, channel_id, wazzup_name, chat_type FROM wazzup_pending"
+        )
+
+    def delete_pending_link(self, link_key: str):
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("DELETE FROM wazzup_pending WHERE link_key=%s", (link_key,))
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
 
     def save_contract(self, contract_number: str, buyer_name: str, created_by: str):
         try:
