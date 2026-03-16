@@ -1960,7 +1960,80 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard
         )
 
-    elif action == "generate_contract":
+    elif action == "reconciliation":
+        buyer_query = params.get("buyer", "")
+        date_from = params.get("date_from", f"{datetime.now().year}-01-01")
+        date_to = params.get("date_to", datetime.now().strftime("%Y-%m-%d"))
+
+        await message.reply_chat_action("typing")
+
+        # Ищем контрагента
+        counterparties = await get_counterparty_balance(buyer_query)
+        if not counterparties:
+            await message.reply_text(
+                f"❌ Компания *{buyer_query}* не найдена в МойСклад.",
+                parse_mode="Markdown"
+            )
+            return
+
+        cp = counterparties[0]
+        cp_id = cp.get("id", "")
+        cp_name = cp.get("name", buyer_query)
+
+        await message.reply_text(
+            f"📊 Формирую акт сверки *{cp_name}*\n"
+            f"📅 Период: {date_from} — {date_to}\n"
+            f"⏳ Запрашиваю данные из МойСклад...",
+            parse_mode="Markdown"
+        )
+
+        try:
+            from reconciliation_generator import (
+                get_reconciliation_data, generate_reconciliation_pdf
+            )
+            from moysklad import get_counterparty_requisites
+
+            # Получаем данные
+            reqs = await get_counterparty_requisites(cp_id)
+            rec_data = await get_reconciliation_data(cp_id, date_from, date_to)
+
+            buyer_info = {
+                "name": reqs.get("buyer_legal_title") or cp_name,
+                "inn": reqs.get("buyer_inn", ""),
+                "ogrn": reqs.get("buyer_ogrn", ""),
+            }
+
+            pdf_bytes = generate_reconciliation_pdf(
+                supplier_data={},
+                buyer_data=buyer_info,
+                rec_data=rec_data,
+                date_from=date_from,
+                date_to=date_to,
+            )
+
+            # Отправляем в группу
+            group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
+            target = group_chat_id or message.chat_id
+            ops_count = len(rec_data["operations"])
+            caption = (
+                f"📊 *Акт сверки — {cp_name}*\n"
+                f"📅 {date_from} — {date_to}\n"
+                f"📋 Операций: {ops_count}\n"
+                f"💰 Сальдо на конец: {rec_data['balance_end']:,.0f} руб."
+            )
+            await context.bot.send_document(
+                chat_id=target,
+                document=io.BytesIO(pdf_bytes),
+                filename=f"Акт_сверки_{cp_name[:30]}_{date_to}.pdf",
+                caption=caption,
+                parse_mode="Markdown"
+            )
+            if target != message.chat_id:
+                await message.reply_text("✅ Акт сверки отправлен в группу.")
+
+        except Exception as e:
+            logger.error(f"reconciliation error: {e}", exc_info=True)
+            await message.reply_text(f"❌ Ошибка формирования акта: {e}")
         buyer_query = params.get("buyer", "")
         await message.reply_chat_action("typing")
 
