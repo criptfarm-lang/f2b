@@ -357,7 +357,7 @@ def generate_contract_pdf(data: dict) -> bytes:
 
             # Подпись — ещё левее и выше напротив фамилии
             if SIGN_PATH and os.path.exists(SIGN_PATH):
-                canvas_obj.drawImage(SIGN_PATH, lx - 65*mm, base_y - 22*mm - 110*mm,
+                canvas_obj.drawImage(SIGN_PATH, lx - 65*mm, base_y - 22*mm - 50*mm,
                                      width=151*mm, height=65*mm,
                                      mask="auto", preserveAspectRatio=True)
 
