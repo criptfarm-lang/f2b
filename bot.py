@@ -427,7 +427,8 @@ async def cmd_clear_wazzup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _pending_contracts: dict = {}
 
 
-async def _create_and_send_contract(contract_data: dict, created_by: str, message, context):
+async def _create_and_send_contract(contract_data: dict, created_by: str,
+                                    message, context, force_number: str = None):
     """Генерирует договор PDF и отправляет в группу."""
     import io, sys, os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -437,7 +438,11 @@ async def _create_and_send_contract(contract_data: dict, created_by: str, messag
         from datetime import datetime
 
         today = datetime.now()
-        contract_number = get_contract_number(today, db)
+
+        if force_number:
+            contract_number = force_number
+        else:
+            contract_number = get_contract_number(today, db)
 
         MONTHS_RU = ["января","февраля","марта","апреля","мая","июня",
                      "июля","августа","сентября","октября","ноября","декабря"]
@@ -446,8 +451,9 @@ async def _create_and_send_contract(contract_data: dict, created_by: str, messag
 
         pdf_bytes = generate_contract_pdf(contract_data)
 
-        # Сохраняем в БД
-        db.save_contract(contract_number, contract_data["buyer_name"], created_by)
+        # Сохраняем в БД с полными реквизитами
+        db.save_contract(contract_number, contract_data["buyer_name"], created_by,
+                         buyer_data=contract_data)
 
         # Отправляем в группу
         group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
@@ -776,6 +782,65 @@ async def cmd_del_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Задача #{task_id} не найдена или уже закрыта.")
     except ValueError:
         await update.message.reply_text("❌ Укажи числовой ID задачи.")
+
+
+async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок подтверждения создания договора."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "contract_cancel":
+        await query.message.edit_text("❌ Создание договора отменено.")
+        return
+
+    if data.startswith("contract_force|"):
+        cp_id = data.split("|")[1]
+        from moysklad import get_counterparty_requisites
+        await query.message.edit_text("🔍 Читаю реквизиты...")
+        reqs = await get_counterparty_requisites(cp_id)
+        contract_data = {
+            "buyer_name": reqs.get("buyer_legal_title") or reqs.get("buyer_name", ""),
+            "buyer_inn": reqs.get("buyer_inn", ""),
+            "buyer_ogrn": reqs.get("buyer_ogrn", ""),
+            "buyer_address": reqs.get("buyer_address", ""),
+            "buyer_bank": reqs.get("buyer_bank", ""),
+            "buyer_rs": reqs.get("buyer_rs", ""),
+            "buyer_bik": reqs.get("buyer_bik", ""),
+            "buyer_ks": reqs.get("buyer_ks", ""),
+            "buyer_phone": reqs.get("buyer_phone", ""),
+            "buyer_email": reqs.get("buyer_email", ""),
+            "buyer_representative": reqs.get("buyer_representative", ""),
+            "buyer_director_name": reqs.get("buyer_director_name", ""),
+            "buyer_basis": "Устава",
+        }
+        # Проверяем недостающие поля
+        REQUIRED = {
+            "buyer_inn": "ИНН", "buyer_ogrn": "ОГРН",
+            "buyer_address": "юридический адрес",
+            "buyer_rs": "расчётный счёт (р/с)", "buyer_bik": "БИК банка",
+            "buyer_bank": "название банка", "buyer_ks": "корреспондентский счёт (к/с)",
+            "buyer_representative": "ФИО директора и должность",
+            "buyer_basis": "основание полномочий",
+        }
+        missing = [(k, v) for k, v in REQUIRED.items() if not contract_data.get(k)]
+        user = query.from_user
+        if missing:
+            _pending_contracts[user.id] = {
+                "data": contract_data,
+                "missing_keys": [m[0] for m in missing],
+                "missing_labels": [m[1] for m in missing],
+                "missing_idx": 0,
+            }
+            await query.message.edit_text(
+                f"📄 *{contract_data['buyer_name']}*\n\n"
+                f"Не хватает данных:\n*{missing[0][1]}*?",
+                parse_mode="Markdown"
+            )
+        else:
+            await _create_and_send_contract(
+                contract_data, user.full_name, query.message, context
+            )
 
 
 async def cmd_deltask_by_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1900,6 +1965,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_chat_action("typing")
 
         from moysklad import get_counterparty_requisites
+        from datetime import date as _date
 
         # Ищем контрагента
         counterparties = await get_counterparty_balance(buyer_query)
@@ -1912,6 +1978,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cp = counterparties[0]
         cp_id = cp.get("id", "")
+        cp_name = cp.get("name", buyer_query)
+
+        # 1. Проверяем — есть ли уже договор с этим клиентом
+        existing = db.find_contract_by_buyer(cp_name)
+        if existing:
+            # Регенерируем PDF с тем же номером
+            saved_data = existing.get("buyer_data")
+            if saved_data and isinstance(saved_data, dict):
+                await message.reply_text(
+                    f"📄 Договор с *{cp_name}* уже создавался.\n"
+                    f"Номер: *{existing['contract_number']}* от {existing['created_at'].strftime('%d.%m.%Y')}\n"
+                    f"Регенерирую...",
+                    parse_mode="Markdown"
+                )
+                await _create_and_send_contract(
+                    saved_data, user.full_name, message, context,
+                    force_number=existing["contract_number"]
+                )
+            else:
+                await message.reply_text(
+                    f"📄 Договор с *{cp_name}* уже создавался.\n"
+                    f"Номер: *{existing['contract_number']}* от {existing['created_at'].strftime('%d.%m.%Y')}\n"
+                    f"Реквизиты не сохранены — создаю новый.",
+                    parse_mode="Markdown"
+                )
+            return
+
+        # 2. Проверяем дату создания клиента в МойСклад
+        # Если клиент создан ДО сегодня — договор уже существовал в прошлом
+        cp_updated = cp.get("updated") or cp.get("created") or ""
+        today_str = _date.today().isoformat()
+        if cp_updated and cp_updated[:10] < today_str:
+            await message.reply_text(
+                f"⚠️ Клиент *{cp_name}* заведён в МойСклад {cp_updated[:10]}.\n"
+                f"Договор с ним уже должен существовать. Создать новый?",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Да, создать", callback_data=f"contract_force|{cp_id}"),
+                    InlineKeyboardButton("❌ Отмена", callback_data="contract_cancel"),
+                ]])
+            )
+            return
 
         # Читаем полные реквизиты
         await message.reply_text(f"🔍 Читаю реквизиты *{cp.get('name','')}*...", parse_mode="Markdown")
@@ -2763,6 +2871,7 @@ def main():
     app.add_handler(CommandHandler("add_webhook", cmd_add_webhook))
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
+    app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr)"))
