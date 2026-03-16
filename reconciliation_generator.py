@@ -1,7 +1,7 @@
 """
 Генератор акта сверки взаиморасчётов PDF.
 """
-import os, io, glob
+import os, glob
 from datetime import datetime
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -14,22 +14,46 @@ from reportlab.pdfbase.ttfonts import TTFont
 import logging
 _log = logging.getLogger(__name__)
 
+# ── Шрифты (та же логика что в contract_generator) ────────────────────────────
 def _find_font(name):
-    for p in [f"/usr/share/fonts/**/{name}", f"/app/**/{name}"]:
+    for p in [f"/usr/share/fonts/**/{name}", f"/usr/local/share/fonts/**/{name}",
+              f"/app/.fonts/{name}", f"/home/**/{name}"]:
         found = glob.glob(p, recursive=True)
         if found: return found[0]
     return None
 
-_F = _find_font("DejaVuSans.ttf")
-_FB = _find_font("DejaVuSans-Bold.ttf")
-if _F:
-    try:
-        pdfmetrics.registerFont(TTFont("RF", _F))
-        pdfmetrics.registerFont(TTFont("RFB", _FB or _F))
-        F, FB = "RF", "RFB"
-    except: F, FB = "Helvetica", "Helvetica-Bold"
-else: F, FB = "Helvetica", "Helvetica-Bold"
+_FONT      = _find_font("DejaVuSans.ttf")
+_FONT_BOLD = _find_font("DejaVuSans-Bold.ttf")
 
+if not _FONT:
+    import urllib.request, zipfile, io as _io2
+    try:
+        os.makedirs("/tmp/dejavu", exist_ok=True)
+        data = urllib.request.urlopen(
+            "https://downloads.sourceforge.net/project/dejavu/dejavu/2.37/dejavu-fonts-ttf-2.37.zip",
+            timeout=30).read()
+        with zipfile.ZipFile(_io2.BytesIO(data)) as z:
+            for nm in z.namelist():
+                if nm.endswith(".ttf") and "DejaVuSans" in nm and "/" not in nm.replace("dejavu-fonts-ttf-2.37/ttf/", ""):
+                    with open(f"/tmp/dejavu/{os.path.basename(nm)}", "wb") as f:
+                        f.write(z.read(nm))
+        _FONT      = "/tmp/dejavu/DejaVuSans.ttf"
+        _FONT_BOLD = "/tmp/dejavu/DejaVuSans-Bold.ttf"
+    except Exception as e:
+        _log.warning(f"Font download failed: {e}")
+        _FONT = None
+
+if _FONT and os.path.exists(_FONT):
+    try:
+        pdfmetrics.registerFont(TTFont("RecF",  _FONT))
+        pdfmetrics.registerFont(TTFont("RecFB", _FONT_BOLD or _FONT))
+        F, FB = "RecF", "RecFB"
+    except Exception:
+        F, FB = "Helvetica", "Helvetica-Bold"
+else:
+    F, FB = "Helvetica", "Helvetica-Bold"
+
+# ── Assets ────────────────────────────────────────────────────────────────────
 def _find_asset(name):
     for d in [os.path.dirname(os.path.abspath(__file__)), "/app"]:
         for sub in ["assets/", ""]:
@@ -38,9 +62,10 @@ def _find_asset(name):
     return None
 
 def generate_reconciliation_pdf(data: dict) -> bytes:
+    import io
     sign  = _find_asset("podpis.png")
     stamp = _find_asset("pechat.png")
-    _log.info(f"reconciliation_generator: sign={sign} stamp={stamp}")
+    _log.info(f"reconciliation_generator: font={F} sign={sign} stamp={stamp}")
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
@@ -108,37 +133,43 @@ def generate_reconciliation_pdf(data: dict) -> bytes:
     ops.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#E8F0FE")),
         ("BACKGROUND",(0,-1),(-1,-1),colors.HexColor("#F5F5F5")),
-        ("BOX",(0,0),(-1,-1),0.5,colors.grey),("INNERGRID",(0,0),(-1,-1),0.3,colors.HexColor("#CCCCCC")),
-        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),("TOPPADDING",(0,0),(-1,-1),2),
-        ("BOTTOMPADDING",(0,0),(-1,-1),2),("LEFTPADDING",(0,0),(-1,-1),3),
+        ("BOX",(0,0),(-1,-1),0.5,colors.grey),
+        ("INNERGRID",(0,0),(-1,-1),0.3,colors.HexColor("#CCCCCC")),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("TOPPADDING",(0,0),(-1,-1),2),("BOTTOMPADDING",(0,0),(-1,-1),2),("LEFTPADDING",(0,0),(-1,-1),3),
     ]))
     story.append(ops)
     story.append(Spacer(1, 4*mm))
 
-    if closing > 0: saldo = f"Задолженность <b>{cp_name}</b> перед АО «ФИШ ТУ БИЗНЕС»: <b>{fm(closing)} руб.</b>"
-    elif closing < 0: saldo = f"Задолженность АО «ФИШ ТУ БИЗНЕС» перед <b>{cp_name}</b>: <b>{fm(abs(closing))} руб.</b>"
-    else: saldo = "Взаиморасчёты <b>согласованы</b>. Задолженность отсутствует."
+    if closing > 0:
+        saldo = f"Задолженность <b>{cp_name}</b> перед АО «ФИШ ТУ БИЗНЕС»: <b>{fm(closing)} руб.</b>"
+    elif closing < 0:
+        saldo = f"Задолженность АО «ФИШ ТУ БИЗНЕС» перед <b>{cp_name}</b>: <b>{fm(abs(closing))} руб.</b>"
+    else:
+        saldo = "Взаиморасчёты <b>согласованы</b>. Задолженность отсутствует."
     story.append(Paragraph(saldo, ParagraphStyle("saldo", fontName=F, fontSize=9, leading=13)))
     story.append(Spacer(1, 40*mm))
 
-    def _draw(c, d):
-        c.saveState()
-        lx = d.leftMargin
-        rx = lx + (A4[0] - lx - d.rightMargin) / 2
+    def _draw(cv, dc):
+        cv.saveState()
+        lx = dc.leftMargin
+        rx = lx + (A4[0] - lx - dc.rightMargin) / 2
         by = 55*mm
-        c.setFont(FB,8); c.drawString(lx, by+16*mm, "От АО «ФИШ ТУ БИЗНЕС»:")
-        c.setFont(F,8);  c.drawString(lx, by+11*mm, "Генеральный Директор")
-        c.line(lx, by+5*mm, lx+65*mm, by+5*mm)
+        cv.setFont(FB,8); cv.drawString(lx, by+16*mm, "От АО «ФИШ ТУ БИЗНЕС»:")
+        cv.setFont(F,8);  cv.drawString(lx, by+11*mm, "Генеральный Директор")
+        cv.line(lx, by+5*mm, lx+65*mm, by+5*mm)
         if sign and os.path.exists(sign):
-            c.drawImage(sign, lx-65*mm, by-22*mm-10*mm, width=151*mm, height=65*mm, mask="auto", preserveAspectRatio=True)
+            cv.drawImage(sign, lx-65*mm, by-22*mm-10*mm, width=151*mm, height=65*mm,
+                         mask="auto", preserveAspectRatio=True)
         if stamp and os.path.exists(stamp):
-            c.drawImage(stamp, lx+2*mm, by-22*mm, width=55*mm, height=55*mm, mask="auto", preserveAspectRatio=True)
-        c.setFont(FB,8); c.drawString(lx, by, "/Маланчук А.В./")
-        c.setFont(FB,8); c.drawString(rx, by+16*mm, f"От {cp_name[:40]}:")
-        c.setFont(F,8);  c.drawString(rx, by+11*mm, "Руководитель")
-        c.line(rx, by+5*mm, rx+65*mm, by+5*mm)
-        c.setFont(FB,8); c.drawString(rx, by, "М.П.")
-        c.restoreState()
+            cv.drawImage(stamp, lx+2*mm, by-22*mm, width=55*mm, height=55*mm,
+                         mask="auto", preserveAspectRatio=True)
+        cv.setFont(FB,8); cv.drawString(lx, by, "/Маланчук А.В./")
+        cv.setFont(FB,8); cv.drawString(rx, by+16*mm, f"От {cp_name[:40]}:")
+        cv.setFont(F,8);  cv.drawString(rx, by+11*mm, "Руководитель")
+        cv.line(rx, by+5*mm, rx+65*mm, by+5*mm)
+        cv.setFont(FB,8); cv.drawString(rx, by, "М.П.")
+        cv.restoreState()
 
     doc.build(story, onFirstPage=_draw, onLaterPages=_draw)
     return buf.getvalue()
