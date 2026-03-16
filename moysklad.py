@@ -1164,9 +1164,8 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                     logger.info(f"get_overdue_demands: контрагент '{query}' не найден")
                     return None
 
-            # Грузим ОТГРУЗКИ (demand) — именно они определяют реальный долг
-            # Дата оплаты берётся из связанного заказа (через customerOrder)
-            url = f"{MS_BASE}/entity/demand"
+            # Грузим ЗАКАЗЫ покупателей — дата оплаты стоит именно в заказе
+            url = f"{MS_BASE}/entity/customerorder"
             all_orders = []
             offset = 0
 
@@ -1179,7 +1178,7 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                 params = {
                     "limit": 100,
                     "offset": offset,
-                    "expand": "agent,customerOrder,customerOrder.attributes",
+                    "expand": "agent,attributes",
                     "order": "moment,asc",
                 }
                 if agent_filter:
@@ -1197,20 +1196,91 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                         break
                     offset += 100
 
-            logger.info(f"get_overdue_demands: {len(all_orders)} отгрузок загружено")
+            logger.info(f"get_overdue_demands: {len(all_orders)} заказов загружено")
 
             by_agent = {}
+            agent_not_overdue = {}
+
             for order in all_orders:
-                # Дата планируемой оплаты — из связанного заказа покупателя
+                # Дата планируемой оплаты — кастомный атрибут заказа
                 ppm = ""
-                customer_order = order.get("customerOrder", {})
-                if customer_order and isinstance(customer_order, dict):
-                    for attr in customer_order.get("attributes", []):
-                        if attr.get("name") == "Дата планируемой оплаты":
-                            ppm = attr.get("value", "")
-                            break
+                for attr in order.get("attributes", []):
+                    if attr.get("name") == "Дата планируемой оплаты":
+                        ppm = attr.get("value", "")
+                        break
                 if not ppm:
                     continue
+
+                try:
+                    due_dt = datetime.fromisoformat(ppm.replace(".000", "").replace("Z", ""))
+                    if due_dt.tzinfo is None:
+                        due_dt = due_dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+
+                total_sum = (order.get("sum", 0) or 0) / 100
+                payed_sum = (order.get("payedSum", 0) or 0) / 100
+                unpaid = round(max(0, total_sum - payed_sum), 2)
+                if unpaid <= 0:
+                    continue
+
+                agent = order.get("agent", {})
+                agent_id = agent.get("id", "")
+                agent_name = agent.get("name", "неизвестно")
+                agent_tags = agent.get("tags", [])
+
+                if not agent_id:
+                    continue
+
+                # Пропускаем розничных покупателей
+                if "розничный покупатель" in agent_name.lower():
+                    continue
+
+                # Фильтр по тегу
+                if tag:
+                    tags_lower = [t.lower() for t in agent_tags]
+                    if not any(tag.lower() in t for t in tags_lower):
+                        continue
+
+                # Непросроченные — откладываем отдельно
+                if due_dt >= today_dt:
+                    agent_not_overdue[agent_id] = agent_not_overdue.get(agent_id, 0) + total_sum
+                    continue
+
+                # Просроченный заказ
+                days_overdue = (today_dt - due_dt).days
+
+                # Определяем менеджера по тегам
+                MANAGER_TAG_MAP = {
+                    "баласанян": "Карина Баласанян",
+                    "скляр": "Инесса Скляр",
+                    "мерзлякова": "Елена Мерзлякова",
+                    "голубева": "Татьяна Голубева",
+                    "леонтьев": "Алексей Леонтьев",
+                }
+                manager_name = "Без менеджера"
+                for t in agent_tags:
+                    if t.lower() in MANAGER_TAG_MAP:
+                        manager_name = MANAGER_TAG_MAP[t.lower()]
+                        break
+
+                if agent_id not in by_agent:
+                    by_agent[agent_id] = {
+                        "id": agent_id,
+                        "name": agent_name,
+                        "overdue_sum": 0,
+                        "max_days": 0,
+                        "demands": [],
+                        "manager": manager_name,
+                    }
+                by_agent[agent_id]["overdue_sum"] += unpaid
+                by_agent[agent_id]["max_days"] = max(by_agent[agent_id]["max_days"], days_overdue)
+                by_agent[agent_id]["demands"].append({
+                    "name": order.get("name", ""),
+                    "due": ppm[:10],
+                    "unpaid": unpaid,
+                    "days": days_overdue,
+                })
 
                 try:
                     due_dt = datetime.fromisoformat(ppm.replace(".000", "").replace("Z", ""))
@@ -1318,17 +1388,18 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                 aid2 = agent2.get("id", "")
                 if not aid2:
                     continue
-                total_s = (order.get("sum", 0) or 0) / 100
                 co = order.get("customerOrder", {})
                 if co and isinstance(co, dict):
                     ps = (co.get("payedSum", 0) or 0) / 100
                     os2 = (co.get("sum", 0) or 0) / 100
                     unpaid2 = max(0, os2 - ps)
                 else:
-                    unpaid2 = total_s
+                    unpaid2 = (order.get("sum", 0) or 0) / 100
                 if unpaid2 <= 0:
                     continue
-                agent_not_overdue[aid2] = agent_not_overdue.get(aid2, 0) + total_s
+                # Используем сумму ЗАКАЗА (не отгрузки) для непросроченных
+                order_sum_for_calc = os2 if (co and isinstance(co, dict)) else unpaid2
+                agent_not_overdue[aid2] = agent_not_overdue.get(aid2, 0) + order_sum_for_calc
 
             result = list(by_agent.values())
 
@@ -1442,18 +1513,14 @@ def format_overdue_demands(items: list, tag: str = None) -> str:
         f"{len(items)} клиентов · Итого: *{fmt_money(total)}*\n",
     ]
     for c in items:
-        days = c.get("max_days", 0)
-        days_str = f"{days} дн." if days > 0 else ""
         header = f"🔴 *{c['name']}* — {fmt_money(c['overdue_sum'])}"
-        if days_str:
-            header += f" · просрочка {days_str}"
         lines.append(header)
-        # Детализация по всем просроченным заказам
         demands = c.get("demands", [])
-        if len(demands) > 1:
-            for d in demands:
-                due_fmt = '.'.join(reversed(d['due'].split('-'))) if d['due'] else d['due']
-                lines.append(f"   └ {d['name']} · {due_fmt} · {fmt_money(d['unpaid'])}")
+        for d in demands:
+            due_fmt = '.'.join(reversed(d['due'].split('-'))) if d['due'] else d['due']
+            days = d.get("days", 0)
+            days_str = f" · {days} дн." if days > 0 else ""
+            lines.append(f"   └ {d['name']} · {due_fmt} · {fmt_money(d['unpaid'])}{days_str}")
         lines.append("")
 
     return "\n".join(lines).rstrip()
