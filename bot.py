@@ -1998,6 +1998,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
+            import io as _io
             from reconciliation_generator import generate_reconciliation_pdf
             from moysklad import get_reconciliation_data
 
@@ -2030,7 +2031,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await context.bot.send_document(
                 chat_id=target,
-                document=io.BytesIO(pdf_bytes),
+                document=_io.BytesIO(pdf_bytes),
                 filename=f"Акт_сверки_{cp_name[:30]}_{date_to}.pdf",
                 caption=caption,
                 parse_mode="Markdown"
@@ -2041,6 +2042,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"reconciliation error: {e}", exc_info=True)
             await message.reply_text(f"❌ Ошибка формирования акта: {e}")
+        return
         buyer_query = params.get("buyer", "")
         await message.reply_chat_action("typing")
 
@@ -3137,6 +3139,17 @@ def main():
         await run_web()
         await app.initialize()
         await app.start()
+
+        # Ждём завершения старого инстанса и принудительно сбрасываем webhook
+        import asyncio as _asyncio
+        for attempt in range(5):
+            try:
+                await app.bot.delete_webhook(drop_pending_updates=True)
+                break
+            except Exception as e:
+                logger.warning(f"delete_webhook attempt {attempt+1}: {e}")
+                await _asyncio.sleep(2)
+
         await app.updater.start_polling(
             drop_pending_updates=True,
             allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post", "callback_query"]
