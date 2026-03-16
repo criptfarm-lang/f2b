@@ -1107,27 +1107,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         import uuid as _uuid_fwd
         link_key = str(_uuid_fwd.uuid4())[:8]
-        _pending_links[link_key] = {
+        entry = {
             "chat_id": fwd_id,
             "channel_id": "ddd24a95-9304-4098-a320-3e47fcd1020a",
             "wazzup_name": fwd_name,
             "chat_type": chat_type,
+            "link_key": link_key,
         }
-        _pending_links[user.id] = {**_pending_links[link_key], "link_key": link_key}
+        _pending_links[link_key] = entry
+        # Используем стек как и везде
+        if user.id not in _pending_links or not isinstance(_pending_links.get(user.id), list):
+            _pending_links[user.id] = []
+        _pending_links[user.id].append(entry)
         await message.reply_text(
             f"👤 Контакт: *{fwd_name}*\n\nКак этот клиент называется в МойСклад?\n_(напиши название или часть названия)_",
             parse_mode="Markdown"
         )
         return
 
-    # В группе ИДЕНТИФИКАЦИЯ — только кнопки, текст игнорируем
+    # В группе ИДЕНТИФИКАЦИЯ — обрабатываем ввод названия компании
     wazzup_id_chat = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
     if wazzup_id_chat and chat_id == wazzup_id_chat:
-        # Обрабатываем только ввод названия компании (pending_links)
-        if user and user.id in _pending_links and text and not text.startswith("/"):
-            pass  # продолжаем — это ввод названия компании
-        else:
+        if not text or text.startswith("/"):
             return
+        # Если у этого пользователя нет pending — ищем любой активный pending в группе
+        if user and user.id not in _pending_links:
+            # Берём первый активный pending от любого пользователя
+            for uid, pl in list(_pending_links.items()):
+                if isinstance(uid, int) and isinstance(pl, list) and pl:
+                    # Переносим на текущего пользователя
+                    _pending_links[user.id] = pl
+                    break
+                elif isinstance(uid, int) and isinstance(pl, dict) and "wazzup_name" in pl:
+                    _pending_links[user.id] = [pl]
+                    break
+        if user and user.id not in _pending_links:
+            return  # нет активных ожиданий — игнорируем
 
     # Сохраняем все сообщения в историю чата
     if text and user:
