@@ -2296,7 +2296,7 @@ async def get_reconciliation_data(counterparty_id: str, date_from: str, date_to:
 
             rows = []
 
-            async def fetch_docs(entity, label, amount_field="sum"):
+            async def fetch_docs(entity, label, is_payment=False, is_return=False):
                 url = f"{MS_BASE}/entity/{entity}"
                 params = {
                     "filter": f"agent={cp_href};moment>={dt_from};moment<={dt_to}",
@@ -2310,30 +2310,54 @@ async def get_reconciliation_data(counterparty_id: str, date_from: str, date_to:
                     for doc in data.get("rows", []):
                         date_str = doc.get("moment", "")[:10]
                         num = doc.get("name", doc.get("id", ""))
-                        amount = round(doc.get(amount_field, 0) / 100, 2)
+                        amount = round((doc.get("sum", 0) or 0) / 100, 2)
+                        if amount <= 0:
+                            continue
                         rows.append({
                             "date": date_str,
                             "doc_type": label,
                             "doc_number": num,
                             "amount": amount,
-                            "is_payment": entity in ("cashin", "paymentin"),
+                            # is_payment=True → кредит (уменьшает долг клиента)
+                            # is_return=True → тоже кредит (возврат уменьшает долг)
+                            "is_payment": is_payment or is_return,
                         })
 
-            # Отгрузки (дебет покупателя)
-            await fetch_docs("demand", "Отгрузка")
-            # Входящие оплаты (кредит покупателя)
-            await fetch_docs("paymentin", "Оплата")
-            await fetch_docs("cashin", "Оплата нал.")
-            # Счета-фактуры (информационно)
-            await fetch_docs("invoiceout", "Счёт")
+            # Дебет покупателя (он должен нам)
+            await fetch_docs("demand",    "Отгрузка",      is_payment=False)
+            await fetch_docs("invoiceout","Счёт",           is_payment=False)
+
+            # Кредит покупателя (он платит или мы возвращаем)
+            await fetch_docs("paymentin", "Оплата б/н",    is_payment=True)
+            await fetch_docs("cashin",    "Оплата нал.",   is_payment=True)
+            await fetch_docs("salesreturn","Возврат",      is_return=True)
+            await fetch_docs("paymentout","Выплата",       is_payment=True)
+            await fetch_docs("cashout",   "Выплата нал.",  is_payment=True)
+
+            # Убираем счета из расчёта сальдо (они информационные)
+            rows_for_calc = [r for r in rows if r["doc_type"] != "Счёт"]
 
             # Сортируем по дате
             rows.sort(key=lambda x: x["date"])
 
             # Считаем сальдо
-            debit_total  = sum(r["amount"] for r in rows if not r["is_payment"])
-            credit_total = sum(r["amount"] for r in rows if r["is_payment"])
-            closing = round(debit_total - credit_total, 2)
+            debit_total  = round(sum(r["amount"] for r in rows_for_calc if not r["is_payment"]), 2)
+            credit_total = round(sum(r["amount"] for r in rows_for_calc if r["is_payment"]), 2)
+
+            # Сверяем с реальным балансом МойСклад
+            async with session.get(
+                f"{MS_BASE}/report/counterparty/{counterparty_id}",
+                headers=get_headers()
+            ) as rb:
+                if rb.status == 200:
+                    rb_data = await rb.json()
+                    real_balance = (rb_data.get("balance", 0) or 0) / 100
+                    # balance < 0 → клиент должен нам
+                    real_debt = round(abs(min(real_balance, 0)), 2)
+                else:
+                    real_debt = round(debit_total - credit_total, 2)
+
+            closing = real_debt  # используем реальный баланс из МойСклад
 
             # ИНН и адрес контрагента
             cp_inn = cp.get("inn", "")
