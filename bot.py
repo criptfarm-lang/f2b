@@ -1308,75 +1308,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Логируем ID для диагностики
     logger.info(f"Message from user.id={user.id}, name={user.full_name}, chat_id={message.chat_id}, manager_ids={manager_ids}")
 
-    if user.id in manager_ids and len(text) > 15:
-        should_extract = True
+    if user.id in manager_ids and len(text) > 5:
         text_lower = text.lower()
 
-        # Слова которые всегда означают запрос данных — никогда не задача
-        DATA_QUERY_KEYWORDS = [
-            "пдз", "долг", "дебитор", "остатк", "отчёт", "отчет",
-            "сводк", "покажи", "дай", "сколько", "кто",
-            "активност", "упоминани", "договор", "баланс", "прайс",
-            "задолженност", "статистик", "аналитик", "кратко", "итог",
-            "просрочка", "просроченн", "должник",
-        ]
-
-        if any(kw in text_lower for kw in DATA_QUERY_KEYWORDS):
-            should_extract = False
-        elif is_bot_addressed(text):
-            has_employee = any(
-                name.lower() in text_lower
-                for name in ["карина", "баласанян", "александра", "белякова", "саша",
-                             "юля", "гераскина", "татьяна", "голубева", "алексей", "дубинин",
-                             "андрей", "иванов", "антон", "кормилицын", "катя", "куревлева",
-                             "леонтьев", "лёша", "маланчук", "малышкин", "елена", "лена",
-                             "мерзлякова", "владимир", "петровский", "самир", "садыгов",
-                             "оксана", "сайгашкина", "инесса", "скляр", "исрафил", "магаммед"]
-            )
-            should_extract = has_employee
-
-        if should_extract:
-            tasks = await extract_tasks_from_message(text, user.full_name)
-            saved_count = 0
-            task_lines = []
-            for task in tasks:
-                executor = task.get("executor", "")
-                if not task.get("task") or not executor:
-                    continue  # пропускаем задачи без исполнителя
-                db.save_task(
-                    text=task["task"],
-                    executor=executor,
-                    deadline=task.get("deadline"),
-                    source_chat=chat_id,
-                    source_message_id=message.message_id,
-                    created_by=user.full_name
-                )
-                saved_count += 1
-                deadline = task.get("deadline")
-                if deadline:
-                    from datetime import date
-                    MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-                    try:
-                        d = date.fromisoformat(deadline)
-                        deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
-                    except Exception:
-                        deadline_str = f" · до {deadline}"
-                else:
-                    deadline_str = ""
-                task_lines.append(f"👤 *{executor}*{deadline_str}: {task['task']}")
-                logger.info(f"Задача: {executor} → {task['task']}")
-
-            if saved_count > 0:
-                lines = [f"📌 Зафиксировано задач: {saved_count}\n"] + task_lines
-                sent = await message.reply_text("\n".join(lines), parse_mode="Markdown")
-                # Сохраняем message_id сообщения бота для всех задач из этого сообщения
-                if sent:
-                    tasks_from_this_msg = db._fetchall(
-                        "SELECT id FROM tasks WHERE source_message_id=%s AND source_chat=%s AND bot_message_id IS NULL",
-                        (message.message_id, chat_id)
+        # Задачи фиксируем ТОЛЬКО если в тексте есть слово "задача"
+        if "задач" in text_lower:
+            # Но не если это запрос данных
+            DATA_QUERY_KEYWORDS = [
+                "пдз", "долг", "дебитор", "остатк", "отчёт", "отчет",
+                "сводк", "покажи", "дай", "сколько", "кто",
+                "активност", "упоминани", "договор", "баланс", "прайс",
+                "задолженност", "статистик", "аналитик", "кратко", "итог",
+                "просрочка", "просроченн", "должник",
+            ]
+            if not any(kw in text_lower for kw in DATA_QUERY_KEYWORDS):
+                tasks = await extract_tasks_from_message(text, user.full_name)
+                saved_count = 0
+                task_lines = []
+                for task in tasks:
+                    executor = task.get("executor", "")
+                    if not task.get("task") or not executor:
+                        continue
+                    db.save_task(
+                        text=task["task"],
+                        executor=executor,
+                        deadline=task.get("deadline"),
+                        source_chat=chat_id,
+                        source_message_id=message.message_id,
+                        created_by=user.full_name
                     )
-                    for t in tasks_from_this_msg:
-                        db.set_task_bot_message_id(t['id'], sent.message_id)
+                    saved_count += 1
+                    deadline = task.get("deadline")
+                    if deadline:
+                        from datetime import date
+                        MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
+                        try:
+                            d = date.fromisoformat(deadline)
+                            deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
+                        except Exception:
+                            deadline_str = f" · до {deadline}"
+                    else:
+                        deadline_str = ""
+                    task_lines.append(f"👤 *{executor}*{deadline_str}: {task['task']}")
+                    logger.info(f"Задача: {executor} → {task['task']}")
+
+                if saved_count > 0:
+                    lines = [f"📌 Зафиксировано задач: {saved_count}\n"] + task_lines
+                    sent = await message.reply_text("\n".join(lines), parse_mode="Markdown")
+                    if sent:
+                        tasks_from_this_msg = db._fetchall(
+                            "SELECT id FROM tasks WHERE source_message_id=%s AND source_chat=%s AND bot_message_id IS NULL",
+                            (message.message_id, chat_id)
+                        )
+                        for t in tasks_from_this_msg:
+                            db.set_task_bot_message_id(t['id'], sent.message_id)
 
     # 3. Автозакрытие задач — Claude анализирует контекст
     sender_name = update.effective_user.full_name if update.effective_user else ""
