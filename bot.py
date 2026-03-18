@@ -2030,6 +2030,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"reconciliation error: {e}", exc_info=True)
             await message.reply_text(f"❌ Ошибка формирования акта: {e}")
         return
+
+    elif action == "generate_contract":
         buyer_query = params.get("buyer", "")
         await message.reply_chat_action("typing")
 
