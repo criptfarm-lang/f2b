@@ -1404,7 +1404,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Проверяем ожидание привязки Wazzup контакта (ПЕРВЫМ — приоритет над договором)
-    if user and user.id in _pending_links and not is_bot_addressed(text):
+    # Обрабатываем ТОЛЬКО из группы ИДЕНТИФИКАЦИИ или личного чата с ботом
+    wazzup_id_chat_for_ident = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
+    is_ident_chat = (chat_id == wazzup_id_chat_for_ident) or (chat_id == user.id if user else False)
+    if user and user.id in _pending_links and not is_bot_addressed(text) and is_ident_chat:
         _pl = _pending_links[user.id]
         pending_link = _pl[0] if isinstance(_pl, list) and _pl else (_pl if isinstance(_pl, dict) else None)
         if not pending_link:
