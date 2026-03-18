@@ -2767,6 +2767,38 @@ async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.edit_text(f"❌ Ошибка: {e}")
 
 
+async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pdz — запускает утренние задачи ПДЗ по всем менеджерам с паузой 2 мин."""
+    user = update.message.from_user
+    manager_ids_str = os.getenv("MANAGER_IDS", "")
+    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
+    if user.id not in manager_ids:
+        await update.message.reply_text("⛔ Только для руководителей.")
+        return
+
+    from scheduler import pdz_morning_task, PDZ_MANAGERS, pdz_launched_today
+    import asyncio
+    from datetime import date as _date
+
+    today = _date.today().isoformat()
+    pdz_launched_today.add(today)
+
+    await update.message.reply_text(
+        f"📋 Запускаю ПДЗ задачи для {len(PDZ_MANAGERS)} менеджеров.\n"
+        f"Интервал: 2 минуты между каждым."
+    )
+
+    for i, mgr in enumerate(PDZ_MANAGERS):
+        try:
+            await pdz_morning_task(context.application, mgr)
+        except Exception as e:
+            logger.error(f"cmd_pdz ошибка для {mgr['name']}: {e}")
+        if i < len(PDZ_MANAGERS) - 1:
+            await asyncio.sleep(120)  # 2 минуты
+
+    await update.message.reply_text("✅ Все задачи ПДЗ отправлены. Сводка придёт в 17:00.")
+
+
 async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тестовый запуск утренних задач ПДЗ. /pdz_test [имя|all]"""
     user = update.message.from_user
@@ -2961,6 +2993,7 @@ def main():
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("add_webhook", cmd_add_webhook))
+    app.add_handler(CommandHandler("pdz", cmd_pdz))
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
