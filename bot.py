@@ -815,28 +815,34 @@ async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT
             "buyer_basis": "Устава",
         }
         # Проверяем недостающие поля
-        REQUIRED = {
+        ASK_REQUIRED = {
+            "buyer_representative": "ФИО директора и должность",
+            "buyer_basis": "основание полномочий",
+        }
+        INFO_REQUIRED = {
             "buyer_inn": "ИНН", "buyer_ogrn": "ОГРН",
             "buyer_address": "юридический адрес",
             "buyer_rs": "расчётный счёт (р/с)", "buyer_bik": "БИК банка",
             "buyer_bank": "название банка", "buyer_ks": "корреспондентский счёт (к/с)",
-            "buyer_representative": "ФИО директора и должность",
-            "buyer_basis": "основание полномочий",
         }
-        missing = [(k, v) for k, v in REQUIRED.items() if not contract_data.get(k)]
+        missing_ask = [(k, v) for k, v in ASK_REQUIRED.items() if not contract_data.get(k)]
+        missing_info = [(k, v) for k, v in INFO_REQUIRED.items() if not contract_data.get(k)]
         user = query.from_user
-        if missing:
+
+        msg = f"📄 *{contract_data['buyer_name']}*\n"
+        if missing_info:
+            names = ", ".join(v for _, v in missing_info)
+            msg += f"⚠️ В МойСклад не заведены: _{names}_\n\n"
+
+        if missing_ask:
             _pending_contracts[user.id] = {
                 "data": contract_data,
-                "missing_keys": [m[0] for m in missing],
-                "missing_labels": [m[1] for m in missing],
+                "missing_keys": [m[0] for m in missing_ask],
+                "missing_labels": [m[1] for m in missing_ask],
                 "missing_idx": 0,
             }
-            await query.message.edit_text(
-                f"📄 *{contract_data['buyer_name']}*\n\n"
-                f"Не хватает данных:\n*{missing[0][1]}*?",
-                parse_mode="Markdown"
-            )
+            msg += f"*{missing_ask[0][1]}*?"
+            await query.message.edit_text(msg, parse_mode="Markdown")
         else:
             await _create_and_send_contract(
                 contract_data, user.full_name, query.message, context
@@ -2114,7 +2120,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         # Проверяем чего не хватает
-        REQUIRED = {
+        # Разделяем: что спрашиваем у менеджера, что просто сообщаем как отсутствующее
+        ASK_REQUIRED = {
+            "buyer_representative": "ФИО директора и должность (напр. 'генерального директора Иванова И.И.')",
+            "buyer_basis": "основание полномочий (напр. 'Устава' или 'доверенности № 1 от 01.01.2026')",
+        }
+        INFO_REQUIRED = {
             "buyer_inn": "ИНН",
             "buyer_ogrn": "ОГРН",
             "buyer_address": "юридический адрес",
@@ -2122,16 +2133,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "buyer_bik": "БИК банка",
             "buyer_bank": "название банка",
             "buyer_ks": "корреспондентский счёт (к/с)",
-            "buyer_representative": "ФИО директора и должность (напр. 'генерального директора Иванова И.И.')",
-            "buyer_basis": "основание полномочий (напр. 'Устава' или 'доверенности № 1 от 01.01.2026')",
         }
-        missing = [(k, v) for k, v in REQUIRED.items() if not contract_data.get(k)]
 
-        if missing:
+        missing_ask = [(k, v) for k, v in ASK_REQUIRED.items() if not contract_data.get(k)]
+        missing_info = [(k, v) for k, v in INFO_REQUIRED.items() if not contract_data.get(k)]
+
+        if missing_ask or missing_info:
             _pending_contracts[user.id] = {
                 "data": contract_data,
-                "missing_keys": [m[0] for m in missing],
-                "missing_labels": [m[1] for m in missing],
+                "missing_keys": [m[0] for m in missing_ask],
+                "missing_labels": [m[1] for m in missing_ask],
                 "missing_idx": 0,
             }
             found_info = []
@@ -2140,13 +2151,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if contract_data["buyer_bank"]: found_info.append(f"Банк: {contract_data['buyer_bank']}")
             found_str = " · ".join(found_info) if found_info else "реквизиты не найдены"
 
-            await message.reply_text(
-                f"📄 *{contract_data['buyer_name']}*\n"
-                f"_{found_str}_\n\n"
-                f"Не хватает данных. Отвечай по одному:\n\n"
-                f"*{missing[0][1]}*?",
-                parse_mode="Markdown"
-            )
+            msg = f"📄 *{contract_data['buyer_name']}*\n_{found_str}_\n\n"
+
+            if missing_info:
+                names = ", ".join(v for _, v in missing_info)
+                msg += f"⚠️ В МойСклад не заведены: _{names}_\n_(попроси клиента предоставить)_\n\n"
+
+            if missing_ask:
+                msg += f"*{missing_ask[0][1]}*?"
+            else:
+                # Только инфо-поля отсутствуют — сразу генерируем
+                await message.reply_text(msg.rstrip(), parse_mode="Markdown")
+                await message.reply_text("⏳ Генерирую договор с имеющимися данными...")
+                await _create_and_send_contract(contract_data, user.full_name, message, context)
+                return
+
+            await message.reply_text(msg, parse_mode="Markdown")
             return
 
         # Все данные есть — генерируем сразу
