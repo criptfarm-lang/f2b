@@ -1,4 +1,3 @@
-
 """
 База данных бота F2B PRO
 PostgreSQL — хранит задачи, медиафайлы, контакты, прайсы, ПДЗ комментарии
@@ -185,9 +184,11 @@ class Database:
                 id SERIAL PRIMARY KEY,
                 contract_number TEXT UNIQUE NOT NULL,
                 buyer_name TEXT,
+                buyer_data JSONB,
                 created_by TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS buyer_data JSONB",
             """CREATE TABLE IF NOT EXISTS call_transcripts (
                 id SERIAL PRIMARY KEY,
                 call_id TEXT UNIQUE,
@@ -728,17 +729,39 @@ class Database:
         except Exception as e:
             self.conn.rollback()
 
-    def save_contract(self, contract_number: str, buyer_name: str, created_by: str):
+    def save_contract(self, contract_number: str, buyer_name: str,
+                      created_by: str, buyer_data: dict = None):
+        import json
         try:
             with self.conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO contracts (contract_number, buyer_name, created_by) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-                    (contract_number, buyer_name, created_by)
+                    """INSERT INTO contracts (contract_number, buyer_name, buyer_data, created_by)
+                       VALUES (%s, %s, %s, %s) ON CONFLICT (contract_number) DO NOTHING""",
+                    (contract_number, buyer_name,
+                     json.dumps(buyer_data, ensure_ascii=False) if buyer_data else None,
+                     created_by)
                 )
             self.conn.commit()
         except Exception as e:
             self.conn.rollback()
             logger.warning(f"save_contract error: {e}")
+
+    def find_contract_by_buyer(self, buyer_name: str) -> dict:
+        """Ищет существующий договор по имени покупателя."""
+        import json
+        rows = self._fetchall(
+            "SELECT * FROM contracts WHERE LOWER(buyer_name) LIKE LOWER(%s) ORDER BY created_at DESC LIMIT 1",
+            (f"%{buyer_name}%",)
+        )
+        if not rows:
+            return None
+        row = dict(rows[0])
+        if row.get("buyer_data") and isinstance(row["buyer_data"], str):
+            try:
+                row["buyer_data"] = json.loads(row["buyer_data"])
+            except Exception:
+                pass
+        return row
 
     def get_contracts_by_date(self, date_str: str) -> list:
         return self._fetchall(
