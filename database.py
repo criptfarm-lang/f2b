@@ -1,42 +1,870 @@
-def _reconnect(self):
-    try:
-        self.conn.close()
-    except Exception:
-        pass
-    self.conn = psycopg2.connect(
-        DATABASE_URL, 
-        cursor_factory=psycopg2.extras.RealDictCursor
-    )
-    self.conn.autocommit = False
 
-def _execute(self, sql: str, params=None):
-    for attempt in range(3):
+"""
+База данных бота F2B PRO
+PostgreSQL — хранит задачи, медиафайлы, контакты, прайсы, ПДЗ комментарии
+"""
+
+import os
+import psycopg2
+import psycopg2.extras
+from datetime import datetime, date, timedelta
+from typing import List, Dict, Optional
+
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:FOfGvpjobKJPQYPBcuefaHWwtGEmVyte@switchback.proxy.rlwy.net:44165/railway")
+
+
+class Database:
+    def __init__(self):
+        self.conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        self.conn.autocommit = False
+        self._create_tables()
+
+    def _execute(self, sql: str, params=None):
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            self.conn.commit()
+            return cur
+
+    def _fetchall(self, sql: str, params=None) -> List[Dict]:
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            return [dict(r) for r in cur.fetchall()]
+
+    def _fetchone(self, sql: str, params=None) -> Optional[Dict]:
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def _create_tables(self):
+        sql = """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                executor TEXT,
+                deadline TEXT,
+                status TEXT DEFAULT 'open',
+                source_chat BIGINT,
+                source_message_id BIGINT,
+                created_by TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                completed_at TIMESTAMP,
+                completed_by TEXT,
+                result TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS media (
+                id SERIAL PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                media_type TEXT,
+                caption TEXT,
+                chat_id BIGINT,
+                uploader TEXT,
+                date TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS prices (
+                id SERIAL PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                filename TEXT,
+                chat_id BIGINT,
+                uploader TEXT,
+                uploaded_at TIMESTAMP DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS contacts (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                phone TEXT,
+                company TEXT,
+                notes TEXT,
+                added_at TIMESTAMP DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS debtors (
+                id SERIAL PRIMARY KEY,
+                client TEXT NOT NULL UNIQUE,
+                manager TEXT,
+                amount REAL,
+                days INTEGER,
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT,
+                user_id BIGINT,
+                user_name TEXT,
+                text TEXT,
+                message_type TEXT DEFAULT 'text',
+                ts TIMESTAMP DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS memory (
+                id SERIAL PRIMARY KEY,
+                key TEXT UNIQUE NOT NULL,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS pdz_comments (
+                id SERIAL PRIMARY KEY,
+                client TEXT NOT NULL,
+                manager TEXT,
+                order_name TEXT,
+                debt_amount REAL,
+                debt_days INTEGER,
+                comment TEXT,
+                commented_by TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS wazzup_messages (
+                id SERIAL PRIMARY KEY,
+                message_id TEXT UNIQUE,
+                channel_id TEXT,
+                chat_type TEXT,
+                chat_id TEXT,
+                contact_name TEXT,
+                manager_id TEXT,
+                manager_name TEXT,
+                text TEXT,
+                is_outbound BOOLEAN DEFAULT FALSE,
+                sent_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql)
+        self.conn.commit()
+        self._migrate()
+
+    def _migrate(self):
+        """Добавляет новые колонки если их нет (для существующих БД)."""
+        migrations = [
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_by TEXT",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS result TEXT",
+            """CREATE TABLE IF NOT EXISTS wazzup_messages (
+                id SERIAL PRIMARY KEY,
+                message_id TEXT UNIQUE,
+                channel_id TEXT,
+                chat_type TEXT,
+                chat_id TEXT,
+                contact_name TEXT,
+                manager_id TEXT,
+                manager_name TEXT,
+                text TEXT,
+                is_outbound BOOLEAN DEFAULT FALSE,
+                sent_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS wazzup_contact_map (
+                id SERIAL PRIMARY KEY,
+                chat_id TEXT UNIQUE NOT NULL,
+                chat_type TEXT,
+                channel_id TEXT,
+                company_name TEXT,
+                wazzup_name TEXT,
+                role TEXT DEFAULT 'закупщик',
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS bot_message_id BIGINT",
+            "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS tags TEXT",
+            "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS manager TEXT",
+            "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS segment TEXT",
+            """CREATE TABLE IF NOT EXISTS wazzup_pending (
+                link_key TEXT PRIMARY KEY,
+                chat_id TEXT,
+                channel_id TEXT,
+                wazzup_name TEXT,
+                chat_type TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS contracts (
+                id SERIAL PRIMARY KEY,
+                contract_number TEXT UNIQUE NOT NULL,
+                buyer_name TEXT,
+                created_by TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS call_transcripts (
+                id SERIAL PRIMARY KEY,
+                call_id TEXT UNIQUE,
+                src_num TEXT,
+                dst_num TEXT,
+                manager_name TEXT,
+                tree_name TEXT,
+                transcript TEXT,
+                duration_sec INTEGER DEFAULT 0,
+                called_at TIMESTAMP DEFAULT NOW()
+            )""",
+            "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS segment TEXT",
+            "ALTER TABLE wazzup_contact_map ADD COLUMN IF NOT EXISTS manager TEXT",
+            """CREATE TABLE IF NOT EXISTS wazzup_pending_ident (
+                id SERIAL PRIMARY KEY,
+                link_key TEXT UNIQUE NOT NULL,
+                chat_id TEXT NOT NULL,
+                channel_id TEXT,
+                wazzup_name TEXT,
+                chat_type TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS wazzup_contacts (
+                id SERIAL PRIMARY KEY,
+                contact_name TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                chat_type TEXT,
+                channel_id TEXT,
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(contact_name, chat_type)
+            )""",
+        ]
+        with self.conn.cursor() as cur:
+            for m in migrations:
+                try:
+                    cur.execute(m)
+                except Exception:
+                    pass
+        self.conn.commit()
+
+    # ─── ЗАДАЧИ ───────────────────────────────────────────────────────────────
+
+    def save_task(self, text: str, executor: str = "", deadline: str = None,
+                  source_chat: int = None, source_message_id: int = None,
+                  created_by: str = "") -> int:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO tasks (text, executor, deadline, source_chat, source_message_id, created_by)
+                   VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+                (text, executor, deadline, source_chat, source_message_id, created_by)
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row['id']
+
+    def set_task_bot_message_id(self, task_id: int, bot_message_id: int):
+        """Сохраняет message_id сообщения бота о задаче."""
+        self._execute(
+            "UPDATE tasks SET bot_message_id=%s WHERE id=%s",
+            (bot_message_id, task_id)
+        )
+
+    def delete_tasks_by_bot_message_id(self, bot_message_id: int, chat_id: int) -> list:
+        """Удаляет задачи привязанные к сообщению бота. Возвращает удалённые задачи."""
+        rows = self._fetchall(
+            "SELECT * FROM tasks WHERE bot_message_id=%s AND source_chat=%s AND status='open'",
+            (bot_message_id, chat_id)
+        )
+        if rows:
+            self._execute(
+                "DELETE FROM tasks WHERE bot_message_id=%s AND source_chat=%s AND status='open'",
+                (bot_message_id, chat_id)
+            )
+        return rows
+
+    def complete_task(self, task_id: int, result: str = "", completed_by: str = ""):
+        self._execute(
+            "UPDATE tasks SET status='done', completed_at=NOW(), result=%s, completed_by=%s WHERE id=%s",
+            (result, completed_by, task_id)
+        )
+
+    def get_recently_done(self, hours: int = 24) -> List[Dict]:
+        """Задачи выполненные за последние N часов."""
+        return self._fetchall(
+            """SELECT * FROM tasks WHERE status='done'
+               AND completed_at >= NOW() - INTERVAL '%s hours'
+               ORDER BY completed_at DESC""",
+            (hours,)
+        )
+
+    def cleanup_done_tasks(self):
+        """Удаляет выполненные задачи старше 24 часов."""
+        self._execute(
+            "DELETE FROM tasks WHERE status='done' AND completed_at < NOW() - INTERVAL '24 hours'"
+        )
+
+    def get_tasks_for_user(self, name: str) -> List[Dict]:
+        name_parts = name.lower().split()
+        rows = self._fetchall(
+            "SELECT * FROM tasks WHERE status='open' ORDER BY deadline ASC NULLS LAST"
+        )
+        today = date.today().isoformat()
+        result = []
+        for row in rows:
+            exe = (row.get('executor') or "").lower()
+            if any(p in exe for p in name_parts):
+                row['overdue'] = bool(row.get('deadline') and str(row['deadline'])[:10] < today)
+                result.append(row)
+        return result
+
+    def get_all_open_tasks(self) -> List[Dict]:
+        today = date.today().isoformat()
+        rows = self._fetchall(
+            "SELECT * FROM tasks WHERE status='open' ORDER BY executor, deadline ASC NULLS LAST"
+        )
+        for row in rows:
+            row['overdue'] = bool(row.get('deadline') and str(row['deadline'])[:10] < today)
+        return rows
+
+    def get_overdue_tasks(self) -> List[Dict]:
+        today = date.today().isoformat()
+        return self._fetchall(
+            "SELECT * FROM tasks WHERE status='open' AND deadline < %s ORDER BY deadline ASC",
+            (today,)
+        )
+
+    def get_tasks_due_today(self) -> List[Dict]:
+        today = date.today().isoformat()
+        return self._fetchall(
+            "SELECT * FROM tasks WHERE status='open' AND deadline::text = %s",
+            (today,)
+        )
+
+    def get_tasks_due_tomorrow(self) -> List[Dict]:
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
+        return self._fetchall(
+            "SELECT * FROM tasks WHERE status='open' AND deadline::text = %s",
+            (tomorrow,)
+        )
+
+    def get_weekly_stats(self) -> Dict[str, Dict]:
+        week_ago = (date.today() - timedelta(days=7)).isoformat()
+        rows = self._fetchall(
+            "SELECT * FROM tasks WHERE created_at >= %s", (week_ago,)
+        )
+        stats = {}
+        today = date.today().isoformat()
+        for row in rows:
+            exe = row.get('executor') or 'Без исполнителя'
+            if exe not in stats:
+                stats[exe] = {'total': 0, 'done': 0, 'overdue': 0}
+            stats[exe]['total'] += 1
+            if row['status'] == 'done':
+                stats[exe]['done'] += 1
+            elif row.get('deadline') and str(row['deadline'])[:10] < today:
+                stats[exe]['overdue'] += 1
+        return stats
+
+    # ─── МЕДИА ────────────────────────────────────────────────────────────────
+
+    def save_media(self, file_id: str, media_type: str, caption: str,
+                   chat_id: int, uploader: str, date: str):
+        self._execute(
+            "INSERT INTO media (file_id, media_type, caption, chat_id, uploader, date) VALUES (%s,%s,%s,%s,%s,%s)",
+            (file_id, media_type, caption, chat_id, uploader, date)
+        )
+
+    def search_media(self, query: str, media_type: str = None) -> List[Dict]:
+        words = query.lower().split()
+        rows = self._fetchall("SELECT * FROM media ORDER BY date DESC")
+        results = []
+        for row in rows:
+            if media_type and row.get('media_type') != media_type:
+                continue
+            caption = (row.get('caption') or "").lower()
+            if all(w in caption for w in words):
+                results.append(row)
+        return results
+
+    # ─── ПРАЙСЫ ───────────────────────────────────────────────────────────────
+
+    def save_price(self, file_id: str, filename: str, chat_id: int, uploader: str):
+        self._execute(
+            "INSERT INTO prices (file_id, filename, chat_id, uploader) VALUES (%s,%s,%s,%s)",
+            (file_id, filename, chat_id, uploader)
+        )
+
+    def get_latest_price(self) -> Optional[Dict]:
+        return self._fetchone(
+            "SELECT *, uploaded_at as date FROM prices ORDER BY uploaded_at DESC LIMIT 1"
+        )
+
+    # ─── КОНТАКТЫ ─────────────────────────────────────────────────────────────
+
+    def save_contact(self, name: str, phone: str, company: str = "", notes: str = ""):
+        self._execute(
+            "INSERT INTO contacts (name, phone, company, notes) VALUES (%s,%s,%s,%s)",
+            (name, phone, company, notes)
+        )
+
+    def search_contacts(self, query: str) -> List[Dict]:
+        q = f"%{query.lower()}%"
+        return self._fetchall(
+            "SELECT * FROM contacts WHERE lower(name) LIKE %s OR lower(company) LIKE %s",
+            (q, q)
+        )
+
+    # ─── ДЕБИТОРКА ────────────────────────────────────────────────────────────
+
+    def save_debtor(self, client: str, manager: str, amount: float, days: int):
+        self._execute(
+            """INSERT INTO debtors (client, manager, amount, days, updated_at)
+               VALUES (%s, %s, %s, %s, NOW())
+               ON CONFLICT (client) DO UPDATE SET manager=%s, amount=%s, days=%s, updated_at=NOW()""",
+            (client, manager, amount, days, manager, amount, days)
+        )
+
+    def get_debtors(self) -> List[Dict]:
+        return self._fetchall("SELECT * FROM debtors ORDER BY days DESC")
+
+    # ─── ИСТОРИЯ СООБЩЕНИЙ ───────────────────────────────────────────────────
+
+    def save_message(self, chat_id: int, user_id: int, user_name: str,
+                     text: str, message_type: str = 'text'):
+        self._execute(
+            """INSERT INTO chat_messages (chat_id, user_id, user_name, text, message_type)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (chat_id, user_id, user_name, text, message_type)
+        )
+        self._execute(
+            """DELETE FROM chat_messages WHERE chat_id = %s AND id NOT IN (
+               SELECT id FROM chat_messages WHERE chat_id = %s
+               ORDER BY id DESC LIMIT 500)""",
+            (chat_id, chat_id)
+        )
+
+    def get_recent_messages(self, chat_id: int, limit: int = 50) -> List[Dict]:
+        rows = self._fetchall(
+            """SELECT user_name, text, ts, message_type
+               FROM chat_messages WHERE chat_id = %s
+               ORDER BY id DESC LIMIT %s""",
+            (chat_id, limit)
+        )
+        return list(reversed(rows))
+
+    def format_history(self, chat_id: int, limit: int = 50) -> str:
+        messages = self.get_recent_messages(chat_id, limit)
+        if not messages:
+            return ""
+        lines = []
+        for m in messages:
+            ts = str(m.get('ts', ''))
+            ts = ts[11:16] if len(ts) > 11 else ""
+            lines.append(f"[{ts}] {m['user_name']}: {m['text']}")
+        return "\n".join(lines)
+
+    # ─── ДОЛГОСРОЧНАЯ ПАМЯТЬ ──────────────────────────────────────────────────
+
+    def remember(self, key: str, value: str):
+        self._execute(
+            """INSERT INTO memory (key, value, updated_at) VALUES (%s, %s, NOW())
+               ON CONFLICT (key) DO UPDATE SET value=%s, updated_at=NOW()""",
+            (key, value, value)
+        )
+
+    def recall(self, key: str) -> Optional[str]:
+        row = self._fetchone("SELECT value FROM memory WHERE key = %s", (key,))
+        return row['value'] if row else None
+
+    def get_all_memories(self) -> List[Dict]:
+        return self._fetchall(
+            "SELECT key, value, updated_at FROM memory ORDER BY updated_at DESC"
+        )
+
+    def format_memories(self) -> str:
+        memories = self.get_all_memories()
+        if not memories:
+            return ""
+        lines = [f"- {m['key']}: {m['value']}" for m in memories[:30]]
+        return "\n".join(lines)
+
+    # ─── КОНТЕКСТ ДЛЯ CLAUDE ──────────────────────────────────────────────────
+
+    def get_context_summary(self) -> str:
+        open_tasks = len(self.get_all_open_tasks())
+        overdue = len(self.get_overdue_tasks())
+        debtors = self.get_debtors()
+        debtor_list = ", ".join(d['client'] for d in debtors[:5]) if debtors else "нет"
+        return (
+            f"Компания: F2B PRO (рыба и морепродукты оптом).\n"
+            f"Открытых задач: {open_tasks}, просрочено: {overdue}.\n"
+            f"Клиенты с долгами: {debtor_list}.\n"
+            f"Сотрудники: Белякова А. (закупки), Баласанян К. (продажи), "
+            f"Скляр И. (продажи), Малышкин А. (финансы), Гераскина Ю. (CRM)."
+        )
+
+    # ─── ПДЗ КОММЕНТАРИИ ──────────────────────────────────────────────────────
+
+    def save_pdz_comment(self, client: str, manager: str, order_name: str,
+                         debt_amount: float, debt_days: int, comment: str,
+                         commented_by: str) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO pdz_comments
+                   (client, manager, order_name, debt_amount, debt_days, comment, commented_by)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                (client, manager, order_name, debt_amount, debt_days, comment, commented_by)
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row['id']
+
+    def get_pdz_comments(self, limit: int = 50) -> list:
+        return self._fetchall(
+            "SELECT * FROM pdz_comments ORDER BY created_at DESC LIMIT %s",
+            (limit,)
+        )
+
+    # ─── WAZZUP СООБЩЕНИЯ ─────────────────────────────────────────────────────
+
+    def save_wazzup_message(self, message_id: str, channel_id: str, chat_type: str,
+                            chat_id: str, contact_name: str, manager_id: str,
+                            manager_name: str, text: str, is_outbound: bool,
+                            sent_at: str) -> bool:
+        """Сохраняет сообщение из Wazzup. Возвращает True если новое."""
         try:
             with self.conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                self.conn.commit()
-                return cur
-        except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            self._reconnect()
-    raise Exception("DB execute failed after 3 attempts")
-
-def _fetchall(self, sql: str, params=None) -> List[Dict]:
-    for attempt in range(3):
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                return [dict(r) for r in cur.fetchall()]
-        except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            self._reconnect()
-    return []
-
-def _fetchone(self, sql: str, params=None) -> Optional[Dict]:
-    for attempt in range(3):
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params or ())
+                cur.execute(
+                    """INSERT INTO wazzup_messages
+                       (message_id, channel_id, chat_type, chat_id, contact_name,
+                        manager_id, manager_name, text, is_outbound, sent_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (message_id) DO NOTHING RETURNING id""",
+                    (message_id, channel_id, chat_type, chat_id, contact_name,
+                     manager_id, manager_name, text, is_outbound, sent_at)
+                )
                 row = cur.fetchone()
-                return dict(row) if row else None
-        except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            self._reconnect()
-    return None
+                self.conn.commit()
+                return row is not None
+        except Exception:
+            self.conn.rollback()
+            return False
+
+    def search_wazzup_mentions(self, keywords: list, days: int = 7,
+                               manager_name: str = None) -> list:
+        """Ищет исходящие сообщения менеджеров с упоминанием ключевых слов."""
+        from datetime import datetime, timedelta
+        since = datetime.now() - timedelta(days=days)
+
+        conditions = ["is_outbound = TRUE", "sent_at >= %s", "text IS NOT NULL"]
+        params = [since]
+
+        if manager_name:
+            conditions.append("LOWER(manager_name) LIKE %s")
+            params.append(f"%{manager_name.lower()}%")
+
+        # Фильтр по ключевым словам (любое из них)
+        kw_conditions = " OR ".join(["LOWER(text) LIKE %s"] * len(keywords))
+        conditions.append(f"({kw_conditions})")
+        for kw in keywords:
+            params.append(f"%{kw.lower()}%")
+
+        sql = f"""
+            SELECT
+                COALESCE(NULLIF(m.manager_name, ''), cm.manager, 'Неизвестно') AS manager_name,
+                m.contact_name,
+                COALESCE(cm.company_name, m.contact_name) AS client_name,
+                m.chat_type,
+                m.text,
+                m.sent_at
+            FROM wazzup_messages m
+            LEFT JOIN wazzup_contact_map cm ON m.chat_id = cm.chat_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY manager_name, m.sent_at DESC
+        """
+        return self._fetchall(sql, params)
+
+    def save_pending_ident(self, link_key: str, chat_id: str, channel_id: str,
+                           wazzup_name: str, chat_type: str):
+        """Сохраняет ожидающую идентификацию в БД (выживает перезапуск)."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wazzup_pending_ident (link_key, chat_id, channel_id, wazzup_name, chat_type)
+                       VALUES (%s,%s,%s,%s,%s) ON CONFLICT (link_key) DO NOTHING""",
+                    (link_key, chat_id, channel_id, wazzup_name, chat_type)
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"save_pending_ident: {e}")
+
+    def get_pending_idents(self) -> list:
+        """Возвращает все ожидающие идентификации."""
+        return self._fetchall(
+            "SELECT * FROM wazzup_pending_ident ORDER BY created_at",
+            []
+        )
+
+    def delete_pending_ident(self, link_key: str):
+        """Удаляет идентификацию после завершения."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("DELETE FROM wazzup_pending_ident WHERE link_key=%s", (link_key,))
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"delete_pending_ident: {e}")
+
+    def save_wazzup_contact(self, contact_name: str, chat_id: str,
+                            chat_type: str, channel_id: str):
+        """Сохраняет или обновляет chatId клиента по каналу."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wazzup_contacts (contact_name, chat_id, chat_type, channel_id, updated_at)
+                       VALUES (%s, %s, %s, %s, NOW())
+                       ON CONFLICT (contact_name, chat_type)
+                       DO UPDATE SET chat_id=EXCLUDED.chat_id, channel_id=EXCLUDED.channel_id, updated_at=NOW()""",
+                    (contact_name, chat_id, chat_type, channel_id)
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"save_wazzup_contact error: {e}")
+
+    def get_wazzup_contacts(self, contact_name: str) -> list:
+        """Возвращает все известные каналы для контакта по имени или компании."""
+        # Сначала ищем по привязке company_name
+        rows = self._fetchall(
+            "SELECT * FROM wazzup_contact_map WHERE LOWER(company_name) LIKE LOWER(%s) ORDER BY created_at DESC",
+            (f"%{contact_name}%",)
+        )
+        if rows:
+            return [{"chat_id": r["chat_id"], "chat_type": r["chat_type"],
+                     "channel_id": r["channel_id"]} for r in rows]
+        # Fallback — по имени в wazzup_contacts
+        return self._fetchall(
+            "SELECT * FROM wazzup_contacts WHERE LOWER(contact_name) LIKE LOWER(%s) ORDER BY updated_at DESC",
+            (f"%{contact_name}%",)
+        )
+
+    def is_wazzup_contact_known(self, chat_id: str) -> bool:
+        """Проверяет есть ли уже привязка для этого chatId."""
+        row = self._fetchone(
+            "SELECT id FROM wazzup_contact_map WHERE chat_id = %s", (chat_id,)
+        )
+        return row is not None
+
+    def link_wazzup_contact(self, chat_id: str, chat_type: str,
+                            channel_id: str, company_name: str,
+                            wazzup_name: str = "", role: str = "закупщик",
+                            segment: str = "", manager: str = "") -> bool:
+        """Привязывает chatId к названию компании и роли."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wazzup_contact_map
+                       (chat_id, chat_type, channel_id, company_name, wazzup_name, role, segment, manager)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (chat_id) DO UPDATE
+                       SET company_name=EXCLUDED.company_name, wazzup_name=EXCLUDED.wazzup_name,
+                           role=EXCLUDED.role, segment=EXCLUDED.segment, manager=EXCLUDED.manager""",
+                    (chat_id, chat_type, channel_id, company_name, wazzup_name, role, segment, manager)
+                )
+            self.conn.commit()
+            # Обновляем и в wazzup_contacts
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wazzup_contacts (contact_name, chat_id, chat_type, channel_id, updated_at)
+                       VALUES (%s, %s, %s, %s, NOW())
+                       ON CONFLICT (contact_name, chat_type)
+                       DO UPDATE SET chat_id=EXCLUDED.chat_id, channel_id=EXCLUDED.channel_id, updated_at=NOW()""",
+                    (company_name, chat_id, chat_type, channel_id)
+                )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"link_wazzup_contact error: {e}")
+            return False
+
+    def update_wazzup_contact_tags(self, chat_id: str, tags: list,
+                                    manager: str = "", segment: str = ""):
+        """Обновляет теги, менеджера и сегмент контакта из МойСклад."""
+        try:
+            tags_str = ", ".join(tags) if tags else ""
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE wazzup_contact_map
+                       SET tags=%s, manager=%s, segment=%s
+                       WHERE chat_id=%s""",
+                    (tags_str, manager, segment, chat_id)
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"update_wazzup_contact_tags error: {e}")
+
+    def get_wazzup_broadcast_contacts(self, company_name: str,
+                                       roles: list = None) -> list:
+        """Возвращает контакты компании подходящие для рассылки (закупщики/директора)."""
+        if roles is None:
+            roles = ["рассылка"]
+        placeholders = ",".join(["%s"] * len(roles))
+        return self._fetchall(
+            f"""SELECT * FROM wazzup_contact_map
+               WHERE LOWER(company_name) LIKE LOWER(%s)
+               AND LOWER(role) IN ({placeholders})
+               ORDER BY created_at DESC""",
+            [f"%{company_name}%"] + roles
+        )
+
+    def save_pending_link(self, link_key: str, chat_id: str, channel_id: str,
+                          wazzup_name: str, chat_type: str):
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wazzup_pending (link_key, chat_id, channel_id, wazzup_name, chat_type)
+                       VALUES (%s,%s,%s,%s,%s) ON CONFLICT (link_key) DO NOTHING""",
+                    (link_key, chat_id, channel_id, wazzup_name, chat_type)
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"save_pending_link: {e}")
+
+    def load_pending_links(self) -> list:
+        return self._fetchall(
+            "SELECT link_key, chat_id, channel_id, wazzup_name, chat_type FROM wazzup_pending"
+        )
+
+    def delete_pending_link(self, link_key: str):
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("DELETE FROM wazzup_pending WHERE link_key=%s", (link_key,))
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+
+    def save_contract(self, contract_number: str, buyer_name: str, created_by: str):
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO contracts (contract_number, buyer_name, created_by) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                    (contract_number, buyer_name, created_by)
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"save_contract error: {e}")
+
+    def get_contracts_by_date(self, date_str: str) -> list:
+        return self._fetchall(
+            "SELECT * FROM contracts WHERE contract_number LIKE %s ORDER BY id",
+            (f"{date_str}%",)
+        )
+
+    def save_call_transcript(self, call_id: str, src_num: str, dst_num: str,
+                             manager_name: str, tree_name: str, transcript: str,
+                             duration_sec: int = 0, called_at: str = None) -> bool:
+        """Сохраняет транскрипцию звонка."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO call_transcripts
+                       (call_id, src_num, dst_num, manager_name, tree_name, transcript, duration_sec, called_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, COALESCE(%s::timestamp, NOW()))
+                       ON CONFLICT (call_id) DO NOTHING RETURNING id""",
+                    (call_id, src_num, dst_num, manager_name, tree_name,
+                     transcript, duration_sec, called_at)
+                )
+                row = cur.fetchone()
+                self.conn.commit()
+                return row is not None
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"save_call_transcript error: {e}")
+            return False
+
+    def search_call_mentions(self, keywords: list, days: int = 7,
+                             manager_name: str = None) -> list:
+        """Ищет упоминания ключевых слов в транскрипциях звонков."""
+        from datetime import datetime, timedelta
+        since = datetime.now() - timedelta(days=days)
+
+        conditions = ["called_at >= %s", "transcript IS NOT NULL"]
+        params = [since]
+
+        if manager_name:
+            conditions.append("LOWER(manager_name) LIKE %s")
+            params.append(f"%{manager_name.lower()}%")
+
+        kw_conditions = " OR ".join(["LOWER(transcript) LIKE %s"] * len(keywords))
+        conditions.append(f"({kw_conditions})")
+        for kw in keywords:
+            params.append(f"%{kw.lower()}%")
+
+        sql = f"""
+            SELECT manager_name, src_num, tree_name, transcript, called_at
+            FROM call_transcripts
+            WHERE {' AND '.join(conditions)}
+            ORDER BY manager_name, called_at DESC
+        """
+        return self._fetchall(sql, params)
+
+    def get_manager_activity(self, days: int = 7, manager_name: str = None) -> list:
+        """Отчёт по активности менеджеров: звонки + сообщения за период."""
+        from datetime import datetime, timedelta
+        since = datetime.now() - timedelta(days=days)
+
+        # Сообщения — берём менеджера из contact_map если в сообщении пустой
+        mgr_filter = "AND LOWER(COALESCE(NULLIF(m.manager_name,''), cm.manager, '')) LIKE %s" if manager_name else ""
+        mgr_params = [since] + ([f"%{manager_name.lower()}%"] if manager_name else [])
+        msg_rows = self._fetchall(
+            f"""SELECT
+                COALESCE(NULLIF(m.manager_name,''), cm.manager, 'Неизвестно') AS manager_name,
+                COUNT(*) as msg_count,
+                COUNT(DISTINCT m.chat_id) as client_count
+                FROM wazzup_messages m
+                LEFT JOIN wazzup_contact_map cm ON m.chat_id = cm.chat_id
+                WHERE m.is_outbound = TRUE AND m.sent_at >= %s
+                {mgr_filter}
+                GROUP BY COALESCE(NULLIF(m.manager_name,''), cm.manager, 'Неизвестно')""",
+            mgr_params
+        )
+
+        # Звонки
+        call_filter = "AND LOWER(manager_name) LIKE %s" if manager_name else ""
+        call_params = [since] + ([f"%{manager_name.lower()}%"] if manager_name else [])
+        call_rows = self._fetchall(
+            f"""SELECT manager_name,
+                COUNT(*) as call_count,
+                COUNT(DISTINCT src_num) as caller_count,
+                ROUND(AVG(duration_sec)) as avg_duration
+                FROM call_transcripts
+                WHERE called_at >= %s
+                AND manager_name IS NOT NULL AND manager_name != ''
+                {call_filter}
+                GROUP BY manager_name""",
+            call_params
+        )
+
+        # Объединяем
+        result = {}
+        for r in msg_rows:
+            mgr = r["manager_name"]
+            if mgr == "Неизвестно":
+                continue
+            result[mgr] = {
+                "manager": mgr,
+                "msg_count": r["msg_count"],
+                "msg_clients": r["client_count"],
+                "call_count": 0,
+                "call_clients": 0,
+                "avg_duration": 0,
+            }
+        for r in call_rows:
+            mgr = r["manager_name"]
+            if mgr not in result:
+                result[mgr] = {"manager": mgr, "msg_count": 0, "msg_clients": 0}
+            result[mgr]["call_count"] = r["call_count"]
+            result[mgr]["call_clients"] = r["caller_count"]
+            result[mgr]["avg_duration"] = int(r["avg_duration"] or 0)
+
+        return sorted(result.values(), key=lambda x: x.get("msg_count", 0) + x.get("call_count", 0), reverse=True)
+
+    def get_wazzup_stats(self, days: int = 7) -> dict:
+        """Статистика сообщений по менеджерам за период."""
+        from datetime import datetime, timedelta
+        since = datetime.now() - timedelta(days=days)
+        rows = self._fetchall(
+            """SELECT manager_name, COUNT(*) as msg_count,
+               COUNT(DISTINCT chat_id) as client_count
+               FROM wazzup_messages
+               WHERE is_outbound = TRUE AND sent_at >= %s AND manager_name IS NOT NULL
+               GROUP BY manager_name ORDER BY msg_count DESC""",
+            (since,)
+        )
+        return {r['manager_name']: r for r in rows}
