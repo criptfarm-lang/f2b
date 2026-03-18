@@ -1255,6 +1255,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 elif isinstance(uid, int) and isinstance(pl, dict) and "wazzup_name" in pl:
                     _pending_links[user.id] = [pl]
                     break
+        logger.info(f"ИДЕНТИФИКАЦИЯ: user={user.id if user else None} pending={user.id in _pending_links if user else False} all_keys={[k for k in _pending_links.keys() if isinstance(k, int)]}")
         if user and user.id not in _pending_links:
             return
 
