@@ -326,6 +326,15 @@ DISPATCHER_PROMPT = f"""Ты — умный диспетчер корпорат�
 Запрос: "сделай договор для Стрелочка"
 Ответ: {{"action": "generate_contract", "params": {{"buyer": "Стрелочка"}}, "confidence": 0.99}}
 
+Запрос: "подготовь договор на Клуб Высоцкого"
+Ответ: {{"action": "generate_contract", "params": {{"buyer": "Клуб Высоцкого"}}, "confidence": 0.99}}
+
+Запрос: "сформируй договор для ИТФИШ"
+Ответ: {{"action": "generate_contract", "params": {{"buyer": "ИТФИШ"}}, "confidence": 0.99}}
+
+Запрос: "нужен договор с Атмосфера"
+Ответ: {{"action": "generate_contract", "params": {{"buyer": "Атмосфера"}}, "confidence": 0.99}}
+
 Запрос: "договор поставки ИТФИШ"
 Ответ: {{"action": "generate_contract", "params": {{"buyer": "ИТФИШ"}}, "confidence": 0.99}}
 
