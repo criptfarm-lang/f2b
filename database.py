@@ -15,22 +15,41 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:FOfGvpjobKJPQYPB
 
 class Database:
     def __init__(self):
-        self.conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-        self.conn.autocommit = False
+        self._dsn = DATABASE_URL
+        self.conn = self._connect()
         self._create_tables()
 
+    def _connect(self):
+        conn = psycopg2.connect(self._dsn, cursor_factory=psycopg2.extras.RealDictCursor)
+        conn.autocommit = False
+        return conn
+
+    def _ensure_connection(self):
+        """Переподключается если соединение закрыто или упало."""
+        try:
+            self.conn.cursor().execute("SELECT 1")
+        except Exception:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = self._connect()
+
     def _execute(self, sql: str, params=None):
+        self._ensure_connection()
         with self.conn.cursor() as cur:
             cur.execute(sql, params or ())
             self.conn.commit()
             return cur
 
     def _fetchall(self, sql: str, params=None) -> List[Dict]:
+        self._ensure_connection()
         with self.conn.cursor() as cur:
             cur.execute(sql, params or ())
             return [dict(r) for r in cur.fetchall()]
 
     def _fetchone(self, sql: str, params=None) -> Optional[Dict]:
+        self._ensure_connection()
         with self.conn.cursor() as cur:
             cur.execute(sql, params or ())
             row = cur.fetchone()
@@ -220,6 +239,23 @@ class Database:
                 updated_at TIMESTAMP DEFAULT NOW(),
                 UNIQUE(contact_name, chat_type)
             )""",
+            """CREATE TABLE IF NOT EXISTS manager_chats (
+                user_id BIGINT PRIMARY KEY,
+                full_name TEXT,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )""",
+            # Таблица для хранения контекста алертов цены (ожидание ответа менеджера)
+            """CREATE TABLE IF NOT EXISTS price_alerts (
+                id SERIAL PRIMARY KEY,
+                order_id TEXT,
+                order_name TEXT,
+                client_name TEXT,
+                manager_name TEXT,
+                manager_user_id BIGINT,
+                alert_text TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:
@@ -229,7 +265,46 @@ class Database:
                     pass
         self.conn.commit()
 
-    # ─── ЗАДАЧИ ───────────────────────────────────────────────────────────────
+    # ─── ЧАТЫ МЕНЕДЖЕРОВ ────────────────────────────────────────────────────────
+
+    def save_manager_chat_id(self, user_id: int, full_name: str):
+        self._execute(
+            """INSERT INTO manager_chats (user_id, full_name, updated_at)
+               VALUES (%s, %s, NOW())
+               ON CONFLICT (user_id) DO UPDATE SET full_name=%s, updated_at=NOW()""",
+            (user_id, full_name, full_name)
+        )
+
+    def get_manager_chat_id(self, name_fragment: str) -> int:
+        """Ищет chat_id менеджера по части имени."""
+        row = self._fetchone(
+            "SELECT user_id FROM manager_chats WHERE LOWER(full_name) LIKE LOWER(%s) LIMIT 1",
+            (f"%{name_fragment}%",)
+        )
+        return row["user_id"] if row else None
+
+    def save_price_alert(self, order_id: str, order_name: str, client_name: str,
+                         manager_name: str, manager_user_id: int, alert_text: str) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO price_alerts (order_id, order_name, client_name, manager_name, manager_user_id, alert_text)
+                   VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (order_id, order_name, client_name, manager_name, manager_user_id, alert_text)
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row["id"]
+
+    def get_price_alert(self, alert_id: int) -> dict:
+        return self._fetchone("SELECT * FROM price_alerts WHERE id=%s", (alert_id,))
+
+    def close_price_alert(self, alert_id: int, comment: str):
+        self._execute(
+            "UPDATE price_alerts SET status='answered', alert_text=alert_text||%s WHERE id=%s",
+            (f"\n💬 Ответ: {comment}", alert_id)
+        )
+
+    # ─── ЗАДАЧИ ─────────────────────────────────────────────────────────────────
 
     def save_task(self, text: str, executor: str = "", deadline: str = None,
                   source_chat: int = None, source_message_id: int = None,
