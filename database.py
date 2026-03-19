@@ -256,6 +256,14 @@ class Database:
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
+            """CREATE TABLE IF NOT EXISTS pdz_results (
+                id SERIAL PRIMARY KEY,
+                manager_name TEXT,
+                manager_user_id BIGINT,
+                result_text TEXT,
+                work_date DATE DEFAULT CURRENT_DATE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:
@@ -264,6 +272,17 @@ class Database:
                 except Exception:
                     pass
         self.conn.commit()
+
+    def save_pdz_result(self, manager_name: str, manager_user_id: int, result_text: str):
+        self._execute(
+            "INSERT INTO pdz_results (manager_name, manager_user_id, result_text) VALUES (%s,%s,%s)",
+            (manager_name, manager_user_id, result_text)
+        )
+
+    def get_pdz_results_today(self) -> list:
+        return self._fetchall(
+            "SELECT * FROM pdz_results WHERE work_date = CURRENT_DATE ORDER BY created_at"
+        )
 
     # ─── ЧАТЫ МЕНЕДЖЕРОВ ────────────────────────────────────────────────────────
 
