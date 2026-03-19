@@ -131,6 +131,12 @@ def clean_query(text: str) -> str:
 # ─── Команды ─────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    # Сохраняем chat_id в БД если это личный чат
+    if user and chat_id == user.id:
+        db.save_manager_chat_id(user.id, user.full_name)
+        logger.info(f"cmd_start: сохранён chat_id={chat_id} name={user.full_name}")
     await update.message.reply_text(
         "👋 Привет! Я Эф — ассистент F2B PRO.\n\n"
         "Обращайся ко мне: *Эф, [вопрос]*\n\n"
@@ -142,12 +148,190 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/tasks — мои задачи\n"
         "/report — отчёт\n"
+        "/mychatid — мой chat ID\n"
         "/help — все команды",
         parse_mode="Markdown"
     )
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает chat_id пользователя."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if user and chat_id == user.id:
+        db.save_manager_chat_id(user.id, user.full_name)
+    await update.message.reply_text(
+        f"👤 *{user.full_name if user else 'Неизвестный'}*\n"
+        f"Твой chat_id: `{chat_id}`",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Панель управления — только для руководителя."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 Все задачи", callback_data="menu_all_tasks"),
+            InlineKeyboardButton("⏰ Просроченные", callback_data="menu_overdue"),
+        ],
+        [
+            InlineKeyboardButton("💰 ПДЗ все", callback_data="menu_pdz_all"),
+            InlineKeyboardButton("🚀 Запустить /pdz", callback_data="menu_pdz_run"),
+        ],
+        [
+            InlineKeyboardButton("📊 Активность", callback_data="menu_activity"),
+            InlineKeyboardButton("📈 Отчёт", callback_data="menu_report"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Очистить открытые", callback_data="menu_clearopen"),
+            InlineKeyboardButton("💣 Очистить ВСЕ", callback_data="menu_clearall"),
+        ],
+        [
+            InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
+            InlineKeyboardButton("📞 Контакты", callback_data="menu_contacts"),
+        ],
+    ])
+
+    await update.message.reply_text(
+        "🎛 *Панель управления Эф*\n\nВыбери действие:",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+
+async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок панели управления."""
+    query = update.callback_query
+    await query.answer()
+
+    if not query.from_user or query.from_user.id != 360092495:
+        await query.answer("⛔ Только для руководителя.", show_alert=True)
+        return
+
+    action = query.data
+
+    if action == "menu_all_tasks":
+        from database import Database
+        tasks = db.get_all_open_tasks()
+        if not tasks:
+            await query.message.reply_text("✅ Открытых задач нет.")
+        else:
+            lines = [f"📋 *Все открытые задачи ({len(tasks)}):*\n"]
+            for t in tasks[:30]:
+                lines.append(f"• *{t.get('executor','')}*: {t.get('text','')[:60]}")
+            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    elif action == "menu_overdue":
+        tasks = db.get_overdue_tasks()
+        if not tasks:
+            await query.message.reply_text("✅ Просроченных задач нет.")
+        else:
+            lines = [f"⏰ *Просроченные задачи ({len(tasks)}):*\n"]
+            for t in tasks[:20]:
+                lines.append(f"• *{t.get('executor','')}*: {t.get('text','')[:60]}")
+            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    elif action == "menu_pdz_all":
+        await query.message.reply_text("⏳ Запрашиваю ПДЗ...")
+        from moysklad import get_overdue_demands, format_overdue_demands
+        items = await get_overdue_demands()
+        if not items:
+            await query.message.reply_text("✅ Просроченных долгов нет.")
+        else:
+            text = format_overdue_demands(items)
+            await query.message.reply_text(text, parse_mode="Markdown")
+
+    elif action == "menu_pdz_run":
+        await query.message.reply_text(
+            "🚀 Запускаю ПДЗ задачи?\nЭто разошлёт задачи всем менеджерам.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Да, запустить", callback_data="menu_pdz_confirm"),
+                InlineKeyboardButton("❌ Отмена", callback_data="menu_cancel"),
+            ]])
+        )
+
+    elif action == "menu_pdz_confirm":
+        import asyncio
+        from scheduler import pdz_morning_task, PDZ_MANAGERS, pdz_launched_today
+        from datetime import date as _date
+        today = _date.today().isoformat()
+        pdz_launched_today.add(today)
+        await query.message.reply_text(f"📋 Запускаю для {len(PDZ_MANAGERS)} менеджеров (2 мин интервал)...")
+        for i, mgr in enumerate(PDZ_MANAGERS):
+            try:
+                await pdz_morning_task(context.application, mgr)
+            except Exception as e:
+                await query.message.reply_text(f"❌ {mgr['name']}: {e}")
+            if i < len(PDZ_MANAGERS) - 1:
+                await asyncio.sleep(120)
+        await query.message.reply_text("✅ Готово. Сводка придёт в 17:00.")
+
+    elif action == "menu_activity":
+        await query.message.reply_text(
+            "📊 Активность менеджеров:\nНапиши *Эф, активность за 7 дней*",
+            parse_mode="Markdown"
+        )
+
+    elif action == "menu_report":
+        await query.message.reply_text("⏳ Формирую отчёт...")
+        context2 = db.get_context_summary()
+        from claude_ai import smart_answer
+        text = await smart_answer("Дай краткий недельный отчёт по задачам команды", context2)
+        await query.message.reply_text(text, parse_mode="Markdown")
+
+    elif action == "menu_clearopen":
+        await query.message.reply_text(
+            "🗑 Очистить все ОТКРЫТЫЕ задачи?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Да", callback_data="menu_clearopen_confirm"),
+                InlineKeyboardButton("❌ Нет", callback_data="menu_cancel"),
+            ]])
+        )
+
+    elif action == "menu_clearopen_confirm":
+        db._ensure_connection()
+        with db.conn.cursor() as cur:
+            cur.execute("UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE status='open'")
+            count = cur.rowcount
+        db.conn.commit()
+        await query.message.reply_text(f"✅ Очищено открытых задач: {count}")
+
+    elif action == "menu_clearall":
+        await query.message.reply_text(
+            "💣 Удалить ВСЕ задачи включая выполненные?\nЭто нельзя отменить!",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💣 Да, удалить всё", callback_data="menu_clearall_confirm"),
+                InlineKeyboardButton("❌ Отмена", callback_data="menu_cancel"),
+            ]])
+        )
+
+    elif action == "menu_clearall_confirm":
+        db._ensure_connection()
+        with db.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) as cnt FROM tasks")
+            row = cur.fetchone()
+            total = row["cnt"] if row else 0
+            cur.execute("TRUNCATE TABLE tasks RESTART IDENTITY")
+        db.conn.commit()
+        await query.message.reply_text(f"💣 Удалено задач: {total}. Таблица очищена.")
+
+    elif action == "menu_test":
+        await query.message.reply_text("🔍 Запускаю диагностику...")
+        fake_update = update
+        await cmd_test(fake_update, context)
+
+    elif action == "menu_contacts":
+        lines = ["📞 *Контакты менеджеров:*\n"]
+        for name, contact in MANAGERS_CONTACTS.items():
+            lines.append(f"• {name}: {contact}")
+        await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    elif action == "menu_cancel":
+        await query.message.delete()
     await update.message.reply_text(
         "📋 *Все команды:*\n\n"
         "*Задачи:*\n"
@@ -651,6 +835,26 @@ async def cmd_clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Все открытые задачи очищены.")
     except Exception as e:
         logger.error(f"cmd_clear_all error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+async def cmd_clear_tasks_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет ВСЕ задачи включая выполненные. Только для руководителя."""
+    user = update.effective_user
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    if user.id not in manager_ids:
+        return
+    try:
+        db._ensure_connection()
+        with db.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) as cnt FROM tasks")
+            row = cur.fetchone()
+            total = row["cnt"] if row else 0
+            cur.execute("TRUNCATE TABLE tasks RESTART IDENTITY")
+        db.conn.commit()
+        await update.message.reply_text(f"🗑 Удалено задач: {total}. Таблица очищена полностью.")
+    except Exception as e:
+        logger.error(f"cmd_clear_tasks_all error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
@@ -1180,6 +1384,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = message.chat_id
     user = message.from_user
     text = message.text or message.caption or ""
+
+    # Ответ менеджера на алерт цены в личке — пересылаем Виктору
+    OWNER_ID = 360092495
+    if user and chat_id == user.id and chat_id != OWNER_ID and text:
+        # Проверяем — это ответ на сообщение с #price_alert_
+        replied = message.reply_to_message
+        if replied and replied.text and "#price_alert_" in replied.text:
+            import re
+            m = re.search(r"#price_alert_(\d+)", replied.text)
+            if m:
+                alert_id = int(m.group(1))
+                alert_data = db.get_price_alert(alert_id)
+                if alert_data:
+                    db.close_price_alert(alert_id, text)
+                    order_name = alert_data.get("order_name", "")
+                    mgr_name = alert_data.get("manager_name", user.full_name)
+                    await context.bot.send_message(
+                        chat_id=OWNER_ID,
+                        text=(
+                            f"💬 *Ответ по алерту цены*\n"
+                            f"👤 Менеджер: *{mgr_name}*\n"
+                            f"📋 Заказ: {order_name or 'см. выше'}\n\n"
+                            f"{text}"
+                        ),
+                        parse_mode="Markdown"
+                    )
+                    await message.reply_text("✅ Ответ отправлен руководителю.")
+                    return
 
     if message.forward_origin and chat_id == (user.id if user else None):
         origin = message.forward_origin
@@ -2887,14 +3119,50 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.delete()
 
     elif action == "price_comment":
-        new_text = query.message.text + f"\n\n💬 *{user.first_name} ждёт комментарий менеджера*"
-        await query.edit_message_text(new_text, parse_mode="Markdown")
-        if group_chat_id:
-            contact = MANAGERS_CONTACTS.get(manager_name)
-            mgr_mention = contact if contact else f"*{manager_name}*" if manager_name else "Менеджер"
+        order_id_val = parts[1] if len(parts) > 1 else ""
+        alert_id = int(parts[2]) if len(parts) > 2 else 0
+        alert_data = db.get_price_alert(alert_id) if alert_id else {}
+        mgr_name = alert_data.get("manager_name", "") if alert_data else manager_name
+
+        # Ищем chat_id менеджера
+        mgr_chat_id = None
+        if mgr_name:
+            # Пробуем найти по фамилии
+            for part in mgr_name.split():
+                cid = db.get_manager_chat_id(part)
+                if cid:
+                    mgr_chat_id = cid
+                    break
+
+        alert_text = query.message.text
+
+        if mgr_chat_id:
             await context.bot.send_message(
-                chat_id=group_chat_id,
-                text=f"{mgr_mention}, дай комментарий по занижению цены.",
+                chat_id=mgr_chat_id,
+                text=(
+                    f"⚠️ *Виктор просит пояснить занижение цены:*\n\n"
+                    f"{alert_text}\n\n"
+                    f"Ответь на это сообщение — ответ уйдёт Виктору. "
+                    f"#price_alert_{alert_id}"
+                ),
+                parse_mode="Markdown"
+            )
+            await query.edit_message_text(
+                query.message.text + f"\n\n💬 *Запрошен комментарий у {mgr_name}*",
+                parse_mode="Markdown"
+            )
+        else:
+            # Нет chat_id — пишем в группу
+            group_chat_id_val = int(os.getenv("GROUP_CHAT_ID", "0"))
+            if group_chat_id_val:
+                contact = MANAGERS_CONTACTS.get(mgr_name, f"*{mgr_name}*")
+                await context.bot.send_message(
+                    chat_id=group_chat_id_val,
+                    text=f"{contact}, Виктор просит пояснить занижение цены по заказу.",
+                    parse_mode="Markdown"
+                )
+            await query.edit_message_text(
+                query.message.text + f"\n\n💬 *Запрошен комментарий у {mgr_name}*",
                 parse_mode="Markdown"
             )
 
@@ -2966,6 +3234,9 @@ def main():
         logger.warning(f"Не удалось восстановить pending_idents: {e}")
 
     # Команды
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CallbackQueryHandler(handle_menu_callback, pattern="^menu_"))
+    app.add_handler(CommandHandler("mychatid", cmd_mychatid))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("clearwazzup", cmd_clear_wazzup))
@@ -2975,6 +3246,7 @@ def main():
     app.add_handler(CommandHandler("wazzup_channels", cmd_wazzup_channels))
     app.add_handler(CommandHandler("wazzup_setup", cmd_wazzup_setup))
     app.add_handler(CommandHandler("clearall", cmd_clear_all))
+    app.add_handler(CommandHandler("cleartasksall", cmd_clear_tasks_all))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("deltask", cmd_del_task))
     app.add_handler(MessageHandler(
@@ -3384,15 +3656,33 @@ async def process_ms_webhook(data: dict, bot):
             alerts = await check_order_prices(order_href)
 
             if alerts:
+                owner_chat_id = 360092495  # Виктор Васильев
                 text = "⚠️ *Цена ниже минимальной!*\n\n" + "\n\n".join(alerts)
-                keyboard = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("✅ Согласовано", callback_data=f"price_ok|{order_id}"),
-                        InlineKeyboardButton("💬 Требуется комментарий", callback_data=f"price_comment|{order_id}"),
-                    ]
-                ])
+
+                # Получаем имя менеджера из данных заказа
+                mgr_name = ""
+                for a in alerts:
+                    for line in a.split("\n"):
+                        if "Менеджер:" in line:
+                            mgr_name = line.replace("Менеджер:", "").strip()
+                            break
+
+                # Сохраняем алерт в БД
+                alert_id = db.save_price_alert(
+                    order_id=order_id,
+                    order_name="",
+                    client_name="",
+                    manager_name=mgr_name,
+                    manager_user_id=0,
+                    alert_text=text
+                )
+
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Согласовано", callback_data=f"price_ok|{order_id}"),
+                    InlineKeyboardButton("💬 Комментарий менеджеру", callback_data=f"price_comment|{order_id}|{alert_id}"),
+                ]])
                 await bot.send_message(
-                    chat_id=group_chat_id,
+                    chat_id=owner_chat_id,
                     text=text,
                     parse_mode="Markdown",
                     reply_markup=keyboard
