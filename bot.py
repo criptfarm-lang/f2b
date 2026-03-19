@@ -181,6 +181,26 @@ async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📋 *Все команды:*\n\n"
+        "*Задачи:*\n"
+        "/tasks — мои задачи\n"
+        "/all_tasks — все задачи команды\n"
+        "/overdue — просроченные задачи\n\n"
+        "*Отчёты:*\n"
+        "/report — недельный отчёт\n"
+        "/дебиторка — срез по дебиторке\n\n"
+        "*Управление:*\n"
+        "/menu — панель управления\n"
+        "/pdz — запустить работу с дебиторкой\n"
+        "/mychatid — мой chat ID\n"
+        "/clearall — очистить открытые задачи\n"
+        "/cleartasksall — очистить все задачи",
+        parse_mode="Markdown"
+    )
+
+
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Панель управления — только для руководителя."""
     user = update.effective_user
