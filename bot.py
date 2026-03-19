@@ -75,7 +75,21 @@ EMPLOYEES = {
         "голубева", "голубевой", "голубеву",
         "таня", "тани", "тане", "таню", "таней",
     ],
+    "Сергей Черентаев": [
+        "сергей", "сергея", "сергею", "сергеем",
+        "черентаев", "черентаева", "черентаеву",
+    ],
 }
+
+# Менеджеры отдела продаж — "всем менеджерам"
+MOP_MANAGERS = [
+    "Карина Баласанян",
+    "Елена Мерзлякова",
+    "Инесса Скляр",
+    "Татьяна Голубева",
+    "Алексей Леонтьев",
+    "Сергей Черентаев",
+]
 
 def find_employee(query: str) -> str | None:
     """Ищет сотрудника по любому варианту имени/фамилии в запросе."""
@@ -357,6 +371,7 @@ _wazzup_notified: set = set()
 
 
 _pending_links: dict = {}
+_pending_task_results: dict = {}  # user_id → {task_id, task_text, executor}
 
 
 async def handle_wazzup_ignore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1053,6 +1068,39 @@ async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT
             )
 
 
+async def handle_task_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки 'Выполнено' — запрашивает результат."""
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split("|")
+    task_id = int(parts[1]) if len(parts) > 1 else 0
+
+    task = db._fetchone("SELECT * FROM tasks WHERE id=%s", (task_id,))
+    if not task:
+        await query.edit_message_text("❌ Задача не найдена.")
+        return
+
+    if task.get("status") == "done":
+        await query.edit_message_text(
+            query.message.text + "\n\n✅ *Уже выполнено*",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Сохраняем ожидание результата
+    _pending_task_results[query.from_user.id] = {
+        "task_id": task_id,
+        "task_text": task.get("text", ""),
+        "executor": task.get("executor", ""),
+        "msg_id": query.message.message_id,
+    }
+
+    await query.edit_message_text(
+        query.message.text + "\n\n✏️ *Напиши результат выполнения:*",
+        parse_mode="Markdown"
+    )
+
+
 async def cmd_deltask_by_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удалить задачу ответом 'удали' на сообщение бота с задачей."""
     msg = update.message
@@ -1388,7 +1436,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ответ менеджера на алерт цены в личке — пересылаем Виктору
     OWNER_ID = 360092495
     if user and chat_id == user.id and chat_id != OWNER_ID and text:
-        # Проверяем — это ответ на сообщение с #price_alert_
+
+        # 1. Ожидаем результат выполнения задачи
+        if user.id in _pending_task_results:
+            pending_tr = _pending_task_results.pop(user.id)
+            task_id = pending_tr["task_id"]
+            task_text = pending_tr["task_text"]
+            executor = pending_tr["executor"]
+            db.complete_task(task_id, result=text, completed_by=user.full_name)
+            # Уведомляем Виктора
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=(
+                    f"✅ *Задача выполнена*\n"
+                    f"👤 *{executor}*\n"
+                    f"📋 {task_text}\n\n"
+                    f"💬 Результат: {text}"
+                ),
+                parse_mode="Markdown"
+            )
+            # Обновляем в группе PRO
+            group_chat_id_tr = int(os.getenv("GROUP_CHAT_ID", "0"))
+            if group_chat_id_tr:
+                await context.bot.send_message(
+                    chat_id=group_chat_id_tr,
+                    text=(
+                        f"✅ *{executor}* выполнил задачу:\n"
+                        f"_{task_text}_\n\n"
+                        f"💬 {text}"
+                    ),
+                    parse_mode="Markdown"
+                )
+            await message.reply_text("✅ Результат сохранён, руководитель уведомлён.")
+            return
+
+        # 2. Ответ на алерт цены
         replied = message.reply_to_message
         if replied and replied.text and "#price_alert_" in replied.text:
             import re
@@ -1412,6 +1494,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     await message.reply_text("✅ Ответ отправлен руководителю.")
                     return
+
+        # 3. Результат по ПДЗ — менеджер пишет в личку боту
+        from scheduler import pdz_launched_today
+        from datetime import date as _date
+        today_str = _date.today().isoformat()
+        if today_str in pdz_launched_today:
+            db.save_pdz_result(
+                manager_name=user.full_name,
+                manager_user_id=user.id,
+                result_text=text
+            )
+            # Пишем в pdz_day_messages для вечерней сводки
+            from scheduler import pdz_day_messages, PDZ_MANAGERS
+            if today_str not in pdz_day_messages:
+                pdz_day_messages[today_str] = {}
+            mgr_tag = "_all"
+            for mgr in PDZ_MANAGERS:
+                frag = mgr.get("name_fragment", mgr["name"]).lower()
+                if frag in user.full_name.lower():
+                    mgr_tag = mgr["tag"]
+                    break
+            if mgr_tag not in pdz_day_messages[today_str]:
+                pdz_day_messages[today_str][mgr_tag] = []
+            pdz_day_messages[today_str][mgr_tag].append(f"{user.full_name}: {text}")
+            await message.reply_text("✅ Принял, записал для отчёта.")
+            return
+
+        # 4. Прочие сообщения в личке — бот не реагирует
+        return
 
     if message.forward_origin and chat_id == (user.id if user else None):
         origin = message.forward_origin
@@ -1552,7 +1663,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Задачи фиксируем ТОЛЬКО если в тексте есть слово "задача"
         if "задач" in text_lower:
-            # Но не если это запрос данных
             DATA_QUERY_KEYWORDS = [
                 "пдз", "долг", "дебитор", "остатк", "отчёт", "отчет",
                 "сводк", "покажи", "дай", "сколько", "кто",
@@ -1562,45 +1672,77 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             if not any(kw in text_lower for kw in DATA_QUERY_KEYWORDS):
                 tasks = await extract_tasks_from_message(text, user.full_name)
-                saved_count = 0
-                task_lines = []
+                group_chat_id_for_tasks = int(os.getenv("GROUP_CHAT_ID", "0"))
+
                 for task in tasks:
                     executor = task.get("executor", "")
                     if not task.get("task") or not executor:
                         continue
-                    db.save_task(
-                        text=task["task"],
-                        executor=executor,
-                        deadline=task.get("deadline"),
-                        source_chat=chat_id,
-                        source_message_id=message.message_id,
-                        created_by=user.full_name
-                    )
-                    saved_count += 1
-                    deadline = task.get("deadline")
-                    if deadline:
-                        from datetime import date
-                        MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-                        try:
-                            d = date.fromisoformat(deadline)
-                            deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
-                        except Exception:
-                            deadline_str = f" · до {deadline}"
-                    else:
-                        deadline_str = ""
-                    task_lines.append(f"👤 *{executor}*{deadline_str}: {task['task']}")
-                    logger.info(f"Задача: {executor} → {task['task']}")
 
-                if saved_count > 0:
-                    lines = [f"📌 Зафиксировано задач: {saved_count}\n"] + task_lines
-                    sent = await message.reply_text("\n".join(lines), parse_mode="Markdown")
-                    if sent:
-                        tasks_from_this_msg = db._fetchall(
-                            "SELECT id FROM tasks WHERE source_message_id=%s AND source_chat=%s AND bot_message_id IS NULL",
-                            (message.message_id, chat_id)
+                    # Если "всем менеджерам" — разворачиваем в список МОП
+                    executors = []
+                    exec_lower = executor.lower()
+                    if any(w in exec_lower for w in ["всем", "все менеджер", "мop", "мoп", "отдел продаж", "команда"]):
+                        executors = MOP_MANAGERS
+                    else:
+                        executors = [executor]
+
+                    for exec_name in executors:
+                        task_id = db.save_task(
+                            text=task["task"],
+                            executor=exec_name,
+                            deadline=task.get("deadline"),
+                            source_chat=chat_id,
+                            source_message_id=message.message_id,
+                            created_by=user.full_name
                         )
-                        for t in tasks_from_this_msg:
-                            db.set_task_bot_message_id(t['id'], sent.message_id)
+
+                        deadline = task.get("deadline")
+                        if deadline:
+                            from datetime import date as _date
+                            MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
+                            try:
+                                d = _date.fromisoformat(deadline)
+                                deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
+                            except Exception:
+                                deadline_str = f" · до {deadline}"
+                        else:
+                            deadline_str = ""
+
+                        # 1. Публикуем в группу PRO без кнопок
+                        if group_chat_id_for_tasks:
+                            pub_text = (
+                                f"📌 *Задача*\n"
+                                f"👤 *{exec_name}*{deadline_str}\n"
+                                f"{task['task']}\n\n"
+                                f"_От: {user.full_name}_"
+                            )
+                            sent = await context.bot.send_message(
+                                chat_id=group_chat_id_for_tasks,
+                                text=pub_text,
+                                parse_mode="Markdown"
+                            )
+                            if sent:
+                                db.set_task_bot_message_id(task_id, sent.message_id)
+
+                        # 2. Дублируем исполнителю в личку с кнопкой
+                        mgr_chat_id = db.get_manager_chat_id(exec_name.split()[0])
+                        if mgr_chat_id:
+                            personal_text = (
+                                f"📋 *Тебе задача*{deadline_str}:\n\n"
+                                f"{task['task']}\n\n"
+                                f"_От: {user.full_name}_"
+                            )
+                            await context.bot.send_message(
+                                chat_id=mgr_chat_id,
+                                text=personal_text,
+                                parse_mode="Markdown",
+                                reply_markup=InlineKeyboardMarkup([[
+                                    InlineKeyboardButton("✅ Выполнено", callback_data=f"task_done|{task_id}")
+                                ]])
+                            )
+
+                        logger.info(f"Задача #{task_id}: {exec_name} → {task['task']}")
 
     # 3. Автозакрытие задач — Claude анализирует контекст
     sender_name = update.effective_user.full_name if update.effective_user else ""
@@ -3000,7 +3142,7 @@ async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/pdz — запускает утренние задачи ПДЗ по всем менеджерам с паузой 2 мин."""
+    """/pdz — ПДЗ в группу + задача менеджерам в личку."""
     user = update.message.from_user
     manager_ids_str = os.getenv("MANAGER_IDS", "")
     manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
@@ -3015,20 +3157,30 @@ async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = _date.today().isoformat()
     pdz_launched_today.add(today)
 
+    # Подтягиваем chat_id менеджеров из БД
+    managers_with_ids = []
+    for mgr in PDZ_MANAGERS:
+        mgr_copy = dict(mgr)
+        cid = db.get_manager_chat_id(mgr.get("name_fragment", mgr["name"]))
+        mgr_copy["chat_id"] = cid
+        if not cid:
+            logger.warning(f"cmd_pdz: нет chat_id для {mgr['name']}")
+        managers_with_ids.append(mgr_copy)
+
     await update.message.reply_text(
-        f"📋 Запускаю ПДЗ задачи для {len(PDZ_MANAGERS)} менеджеров.\n"
-        f"Интервал: 2 минуты между каждым."
+        f"📋 Запускаю ПДЗ для {len(managers_with_ids)} менеджеров.\n"
+        f"Интервал: 2 минуты. Результаты — боту в личку."
     )
 
-    for i, mgr in enumerate(PDZ_MANAGERS):
+    for i, mgr in enumerate(managers_with_ids):
         try:
             await pdz_morning_task(context.application, mgr)
         except Exception as e:
             logger.error(f"cmd_pdz ошибка для {mgr['name']}: {e}")
-        if i < len(PDZ_MANAGERS) - 1:
-            await asyncio.sleep(120)  # 2 минуты
+        if i < len(managers_with_ids) - 1:
+            await asyncio.sleep(120)
 
-    await update.message.reply_text("✅ Все задачи ПДЗ отправлены. Сводка придёт в 17:00.")
+    await update.message.reply_text("✅ Готово. Сводка результатов придёт в 17:00.")
 
 
 async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3234,6 +3386,7 @@ def main():
         logger.warning(f"Не удалось восстановить pending_idents: {e}")
 
     # Команды
+    app.add_handler(CallbackQueryHandler(handle_task_done_callback, pattern="^task_done\\|"))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CallbackQueryHandler(handle_menu_callback, pattern="^menu_"))
     app.add_handler(CommandHandler("mychatid", cmd_mychatid))
