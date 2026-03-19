@@ -31,13 +31,14 @@ def get_group_chat_id():
 
 
 # Менеджеры ПДЗ — порядок определяет очерёдность отправки (2 мин между каждым)
+# chat_id подтягивается из БД (менеджер пишет /mychatid боту)
 PDZ_MANAGERS = [
-    {"name": "Карина",   "tag": "баласанян"},
-    {"name": "Елена",    "tag": "мерзлякова"},
-    {"name": "Инесса",   "tag": "скляр"},
-    {"name": "Татьяна",  "tag": "голубева"},
-    {"name": "Алексей",  "tag": "леонтьев"},
-    {"name": "Сергей",   "tag": "черентаев"},
+    {"name": "Карина",   "tag": "баласанян",  "name_fragment": "Баласанян"},
+    {"name": "Елена",    "tag": "мерзлякова", "name_fragment": "Мерзлякова"},
+    {"name": "Инесса",   "tag": "скляр",      "name_fragment": "Скляр"},
+    {"name": "Татьяна",  "tag": "голубева",   "name_fragment": "Голубева"},
+    {"name": "Алексей",  "tag": "леонтьев",   "name_fragment": "Леонтьев"},
+    {"name": "Сергей",   "tag": "черентаев",  "name_fragment": "Черентаев"},
 ]
 
 # Флаг — был ли запущен /pdz сегодня (для вечерней сводки)
@@ -130,7 +131,10 @@ async def remind_today_tasks(app: Application, db):
 
 
 async def pdz_morning_task(app: Application, mgr: dict):
-    """Отправляет задачу по ПДЗ конкретному менеджеру. Вызывается из /pdz."""
+    """
+    Отправляет ПДЗ по менеджеру в группу.
+    Затем шлёт менеджеру в личку задачу проработать дебиторку.
+    """
     chat_id = get_group_chat_id()
     if not chat_id:
         return
@@ -143,25 +147,53 @@ async def pdz_morning_task(app: Application, mgr: dict):
 
     try:
         items = await get_overdue_demands(tag=mgr["tag"])
+
         if not items:
             logger.info(f"pdz_morning_task: нет просрочки у {mgr['name']}")
-            await app.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ *{mgr['name']}* — просроченных долгов нет.",
-                parse_mode="Markdown"
-            )
+            # В личку — нет долгов
+            mgr_chat_id = mgr.get("chat_id")
+            if mgr_chat_id:
+                try:
+                    await app.bot.send_message(
+                        chat_id=mgr_chat_id,
+                        text=f"✅ {mgr['name']}, у твоих клиентов сегодня нет просроченной дебиторки. Хорошая работа!"
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось написать {mgr['name']} в личку: {e}")
             return
 
         pdz_text = format_overdue_summary(items)
-        text = (
-            f"📋 *{mgr['name']}*, задача на сегодня:\n\n"
-            f"Свяжись с клиентами по просроченной задолженности и напиши "
-            f"в группу кто и когда оплатит. Срок — до 17:00.\n\n"
-            f"{pdz_text}"
-        )
 
-        await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-        logger.info(f"pdz_morning_task отправлена для {mgr['name']}")
+        # 1. Отправляем ПДЗ в группу
+        group_msg = await app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"📋 *Дебиторка — {mgr['name']}*\n\n"
+                f"{pdz_text}"
+            ),
+            parse_mode="Markdown"
+        )
+        logger.info(f"pdz_morning_task: ПДЗ {mgr['name']} отправлена в группу")
+
+        # 2. Пишем менеджеру в личку
+        mgr_chat_id = mgr.get("chat_id")
+        if mgr_chat_id:
+            try:
+                await app.bot.send_message(
+                    chat_id=mgr_chat_id,
+                    text=(
+                        f"📋 *{mgr['name']}, задача по дебиторке*\n\n"
+                        f"Твоя просроченная дебиторка опубликована в группе.\n"
+                        f"Свяжись с каждым клиентом и пиши результаты *мне в личку* — "
+                        f"кто и когда оплатит.\n\n"
+                        f"Срок отчёта — до 17:00.\n\n"
+                        f"Пример: _«Атмосфера — оплатит в пятницу 21.03»_"
+                    ),
+                    parse_mode="Markdown"
+                )
+                logger.info(f"pdz_morning_task: личка {mgr['name']} отправлена")
+            except Exception as e:
+                logger.warning(f"Не удалось написать {mgr['name']} в личку: {e}")
 
     except Exception as e:
         logger.error(f"Ошибка pdz_morning_task для {mgr['name']}: {e}", exc_info=True)
@@ -178,13 +210,11 @@ def record_group_message(sender_name: str, tag: str, text: str):
 
 
 async def pdz_evening_summary(app: Application):
-    """В 17:00 анализирует ответы менеджеров и отправляет сводку по ПДЗ."""
-    from claude_ai import analyze_pdz_responses
+    """В 17:00 собирает результаты из БД и отправляет сводку по каждому менеджеру."""
     import asyncio
 
     today = date.today().isoformat()
 
-    # Отправляем только если /pdz был запущен сегодня
     if today not in pdz_launched_today:
         logger.info("pdz_evening_summary: /pdz не запускался сегодня, пропускаем")
         return
@@ -193,47 +223,51 @@ async def pdz_evening_summary(app: Application):
     if not chat_id:
         return
 
-    day_data = pdz_day_messages.get(today, {})
-
     try:
-        results = {}
-        for mgr in PDZ_MANAGERS:
-            tag = mgr["tag"]
-            items = await get_overdue_demands(tag=tag)
-            messages = day_data.get(tag, [])
-            messages += day_data.get("_all", [])
-            results[mgr["name"]] = {
-                "items": items or [],
-                "messages": messages,
-            }
+        from database import Database
+        db_local = Database()
+        results = db_local.get_pdz_results_today()
 
-        summary = await analyze_pdz_responses(results)
+        # Группируем по менеджеру
+        by_manager = {}
+        for r in results:
+            name = r.get("manager_name", "Неизвестный")
+            if name not in by_manager:
+                by_manager[name] = []
+            by_manager[name].append(r.get("result_text", ""))
 
         # Отправляем по каждому менеджеру с паузой 2 мин
         for i, mgr in enumerate(PDZ_MANAGERS):
             mgr_name = mgr["name"]
-            mgr_result = results.get(mgr_name, {})
-            items = mgr_result.get("items") or []
-            msgs = mgr_result.get("messages", [])
+            # Ищем результаты по фрагменту имени
+            mgr_results = []
+            frag = mgr.get("name_fragment", mgr_name).lower()
+            for full_name, msgs in by_manager.items():
+                if frag in full_name.lower():
+                    mgr_results = msgs
+                    break
 
-            if not items:
-                continue
-
+            # Текущая просрочка
+            items = await get_overdue_demands(tag=mgr["tag"])
             from moysklad import format_overdue_demands
-            pdz_text = format_overdue_demands(items)
-            msgs_text = "\n".join(f"  — {m}" for m in msgs[-5:]) if msgs else "  — нет ответов"
+            pdz_text = format_overdue_demands(items) if items else "✅ Просрочек нет"
+
+            if mgr_results:
+                results_text = "\n".join(f"  — {r}" for r in mgr_results)
+            else:
+                results_text = "  — ответов не поступало"
 
             text = (
                 f"📊 *Итог дня — {mgr_name}*\n\n"
                 f"{pdz_text}\n\n"
-                f"💬 Ответы за день:\n{msgs_text}"
+                f"💬 *Результаты работы:*\n{results_text}"
             )
 
             await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
             logger.info(f"pdz_evening_summary отправлена для {mgr_name}")
 
             if i < len(PDZ_MANAGERS) - 1:
-                await asyncio.sleep(120)  # 2 минуты между менеджерами
+                await asyncio.sleep(120)
 
     except Exception as e:
         logger.error(f"Ошибка pdz_evening_summary: {e}", exc_info=True)
