@@ -381,6 +381,9 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif action == "menu_cancel":
         await query.message.delete()
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *Все команды:*\n\n"
         "*Задачи:*\n"
