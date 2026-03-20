@@ -267,6 +267,10 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
         ],
         [
+            InlineKeyboardButton("📊 Статистика бота", callback_data="menu_stats"),
+            InlineKeyboardButton("🔒 Заблокировать", callback_data="menu_block"),
+        ],
+        [
             InlineKeyboardButton("🗑 Очистить открытые", callback_data="menu_clearopen"),
             InlineKeyboardButton("💣 Очистить ВСЕ", callback_data="menu_clearall"),
         ],
@@ -425,6 +429,56 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         for name, contact in MANAGERS_CONTACTS.items():
             lines.append(f"• {name}: {contact}")
         await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    elif action == "menu_stats":
+        stats = db.get_usage_stats()
+        if not stats:
+            await query.message.reply_text("📭 Статистики пока нет.")
+        else:
+            lines = ["📊 *Статистика использования бота*\n"]
+            for s in stats:
+                blocked = " 🔒" if s.get("is_blocked") else ""
+                last = s.get("last_seen")
+                last_str = last.strftime("%d.%m %H:%M") if last else "—"
+                lines.append(
+                    f"👤 *{s.get('full_name','?')}*{blocked}\n"
+                    f"   `{s.get('user_id')}` · {s.get('request_count',0)} зап. · {last_str}"
+                )
+            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    elif action == "menu_block":
+        stats = db.get_usage_stats()
+        if not stats:
+            await query.message.reply_text("Нет пользователей.")
+            return
+        buttons = []
+        for s in stats:
+            if s.get("user_id") == 360092495:
+                continue
+            status = "🔒" if s.get("is_blocked") else "✅"
+            cb = f"menu_toggleblock|{s['user_id']}"
+            buttons.append([InlineKeyboardButton(
+                f"{status} {s.get('full_name','?')} ({s.get('request_count',0)} зап.)",
+                callback_data=cb
+            )])
+        buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_cancel")])
+        await query.message.reply_text(
+            "🔒 *Управление доступом*\nНажми на пользователя чтобы заблокировать/разблокировать:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    elif action.startswith("menu_toggleblock|"):
+        uid = int(action.split("|")[1])
+        row = db._fetchone("SELECT full_name, is_blocked FROM manager_chats WHERE user_id=%s", (uid,))
+        if row:
+            if row.get("is_blocked"):
+                db.unblock_user(uid)
+                await query.answer(f"🔓 {row['full_name']} разблокирован")
+            else:
+                db.block_user(uid)
+                await query.answer(f"🔒 {row['full_name']} заблокирован")
+        await query.message.delete()
 
     elif action == "menu_cancel":
         await query.message.delete()
@@ -1517,6 +1571,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = message.chat_id
     user = message.from_user
     text = message.text or message.caption or ""
+
+    # Проверяем блокировку
+    if user and db.is_user_blocked(user.id):
+        await message.reply_text("⛔ Доступ ограничен. Обратитесь к руководителю.")
+        return
+
+    # Логируем запрос
+    if user and text:
+        db.log_usage(user.id, user.full_name, text[:100], chat_id)
 
     # Обработка ожидаемого ввода из меню (фото / ПДЗ клиента)
     awaiting = context.user_data.get("awaiting") if context.user_data else None
@@ -3373,7 +3436,55 @@ async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Готово. Сводка результатов придёт в 17:00.")
 
 
-async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/block [user_id] — заблокировать пользователя."""
+    if not update.effective_user or update.effective_user.id != 360092495:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /block [user_id]")
+        return
+    try:
+        uid = int(context.args[0])
+        db.block_user(uid)
+        await update.message.reply_text(f"🔒 Пользователь {uid} заблокирован.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}")
+
+
+async def cmd_unblock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unblock [user_id] — разблокировать пользователя."""
+    if not update.effective_user or update.effective_user.id != 360092495:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /unblock [user_id]")
+        return
+    try:
+        uid = int(context.args[0])
+        db.unblock_user(uid)
+        await update.message.reply_text(f"🔓 Пользователь {uid} разблокирован.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}")
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/stats — статистика использования бота."""
+    if not update.effective_user or update.effective_user.id != 360092495:
+        return
+    stats = db.get_usage_stats()
+    if not stats:
+        await update.message.reply_text("📭 Статистики пока нет.")
+        return
+    lines = ["📊 *Статистика использования бота*\n"]
+    for s in stats:
+        blocked = " 🔒" if s.get("is_blocked") else ""
+        last = s.get("last_seen")
+        last_str = last.strftime("%d.%m %H:%M") if last else "—"
+        lines.append(
+            f"👤 *{s.get('full_name','?')}*{blocked}\n"
+            f"   ID: `{s.get('user_id')}` · Запросов: {s.get('request_count',0)} · "
+            f"Был: {last_str}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     """/pdz_results — результаты ПДЗ в личку по каждому менеджеру."""
     user = update.effective_user
     if not user or user.id != 360092495:
@@ -3708,6 +3819,9 @@ def main():
 
     # Команды
     app.add_handler(CallbackQueryHandler(handle_task_done_callback, pattern="^task_done\\|"))
+    app.add_handler(CommandHandler("block", cmd_block_user))
+    app.add_handler(CommandHandler("unblock", cmd_unblock_user))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("usermenu", cmd_user_menu))
     app.add_handler(CallbackQueryHandler(handle_user_menu_callback, pattern="^user_"))
     app.add_handler(CommandHandler("menu", cmd_menu))
