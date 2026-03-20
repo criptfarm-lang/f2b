@@ -3226,27 +3226,36 @@ async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     OWNER_ID = 360092495
     from scheduler import PDZ_MANAGERS
+    from moysklad import get_overdue_demands
+
+    # Берём сегодняшние результаты, если нет — последние доступные
+    today_results = db.get_pdz_results_today()
+    if today_results:
+        all_results = today_results
+        date_label = "сегодня"
+    else:
+        last_date, all_results = db.get_pdz_results_last()
+        if not all_results:
+            await context.bot.send_message(chat_id=OWNER_ID, text="📭 Результатов по ПДЗ пока нет.")
+            return
+        date_label = last_date.strftime("%d.%m.%Y") if hasattr(last_date, "strftime") else str(last_date)
 
     sent_any = False
     for mgr in PDZ_MANAGERS:
-        # Получаем результаты этого менеджера
-        all_results = db.get_pdz_results_today()
         frag = mgr.get("name_fragment", mgr["name"]).lower()
         mgr_results = [
             r.get("result_text", "") for r in all_results
             if frag in r.get("manager_name", "").lower()
         ]
 
-        # Получаем текущую просрочку этого менеджера
-        from moysklad import get_overdue_demands
+        # Текущая просрочка
         items = await get_overdue_demands(tag=mgr["tag"])
         if not items:
-            continue  # нет просрочки — пропускаем
+            continue
 
-        # Клиенты из просрочки
         overdue_clients = [i.get("name", "") for i in items]
 
-        # Определяем по каким клиентам нет ответа
+        # Клиенты с ответами
         answered_clients = []
         for res_text in mgr_results:
             res_lower = res_text.lower()
@@ -3257,15 +3266,12 @@ async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         unanswered = [c for c in overdue_clients if c not in answered_clients]
 
-        # Формируем сообщение
-        lines = [f"📊 *{mgr['name']} — ПДЗ*\n"]
-
+        lines = [f"📊 *{mgr['name']} — ПДЗ* ({date_label})\n"]
         if mgr_results:
             lines.append("💬 *Ответы менеджера:*")
             for r in mgr_results:
                 lines.append(f"   — {r}")
             lines.append("")
-
         if unanswered:
             lines.append("❓ *Без ответа:*")
             for c in unanswered:
@@ -3275,18 +3281,10 @@ async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = "\n".join(lines)
 
-        # Кнопка только если есть клиенты без ответа
         keyboard = None
         if unanswered:
             mgr_chat_id = db.get_manager_chat_id(mgr.get("name_fragment", mgr["name"]))
             if mgr_chat_id:
-                import json
-                payload = json.dumps({
-                    "mgr_name": mgr["name"],
-                    "mgr_chat_id": mgr_chat_id,
-                    "clients": unanswered[:5]  # max 5 в callback_data
-                })
-                # Сохраняем payload в БД, передаём только ID
                 alert_id = db.save_price_alert(
                     order_id=f"pdz_{mgr['tag']}",
                     order_name=", ".join(unanswered[:3]),
@@ -3296,25 +3294,18 @@ async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     alert_text=text
                 )
                 keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "📨 Запросить комментарии",
-                        callback_data=f"pdz_request|{alert_id}"
-                    )
+                    InlineKeyboardButton("📨 Запросить комментарии",
+                                         callback_data=f"pdz_request|{alert_id}")
                 ]])
 
         await context.bot.send_message(
-            chat_id=OWNER_ID,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=keyboard
+            chat_id=OWNER_ID, text=text,
+            parse_mode="Markdown", reply_markup=keyboard
         )
         sent_any = True
 
     if not sent_any:
-        await context.bot.send_message(
-            chat_id=OWNER_ID,
-            text="📭 Просроченных долгов по менеджерам нет.",
-        )
+        await context.bot.send_message(chat_id=OWNER_ID, text="📭 Просроченных долгов нет.")
 
 
 async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
