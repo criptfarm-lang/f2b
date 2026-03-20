@@ -1542,25 +1542,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from datetime import date as _date
         today_str = _date.today().isoformat()
         if today_str in pdz_launched_today:
-            db.save_pdz_result(
-                manager_name=user.full_name,
-                manager_user_id=user.id,
-                result_text=text
+            text_lower = text.lower()
+
+            # Фильтруем — НЕ сохраняем если это запрос к боту или нерелевантное сообщение
+            is_bot_request = (
+                text_lower.startswith("эф") or
+                text_lower.startswith("пришли фото") or
+                text_lower.startswith("фото ") or
+                "пдз пробка" in text_lower or
+                "/pdz" in text_lower or
+                len(text.strip()) < 5
             )
-            # Пишем в pdz_day_messages для вечерней сводки
-            from scheduler import pdz_day_messages, PDZ_MANAGERS
-            if today_str not in pdz_day_messages:
-                pdz_day_messages[today_str] = {}
-            mgr_tag = "_all"
-            for mgr in PDZ_MANAGERS:
-                frag = mgr.get("name_fragment", mgr["name"]).lower()
-                if frag in user.full_name.lower():
-                    mgr_tag = mgr["tag"]
-                    break
-            if mgr_tag not in pdz_day_messages[today_str]:
-                pdz_day_messages[today_str][mgr_tag] = []
-            pdz_day_messages[today_str][mgr_tag].append(f"{user.full_name}: {text}")
-            await message.reply_text("✅ Принял, записал для отчёта.")
+
+            # Признаки ПДЗ ответа — упоминание оплаты/суммы/клиента/даты
+            pdz_keywords = [
+                "оплат", "перевод", "платёж", "платеж", "платежк",
+                "тыс", "руб", "завтра", "пятниц", "понедельник",
+                "вторник", "среда", "четверг", "задолженност",
+                "ип ", "ооо ", "пришлёт", "пришлет", "перечислит",
+                "отсрочк", "просрочк", "долг"
+            ]
+            is_pdz_result = any(kw in text_lower for kw in pdz_keywords)
+
+            if not is_bot_request and is_pdz_result:
+                db.save_pdz_result(
+                    manager_name=user.full_name,
+                    manager_user_id=user.id,
+                    result_text=text
+                )
+                from scheduler import pdz_day_messages, PDZ_MANAGERS
+                if today_str not in pdz_day_messages:
+                    pdz_day_messages[today_str] = {}
+                mgr_tag = "_all"
+                for mgr in PDZ_MANAGERS:
+                    frag = mgr.get("name_fragment", mgr["name"]).lower()
+                    if frag in user.full_name.lower():
+                        mgr_tag = mgr["tag"]
+                        break
+                if mgr_tag not in pdz_day_messages[today_str]:
+                    pdz_day_messages[today_str][mgr_tag] = []
+                pdz_day_messages[today_str][mgr_tag].append(f"{user.full_name}: {text}")
+                await message.reply_text("✅ Принял, записал для отчёта.")
+            elif is_bot_request:
+                # Это запрос к боту — не отвечаем (обработается ниже)
+                pass
+            else:
+                await message.reply_text(
+                    "ℹ️ Не похоже на ответ по дебиторке.\n"
+                    "Напиши например: _«Атмосфера оплатит в пятницу»_",
+                    parse_mode="Markdown"
+                )
             return
 
         # 4. Прочие сообщения в личке — бот не реагирует
