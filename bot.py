@@ -147,25 +147,58 @@ def clean_query(text: str) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
-    # Сохраняем chat_id в БД если это личный чат
     if user and chat_id == user.id:
         db.save_manager_chat_id(user.id, user.full_name)
         logger.info(f"cmd_start: сохранён chat_id={chat_id} name={user.full_name}")
     await update.message.reply_text(
-        "👋 Привет! Я Эф — ассистент F2B PRO.\n\n"
-        "Обращайся ко мне: *Эф, [вопрос]*\n\n"
-        "Примеры:\n"
-        "• Эф, пришли фото тунца\n"
-        "• Эф, какая цена на лосось?\n"
-        "• Эф, задачи Карины\n"
-        "• Эф, кто нам должен?\n\n"
-        "Команды:\n"
-        "/tasks — мои задачи\n"
-        "/report — отчёт\n"
-        "/mychatid — мой chat ID\n"
-        "/help — все команды",
-        parse_mode="Markdown"
+        f"👋 Привет, *{user.full_name if user else 'друг'}*! Я Эф — ассистент F2B PRO.\n\n"
+        f"Используй меню ниже или обращайся: *Эф, [вопрос]*",
+        parse_mode="Markdown",
+        reply_markup=_user_menu_keyboard()
     )
+
+
+def _user_menu_keyboard() -> InlineKeyboardMarkup:
+    """Общее меню для всех пользователей."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📸 Запросить фото товара", callback_data="user_photo"),
+            InlineKeyboardButton("💰 ПДЗ клиента", callback_data="user_pdz_client"),
+        ],
+    ])
+
+
+async def cmd_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/usermenu — общее меню."""
+    await update.message.reply_text(
+        "Выбери действие:",
+        reply_markup=_user_menu_keyboard()
+    )
+
+
+async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик общего меню пользователей."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    action = query.data
+
+    if action == "user_photo":
+        await query.message.reply_text(
+            "📸 Напиши название товара — пришлю фото.\n"
+            "Например: _форель охл трим С_",
+            parse_mode="Markdown"
+        )
+        # Сохраняем ожидание запроса фото
+        context.user_data["awaiting"] = "photo"
+
+    elif action == "user_pdz_client":
+        await query.message.reply_text(
+            "💰 Напиши название клиента — покажу его дебиторку.\n"
+            "Например: _Атмосфера_ или _ИТФИШ_",
+            parse_mode="Markdown"
+        )
+        context.user_data["awaiting"] = "pdz_client"
 
 
 async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -205,9 +238,22 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Панель управления — только для руководителя."""
     user = update.effective_user
     if not user or user.id != 360092495:
+        # Для остальных — общее меню
+        await update.message.reply_text(
+            "Выбери действие:",
+            reply_markup=_user_menu_keyboard()
+        )
         return
 
     keyboard = InlineKeyboardMarkup([
+        # ── Доступно всем ──────────────────────────────────────────
+        [InlineKeyboardButton("── Общие функции ──", callback_data="menu_noop")],
+        [
+            InlineKeyboardButton("📸 Фото товара", callback_data="user_photo"),
+            InlineKeyboardButton("💰 ПДЗ клиента", callback_data="user_pdz_client"),
+        ],
+        # ── Только руководитель ────────────────────────────────────
+        [InlineKeyboardButton("── Только для меня ──", callback_data="menu_noop")],
         [
             InlineKeyboardButton("📋 Все задачи", callback_data="menu_all_tasks"),
             InlineKeyboardButton("⏰ Просроченные", callback_data="menu_overdue"),
@@ -244,7 +290,24 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     action = query.data
 
-    if action == "menu_all_tasks":
+    if action == "menu_noop":
+        return  # разделитель — ничего не делаем
+
+    elif action == "user_photo":
+        await query.message.reply_text(
+            "📸 Напиши название товара — пришлю фото.\nНапример: _форель охл трим С_",
+            parse_mode="Markdown"
+        )
+        context.user_data["awaiting"] = "photo"
+
+    elif action == "user_pdz_client":
+        await query.message.reply_text(
+            "💰 Напиши название клиента — покажу его дебиторку.\nНапример: _Атмосфера_",
+            parse_mode="Markdown"
+        )
+        context.user_data["awaiting"] = "pdz_client"
+
+    elif action == "menu_all_tasks":
         from database import Database
         tasks = db.get_all_open_tasks()
         if not tasks:
@@ -1454,6 +1517,80 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = message.chat_id
     user = message.from_user
     text = message.text or message.caption or ""
+
+    # Обработка ожидаемого ввода из меню (фото / ПДЗ клиента)
+    awaiting = context.user_data.get("awaiting") if context.user_data else None
+    if awaiting and user and chat_id == user.id and text and not text.startswith("/"):
+        context.user_data.pop("awaiting", None)
+
+        if awaiting == "photo":
+            from moysklad import find_product_photos
+            await message.reply_chat_action("upload_photo")
+            photos = await find_product_photos(text)
+            if photos:
+                for p in photos[:3]:
+                    try:
+                        await context.bot.send_photo(chat_id=chat_id, photo=p)
+                    except Exception:
+                        pass
+            else:
+                await message.reply_text(f"😕 Фото *{text}* не найдено.", parse_mode="Markdown")
+            await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+            return
+
+        elif awaiting == "pdz_client":
+            await message.reply_chat_action("typing")
+            from moysklad import get_counterparty_balance, get_overdue_demands
+            counterparties = await get_counterparty_balance(text)
+            if not counterparties:
+                await message.reply_text(f"❌ Клиент *{text}* не найден.", parse_mode="Markdown")
+                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+                return
+
+            cp = counterparties[0]
+            cp_name = cp.get("name", text)
+            balance = cp.get("balance", 0)
+            tags = cp.get("tags", [])
+
+            MANAGER_TAG_MAP = {
+                "баласанян": "Карина Баласанян", "мерзлякова": "Елена Мерзлякова",
+                "скляр": "Инесса Скляр", "голубева": "Татьяна Голубева",
+                "леонтьев": "Алексей Леонтьев", "черентаев": "Сергей Черентаев",
+            }
+            manager = "Не назначен"
+            for tag in tags:
+                if tag.lower() in MANAGER_TAG_MAP:
+                    manager = MANAGER_TAG_MAP[tag.lower()]
+                    break
+
+            overdue_items = await get_overdue_demands(query=cp_name)
+            overdue_sum = sum(i.get("overdue_sum", 0) for i in overdue_items) if overdue_items else 0
+            overdue_lines = []
+            if overdue_items:
+                for item in overdue_items:
+                    for d in item.get("demands", []):
+                        overdue_lines.append(
+                            f"   └ {d.get('name','')} · {d.get('due','')} · "
+                            f"{d.get('unpaid',0):,.2f} руб. · {d.get('days',0)} дн."
+                        )
+
+            lines = [
+                f"📊 *{cp_name}*\n",
+                f"👤 Менеджер: *{manager}*",
+                f"🏷 Теги: {', '.join(tags) if tags else '—'}",
+                f"💵 Общий долг: *{abs(balance):,.2f} руб.*",
+            ]
+            if overdue_sum > 0:
+                lines.append(f"🔴 Просрочено: *{overdue_sum:,.2f} руб.*")
+                if overdue_lines:
+                    lines.append("\n*Просроченные заказы:*")
+                    lines.extend(overdue_lines[:5])
+            else:
+                lines.append("✅ Просроченных долгов нет")
+
+            await message.reply_text("\n".join(lines), parse_mode="Markdown",
+                                     reply_markup=_user_menu_keyboard())
+            return
 
     # Ответ менеджера на алерт цены в личке — пересылаем Виктору
     OWNER_ID = 360092495
@@ -3571,6 +3708,8 @@ def main():
 
     # Команды
     app.add_handler(CallbackQueryHandler(handle_task_done_callback, pattern="^task_done\\|"))
+    app.add_handler(CommandHandler("usermenu", cmd_user_menu))
+    app.add_handler(CallbackQueryHandler(handle_user_menu_callback, pattern="^user_"))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CallbackQueryHandler(handle_menu_callback, pattern="^menu_"))
     app.add_handler(CommandHandler("mychatid", cmd_mychatid))
