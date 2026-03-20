@@ -1595,7 +1595,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif awaiting == "pdz_client":
             await message.reply_chat_action("typing")
-            from moysklad import get_counterparty_balance, get_overdue_demands
+            from moysklad import get_overdue_demands
             counterparties = await get_counterparty_balance(text)
             if not counterparties:
                 await message.reply_text(f"❌ Клиент *{text}* не найден.", parse_mode="Markdown")
@@ -3049,18 +3049,30 @@ async def save_media(message: Message, media_type: str):
 
 
 async def search_photo_in_content_channel(context: ContextTypes.DEFAULT_TYPE, query: str) -> list:
-    """Ищет фото в канале Контент F2B по ключевым словам в подписи.
-    Возвращает список (file_id, caption) подходящих фото.
-    """
+    """Ищет фото в канале Контент F2B по ключевым словам."""
     content_chat_id = int(os.getenv("CONTENT_CHAT_ID", "-1001433042091"))
     query_lower = query.lower()
     results = []
+    seen = set()
 
-    # Ищем в локальной БД (фото из канала сохраняются при поступлении)
+    # Сначала ищем по полному запросу
     photos = db.search_media(query_lower, media_type="photo")
     for p in photos:
-        if p.get("chat_id") == content_chat_id:
+        if p.get("chat_id") == content_chat_id and p["file_id"] not in seen:
             results.append({"file_id": p["file_id"], "caption": p.get("caption", "")})
+            seen.add(p["file_id"])
+
+    # Если не нашли — ищем по каждому значимому слову
+    if not results:
+        words = [w for w in query_lower.split() if len(w) >= 4]
+        for word in words:
+            photos = db.search_media(word, media_type="photo")
+            for p in photos:
+                if p.get("chat_id") == content_chat_id and p["file_id"] not in seen:
+                    results.append({"file_id": p["file_id"], "caption": p.get("caption", "")})
+                    seen.add(p["file_id"])
+            if results:
+                break  # нашли по первому слову — достаточно
 
     return results
 
