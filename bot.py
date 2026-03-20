@@ -3575,6 +3575,92 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=OWNER_ID, text="📭 Просроченных долгов нет.")
 
 
+async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pdz_results — результаты ПДЗ в личку по каждому менеджеру."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+
+    OWNER_ID = 360092495
+    from scheduler import PDZ_MANAGERS
+    from moysklad import get_overdue_demands
+
+    today_results = db.get_pdz_results_today()
+    if today_results:
+        all_results = today_results
+        date_label = "сегодня"
+    else:
+        last_date, all_results = db.get_pdz_results_last()
+        if not all_results:
+            await context.bot.send_message(chat_id=OWNER_ID, text="📭 Результатов по ПДЗ пока нет.")
+            return
+        date_label = last_date.strftime("%d.%m.%Y") if hasattr(last_date, "strftime") else str(last_date)
+
+    sent_any = False
+    for mgr in PDZ_MANAGERS:
+        frag = mgr.get("name_fragment", mgr["name"]).lower()
+        mgr_results = [
+            r.get("result_text", "") for r in all_results
+            if frag in r.get("manager_name", "").lower()
+        ]
+
+        items = await get_overdue_demands(tag=mgr["tag"])
+        overdue_clients = [i.get("name", "") for i in items] if items else []
+
+        answered_clients = []
+        for res_text in mgr_results:
+            res_lower = res_text.lower()
+            for client in overdue_clients:
+                if any(w.lower() in res_lower for w in client.split() if len(w) >= 4):
+                    if client not in answered_clients:
+                        answered_clients.append(client)
+
+        unanswered = [c for c in overdue_clients if c not in answered_clients]
+
+        lines = [f"📊 *{mgr['name']} — ПДЗ* ({date_label})\n"]
+        if not overdue_clients:
+            lines.append("✅ Просроченных долгов нет")
+        else:
+            if mgr_results:
+                lines.append("💬 *Ответы менеджера:*")
+                for r in mgr_results:
+                    lines.append(f"   — {r}")
+                lines.append("")
+            if unanswered:
+                lines.append("❓ *Без ответа:*")
+                for c in unanswered:
+                    lines.append(f"   • {c}")
+            else:
+                lines.append("✅ По всем клиентам есть ответы")
+
+        text = "\n".join(lines)
+        keyboard = None
+        if unanswered:
+            mgr_chat_id = db.get_manager_chat_id(mgr.get("name_fragment", mgr["name"]))
+            if mgr_chat_id:
+                alert_id = db.save_price_alert(
+                    order_id=f"pdz_{mgr['tag']}",
+                    order_name=", ".join(unanswered[:3]),
+                    client_name=", ".join(unanswered[:3]),
+                    manager_name=mgr["name"],
+                    manager_user_id=mgr_chat_id,
+                    alert_text=text
+                )
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📨 Запросить комментарии",
+                                         callback_data=f"pdz_request|{alert_id}")
+                ]])
+
+        await context.bot.send_message(
+            chat_id=OWNER_ID, text=text,
+            parse_mode="Markdown", reply_markup=keyboard
+        )
+        sent_any = True
+
+    if not sent_any:
+        await context.bot.send_message(chat_id=OWNER_ID, text="📭 Просроченных долгов нет.")
+
+
 async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тестовый запуск утренних задач ПДЗ. /pdz_test [имя|all]"""
     user = update.message.from_user
