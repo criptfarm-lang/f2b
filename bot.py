@@ -1584,7 +1584,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Обработка ожидаемого ввода из меню (фото / ПДЗ клиента)
     awaiting = _user_awaiting.get(user.id) if user else None
-    if awaiting and user and chat_id == user.id and text and not text.startswith("/"):
+    if awaiting and user and text and not text.startswith("/"):
         _user_awaiting.pop(user.id, None)
 
         if awaiting == "photo":
@@ -3057,7 +3057,9 @@ async def search_photo_in_content_channel(context: ContextTypes.DEFAULT_TYPE, qu
 
     # Сначала ищем по полному запросу
     photos = db.search_media(query_lower, media_type="photo")
+    logger.info(f"search_photo: query='{query_lower}' total_in_db={len(photos)}")
     for p in photos:
+        logger.info(f"search_photo: chat_id={p.get('chat_id')} expected={content_chat_id} caption='{(p.get('caption') or '')[:40]}'")
         if p.get("chat_id") == content_chat_id and p["file_id"] not in seen:
             results.append({"file_id": p["file_id"], "caption": p.get("caption", "")})
             seen.add(p["file_id"])
@@ -3067,13 +3069,15 @@ async def search_photo_in_content_channel(context: ContextTypes.DEFAULT_TYPE, qu
         words = [w for w in query_lower.split() if len(w) >= 4]
         for word in words:
             photos = db.search_media(word, media_type="photo")
+            logger.info(f"search_photo: word='{word}' found={len(photos)}")
             for p in photos:
                 if p.get("chat_id") == content_chat_id and p["file_id"] not in seen:
                     results.append({"file_id": p["file_id"], "caption": p.get("caption", "")})
                     seen.add(p["file_id"])
             if results:
-                break  # нашли по первому слову — достаточно
+                break
 
+    logger.info(f"search_photo: returning {len(results)} for '{query}'")
     return results
 
 
@@ -4358,6 +4362,18 @@ async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
 
         if not address or not delivery_date:
             return
+
+        # Не алертим старые заказы (старше 3 дней)
+        from datetime import datetime, timezone, timedelta
+        try:
+            delivery_dt = datetime.fromisoformat(delivery_date.replace("Z", "+00:00"))
+            if delivery_dt.tzinfo is None:
+                delivery_dt = delivery_dt.replace(tzinfo=timezone.utc)
+            if delivery_dt < datetime.now(timezone.utc) - timedelta(days=3):
+                logger.info(f"check_logistics_alert: заказ {order_name} слишком старый ({delivery_date}), пропускаем")
+                return
+        except Exception:
+            pass
 
         result = await check_delivery_schedule(address, delivery_date)
         if result.get("ok"):
