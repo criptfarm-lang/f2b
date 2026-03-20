@@ -284,6 +284,20 @@ class Database:
             "SELECT * FROM pdz_results WHERE work_date = CURRENT_DATE ORDER BY created_at"
         )
 
+    def get_pdz_results_last(self) -> tuple:
+        """Возвращает (дата, результаты) последнего дня с результатами."""
+        row = self._fetchone(
+            "SELECT work_date FROM pdz_results ORDER BY work_date DESC, created_at DESC LIMIT 1"
+        )
+        if not row:
+            return None, []
+        last_date = row["work_date"]
+        results = self._fetchall(
+            "SELECT * FROM pdz_results WHERE work_date = %s ORDER BY created_at",
+            (last_date,)
+        )
+        return last_date, results
+
     # ─── ЧАТЫ МЕНЕДЖЕРОВ ────────────────────────────────────────────────────────
 
     def save_manager_chat_id(self, user_id: int, full_name: str):
