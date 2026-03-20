@@ -213,20 +213,16 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("⏰ Просроченные", callback_data="menu_overdue"),
         ],
         [
-            InlineKeyboardButton("💰 ПДЗ все", callback_data="menu_pdz_all"),
             InlineKeyboardButton("🚀 Запустить /pdz", callback_data="menu_pdz_run"),
+            InlineKeyboardButton("📊 Результат ПДЗ", callback_data="menu_pdz_results"),
         ],
         [
-            InlineKeyboardButton("📊 Активность", callback_data="menu_activity"),
-            InlineKeyboardButton("📈 Отчёт", callback_data="menu_report"),
+            InlineKeyboardButton("📈 Активность", callback_data="menu_activity"),
+            InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
         ],
         [
             InlineKeyboardButton("🗑 Очистить открытые", callback_data="menu_clearopen"),
             InlineKeyboardButton("💣 Очистить ВСЕ", callback_data="menu_clearall"),
-        ],
-        [
-            InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
-            InlineKeyboardButton("📞 Контакты", callback_data="menu_contacts"),
         ],
     ])
 
@@ -303,6 +299,25 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             if i < len(PDZ_MANAGERS) - 1:
                 await asyncio.sleep(120)
         await query.message.reply_text("✅ Готово. Сводка придёт в 17:00.")
+
+    elif action == "menu_pdz_results":
+        results = db.get_pdz_results_today()
+        if not results:
+            await query.message.reply_text("📭 Результатов по ПДЗ за сегодня нет.")
+        else:
+            by_manager = {}
+            for r in results:
+                name = r.get("manager_name", "Неизвестный")
+                if name not in by_manager:
+                    by_manager[name] = []
+                by_manager[name].append(r.get("result_text", ""))
+            lines = ["📊 *Результаты работы с дебиторкой*\n"]
+            for name, msgs in by_manager.items():
+                lines.append(f"👤 *{name}:*")
+                for m in msgs:
+                    lines.append(f"   — {m}")
+                lines.append("")
+            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     elif action == "menu_activity":
         await query.message.reply_text(
@@ -3203,6 +3218,36 @@ async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Готово. Сводка результатов придёт в 17:00.")
 
 
+async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pdz_results — сводка результатов работы с дебиторкой за сегодня."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+
+    results = db.get_pdz_results_today()
+
+    if not results:
+        await update.message.reply_text("📭 Результатов по ПДЗ за сегодня нет.")
+        return
+
+    # Группируем по менеджеру
+    by_manager = {}
+    for r in results:
+        name = r.get("manager_name", "Неизвестный")
+        if name not in by_manager:
+            by_manager[name] = []
+        by_manager[name].append(r.get("result_text", ""))
+
+    lines = ["📊 *Результаты работы с дебиторкой*\n"]
+    for name, msgs in by_manager.items():
+        lines.append(f"👤 *{name}:*")
+        for m in msgs:
+            lines.append(f"   — {m}")
+        lines.append("")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тестовый запуск утренних задач ПДЗ. /pdz_test [имя|all]"""
     user = update.message.from_user
@@ -3438,6 +3483,7 @@ def main():
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("add_webhook", cmd_add_webhook))
+    app.add_handler(CommandHandler("pdz_results", cmd_pdz_results))
     app.add_handler(CommandHandler("pdz", cmd_pdz))
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
