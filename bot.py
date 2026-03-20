@@ -301,27 +301,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text("✅ Готово. Сводка придёт в 17:00.")
 
     elif action == "menu_pdz_results":
-        results = db.get_pdz_results_today()
-        date_label = "сегодня"
-        if not results:
-            last_date, results = db.get_pdz_results_last()
-            if not results:
-                await query.message.reply_text("📭 Результатов по ПДЗ пока нет.")
-                return
-            date_label = last_date.strftime("%d.%m.%Y") if hasattr(last_date, "strftime") else str(last_date)
-        by_manager = {}
-        for r in results:
-            name = r.get("manager_name", "Неизвестный")
-            if name not in by_manager:
-                by_manager[name] = []
-            by_manager[name].append(r.get("result_text", ""))
-        lines = [f"📊 *Результаты работы с дебиторкой* ({date_label})\n"]
-        for name, msgs in by_manager.items():
-            lines.append(f"👤 *{name}:*")
-            for m in msgs:
-                lines.append(f"   — {m}")
-            lines.append("")
-        await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await cmd_pdz_results(update, context)
 
     elif action == "menu_activity":
         await query.message.reply_text(
@@ -3288,10 +3268,7 @@ async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Текущая просрочка
         items = await get_overdue_demands(tag=mgr["tag"])
-        if not items:
-            continue
-
-        overdue_clients = [i.get("name", "") for i in items]
+        overdue_clients = [i.get("name", "") for i in items] if items else []
 
         # Клиенты с ответами
         answered_clients = []
@@ -3305,17 +3282,21 @@ async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
         unanswered = [c for c in overdue_clients if c not in answered_clients]
 
         lines = [f"📊 *{mgr['name']} — ПДЗ* ({date_label})\n"]
-        if mgr_results:
-            lines.append("💬 *Ответы менеджера:*")
-            for r in mgr_results:
-                lines.append(f"   — {r}")
-            lines.append("")
-        if unanswered:
-            lines.append("❓ *Без ответа:*")
-            for c in unanswered:
-                lines.append(f"   • {c}")
+
+        if not overdue_clients:
+            lines.append("✅ Просроченных долгов нет")
         else:
-            lines.append("✅ По всем клиентам есть ответы")
+            if mgr_results:
+                lines.append("💬 *Ответы менеджера:*")
+                for r in mgr_results:
+                    lines.append(f"   — {r}")
+                lines.append("")
+            if unanswered:
+                lines.append("❓ *Без ответа:*")
+                for c in unanswered:
+                    lines.append(f"   • {c}")
+            else:
+                lines.append("✅ По всем клиентам есть ответы")
 
         text = "\n".join(lines)
 
