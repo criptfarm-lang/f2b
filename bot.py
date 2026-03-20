@@ -302,22 +302,26 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif action == "menu_pdz_results":
         results = db.get_pdz_results_today()
+        date_label = "сегодня"
         if not results:
-            await query.message.reply_text("📭 Результатов по ПДЗ за сегодня нет.")
-        else:
-            by_manager = {}
-            for r in results:
-                name = r.get("manager_name", "Неизвестный")
-                if name not in by_manager:
-                    by_manager[name] = []
-                by_manager[name].append(r.get("result_text", ""))
-            lines = ["📊 *Результаты работы с дебиторкой*\n"]
-            for name, msgs in by_manager.items():
-                lines.append(f"👤 *{name}:*")
-                for m in msgs:
-                    lines.append(f"   — {m}")
-                lines.append("")
-            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            last_date, results = db.get_pdz_results_last()
+            if not results:
+                await query.message.reply_text("📭 Результатов по ПДЗ пока нет.")
+                return
+            date_label = last_date.strftime("%d.%m.%Y") if hasattr(last_date, "strftime") else str(last_date)
+        by_manager = {}
+        for r in results:
+            name = r.get("manager_name", "Неизвестный")
+            if name not in by_manager:
+                by_manager[name] = []
+            by_manager[name].append(r.get("result_text", ""))
+        lines = [f"📊 *Результаты работы с дебиторкой* ({date_label})\n"]
+        for name, msgs in by_manager.items():
+            lines.append(f"👤 *{name}:*")
+            for m in msgs:
+                lines.append(f"   — {m}")
+            lines.append("")
+        await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     elif action == "menu_activity":
         await query.message.reply_text(
