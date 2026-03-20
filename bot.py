@@ -190,7 +190,7 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
             parse_mode="Markdown"
         )
         # Сохраняем ожидание запроса фото
-        context.user_data["awaiting"] = "photo"
+        _user_awaiting[query.from_user.id] = "photo"
 
     elif action == "user_pdz_client":
         await query.message.reply_text(
@@ -198,7 +198,7 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
             "Например: _Атмосфера_ или _ИТФИШ_",
             parse_mode="Markdown"
         )
-        context.user_data["awaiting"] = "pdz_client"
+        _user_awaiting[query.from_user.id] = "pdz_client"
 
 
 async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -302,14 +302,14 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             "📸 Напиши название товара — пришлю фото.\nНапример: _форель охл трим С_",
             parse_mode="Markdown"
         )
-        context.user_data["awaiting"] = "photo"
+        _user_awaiting[query.from_user.id] = "photo"
 
     elif action == "user_pdz_client":
         await query.message.reply_text(
             "💰 Напиши название клиента — покажу его дебиторку.\nНапример: _Атмосфера_",
             parse_mode="Markdown"
         )
-        context.user_data["awaiting"] = "pdz_client"
+        _user_awaiting[query.from_user.id] = "pdz_client"
 
     elif action == "menu_all_tasks":
         from database import Database
@@ -511,6 +511,7 @@ _wazzup_notified: set = set()
 
 _pending_links: dict = {}
 _pending_task_results: dict = {}  # user_id → {task_id, task_text, executor}
+_user_awaiting: dict = {}  # user_id → "photo" | "pdz_client"
 
 
 async def handle_wazzup_ignore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1582,9 +1583,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.log_usage(user.id, user.full_name, text[:100], chat_id)
 
     # Обработка ожидаемого ввода из меню (фото / ПДЗ клиента)
-    awaiting = context.user_data.get("awaiting") if context.user_data else None
+    awaiting = _user_awaiting.get(user.id) if user else None
     if awaiting and user and chat_id == user.id and text and not text.startswith("/"):
-        context.user_data.pop("awaiting", None)
+        _user_awaiting.pop(user.id, None)
 
         if awaiting == "photo":
             await message.reply_chat_action("upload_photo")
