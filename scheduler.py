@@ -68,14 +68,6 @@ def setup_scheduler(app: Application, db):
         id="remind_today_tasks"
     )
 
-    # 17:00 — вечерняя сводка ПДЗ (только если /pdz был запущен сегодня)
-    scheduler.add_job(
-        pdz_evening_summary,
-        CronTrigger(hour=17, minute=0),
-        args=[app],
-        id="pdz_evening_summary"
-    )
-
     # 03:00 — очистка старых задач
     scheduler.add_job(
         cleanup_done_tasks,
