@@ -1587,17 +1587,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("awaiting", None)
 
         if awaiting == "photo":
-            from moysklad import find_product_photos
             await message.reply_chat_action("upload_photo")
-            photos = await find_product_photos(text)
-            if photos:
-                for p in photos[:3]:
-                    try:
-                        await context.bot.send_photo(chat_id=chat_id, photo=p)
-                    except Exception:
-                        pass
-            else:
-                await message.reply_text(f"😕 Фото *{text}* не найдено.", parse_mode="Markdown")
+            await search_and_send_photo(update, context, text)
             await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
             return
 
@@ -3074,11 +3065,9 @@ async def search_photo_in_content_channel(context: ContextTypes.DEFAULT_TYPE, qu
 
 
 async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
-    """Ищет фото товара: сначала в канале Контент, потом в МойСклад."""
-    import io as _io
+    """Ищет фото товара в канале Контент F2B."""
     await update.message.reply_chat_action("upload_photo")
 
-    # 1. Ищем в канале Контент F2B
     content_photos = await search_photo_in_content_channel(context, query)
     if content_photos:
         sent = 0
@@ -3094,44 +3083,7 @@ async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TY
         if sent > 0:
             return
 
-    # 2. Fallback — ищем в МойСклад
-    products = await search_products(query)
-    with_photo = [p for p in products if p.get("image_href")]
-
-    if not with_photo:
-        if products:
-            text = format_products(products, query)
-            await update.message.reply_text(
-                f"😕 Фото не найдено, но вот что есть:\n\n{text}",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(f"😕 Фото '{query}' не найдено ни в канале Контент, ни в МойСклад.")
-        return
-
-    sent = 0
-    for product in with_photo[:3]:
-        try:
-            img_bytes = await download_image(product["image_href"])
-            if img_bytes:
-                name = product.get("name", query)
-                price = product.get("sale_price", 0)
-                stock = product.get("stock", 0)
-                caption = f"📸 {name}"
-                if price:
-                    caption += f"\n💰 {price} руб/кг"
-                if stock and stock > 0:
-                    caption += f"\n📦 В наличии: {stock} кг"
-                await update.message.reply_photo(
-                    photo=_io.BytesIO(img_bytes),
-                    caption=caption
-                )
-                sent += 1
-        except Exception as e:
-            logger.warning(f"Не удалось отправить фото {product.get('name')}: {e}")
-
-    if sent == 0:
-        await update.message.reply_text(f"😕 Фото '{query}' есть в МойСклад, но не удалось загрузить.")
+    await update.message.reply_text(f"😕 Фото *{query}* не найдено в канале Контент.", parse_mode="Markdown")
 
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
