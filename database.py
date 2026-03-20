@@ -242,7 +242,21 @@ class Database:
             """CREATE TABLE IF NOT EXISTS manager_chats (
                 user_id BIGINT PRIMARY KEY,
                 full_name TEXT,
+                is_blocked BOOLEAN DEFAULT FALSE,
+                request_count INT DEFAULT 0,
+                last_seen TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
+            )""",
+            "ALTER TABLE manager_chats ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE manager_chats ADD COLUMN IF NOT EXISTS request_count INT DEFAULT 0",
+            "ALTER TABLE manager_chats ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT NOW()",
+            """CREATE TABLE IF NOT EXISTS bot_usage_log (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                full_name TEXT,
+                action TEXT,
+                chat_id BIGINT,
+                created_at TIMESTAMP DEFAULT NOW()
             )""",
             # Таблица для хранения контекста алертов цены (ожидание ответа менеджера)
             """CREATE TABLE IF NOT EXISTS price_alerts (
@@ -306,6 +320,50 @@ class Database:
                VALUES (%s, %s, NOW())
                ON CONFLICT (user_id) DO UPDATE SET full_name=%s, updated_at=NOW()""",
             (user_id, full_name, full_name)
+        )
+
+    def log_usage(self, user_id: int, full_name: str, action: str, chat_id: int):
+        """Логирует запрос пользователя и обновляет счётчик."""
+        try:
+            self._execute(
+                """INSERT INTO bot_usage_log (user_id, full_name, action, chat_id)
+                   VALUES (%s, %s, %s, %s)""",
+                (user_id, full_name, action[:200], chat_id)
+            )
+            self._execute(
+                """INSERT INTO manager_chats (user_id, full_name, request_count, last_seen, updated_at)
+                   VALUES (%s, %s, 1, NOW(), NOW())
+                   ON CONFLICT (user_id) DO UPDATE SET
+                     full_name=%s, request_count=manager_chats.request_count+1,
+                     last_seen=NOW(), updated_at=NOW()""",
+                (user_id, full_name, full_name)
+            )
+        except Exception as e:
+            logger.warning(f"log_usage: {e}")
+
+    def is_user_blocked(self, user_id: int) -> bool:
+        row = self._fetchone(
+            "SELECT is_blocked FROM manager_chats WHERE user_id=%s", (user_id,)
+        )
+        return bool(row and row.get("is_blocked"))
+
+    def block_user(self, user_id: int):
+        self._execute(
+            """INSERT INTO manager_chats (user_id, full_name, is_blocked)
+               VALUES (%s, '', TRUE)
+               ON CONFLICT (user_id) DO UPDATE SET is_blocked=TRUE""",
+            (user_id,)
+        )
+
+    def unblock_user(self, user_id: int):
+        self._execute(
+            "UPDATE manager_chats SET is_blocked=FALSE WHERE user_id=%s", (user_id,)
+        )
+
+    def get_usage_stats(self) -> list:
+        return self._fetchall(
+            """SELECT user_id, full_name, request_count, last_seen, is_blocked
+               FROM manager_chats ORDER BY request_count DESC"""
         )
 
     def get_manager_chat_id(self, name_fragment: str) -> int:
