@@ -600,8 +600,10 @@ async def get_counterparty_balance(query: str) -> list:
                     "name": c.get("name", ""),
                     "balance": balance,
                     "debt": debt,
+                    "tags": c.get("tags", []),
                     "href": c.get("meta", {}).get("href", f"{MS_BASE}/entity/counterparty/{cid}"),
                 })
+                logger.info(f"get_counterparty_balance: {c.get('name')} tags={c.get('tags', [])}")
             return result
 
     except Exception as e:
