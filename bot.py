@@ -165,6 +165,9 @@ def _user_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📸 Запросить фото товара", callback_data="user_photo"),
             InlineKeyboardButton("💰 ПДЗ клиента", callback_data="user_pdz_client"),
         ],
+        [
+            InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
+        ],
     ])
 
 
@@ -189,7 +192,6 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
             "Например: _форель охл трим С_",
             parse_mode="Markdown"
         )
-        # Сохраняем ожидание запроса фото
         _user_awaiting[query.from_user.id] = "photo"
 
     elif action == "user_pdz_client":
@@ -199,6 +201,14 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
             parse_mode="Markdown"
         )
         _user_awaiting[query.from_user.id] = "pdz_client"
+
+    elif action == "user_contract":
+        await query.message.reply_text(
+            "📄 Напиши название компании — сформирую договор поставки.\n"
+            "Например: _Атмосфера_ или _ИТФИШ_",
+            parse_mode="Markdown"
+        )
+        _user_awaiting[query.from_user.id] = "contract"
 
 
 async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1593,8 +1603,77 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
             return
 
-        elif awaiting == "pdz_client":
+        elif awaiting == "contract":
             await message.reply_chat_action("typing")
+            # Обрабатываем как generate_contract напрямую
+            buyer_query = text
+            from moysklad import get_counterparty_requisites
+            from datetime import date as _date
+            counterparties = await get_counterparty_balance(buyer_query)
+            if not counterparties:
+                await message.reply_text(
+                    f"❌ Компания *{buyer_query}* не найдена в МойСклад.",
+                    parse_mode="Markdown"
+                )
+                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+                return
+            cp = counterparties[0]
+            cp_id = cp.get("id", "")
+            cp_name = cp.get("name", buyer_query)
+            existing = db.find_contract_by_buyer(cp_name)
+            if existing:
+                saved_data = existing.get("buyer_data")
+                if saved_data and isinstance(saved_data, dict):
+                    await message.reply_text(
+                        f"📄 Договор с *{cp_name}* уже создавался.\n"
+                        f"Номер: *{existing['contract_number']}* от {existing['created_at'].strftime('%d.%m.%Y')}\n"
+                        f"Регенерирую...", parse_mode="Markdown"
+                    )
+                    await _create_and_send_contract(
+                        saved_data, user.full_name, message, context,
+                        force_number=existing["contract_number"]
+                    )
+                return
+            await message.reply_text(f"🔍 Читаю реквизиты *{cp_name}*...", parse_mode="Markdown")
+            reqs = await get_counterparty_requisites(cp_id)
+            contract_data = {
+                "buyer_name": reqs.get("buyer_legal_title") or reqs.get("buyer_name", buyer_query),
+                "buyer_inn": reqs.get("buyer_inn", ""),
+                "buyer_ogrn": reqs.get("buyer_ogrn", ""),
+                "buyer_address": reqs.get("buyer_address", ""),
+                "buyer_bank": reqs.get("buyer_bank", ""),
+                "buyer_rs": reqs.get("buyer_rs", ""),
+                "buyer_bik": reqs.get("buyer_bik", ""),
+                "buyer_ks": reqs.get("buyer_ks", ""),
+                "buyer_phone": reqs.get("buyer_phone", ""),
+                "buyer_email": reqs.get("buyer_email", ""),
+                "buyer_representative": reqs.get("buyer_representative", ""),
+                "buyer_director_name": reqs.get("buyer_director_name", ""),
+                "buyer_basis": "Устава",
+            }
+            REQUIRED = {
+                "buyer_inn": "ИНН", "buyer_ogrn": "ОГРН",
+                "buyer_address": "юридический адрес",
+                "buyer_rs": "расчётный счёт (р/с)", "buyer_bik": "БИК банка",
+                "buyer_bank": "название банка", "buyer_ks": "корреспондентский счёт (к/с)",
+                "buyer_representative": "ФИО директора и должность",
+                "buyer_basis": "основание полномочий",
+            }
+            missing = [(k, v) for k, v in REQUIRED.items() if not contract_data.get(k)]
+            if missing:
+                _pending_contracts[user.id] = {
+                    "data": contract_data,
+                    "missing_keys": [m[0] for m in missing],
+                    "missing_labels": [m[1] for m in missing],
+                    "missing_idx": 0,
+                }
+                await message.reply_text(
+                    f"📄 *{contract_data['buyer_name']}*\n\nНе хватает данных:\n*{missing[0][1]}*?",
+                    parse_mode="Markdown"
+                )
+            else:
+                await _create_and_send_contract(contract_data, user.full_name, message, context)
+            return
             from moysklad import get_overdue_demands
             counterparties = await get_counterparty_balance(text)
             if not counterparties:
