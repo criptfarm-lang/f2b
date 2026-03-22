@@ -167,6 +167,7 @@ def _user_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
+            InlineKeyboardButton("📋 Мои задачи", callback_data="user_my_tasks"),
         ],
     ])
 
@@ -209,6 +210,27 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
             parse_mode="Markdown"
         )
         _user_awaiting[query.from_user.id] = "contract"
+
+    elif action == "user_my_tasks":
+        tasks = db.get_tasks_by_executor(user.full_name)
+        if not tasks:
+            await query.message.reply_text("✅ У тебя нет открытых задач.")
+        else:
+            lines = [f"📋 *Твои задачи ({len(tasks)}):*\n"]
+            for t in tasks:
+                deadline = t.get("deadline")
+                if deadline:
+                    from datetime import date as _d
+                    MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
+                    try:
+                        d = _d.fromisoformat(str(deadline)[:10])
+                        dl = f" · до {d.day} {MONTHS[d.month-1]}"
+                    except Exception:
+                        dl = f" · до {deadline}"
+                else:
+                    dl = ""
+                lines.append(f"• {t.get('text','')}{dl}")
+            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
