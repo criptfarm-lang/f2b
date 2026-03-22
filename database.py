@@ -465,6 +465,15 @@ class Database:
                 result.append(row)
         return result
 
+    def get_tasks_by_executor(self, executor_name: str) -> List[Dict]:
+        """Возвращает открытые задачи по имени исполнителя."""
+        return self._fetchall(
+            """SELECT * FROM tasks WHERE status='open'
+               AND LOWER(executor) LIKE LOWER(%s)
+               ORDER BY deadline NULLS LAST, created_at""",
+            (f"%{executor_name.split()[0]}%",)
+        )
+
     def get_all_open_tasks(self) -> List[Dict]:
         today = date.today().isoformat()
         rows = self._fetchall(
