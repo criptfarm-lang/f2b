@@ -370,7 +370,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif action == "menu_pdz_all":
         await query.message.reply_text("⏳ Запрашиваю ПДЗ...")
-        from moysklad import get_overdue_demands, format_overdue_demands
+        from moysklad import get_overdue_demands
         items = await get_overdue_demands()
         if not items:
             await query.message.reply_text("✅ Просроченных долгов нет.")
@@ -389,7 +389,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif action == "menu_pdz_confirm":
         import asyncio
-        from scheduler import pdz_morning_task, PDZ_MANAGERS, pdz_launched_today
+        from scheduler import pdz_morning_task, pdz_launched_today
         from datetime import date as _date
         today = _date.today().isoformat()
         pdz_launched_today.add(today)
@@ -1908,7 +1908,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     manager_user_id=user.id,
                     result_text=text
                 )
-                from scheduler import pdz_day_messages, PDZ_MANAGERS
+                from scheduler import pdz_day_messages
                 if today_str not in pdz_day_messages:
                     pdz_day_messages[today_str] = {}
                 mgr_tag = "_all"
@@ -3394,7 +3394,7 @@ async def cmd_add_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     arg = (context.args[0].lower() if context.args else "all")
 
-    from scheduler import pdz_morning_task, PDZ_MANAGERS
+    from scheduler import pdz_morning_task
     app = update.get_bot()  # используем контекст
 
     targets = PDZ_MANAGERS if arg == "all" else [
@@ -3557,7 +3557,7 @@ async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Только для руководителей.")
         return
 
-    from scheduler import pdz_morning_task, PDZ_MANAGERS, pdz_launched_today
+    from scheduler import pdz_morning_task, pdz_launched_today
     import asyncio
     from datetime import date as _date
 
@@ -4011,7 +4011,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     OWNER_ID = 360092495
-    from scheduler import PDZ_MANAGERS
     from moysklad import get_overdue_demands
 
     # Берём сегодняшние результаты, если нет — последние доступные
@@ -4102,7 +4101,6 @@ async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     OWNER_ID = 360092495
-    from scheduler import PDZ_MANAGERS
     from moysklad import get_overdue_demands
 
     today_results = db.get_pdz_results_today()
@@ -4192,7 +4190,7 @@ async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     arg = (context.args[0].lower() if context.args else "all")
 
-    from scheduler import pdz_morning_task, PDZ_MANAGERS
+    from scheduler import pdz_morning_task
     app = update.get_bot()
 
     targets = PDZ_MANAGERS if arg == "all" else [
