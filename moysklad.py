@@ -2584,12 +2584,11 @@ async def get_evening_stats() -> dict:
 
 async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
     """
-    Берёт все отгрузки за период и группирует по группе контрагента.
-    Возвращает {manager_name: {revenue, shipments, clients}}
+    Берёт все отгрузки за период, загружает теги агентов и группирует по менеджеру.
     """
     import aiohttp
 
-    GROUP_TO_NAME = {
+    TAG_TO_NAME = {
         "скляр":      "Инесса Скляр",
         "мерзлякова": "Елена Мерзлякова",
         "баласанян":  "Карина Баласанян",
@@ -2598,19 +2597,18 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
     }
 
     result = {name: {"revenue": 0.0, "shipments": 0, "clients": set()}
-              for name in GROUP_TO_NAME.values()}
+              for name in TAG_TO_NAME.values()}
 
     try:
         async with aiohttp.ClientSession() as session:
-            # Теги не приходят в expand — загружаем отгрузки, потом карточки агентов
-            offset = 0
-            agent_tags_cache = {}  # agent_id → [tags]
 
+            # 1. Загружаем все отгрузки за период
+            demands = []
+            offset = 0
             while True:
                 params = {
                     "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
-                    "expand": "agent",
-                    "limit":  200,
+                    "limit": 200,
                     "offset": offset,
                 }
                 async with session.get(
@@ -2624,41 +2622,45 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
 
                 rows = data.get("rows", [])
                 for row in rows:
-                    agent = row.get("agent", {})
-                    agent_id = agent.get("id", "")
-                    revenue = (row.get("sum", 0) or 0) / 100
-
-                    if not agent_id:
-                        continue
-
-                    # Берём теги из кэша или дозагружаем
-                    if agent_id not in agent_tags_cache:
-                        try:
-                            async with session.get(
-                                f"{MS_BASE}/entity/counterparty/{agent_id}",
-                                headers=get_headers()
-                            ) as r2:
-                                if r2.status == 200:
-                                    cp = await r2.json()
-                                    agent_tags_cache[agent_id] = [t.lower() for t in cp.get("tags", [])]
-                                else:
-                                    agent_tags_cache[agent_id] = []
-                        except Exception:
-                            agent_tags_cache[agent_id] = []
-
-                    tags = agent_tags_cache[agent_id]
-                    for key, mgr_name in GROUP_TO_NAME.items():
-                        if key in tags:
-                            result[mgr_name]["revenue"] += revenue
-                            result[mgr_name]["shipments"] += 1
-                            result[mgr_name]["clients"].add(agent_id)
-                            break
-
+                    agent_meta = row.get("agent", {}).get("meta", {})
+                    agent_href = agent_meta.get("href", "")
+                    agent_id = agent_href.split("/")[-1] if agent_href else ""
+                    if agent_id:
+                        demands.append({
+                            "agent_id": agent_id,
+                            "agent_href": agent_href,
+                            "revenue": (row.get("sum", 0) or 0) / 100,
+                        })
                 if len(rows) < 200:
                     break
                 offset += 200
 
-            logger.info(f"get_all_managers_fact: обработано отгрузок, агентов в кэше={len(agent_tags_cache)}")
+            logger.info(f"get_all_managers_fact: отгрузок={len(demands)}")
+
+            # 2. Загружаем теги уникальных агентов
+            unique_agents = {d["agent_id"]: d["agent_href"] for d in demands}
+            agent_tags = {}
+
+            for agent_id, agent_href in unique_agents.items():
+                try:
+                    async with session.get(agent_href, headers=get_headers()) as r:
+                        if r.status == 200:
+                            cp = await r.json()
+                            agent_tags[agent_id] = [t.lower() for t in cp.get("tags", [])]
+                except Exception:
+                    agent_tags[agent_id] = []
+
+            logger.info(f"get_all_managers_fact: уникальных агентов={len(unique_agents)}")
+
+            # 3. Группируем по менеджеру
+            for d in demands:
+                tags = agent_tags.get(d["agent_id"], [])
+                for tag, mgr_name in TAG_TO_NAME.items():
+                    if tag in tags:
+                        result[mgr_name]["revenue"] += d["revenue"]
+                        result[mgr_name]["shipments"] += 1
+                        result[mgr_name]["clients"].add(d["agent_id"])
+                        break
 
     except Exception as e:
         logger.error(f"get_all_managers_fact: {e}", exc_info=True)
@@ -2669,7 +2671,6 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
                     f"ship={result[name]['shipments']} clients={result[name]['clients']}")
 
     return result
-
 
 async def get_sales_fact(manager_name: str, date_from: str, date_to: str) -> dict:
     """Обёртка для совместимости — берёт данные из get_all_managers_fact."""
