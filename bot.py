@@ -3666,7 +3666,6 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime, timedelta
 
     stats = await get_evening_stats()
-    contracts = db.get_contracts_today()
 
     MANAGERS = ["Карина Баласанян", "Елена Мерзлякова", "Инесса Скляр",
                 "Алексей Леонтьев", "Сергей Черентаев"]
@@ -3679,21 +3678,14 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     today = datetime.now().strftime("%d.%m.%Y")
-    lines = [f"📊 *Сводка — {today}*\n"]
+    lines = [f"📊 *Сводка — {today}*"]
 
-    # ── Новые договоры ────────────────────────────────────────────
-    if contracts:
-        lines.append(f"📄 *Новые договоры ({len(contracts)}):*")
-        for c in contracts:
-            lines.append(f"  • {c.get('buyer_name','?')} — {c.get('contract_number','?')}")
-        lines.append("")
-
-    # ── Первые отгрузки новым клиентам ────────────────────────────
+    # Первые отгрузки новым клиентам
     new_clients = [nc for nc in stats.get("new_clients", []) if nc.get("manager","") in MANAGERS]
     for nc in new_clients:
         short = SHORT.get(nc.get("manager",""), "")
         lines.append(
-            f"🎉 *Первая отгрузка новому клиенту!*\n"
+            f"\n🎉 *Первая отгрузка новому клиенту!*\n"
             f"👤 *{nc['name']}*\n"
             f"🏆 Отличная работа, *{short}*!"
         )
