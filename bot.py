@@ -3531,6 +3531,90 @@ async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Готово. Сводка результатов придёт в 17:00.")
 
 
+async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/plan — подать план на неделю (только по понедельникам или руководитель в любой день).
+    Формат: /plan выручка отгрузки клиенты
+    Пример: /plan 5000000 150 28
+    """
+    user = update.effective_user
+    if not user:
+        return
+
+    # Определяем менеджера
+    MANAGER_BY_ID = {}  # заполняется из БД
+    MANAGER_TAG_MAP = {
+        "Карина Баласанян":  "баласанян",
+        "Елена Мерзлякова":  "мерзлякова",
+        "Инесса Скляр":      "скляр",
+        "Алексей Леонтьев":  "леонтьев",
+        "Сергей Черентаев":  "черентаев",
+    }
+
+    from datetime import date, timedelta
+
+    # Руководитель может задать план любому: /plan Карина 5000000 150 28
+    is_owner = (user.id == 360092495)
+    args = context.args or []
+
+    if is_owner and args and args[0] in [n.split()[0] for n in MANAGER_TAG_MAP]:
+        # /plan Карина 5000000 150 28
+        first_name = args[0]
+        manager = next((n for n in MANAGER_TAG_MAP if n.startswith(first_name)), None)
+        args = args[1:]
+    else:
+        # Определяем менеджера по chat_id
+        row = db._fetchone("SELECT full_name FROM manager_chats WHERE user_id=%s", (user.id,))
+        manager = row["full_name"] if row else None
+        if manager not in MANAGER_TAG_MAP:
+            await update.message.reply_text(
+                "⛔ Не удалось определить твой профиль менеджера.\n"
+                "Напиши /mychatid чтобы зарегистрироваться."
+            )
+            return
+
+    if len(args) < 3:
+        await update.message.reply_text(
+            "📋 Формат плана:\n"
+            "/plan [выручка] [отгрузки] [клиенты]\n\n"
+            "Пример: `/plan 5000000 150 28`\n"
+            "Руководитель: `/plan Карина 5000000 150 28`",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        revenue = float(args[0].replace(",", "."))
+        shipments = int(args[1])
+        clients = int(args[2])
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Пример: `/plan 5000000 150 28`", parse_mode="Markdown")
+        return
+
+    # Период: текущая неделя (пн–вс)
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
+
+    db.save_sales_plan(
+        manager=manager,
+        period_start=monday,
+        period_end=sunday,
+        revenue=revenue,
+        shipments=shipments,
+        clients=clients,
+        created_by=user.full_name
+    )
+
+    short = manager.split()[0]
+    await update.message.reply_text(
+        f"✅ *План {short} на {monday.strftime('%d.%m')}–{sunday.strftime('%d.%m')} сохранён:*\n"
+        f"💰 Выручка: {revenue:,.0f} руб.\n"
+        f"🚚 Отгрузок: {shipments}\n"
+        f"👥 Клиентов: {clients}",
+        parse_mode="Markdown"
+    )
+
+
 async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/evening — вечерняя сводка дня."""
     OWNER_ID = 360092495
@@ -3628,10 +3712,127 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    # График — только известные менеджеры
+    # ── График планов продаж ───────────────────────────────────────
+    await _send_sales_plan_chart(context, chat_id)
+
+    # ── График активности за 7 дней — только известные менеджеры ──
     known_activity = [r for r in activity if r.get("manager","") in MANAGERS]
     if known_activity:
         await _send_activity_chart(context, chat_id, known_activity)
+
+
+async def _send_sales_plan_chart(context, chat_id: int):
+    """Горизонтальные прогресс-бары: план vs факт по трём показателям."""
+    try:
+        import io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        from datetime import date
+        from moysklad import get_sales_fact
+
+        MANAGERS = [
+            ("Инесса Скляр",     "скляр",     "Инесса"),
+            ("Карина Баласанян", "баласанян",  "Карина"),
+            ("Елена Мерзлякова", "мерзлякова", "Елена"),
+            ("Алексей Леонтьев", "леонтьев",   "Алексей"),
+            ("Сергей Черентаев", "черентаев",  "Сергей"),
+        ]
+
+        # Планы накопительным итогом
+        plans_raw = db.get_current_plans()
+        plans = {p["manager"]: p for p in plans_raw}
+
+        # Факт из МойСклад за период с начала первого плана
+        today = date.today()
+        # Берём с начала текущего месяца
+        month_start = today.replace(day=1).isoformat()
+        today_str = today.isoformat()
+
+        facts = {}
+        for full_name, tag, short in MANAGERS:
+            facts[full_name] = await get_sales_fact(tag, month_start, today_str)
+
+        # Строим график
+        n_managers = len(MANAGERS)
+        fig, axes = plt.subplots(n_managers, 3, figsize=(13, n_managers * 1.6 + 1))
+        fig.patch.set_facecolor("#0d1117")
+
+        METRICS = [
+            ("revenue",   "Выручка, млн ₽",  1_000_000),
+            ("shipments", "Отгрузки",         1),
+            ("clients",   "Клиенты (АКБ)",    1),
+        ]
+        COL_COLORS = ["#4FC3F7", "#66BB6A", "#FFA726"]
+
+        for row_i, (full_name, tag, short) in enumerate(MANAGERS):
+            plan = plans.get(full_name, {})
+            fact = facts.get(full_name, {})
+
+            for col_i, (metric, label, divisor) in enumerate(METRICS):
+                ax = axes[row_i][col_i]
+                ax.set_facecolor("#0d1117")
+
+                plan_val = float(plan.get(metric, 0) or 0) / divisor
+                fact_val = float(fact.get(metric, 0) or 0) / divisor
+                pct = min(fact_val / plan_val, 1.0) if plan_val > 0 else 0.0
+
+                # Фоновый бар (план)
+                ax.barh(0, 1.0, color="#21262d", height=0.6, left=0)
+                # Заштрихованный бар (факт)
+                ax.barh(0, pct, color=COL_COLORS[col_i], height=0.6,
+                        left=0, alpha=0.85,
+                        hatch="////" if pct < 1.0 else "",
+                        edgecolor=COL_COLORS[col_i])
+
+                # Подпись %
+                pct_label = f"{pct*100:.0f}%"
+                ax.text(min(pct + 0.02, 0.98), 0, pct_label,
+                        va="center", ha="left", color="white",
+                        fontsize=8, fontweight="bold")
+
+                # Значения
+                if plan_val > 0:
+                    fact_str = f"{fact_val:.1f}" if divisor == 1_000_000 else f"{fact_val:.0f}"
+                    plan_str = f"{plan_val:.1f}" if divisor == 1_000_000 else f"{plan_val:.0f}"
+                    ax.set_xlabel(f"{fact_str} / {plan_str}", color="#8b949e",
+                                  fontsize=7, labelpad=2)
+                else:
+                    ax.set_xlabel("план не задан", color="#555", fontsize=7, labelpad=2)
+
+                # Заголовок колонки только в первой строке
+                if row_i == 0:
+                    ax.set_title(label, color="#c9d1d9", fontsize=8, pad=4)
+
+                # Имя менеджера только в первой колонке
+                if col_i == 0:
+                    ax.set_ylabel(short, color="#c9d1d9", fontsize=9,
+                                  rotation=0, labelpad=40, va="center")
+
+                ax.set_xlim(0, 1.15)
+                ax.set_yticks([])
+                ax.set_xticks([])
+                for spine in ax.spines.values():
+                    spine.set_visible(False)
+
+        fig.suptitle(f"📊 Выполнение плана — {today.strftime('%d.%m.%Y')}",
+                     color="#c9d1d9", fontsize=11, y=1.01)
+        plt.tight_layout(rect=[0.07, 0, 1, 1])
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=130,
+                    facecolor=fig.get_facecolor(), bbox_inches="tight")
+        buf.seek(0)
+        plt.close()
+
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=buf,
+            caption="📊 Выполнение плана продаж"
+        )
+    except Exception as e:
+        logger.warning(f"_send_sales_plan_chart: {e}", exc_info=True)
 
 
 async def _send_activity_chart(context, chat_id: int, activity: list):
@@ -4209,6 +4410,7 @@ def main():
 
     # Команды
     app.add_handler(CallbackQueryHandler(handle_task_done_callback, pattern="^task_done\\|"))
+    app.add_handler(CommandHandler("plan", cmd_plan))
     app.add_handler(CommandHandler("evening", cmd_evening))
     app.add_handler(CommandHandler("del_tasks", cmd_delete_executor_tasks))
     app.add_handler(CommandHandler("block", cmd_block_user))
