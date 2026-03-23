@@ -2603,26 +2603,27 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
     try:
         async with aiohttp.ClientSession() as session:
 
-            # 1. Получаем все группы контрагентов и их href
+            # Группы контрагентов — отдельный эндпоинт
+            group_href_map = {}
             async with session.get(
-                f"{MS_BASE}/entity/counterparty/metadata",
-                headers=get_headers()
+                f"{MS_BASE}/entity/counterpartygroup",
+                headers=get_headers(),
+                params={"limit": 100}
             ) as r:
-                if r.status != 200:
-                    logger.error(f"get_all_managers_fact: metadata {r.status}")
-                    return result
-                meta = await r.json()
+                if r.status == 200:
+                    data = await r.json()
+                    all_groups = data.get("rows", [])
+                    logger.info(f"get_all_managers_fact: все группы = {[g.get('name') for g in all_groups]}")
+                    for g in all_groups:
+                        g_name = g.get("name", "").lower().strip()
+                        for key in GROUP_TO_NAME:
+                            if key in g_name:
+                                group_href_map[key] = g.get("meta", {}).get("href", "")
+                                logger.info(f"  matched: '{g['name']}' → {key}")
+                                break
+                else:
+                    logger.error(f"get_all_managers_fact: counterpartygroup {r.status}")
 
-            group_href_map = {}  # "скляр" → href
-            all_groups = meta.get("groups", {}).get("rows", [])
-            logger.info(f"get_all_managers_fact: все группы в МС = {[g.get('name') for g in all_groups]}")
-            for g in all_groups:
-                g_name = g.get("name", "").lower().strip()
-                for key in GROUP_TO_NAME:
-                    if key in g_name:
-                        group_href_map[key] = g.get("meta", {}).get("href", "")
-                        logger.info(f"  matched: '{g['name']}' → {key}")
-                        break
             logger.info(f"get_all_managers_fact: групп найдено {len(group_href_map)}: {list(group_href_map.keys())}")
 
             if not group_href_map:
