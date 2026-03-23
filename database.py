@@ -795,7 +795,7 @@ class Database:
                                manager_name: str = None) -> list:
         """Ищет исходящие сообщения менеджеров с упоминанием ключевых слов."""
         from datetime import datetime, timedelta
-        since = datetime.now() - timedelta(days=days)
+        since = datetime.utcnow() - timedelta(days=days)
 
         conditions = ["is_outbound = TRUE", "sent_at >= %s", "text IS NOT NULL"]
         params = [since]
@@ -823,7 +823,10 @@ class Database:
             WHERE {' AND '.join(conditions)}
             ORDER BY manager_name, m.sent_at DESC
         """
-        return self._fetchall(sql, params)
+        result = self._fetchall(sql, params)
+        import logging
+        logging.getLogger(__name__).info(f"search_wazzup_mentions: days={days} since={since.date()} keywords={keywords} found={len(result)}")
+        return result
 
     def save_pending_ident(self, link_key: str, chat_id: str, channel_id: str,
                            wazzup_name: str, chat_type: str):
