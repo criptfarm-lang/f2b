@@ -2584,9 +2584,10 @@ async def get_evening_stats() -> dict:
 
 async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
     """
-    Берёт отчёт прибыльности по покупателям за период,
-    загружает теги каждого покупателя и группирует по менеджеру.
-    Использует ту же логику что работает в get_buyers_by_product.
+    Берёт все отгрузки за период, загружает теги агентов, группирует по менеджеру.
+    revenue — из отчёта прибыльности
+    shipments — из отгрузок напрямую
+    clients — уникальные клиенты с отгрузками
     """
     import aiohttp
 
@@ -2601,14 +2602,65 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
     result = {name: {"revenue": 0.0, "shipments": 0, "clients": set()}
               for name in TAG_TO_NAME.values()}
 
-    STORE_ID = os.getenv("MS_STORE_ID", "0044d71e-9a9a-11f0-0a80-03a90002743d")
-    STORE_HREF = f"{MS_BASE}/entity/store/{STORE_ID}"
+    agent_tags_cache = {}  # cp_id → [tags]
 
     try:
         async with aiohttp.ClientSession() as session:
 
-            # 1. Отчёт прибыльности по покупателям за период
-            buyers = []
+            # 1. Все отгрузки за период — считаем shipments и clients
+            offset = 0
+            while True:
+                params = {
+                    "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
+                    "expand": "agent",
+                    "limit": 200,
+                    "offset": offset,
+                }
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(), params=params
+                ) as r:
+                    if r.status != 200:
+                        logger.error(f"get_all_managers_fact demand: {r.status}")
+                        break
+                    data = await r.json()
+
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent = row.get("agent", {})
+                    cp_id = agent.get("id", "")
+                    cp_href = agent.get("meta", {}).get("href", "")
+                    if not cp_id:
+                        continue
+
+                    # Загружаем теги если ещё не в кэше
+                    if cp_id not in agent_tags_cache:
+                        try:
+                            async with session.get(cp_href, headers=get_headers()) as r2:
+                                if r2.status == 200:
+                                    cp_data = await r2.json()
+                                    agent_tags_cache[cp_id] = [t.lower() for t in cp_data.get("tags", [])]
+                                else:
+                                    agent_tags_cache[cp_id] = []
+                        except Exception:
+                            agent_tags_cache[cp_id] = []
+
+                    tags = agent_tags_cache[cp_id]
+                    for tag, mgr_name in TAG_TO_NAME.items():
+                        if tag in tags:
+                            result[mgr_name]["shipments"] += 1
+                            result[mgr_name]["clients"].add(cp_id)
+                            break
+
+                if len(rows) < 200:
+                    break
+                offset += 200
+
+            logger.info(f"get_all_managers_fact: отгрузок обработано, агентов в кэше={len(agent_tags_cache)}")
+
+            # 2. Выручка из отчёта прибыльности
+            STORE_ID = os.getenv("MS_STORE_ID", "0044d71e-9a9a-11f0-0a80-03a90002743d")
+            STORE_HREF = f"{MS_BASE}/entity/store/{STORE_ID}"
             offset = 0
             while True:
                 params = {
@@ -2623,8 +2675,6 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
                     headers=get_headers(), params=params
                 ) as r:
                     if r.status != 200:
-                        body = await r.text()
-                        logger.error(f"get_all_managers_fact profit: {r.status} {body[:200]}")
                         break
                     data = await r.json()
 
@@ -2633,73 +2683,29 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
                     cp = row.get("counterparty", {})
                     cp_href = cp.get("meta", {}).get("href", "")
                     cp_id = cp_href.split("/")[-1] if cp_href else ""
-                    if cp_id:
-                        buyers.append({
-                            "id": cp_id,
-                            "href": cp_href,
-                            "revenue": (row.get("sellSum", 0) or 0) / 100,
-                            "shipments": row.get("demandCount", 0) or 0,
-                        })
+                    if not cp_id:
+                        continue
+                    # Теги уже в кэше — используем их
+                    tags = agent_tags_cache.get(cp_id, [])
+                    if not tags:
+                        # Загружаем если нет в кэше
+                        try:
+                            async with session.get(cp_href, headers=get_headers()) as r2:
+                                if r2.status == 200:
+                                    cp_data = await r2.json()
+                                    tags = [t.lower() for t in cp_data.get("tags", [])]
+                                    agent_tags_cache[cp_id] = tags
+                        except Exception:
+                            pass
+                    for tag, mgr_name in TAG_TO_NAME.items():
+                        if tag in tags:
+                            result[mgr_name]["revenue"] += (row.get("sellSum", 0) or 0) / 100
+                            break
 
                 total = data.get("meta", {}).get("size", 0)
                 offset += len(rows)
                 if offset >= total or len(rows) < 200:
                     break
-
-            logger.info(f"get_all_managers_fact: покупателей в отчёте={len(buyers)}")
-
-            # 1б. Отгрузки по тегам через /entity/demand
-            shipments_by_cp = {}  # cp_id → count
-            offset = 0
-            while True:
-                params = {
-                    "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
-                    "expand": "agent",
-                    "limit": 200,
-                    "offset": offset,
-                }
-                async with session.get(
-                    f"{MS_BASE}/entity/demand",
-                    headers=get_headers(), params=params
-                ) as r:
-                    if r.status != 200:
-                        break
-                    data = await r.json()
-                rows = data.get("rows", [])
-                for row in rows:
-                    agent = row.get("agent", {})
-                    cp_id = agent.get("id", "")
-                    if cp_id:
-                        shipments_by_cp[cp_id] = shipments_by_cp.get(cp_id, 0) + 1
-                if len(rows) < 200:
-                    break
-                offset += 200
-
-            logger.info(f"get_all_managers_fact: уникальных клиентов с отгрузками={len(shipments_by_cp)}")
-
-            # 2. Загружаем теги для каждого покупателя (как в get_buyers_by_product)
-            for b in buyers:
-                try:
-                    async with session.get(b["href"], headers=get_headers()) as r:
-                        if r.status == 200:
-                            cp_data = await r.json()
-                            b["tags"] = [t.lower() for t in cp_data.get("tags", [])]
-                        else:
-                            b["tags"] = []
-                except Exception:
-                    b["tags"] = []
-
-            # 3. Группируем по менеджеру
-            for b in buyers:
-                for tag, mgr_name in TAG_TO_NAME.items():
-                    if tag in b["tags"]:
-                        ships = shipments_by_cp.get(b["id"], 0)
-                        if mgr_name == "Алексей Леонтьев":
-                            logger.info(f"Леонтьев клиент: id={b['id']} tags={b['tags']} ships={ships}")
-                        result[mgr_name]["revenue"] += b["revenue"]
-                        result[mgr_name]["shipments"] += ships
-                        result[mgr_name]["clients"].add(b["id"])
-                        break
 
     except Exception as e:
         logger.error(f"get_all_managers_fact: {e}", exc_info=True)
