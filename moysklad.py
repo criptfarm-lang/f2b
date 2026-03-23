@@ -2386,3 +2386,90 @@ async def get_reconciliation_data(counterparty_id: str, date_from: str, date_to:
     except Exception as e:
         logger.error(f"get_reconciliation_data: {e}", exc_info=True)
         return {}
+
+
+async def get_aging_clients(days: int = 50) -> list:
+    """
+    Возвращает клиентов у которых последняя отгрузка была 50+ дней назад.
+    Логика: берём все отгрузки за последние 50 дней — у кого нет = стареющий.
+    """
+    import aiohttp
+    from datetime import datetime, timezone, timedelta
+
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = today - timedelta(days=days)
+    cutoff_str = cutoff.strftime("%Y-%m-%d 00:00:00")
+    today_str = today.strftime("%Y-%m-%d 23:59:59")
+
+    # Дата начала истории (берём последние 2 года для нахождения активных клиентов)
+    history_from = (today - timedelta(days=730)).strftime("%Y-%m-%d 00:00:00")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+
+            # 1. Клиенты у которых ЕСТЬ отгрузки за последние 50 дней — исключаем их
+            recent_params = {
+                "filter": f"moment>={cutoff_str};moment<={today_str}",
+                "expand": "agent",
+                "limit": 1000,
+            }
+            async with session.get(f"{MS_BASE}/entity/demand",
+                                   headers=get_headers(), params=recent_params) as resp:
+                if resp.status != 200:
+                    return []
+                recent_data = await resp.json()
+
+            active_ids = set()
+            for doc in recent_data.get("rows", []):
+                agent = doc.get("agent", {})
+                if agent.get("id"):
+                    active_ids.add(agent["id"])
+
+            logger.info(f"get_aging_clients: активных за {days} дней = {len(active_ids)}")
+
+            # 2. Все клиенты с отгрузками за последние 2 года
+            all_agents = {}
+            offset = 0
+            while True:
+                hist_params = {
+                    "filter": f"moment>={history_from};moment<={cutoff_str}",
+                    "expand": "agent",
+                    "limit": 200,
+                    "offset": offset,
+                    "order": "moment,desc",
+                }
+                async with session.get(f"{MS_BASE}/entity/demand",
+                                       headers=get_headers(), params=hist_params) as resp:
+                    if resp.status != 200:
+                        break
+                    hist_data = await resp.json()
+                    rows = hist_data.get("rows", [])
+                    for doc in rows:
+                        agent = doc.get("agent", {})
+                        agent_id = agent.get("id", "")
+                        if not agent_id or agent_id in active_ids:
+                            continue
+                        if "розничный покупатель" in agent.get("name", "").lower():
+                            continue
+                        if agent_id not in all_agents:
+                            doc_date = doc.get("moment", "")[:10]
+                            days_ago = (today.date() - datetime.strptime(doc_date, "%Y-%m-%d").date()).days
+                            all_agents[agent_id] = {
+                                "id": agent_id,
+                                "name": agent.get("name", ""),
+                                "tags": agent.get("tags", []),
+                                "last_demand_date": doc_date,
+                                "days": days_ago,
+                            }
+                    if len(rows) < 200:
+                        break
+                    offset += 200
+
+            result = list(all_agents.values())
+            result.sort(key=lambda x: x["days"], reverse=True)
+            logger.info(f"get_aging_clients: стареющих клиентов = {len(result)}")
+            return result
+
+    except Exception as e:
+        logger.error(f"get_aging_clients: {e}", exc_info=True)
+        return []
