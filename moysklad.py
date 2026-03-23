@@ -2648,6 +2648,35 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
 
             logger.info(f"get_all_managers_fact: покупателей в отчёте={len(buyers)}")
 
+            # 1б. Отгрузки по тегам через /entity/demand
+            shipments_by_cp = {}  # cp_id → count
+            offset = 0
+            while True:
+                params = {
+                    "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
+                    "expand": "agent",
+                    "limit": 200,
+                    "offset": offset,
+                }
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(), params=params
+                ) as r:
+                    if r.status != 200:
+                        break
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent = row.get("agent", {})
+                    cp_id = agent.get("id", "")
+                    if cp_id:
+                        shipments_by_cp[cp_id] = shipments_by_cp.get(cp_id, 0) + 1
+                if len(rows) < 200:
+                    break
+                offset += 200
+
+            logger.info(f"get_all_managers_fact: уникальных клиентов с отгрузками={len(shipments_by_cp)}")
+
             # 2. Загружаем теги для каждого покупателя (как в get_buyers_by_product)
             for b in buyers:
                 try:
@@ -2665,7 +2694,7 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
                 for tag, mgr_name in TAG_TO_NAME.items():
                     if tag in b["tags"]:
                         result[mgr_name]["revenue"] += b["revenue"]
-                        result[mgr_name]["shipments"] += b["shipments"]
+                        result[mgr_name]["shipments"] += shipments_by_cp.get(b["id"], 0)
                         result[mgr_name]["clients"].add(b["id"])
                         break
 
