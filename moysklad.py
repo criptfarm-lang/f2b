@@ -1598,7 +1598,11 @@ async def get_counterparties_by_product(product_query: str, period_days: int = 1
                         assortment = pos.get("assortment", {})
                         pos_name = assortment.get("name", "").lower()
                         if product_lower in pos_name:
-                            found[agent_id] = {"name": agent_name, "phone": None}
+                            found[agent_id] = {
+                                "name": agent_name,
+                                "phone": None,
+                                "tags": agent.get("tags", []),
+                            }
                             break
 
                 offset += limit
@@ -1713,6 +1717,19 @@ async def get_buyers_by_product(product_query: str, period_days: int = 180) -> l
                     break
 
         logger.info(f"get_buyers_by_product: '{product_name}' за {period_days} дней → {len(buyers)} покупателей")
+
+        # Загружаем теги для каждого покупателя
+        async with aiohttp.ClientSession() as session:
+            for b in buyers:
+                try:
+                    href = b.get("href", "")
+                    if href:
+                        async with session.get(href, headers=get_headers()) as r:
+                            if r.status == 200:
+                                cp_data = await r.json()
+                                b["tags"] = cp_data.get("tags", [])
+                except Exception:
+                    b["tags"] = []
 
     except Exception as e:
         logger.error(f"get_buyers_by_product: {e}")
