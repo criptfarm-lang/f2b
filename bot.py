@@ -300,7 +300,7 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📈 Активность", callback_data="menu_activity"),
-            InlineKeyboardButton("🌆 Вечерняя сводка", callback_data="menu_evening"),
+            InlineKeyboardButton("📊 Сводка", callback_data="menu_evening"),
         ],
         [
             InlineKeyboardButton("📊 Статистика бота", callback_data="menu_stats"),
@@ -3561,13 +3561,14 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     today = datetime.now().strftime("%d.%m.%Y")
-    lines = [f"🌆 *Вечерняя сводка — {today}*\n"]
+    lines = [f"📊 *Сводка — {today}*\n"]
 
-    # ── 1. Активность сегодня ─────────────────────────────────────
+    # ── 1. Активность сегодня — только известные менеджеры ────────
     lines.append("📞 *Активность сегодня:*")
+    activity_today = [m for m in activity_today if m.get("manager","") in MANAGERS]
     for mgr_data in sorted(activity_today, key=lambda x: x.get("msg_count",0)+x.get("call_count",0), reverse=True):
         mgr = mgr_data.get("manager","")
-        short = SHORT.get(mgr, mgr.split()[0] if mgr else "?")
+        short = SHORT.get(mgr, mgr)
         calls = mgr_data.get("call_count", 0)
         msgs = mgr_data.get("msg_count", 0)
         total = calls + msgs
@@ -3582,7 +3583,8 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if created:
         lines.append("📝 *Созданные заказы:*")
         for mgr, cnt in sorted(created.items(), key=lambda x: x[1], reverse=True):
-            short = SHORT.get(mgr, mgr.split()[0] if mgr else "?")
+            if mgr not in MANAGERS: continue
+            short = SHORT[mgr]
             lines.append(f"  {short}: {cnt} заказ{'ов' if cnt>4 else 'а' if cnt>1 else ''}")
         lines.append("")
 
@@ -3591,7 +3593,8 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if shipped:
         lines.append("🚚 *Отгрузки:*")
         for mgr, cnt in sorted(shipped.items(), key=lambda x: x[1], reverse=True):
-            short = SHORT.get(mgr, mgr.split()[0] if mgr else "?")
+            if mgr not in MANAGERS: continue
+            short = SHORT[mgr]
             lines.append(f"  {short}: {cnt} отгруз{'ок' if cnt>4 else 'ки' if cnt>1 else 'ка'}")
         lines.append("")
 
@@ -3615,9 +3618,6 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         lines.append("")
 
-    # ── 6. Выполнение планов ──────────────────────────────────────
-    lines.append("📊 *Выполнение планов:*")
-    lines.append("  — данные планов будут доступны после настройки")
 
     text = "\n".join(lines)
 
@@ -3628,20 +3628,20 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    # Отправляем график активности за 7 дней
-    if activity:
-        await _send_activity_chart(context, chat_id, activity)
+    # График — только известные менеджеры
+    known_activity = [r for r in activity if r.get("manager","") in MANAGERS]
+    if known_activity:
+        await _send_activity_chart(context, chat_id, known_activity)
 
 
 async def _send_activity_chart(context, chat_id: int, activity: list):
-    """Генерирует и отправляет график активности менеджеров за 7 дней."""
+    """Линейный график активности менеджеров за 7 дней."""
     try:
         import io
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
-        from datetime import datetime, timedelta
+        from datetime import datetime
         from collections import defaultdict
 
         MANAGERS_SHORT = {
@@ -3651,44 +3651,62 @@ async def _send_activity_chart(context, chat_id: int, activity: list):
             "Алексей Леонтьев": "Алексей",
             "Сергей Черентаев": "Сергей",
         }
-        COLORS = ["#4F81BD", "#C0504D", "#9BBB59", "#8064A2", "#F79646"]
+        COLORS = {
+            "Карина Баласанян":  "#4FC3F7",
+            "Елена Мерзлякова":  "#EF5350",
+            "Инесса Скляр":      "#66BB6A",
+            "Алексей Леонтьев":  "#AB47BC",
+            "Сергей Черентаев":  "#FFA726",
+        }
 
-        # Строим структуру данных
-        days_set = sorted(set(r["day"] for r in activity))[-7:]
-        managers = [m for m in MANAGERS_SHORT.keys()]
-
+        # Данные по дням
+        days_set = sorted(set(str(r["day"]) for r in activity))[-7:]
         data = defaultdict(lambda: defaultdict(int))
         for r in activity:
-            day = r["day"]
+            day = str(r["day"])
             mgr = r["manager"]
             if mgr in MANAGERS_SHORT and day in days_set:
                 data[mgr][day] += r.get("msgs", 0) + r.get("calls", 0)
 
-        fig, ax = plt.subplots(figsize=(10, 5))
-        fig.patch.set_facecolor("#1a1a2e")
-        ax.set_facecolor("#16213e")
-
-        x = list(range(len(days_set)))
-        width = 0.15
-        for i, mgr in enumerate(managers):
-            vals = [data[mgr].get(d, 0) for d in days_set]
-            bars = ax.bar([xi + i * width for xi in x], vals,
-                          width=width, label=MANAGERS_SHORT[mgr],
-                          color=COLORS[i % len(COLORS)], alpha=0.85)
-
-        ax.set_xticks([xi + width * 2 for xi in x])
         day_labels = [datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m") for d in days_set]
-        ax.set_xticklabels(day_labels, color="white", fontsize=9)
-        ax.tick_params(colors="white")
-        ax.spines[:].set_color("#333355")
-        ax.set_title("Активность менеджеров (звонки + сообщения)", color="white", fontsize=12)
-        ax.legend(facecolor="#1a1a2e", labelcolor="white", fontsize=8)
-        ax.yaxis.label.set_color("white")
-        ax.set_ylabel("Контактов", color="white")
+        x = list(range(len(days_set)))
+
+        fig, ax = plt.subplots(figsize=(11, 5))
+        fig.patch.set_facecolor("#0d1117")
+        ax.set_facecolor("#0d1117")
+
+        has_data = False
+        for mgr, short in MANAGERS_SHORT.items():
+            vals = [data[mgr].get(d, 0) for d in days_set]
+            if any(v > 0 for v in vals):
+                has_data = True
+            ax.plot(x, vals,
+                    marker="o", linewidth=2, markersize=5,
+                    label=short, color=COLORS[mgr], alpha=0.9)
+            # Подписи значений на точках
+            for xi, v in zip(x, vals):
+                if v > 0:
+                    ax.annotate(str(v), (xi, v),
+                                textcoords="offset points", xytext=(0, 6),
+                                ha="center", fontsize=7, color=COLORS[mgr])
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(day_labels, color="#c9d1d9", fontsize=9)
+        ax.tick_params(axis="y", colors="#c9d1d9", labelsize=8)
+        ax.tick_params(axis="x", colors="#c9d1d9")
+        for spine in ax.spines.values():
+            spine.set_color("#30363d")
+        ax.yaxis.grid(True, color="#21262d", linewidth=0.7)
+        ax.set_axisbelow(True)
+        ax.set_title("Активность менеджеров · звонки + сообщения",
+                     color="#c9d1d9", fontsize=11, pad=12)
+        ax.set_ylabel("Контактов", color="#8b949e", fontsize=9)
+        ax.legend(facecolor="#161b22", labelcolor="#c9d1d9",
+                  edgecolor="#30363d", fontsize=9, loc="upper left")
 
         buf = io.BytesIO()
         plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=120, facecolor=fig.get_facecolor())
+        plt.savefig(buf, format="png", dpi=130, facecolor=fig.get_facecolor())
         buf.seek(0)
         plt.close()
 
