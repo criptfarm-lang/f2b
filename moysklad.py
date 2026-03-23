@@ -601,6 +601,7 @@ async def get_counterparty_balance(query: str) -> list:
                     "balance": balance,
                     "debt": debt,
                     "tags": c.get("tags", []),
+                    "created": c.get("created", ""),
                     "href": c.get("meta", {}).get("href", f"{MS_BASE}/entity/counterparty/{cid}"),
                 })
                 logger.info(f"get_counterparty_balance: {c.get('name')} tags={c.get('tags', [])}")
