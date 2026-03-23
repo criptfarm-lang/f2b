@@ -3772,7 +3772,7 @@ async def _send_sales_plan_chart(context, chat_id: int):
             fact = facts.get(full_name, {})
 
             # Позиция метки менеджера — по центру трёх баров
-            center_y = y + 1  # средний из трёх баров
+            center_y = y + 0.3  # средний из трёх баров (шаг 0.3)
             manager_label_y.append((center_y, short))
 
             for bar_i, (metric, label, divisor, color) in enumerate(reversed(METRICS)):
