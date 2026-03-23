@@ -3767,7 +3767,7 @@ async def _send_sales_plan_chart(context, chat_id: int):
         ytick_labels = []
         manager_label_y = []
 
-        for mgr_i, (full_name, tag, short) in enumerate(MANAGERS):
+        for mgr_i, (full_name, tag, short) in enumerate(reversed(MANAGERS)):
             plan = plans.get(full_name, {})
             fact = facts.get(full_name, {})
 
@@ -3775,7 +3775,7 @@ async def _send_sales_plan_chart(context, chat_id: int):
             center_y = y + 1  # средний из трёх баров
             manager_label_y.append((center_y, short))
 
-            for bar_i, (metric, label, divisor, color) in enumerate(METRICS):
+            for bar_i, (metric, label, divisor, color) in enumerate(reversed(METRICS)):
                 plan_val = float(plan.get(metric, 0) or 0) / divisor
                 fact_val = float(fact.get(metric, 0) or 0) / divisor
                 pct = min(fact_val / plan_val, 1.0) if plan_val > 0 else 0.0
