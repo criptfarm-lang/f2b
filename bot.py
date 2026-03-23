@@ -1704,6 +1704,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await _create_and_send_contract(contract_data, user.full_name, message, context)
             return
+
+        elif awaiting == "pdz_client":
+            await message.reply_chat_action("typing")
             from moysklad import get_overdue_demands
             counterparties = await get_counterparty_balance(text)
             if not counterparties:
@@ -1718,7 +1721,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             MANAGER_TAG_MAP = {
                 "баласанян": "Карина Баласанян", "мерзлякова": "Елена Мерзлякова",
-                "скляр": "Инесса Скляр",                 "леонтьев": "Алексей Леонтьев", "черентаев": "Сергей Черентаев",
+                "скляр": "Инесса Скляр", "леонтьев": "Алексей Леонтьев", "черентаев": "Сергей Черентаев",
             }
             manager = "Не назначен"
             for tag in tags:
@@ -2516,8 +2519,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"_Искал товар: {found_name}_", parse_mode="Markdown")
             return
         lines = [f"👥 *Покупатели {found_name}* за {period_days} дней ({len(buyers)}):\n"]
+
+        MANAGER_TAG_MAP = {
+            "баласанян": "Карина", "мерзлякова": "Елена",
+            "скляр": "Инесса", "леонтьев": "Алексей", "черентаев": "Сергей",
+        }
+        SPEC_TAGS = {"опт", "хорека", "розница"}
+
         for b in buyers:
-            lines.append(f"• {b['name']}")
+            tags = b.get("tags", [])
+            tags_lower = [t.lower() for t in tags]
+
+            # Специализация
+            spec = next((t.capitalize() for t in tags_lower if t in SPEC_TAGS), "")
+            # Менеджер
+            manager = next((MANAGER_TAG_MAP[t] for t in tags_lower if t in MANAGER_TAG_MAP), "")
+
+            suffix = ""
+            if spec:
+                suffix += f" · {spec}"
+            if manager:
+                suffix += f" · {manager}"
+
+            lines.append(f"• {b['name']}{suffix}")
         text = "\n".join(lines)
         if len(text) > 4000:
             text = text[:3900] + "\n\n_...и ещё_"
