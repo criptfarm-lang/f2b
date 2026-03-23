@@ -2579,3 +2579,49 @@ async def get_evening_stats() -> dict:
     except Exception as e:
         logger.error(f"get_evening_stats: {e}", exc_info=True)
         return result
+
+
+async def get_sales_fact(manager_tag: str, date_from: str, date_to: str) -> dict:
+    """
+    Фактические показатели менеджера за период:
+    - revenue: выручка (сумма отгрузок)
+    - shipments: количество отгрузок
+    - clients: уникальные клиенты (АКБ)
+    """
+    import aiohttp
+    result = {"revenue": 0.0, "shipments": 0, "clients": set()}
+    try:
+        async with aiohttp.ClientSession() as session:
+            offset = 0
+            while True:
+                params = {
+                    "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
+                    "expand": "agent",
+                    "limit": 200,
+                    "offset": offset,
+                }
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(), params=params
+                ) as r:
+                    if r.status != 200:
+                        break
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent = row.get("agent", {})
+                    tags = [t.lower() for t in agent.get("tags", [])]
+                    if manager_tag.lower() not in tags:
+                        continue
+                    result["shipments"] += 1
+                    result["revenue"] += (row.get("sum", 0) or 0) / 100
+                    agent_id = agent.get("id", "")
+                    if agent_id:
+                        result["clients"].add(agent_id)
+                if len(rows) < 200:
+                    break
+                offset += 200
+    except Exception as e:
+        logger.error(f"get_sales_fact {manager_tag}: {e}")
+    result["clients"] = len(result["clients"])
+    return result
