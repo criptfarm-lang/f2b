@@ -68,6 +68,14 @@ def setup_scheduler(app: Application, db):
         id="remind_today_tasks"
     )
 
+    # 12:00 МСК — проверка стареющих клиентов
+    scheduler.add_job(
+        check_aging_clients,
+        CronTrigger(hour=12, minute=0),
+        args=[app],
+        id="aging_clients"
+    )
+
     # 03:00 — очистка старых задач
     scheduler.add_job(
         cleanup_done_tasks,
@@ -274,3 +282,98 @@ def cleanup_done_tasks():
         logger.info("cleanup_done_tasks: старые выполненные задачи удалены")
     except Exception as e:
         logger.error(f"cleanup_done_tasks: {e}")
+
+
+async def check_aging_clients(app: Application):
+    """Ежедневно в 12:00 — проверяет клиентов без отгрузок 50 дней."""
+    from moysklad import get_aging_clients
+    from database import Database
+
+    chat_id = get_group_chat_id()
+    if not chat_id:
+        return
+
+    db = Database()
+
+    try:
+        clients = await get_aging_clients(days=50)
+        if not clients:
+            logger.info("check_aging_clients: стареющих клиентов нет")
+            return
+
+        MANAGER_TAG_MAP = {
+            "баласанян": "Карина Баласанян",
+            "мерзлякова": "Елена Мерзлякова",
+            "скляр": "Инесса Скляр",
+            "голубева": "Татьяна Голубева",
+            "леонтьев": "Алексей Леонтьев",
+            "черентаев": "Сергей Черентаев",
+        }
+
+        import asyncio
+        for i, client in enumerate(clients):
+            name = client["name"]
+            tags = client.get("tags", [])
+            last_date = client["last_demand_date"]
+            days = client.get("days", 50)
+
+            # Определяем менеджера
+            manager_name = "Без менеджера"
+            manager_tag = None
+            for tag in tags:
+                if tag.lower() in MANAGER_TAG_MAP:
+                    manager_name = MANAGER_TAG_MAP[tag.lower()]
+                    manager_tag = tag.lower()
+                    break
+
+            # 1. Алерт в группу PRO
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ *Стареющий клиент*\n\n"
+                    f"👤 *{name}*\n"
+                    f"📅 Последняя отгрузка: {last_date} ({days} дней назад)\n"
+                    f"👔 Менеджер: {manager_name}\n\n"
+                    f"Необходимо связаться с клиентом и сделать специальное предложение."
+                ),
+                parse_mode="Markdown"
+            )
+
+            # 2. Задача в список задач
+            task_text = f"Связаться с {name} — нет отгрузок {days} дней. Сделать спецпредложение."
+            db.save_task(
+                text=task_text,
+                executor=manager_name,
+                deadline=None,
+                source_chat=chat_id,
+                source_message_id=0,
+                created_by="Эф (авто)"
+            )
+
+            # 3. Личное сообщение менеджеру
+            if manager_tag:
+                mgr_chat_id = db.get_manager_chat_id(manager_name.split()[0])
+                if mgr_chat_id:
+                    try:
+                        await app.bot.send_message(
+                            chat_id=mgr_chat_id,
+                            text=(
+                                f"📋 *Задача: стареющий клиент*\n\n"
+                                f"👤 *{name}* не делал заказов уже {days} дней.\n"
+                                f"Последняя отгрузка: {last_date}\n\n"
+                                f"Свяжись с клиентом, узнай причину и сделай специальное предложение.\n"
+                                f"Результат напиши мне в личку."
+                            ),
+                            parse_mode="Markdown"
+                        )
+                    except Exception as e:
+                        logger.warning(f"check_aging_clients: не удалось написать {manager_name}: {e}")
+
+            logger.info(f"check_aging_clients: обработан {name} → {manager_name}")
+
+            # Пауза 2 минуты между алертами
+            if i < len(clients) - 1:
+                await asyncio.sleep(120)
+
+    except Exception as e:
+        logger.error(f"check_aging_clients: {e}", exc_info=True)
