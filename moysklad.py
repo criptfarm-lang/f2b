@@ -2584,12 +2584,12 @@ async def get_evening_stats() -> dict:
 
 async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
     """
-    Берёт все отгрузки за период и группирует по тегу менеджера.
+    Берёт все отгрузки за период и группирует по группе контрагента.
     Возвращает {manager_name: {revenue, shipments, clients}}
     """
     import aiohttp
 
-    TAG_TO_NAME = {
+    GROUP_TO_NAME = {
         "скляр":      "Инесса Скляр",
         "мерзлякова": "Елена Мерзлякова",
         "баласанян":  "Карина Баласанян",
@@ -2598,50 +2598,76 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
     }
 
     result = {name: {"revenue": 0.0, "shipments": 0, "clients": set()}
-              for name in TAG_TO_NAME.values()}
+              for name in GROUP_TO_NAME.values()}
 
     try:
         async with aiohttp.ClientSession() as session:
-            offset = 0
-            while True:
-                params = {
-                    "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
-                    "expand": "agent",
-                    "limit":  200,
-                    "offset": offset,
-                }
-                async with session.get(
-                    f"{MS_BASE}/entity/demand",
-                    headers=get_headers(), params=params
-                ) as r:
-                    if r.status != 200:
-                        logger.error(f"get_all_managers_fact: {r.status}")
+
+            # 1. Получаем все группы контрагентов и их href
+            async with session.get(
+                f"{MS_BASE}/entity/counterparty/metadata",
+                headers=get_headers()
+            ) as r:
+                if r.status != 200:
+                    logger.error(f"get_all_managers_fact: metadata {r.status}")
+                    return result
+                meta = await r.json()
+
+            group_href_map = {}  # "скляр" → href
+            all_groups = meta.get("groups", {}).get("rows", [])
+            logger.info(f"get_all_managers_fact: все группы в МС = {[g.get('name') for g in all_groups]}")
+            for g in all_groups:
+                g_name = g.get("name", "").lower().strip()
+                for key in GROUP_TO_NAME:
+                    if key in g_name:
+                        group_href_map[key] = g.get("meta", {}).get("href", "")
+                        logger.info(f"  matched: '{g['name']}' → {key}")
                         break
-                    data = await r.json()
+            logger.info(f"get_all_managers_fact: групп найдено {len(group_href_map)}: {list(group_href_map.keys())}")
 
-                rows = data.get("rows", [])
-                for row in rows:
-                    agent = row.get("agent", {})
-                    tags = [t.lower() for t in agent.get("tags", [])]
-                    agent_id = agent.get("id", "")
-                    revenue = (row.get("sum", 0) or 0) / 100
+            if not group_href_map:
+                logger.warning("get_all_managers_fact: группы менеджеров не найдены в МойСклад")
+                return result
 
-                    for tag, name in TAG_TO_NAME.items():
-                        if tag in tags:
-                            result[name]["revenue"] += revenue
-                            result[name]["shipments"] += 1
-                            if agent_id:
-                                result[name]["clients"].add(agent_id)
+            # 2. Для каждой группы запрашиваем отчёт прибыльности
+            for group_name, group_href in group_href_map.items():
+                manager_name = GROUP_TO_NAME[group_name]
+                offset = 0
+                while True:
+                    params = {
+                        "momentFrom": f"{date_from} 00:00:00",
+                        "momentTo":   f"{date_to} 23:59:59",
+                        "filter":     f"counterpartyGroup={group_href}",
+                        "limit": 200,
+                        "offset": offset,
+                    }
+                    async with session.get(
+                        f"{MS_BASE}/report/profit/bycounterparty",
+                        headers=get_headers(), params=params
+                    ) as r:
+                        if r.status != 200:
+                            body = await r.text()
+                            logger.error(f"get_all_managers_fact {group_name}: {r.status} {body[:200]}")
                             break
+                        data = await r.json()
 
-                if len(rows) < 200:
-                    break
-                offset += 200
+                    rows = data.get("rows", [])
+                    for row in rows:
+                        result[manager_name]["revenue"]   += (row.get("sellSum", 0) or 0) / 100
+                        result[manager_name]["shipments"] += row.get("demandCount", 0) or 0
+                        cp_href = row.get("counterparty", {}).get("meta", {}).get("href", "")
+                        cp_id = cp_href.split("/")[-1] if cp_href else ""
+                        if cp_id:
+                            result[manager_name]["clients"].add(cp_id)
+
+                    total = data.get("meta", {}).get("size", 0)
+                    offset += len(rows)
+                    if offset >= total or len(rows) < 200:
+                        break
 
     except Exception as e:
         logger.error(f"get_all_managers_fact: {e}", exc_info=True)
 
-    # Конвертируем set в count
     for name in result:
         result[name]["clients"] = len(result[name]["clients"])
         logger.info(f"fact {name}: revenue={result[name]['revenue']:.0f} "
