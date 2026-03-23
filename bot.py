@@ -1635,10 +1635,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif awaiting == "contract":
             await message.reply_chat_action("typing")
-            # Обрабатываем как generate_contract напрямую
             buyer_query = text
             from moysklad import get_counterparty_requisites
-            from datetime import date as _date
+            from datetime import date as _date, datetime as _datetime
             counterparties = await get_counterparty_balance(buyer_query)
             if not counterparties:
                 await message.reply_text(
@@ -1650,6 +1649,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cp = counterparties[0]
             cp_id = cp.get("id", "")
             cp_name = cp.get("name", buyer_query)
+
+            # Проверяем дату создания клиента — если до 20.03.2026, договор не создаём
+            created_str = cp.get("created", "")
+            CUTOFF = _datetime(2026, 3, 20)
+            is_old_client = False
+            if created_str:
+                try:
+                    created_dt = _datetime.fromisoformat(created_str[:19])
+                    if created_dt < CUTOFF:
+                        is_old_client = True
+                except Exception:
+                    pass
+
+            if is_old_client:
+                await message.reply_text(
+                    f"⚠️ *{cp_name}* — действующий клиент.\n\n"
+                    f"Договор по этому клиенту уже существует или ведётся в работе.\n"
+                    f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
+                    parse_mode="Markdown",
+                    reply_markup=_user_menu_keyboard()
+                )
+                return
+
             existing = db.find_contract_by_buyer(cp_name)
             if existing:
                 await message.reply_text(
@@ -2805,9 +2827,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_chat_action("typing")
 
         from moysklad import get_counterparty_requisites
-        from datetime import date as _date
+        from datetime import date as _date, datetime as _datetime
 
-        # Ищем контрагента
         counterparties = await get_counterparty_balance(buyer_query)
         if not counterparties:
             await message.reply_text(
@@ -2820,7 +2841,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cp_id = cp.get("id", "")
         cp_name = cp.get("name", buyer_query)
 
-        # 1. Проверяем — есть ли уже договор с этим клиентом
+        # Запрет на договор для клиентов созданных до 20.03.2026
+        created_str = cp.get("created", "")
+        CUTOFF = _datetime(2026, 3, 20)
+        if created_str:
+            try:
+                if _datetime.fromisoformat(created_str[:19]) < CUTOFF:
+                    await message.reply_text(
+                        f"⚠️ *{cp_name}* — действующий клиент.\n\n"
+                        f"Договор по этому клиенту уже существует или ведётся в работе.\n"
+                        f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
+                        parse_mode="Markdown"
+                    )
+                    return
+            except Exception:
+                pass
+
+        # Проверяем — есть ли уже договор созданный Эфом
         existing = db.find_contract_by_buyer(cp_name)
         if existing:
             await message.reply_text(
