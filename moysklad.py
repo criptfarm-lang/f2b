@@ -2629,9 +2629,9 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
                             ) as r2:
                                 if r2.status == 200:
                                     cp = await r2.json()
-                                    cp_keys = list(cp.keys())
-                                    logger.info(f"ДИАГНОСТИКА full cp keys={cp_keys}")
-                                    logger.info(f"ДИАГНОСТИКА group={cp.get('group')} tags={cp.get('tags')} counterpartyGroup={cp.get('counterpartyGroup')}")
+                                    logger.info(f"ДИАГНОСТИКА full cp tags={cp.get('tags')} group={cp.get('group')}")
+                                    # Также логируем теги прямо из agent в отгрузке
+                        logger.info(f"ДИАГНОСТИКА agent tags={agent.get('tags')}")
 
             group_href_map = {}
 
