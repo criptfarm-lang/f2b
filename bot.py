@@ -1228,10 +1228,19 @@ async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT
         missing_info = [(k, v) for k, v in INFO_REQUIRED.items() if not contract_data.get(k)]
         user = query.from_user
 
-        msg = f"📄 *{contract_data['buyer_name']}*\n"
+        # Если не хватает данных из МойСклад — останавливаемся
         if missing_info:
-            names = ", ".join(v for _, v in missing_info)
-            msg += f"⚠️ В МойСклад не заведены: _{names}_\n\n"
+            names = "\n".join(f"   • {v}" for _, v in missing_info)
+            await query.message.edit_text(
+                f"📄 *{contract_data['buyer_name']}*\n\n"
+                f"❌ *Договор не сформирован* — в МойСклад отсутствуют:\n{names}\n\n"
+                f"Попроси клиента предоставить данные и внеси их в карточку МойСклад, "
+                f"затем запроси договор повторно.",
+                parse_mode="Markdown"
+            )
+            return
+
+        msg = f"📄 *{contract_data['buyer_name']}*\n"
 
         if missing_ask:
             _pending_contracts[user.id] = {
@@ -1713,24 +1722,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "buyer_director_name": reqs.get("buyer_director_name", ""),
                 "buyer_basis": "Устава",
             }
-            REQUIRED = {
+            INFO_REQUIRED = {
                 "buyer_inn": "ИНН", "buyer_ogrn": "ОГРН",
                 "buyer_address": "юридический адрес",
                 "buyer_rs": "расчётный счёт (р/с)", "buyer_bik": "БИК банка",
                 "buyer_bank": "название банка", "buyer_ks": "корреспондентский счёт (к/с)",
+            }
+            ASK_REQUIRED = {
                 "buyer_representative": "ФИО директора и должность",
                 "buyer_basis": "основание полномочий",
             }
-            missing = [(k, v) for k, v in REQUIRED.items() if not contract_data.get(k)]
-            if missing:
+            missing_info = [(k, v) for k, v in INFO_REQUIRED.items() if not contract_data.get(k)]
+            missing_ask = [(k, v) for k, v in ASK_REQUIRED.items() if not contract_data.get(k)]
+
+            if missing_info:
+                names = "\n".join(f"   • {v}" for _, v in missing_info)
+                await message.reply_text(
+                    f"📄 *{contract_data['buyer_name']}*\n\n"
+                    f"❌ *Договор не сформирован* — в МойСклад отсутствуют:\n{names}\n\n"
+                    f"Внеси данные в карточку МойСклад и запроси договор повторно.",
+                    parse_mode="Markdown",
+                    reply_markup=_user_menu_keyboard()
+                )
+                return
+            if missing_ask:
                 _pending_contracts[user.id] = {
                     "data": contract_data,
-                    "missing_keys": [m[0] for m in missing],
-                    "missing_labels": [m[1] for m in missing],
+                    "missing_keys": [m[0] for m in missing_ask],
+                    "missing_labels": [m[1] for m in missing_ask],
                     "missing_idx": 0,
                 }
                 await message.reply_text(
-                    f"📄 *{contract_data['buyer_name']}*\n\nНе хватает данных:\n*{missing[0][1]}*?",
+                    f"📄 *{contract_data['buyer_name']}*\n\nУточни:\n*{missing_ask[0][1]}*?",
                     parse_mode="Markdown"
                 )
             else:
@@ -2937,20 +2960,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = f"📄 *{contract_data['buyer_name']}*\n_{found_str}_\n\n"
 
             if missing_info:
-                names = ", ".join(v for _, v in missing_info)
-                msg += f"⚠️ В МойСклад не заведены: _{names}_\n_(попроси клиента предоставить)_\n\n"
+                names = "\n".join(f"   • {v}" for _, v in missing_info)
+                await message.reply_text(
+                    f"📄 *{contract_data['buyer_name']}*\n\n"
+                    f"❌ *Договор не сформирован* — в МойСклад отсутствуют:\n{names}\n\n"
+                    f"Внеси данные в карточку МойСклад и запроси договор повторно.",
+                    parse_mode="Markdown"
+                )
+                return
 
             if missing_ask:
                 msg += f"*{missing_ask[0][1]}*?"
-            else:
-                # Только инфо-поля отсутствуют — сразу генерируем
-                await message.reply_text(msg.rstrip(), parse_mode="Markdown")
-                await message.reply_text("⏳ Генерирую договор с имеющимися данными...")
-                await _create_and_send_contract(contract_data, user.full_name, message, context)
+                await message.reply_text(msg, parse_mode="Markdown")
                 return
-
-            await message.reply_text(msg, parse_mode="Markdown")
-            return
 
         # Все данные есть — генерируем сразу
         await message.reply_text("✅ Все реквизиты найдены. Генерирую договор...")
