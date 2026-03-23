@@ -296,11 +296,11 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📈 Активность", callback_data="menu_activity"),
-            InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
+            InlineKeyboardButton("🌆 Вечерняя сводка", callback_data="menu_evening"),
         ],
         [
             InlineKeyboardButton("📊 Статистика бота", callback_data="menu_stats"),
-            InlineKeyboardButton("🔒 Заблокировать", callback_data="menu_block"),
+            InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
         ],
         [
             InlineKeyboardButton("🗑 Очистить открытые", callback_data="menu_clearopen"),
@@ -401,6 +401,10 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif action == "menu_pdz_results":
         await cmd_pdz_results(update, context)
+
+    elif action == "menu_evening":
+        await query.answer()
+        await cmd_evening(update, context)
 
     elif action == "menu_activity":
         await query.message.reply_text(
@@ -3502,6 +3506,176 @@ async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Готово. Сводка результатов придёт в 17:00.")
 
 
+async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/evening — вечерняя сводка дня."""
+    OWNER_ID = 360092495
+    user = update.effective_user
+    if not user or user.id != OWNER_ID:
+        return
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    from moysklad import get_evening_stats
+    from datetime import datetime, timedelta
+
+    # Собираем данные параллельно
+    stats = await get_evening_stats()
+    activity = db.get_activity_by_day(days=7)
+    contracts = db.get_contracts_today()
+    activity_today = db.get_manager_activity(days=1)
+
+    MANAGERS = ["Карина Баласанян", "Елена Мерзлякова", "Инесса Скляр",
+                "Алексей Леонтьев", "Сергей Черентаев"]
+    SHORT = {
+        "Карина Баласанян": "Карина",
+        "Елена Мерзлякова": "Елена",
+        "Инесса Скляр": "Инесса",
+        "Алексей Леонтьев": "Алексей",
+        "Сергей Черентаев": "Сергей",
+    }
+
+    today = datetime.now().strftime("%d.%m.%Y")
+    lines = [f"🌆 *Вечерняя сводка — {today}*\n"]
+
+    # ── 1. Активность сегодня ─────────────────────────────────────
+    lines.append("📞 *Активность сегодня:*")
+    for mgr_data in sorted(activity_today, key=lambda x: x.get("msg_count",0)+x.get("call_count",0), reverse=True):
+        mgr = mgr_data.get("manager","")
+        short = SHORT.get(mgr, mgr.split()[0] if mgr else "?")
+        calls = mgr_data.get("call_count", 0)
+        msgs = mgr_data.get("msg_count", 0)
+        total = calls + msgs
+        bar = "▓" * min(total // 5, 10)
+        lines.append(f"  {short}: {bar} {calls}📞 {msgs}💬")
+    if not activity_today:
+        lines.append("  — нет данных")
+    lines.append("")
+
+    # ── 2. Созданные заказы ───────────────────────────────────────
+    created = stats.get("created_orders", {})
+    if created:
+        lines.append("📝 *Созданные заказы:*")
+        for mgr, cnt in sorted(created.items(), key=lambda x: x[1], reverse=True):
+            short = SHORT.get(mgr, mgr.split()[0] if mgr else "?")
+            lines.append(f"  {short}: {cnt} заказ{'ов' if cnt>4 else 'а' if cnt>1 else ''}")
+        lines.append("")
+
+    # ── 3. Отгруженные заказы ─────────────────────────────────────
+    shipped = stats.get("shipped_orders", {})
+    if shipped:
+        lines.append("🚚 *Отгрузки:*")
+        for mgr, cnt in sorted(shipped.items(), key=lambda x: x[1], reverse=True):
+            short = SHORT.get(mgr, mgr.split()[0] if mgr else "?")
+            lines.append(f"  {short}: {cnt} отгруз{'ок' if cnt>4 else 'ки' if cnt>1 else 'ка'}")
+        lines.append("")
+
+    # ── 4. Новые договоры ─────────────────────────────────────────
+    if contracts:
+        lines.append(f"📄 *Новые договоры ({len(contracts)}):*")
+        for c in contracts:
+            lines.append(f"  • {c.get('buyer_name','?')} — {c.get('contract_number','?')}")
+        lines.append("")
+
+    # ── 5. 🎉 Первые отгрузки новым клиентам ─────────────────────
+    new_clients = stats.get("new_clients", [])
+    if new_clients:
+        for nc in new_clients:
+            mgr = nc.get("manager", "")
+            short = SHORT.get(mgr, mgr)
+            lines.append(
+                f"🎉 *Первая отгрузка новому клиенту!*\n"
+                f"👤 *{nc['name']}*\n"
+                f"🏆 Отличная работа, *{short}*! Новый клиент в семье F2B!"
+            )
+        lines.append("")
+
+    # ── 6. Выполнение планов ──────────────────────────────────────
+    lines.append("📊 *Выполнение планов:*")
+    lines.append("  — данные планов будут доступны после настройки")
+
+    text = "\n".join(lines)
+
+    # Отправляем основную сводку
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="Markdown"
+    )
+
+    # Отправляем график активности за 7 дней
+    if activity:
+        await _send_activity_chart(context, chat_id, activity)
+
+
+async def _send_activity_chart(context, chat_id: int, activity: list):
+    """Генерирует и отправляет график активности менеджеров за 7 дней."""
+    try:
+        import io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from datetime import datetime, timedelta
+        from collections import defaultdict
+
+        MANAGERS_SHORT = {
+            "Карина Баласанян": "Карина",
+            "Елена Мерзлякова": "Елена",
+            "Инесса Скляр": "Инесса",
+            "Алексей Леонтьев": "Алексей",
+            "Сергей Черентаев": "Сергей",
+        }
+        COLORS = ["#4F81BD", "#C0504D", "#9BBB59", "#8064A2", "#F79646"]
+
+        # Строим структуру данных
+        days_set = sorted(set(r["day"] for r in activity))[-7:]
+        managers = [m for m in MANAGERS_SHORT.keys()]
+
+        data = defaultdict(lambda: defaultdict(int))
+        for r in activity:
+            day = r["day"]
+            mgr = r["manager"]
+            if mgr in MANAGERS_SHORT and day in days_set:
+                data[mgr][day] += r.get("msgs", 0) + r.get("calls", 0)
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        fig.patch.set_facecolor("#1a1a2e")
+        ax.set_facecolor("#16213e")
+
+        x = list(range(len(days_set)))
+        width = 0.15
+        for i, mgr in enumerate(managers):
+            vals = [data[mgr].get(d, 0) for d in days_set]
+            bars = ax.bar([xi + i * width for xi in x], vals,
+                          width=width, label=MANAGERS_SHORT[mgr],
+                          color=COLORS[i % len(COLORS)], alpha=0.85)
+
+        ax.set_xticks([xi + width * 2 for xi in x])
+        day_labels = [datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m") for d in days_set]
+        ax.set_xticklabels(day_labels, color="white", fontsize=9)
+        ax.tick_params(colors="white")
+        ax.spines[:].set_color("#333355")
+        ax.set_title("Активность менеджеров (звонки + сообщения)", color="white", fontsize=12)
+        ax.legend(facecolor="#1a1a2e", labelcolor="white", fontsize=8)
+        ax.yaxis.label.set_color("white")
+        ax.set_ylabel("Контактов", color="white")
+
+        buf = io.BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format="png", dpi=120, facecolor=fig.get_facecolor())
+        buf.seek(0)
+        plt.close()
+
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=buf,
+            caption="📈 Активность за 7 дней"
+        )
+    except Exception as e:
+        logger.warning(f"_send_activity_chart: {e}")
+
+
 async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/block [user_id] — заблокировать пользователя."""
     if not update.effective_user or update.effective_user.id != 360092495:
@@ -3971,6 +4145,7 @@ def main():
 
     # Команды
     app.add_handler(CallbackQueryHandler(handle_task_done_callback, pattern="^task_done\\|"))
+    app.add_handler(CommandHandler("evening", cmd_evening))
     app.add_handler(CommandHandler("block", cmd_block_user))
     app.add_handler(CommandHandler("unblock", cmd_unblock_user))
     app.add_handler(CommandHandler("stats", cmd_stats))
