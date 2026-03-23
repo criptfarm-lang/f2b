@@ -2469,3 +2469,96 @@ async def get_aging_clients(days: int = 50) -> list:
     except Exception as e:
         logger.error(f"get_aging_clients: {e}", exc_info=True)
         return []
+
+
+async def get_evening_stats() -> dict:
+    """
+    Статистика за сегодня для вечерней сводки:
+    - Созданные заказы по менеджерам
+    - Отгруженные заказы по менеджерам
+    - Первые отгрузки новым клиентам
+    """
+    import aiohttp
+    from datetime import datetime, timezone
+
+    today_from = datetime.now().strftime("%Y-%m-%d 00:00:00")
+    today_to   = datetime.now().strftime("%Y-%m-%d 23:59:59")
+
+    MANAGER_TAG_MAP = {
+        "баласанян": "Карина Баласанян",
+        "мерзлякова": "Елена Мерзлякова",
+        "скляр": "Инесса Скляр",
+        "леонтьев": "Алексей Леонтьев",
+        "черентаев": "Сергей Черентаев",
+    }
+
+    def get_manager(tags):
+        for tag in tags:
+            if tag.lower() in MANAGER_TAG_MAP:
+                return MANAGER_TAG_MAP[tag.lower()]
+        return "Без менеджера"
+
+    result = {
+        "created_orders": {},   # manager → count
+        "shipped_orders": {},   # manager → count
+        "new_clients": [],      # [{name, manager}]
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+
+            # 1. Созданные заказы сегодня
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder",
+                headers=get_headers(),
+                params={"filter": f"moment>={today_from};moment<={today_to}",
+                        "expand": "agent,owner", "limit": 200}
+            ) as r:
+                if r.status == 200:
+                    for order in (await r.json()).get("rows", []):
+                        agent = order.get("agent", {})
+                        tags = agent.get("tags", [])
+                        mgr = get_manager(tags)
+                        result["created_orders"][mgr] = result["created_orders"].get(mgr, 0) + 1
+
+            # 2. Отгрузки сегодня
+            async with session.get(
+                f"{MS_BASE}/entity/demand",
+                headers=get_headers(),
+                params={"filter": f"moment>={today_from};moment<={today_to}",
+                        "expand": "agent", "limit": 200}
+            ) as r:
+                if r.status == 200:
+                    for demand in (await r.json()).get("rows", []):
+                        agent = demand.get("agent", {})
+                        tags = agent.get("tags", [])
+                        mgr = get_manager(tags)
+                        result["shipped_orders"][mgr] = result["shipped_orders"].get(mgr, 0) + 1
+
+                        # Первая отгрузка нового клиента?
+                        agent_id = agent.get("id", "")
+                        agent_name = agent.get("name", "")
+                        if agent_id and "розничный покупатель" not in agent_name.lower():
+                            # Проверяем были ли отгрузки раньше
+                            async with session.get(
+                                f"{MS_BASE}/entity/demand",
+                                headers=get_headers(),
+                                params={
+                                    "filter": f"agent={MS_BASE}/entity/counterparty/{agent_id};"
+                                              f"moment<{today_from}",
+                                    "limit": 1
+                                }
+                            ) as prev:
+                                if prev.status == 200:
+                                    prev_data = await prev.json()
+                                    if not prev_data.get("rows"):
+                                        result["new_clients"].append({
+                                            "name": agent_name,
+                                            "manager": mgr
+                                        })
+
+        return result
+
+    except Exception as e:
+        logger.error(f"get_evening_stats: {e}", exc_info=True)
+        return result
