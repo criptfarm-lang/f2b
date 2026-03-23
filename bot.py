@@ -284,6 +284,10 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("📸 Фото товара", callback_data="user_photo"),
             InlineKeyboardButton("💰 ПДЗ клиента", callback_data="user_pdz_client"),
         ],
+        [
+            InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
+            InlineKeyboardButton("📋 Мои задачи", callback_data="user_my_tasks"),
+        ],
         # ── Только руководитель ────────────────────────────────────
         [InlineKeyboardButton("── Только для меня ──", callback_data="menu_noop")],
         [
