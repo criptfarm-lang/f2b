@@ -2602,78 +2602,47 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
 
     try:
         async with aiohttp.ClientSession() as session:
-
-            # Диагностика: смотрим структуру одной отгрузки и одного контрагента
-            async with session.get(
-                f"{MS_BASE}/entity/demand",
-                headers=get_headers(),
-                params={"filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
-                        "expand": "agent", "limit": 1}
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    rows = data.get("rows", [])
-                    if rows:
-                        agent = rows[0].get("agent", {})
-                        agent_id = agent.get("id", "")
-                        agent_name = agent.get("name", "")
-                        agent_keys = list(agent.keys())
-                        logger.info(f"ДИАГНОСТИКА agent keys={agent_keys}")
-                        logger.info(f"ДИАГНОСТИКА agent name={agent_name} group={agent.get('group')} counterpartyGroup={agent.get('counterpartyGroup')}")
-
-                        # Дозагружаем полную карточку контрагента
-                        if agent_id:
-                            async with session.get(
-                                f"{MS_BASE}/entity/counterparty/{agent_id}",
-                                headers=get_headers()
-                            ) as r2:
-                                if r2.status == 200:
-                                    cp = await r2.json()
-                                    logger.info(f"ДИАГНОСТИКА full cp tags={cp.get('tags')} group={cp.get('group')}")
-                                    # Также логируем теги прямо из agent в отгрузке
-                        logger.info(f"ДИАГНОСТИКА agent tags={agent.get('tags')}")
-
-            group_href_map = {}
+            group_href_map = {}  # не используется, оставляем для совместимости
 
             if not group_href_map:
-                logger.warning("get_all_managers_fact: группы менеджеров не найдены в МойСклад")
-                return result
-
-            # 2. Для каждой группы запрашиваем отчёт прибыльности
-            for group_name, group_href in group_href_map.items():
-                manager_name = GROUP_TO_NAME[group_name]
+                # Теги приходят прямо в agent при expand — используем их
                 offset = 0
                 while True:
                     params = {
-                        "momentFrom": f"{date_from} 00:00:00",
-                        "momentTo":   f"{date_to} 23:59:59",
-                        "filter":     f"counterpartyGroup={group_href}",
-                        "limit": 200,
+                        "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
+                        "expand": "agent",
+                        "limit":  200,
                         "offset": offset,
                     }
                     async with session.get(
-                        f"{MS_BASE}/report/profit/bycounterparty",
+                        f"{MS_BASE}/entity/demand",
                         headers=get_headers(), params=params
                     ) as r:
                         if r.status != 200:
-                            body = await r.text()
-                            logger.error(f"get_all_managers_fact {group_name}: {r.status} {body[:200]}")
+                            logger.error(f"get_all_managers_fact demand: {r.status}")
                             break
                         data = await r.json()
 
                     rows = data.get("rows", [])
                     for row in rows:
-                        result[manager_name]["revenue"]   += (row.get("sellSum", 0) or 0) / 100
-                        result[manager_name]["shipments"] += row.get("demandCount", 0) or 0
-                        cp_href = row.get("counterparty", {}).get("meta", {}).get("href", "")
-                        cp_id = cp_href.split("/")[-1] if cp_href else ""
-                        if cp_id:
-                            result[manager_name]["clients"].add(cp_id)
+                        agent = row.get("agent", {})
+                        agent_id = agent.get("id", "")
+                        revenue = (row.get("sum", 0) or 0) / 100
+                        tags = [t.lower() for t in agent.get("tags", [])]
 
-                    total = data.get("meta", {}).get("size", 0)
-                    offset += len(rows)
-                    if offset >= total or len(rows) < 200:
+                        for key, mgr_name in GROUP_TO_NAME.items():
+                            if key in tags:
+                                result[mgr_name]["revenue"] += revenue
+                                result[mgr_name]["shipments"] += 1
+                                if agent_id:
+                                    result[mgr_name]["clients"].add(agent_id)
+                                break
+
+                    if len(rows) < 200:
                         break
+                    offset += 200
+
+                logger.info(f"get_all_managers_fact: загружено по тегам")
 
     except Exception as e:
         logger.error(f"get_all_managers_fact: {e}", exc_info=True)
