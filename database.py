@@ -293,6 +293,46 @@ class Database:
             (manager_name, manager_user_id, result_text)
         )
 
+    def get_activity_by_day(self, days: int = 7) -> list:
+        """Активность менеджеров по дням: звонки + сообщения."""
+        from datetime import datetime, timedelta
+        since = datetime.now() - timedelta(days=days)
+        msgs = self._fetchall(
+            """SELECT
+                DATE(sent_at) as day,
+                COALESCE(NULLIF(m.manager_name,''), cm.manager, 'Неизвестно') AS manager,
+                COUNT(*) as msg_count
+               FROM wazzup_messages m
+               LEFT JOIN wazzup_contact_map cm ON m.chat_id = cm.chat_id
+               WHERE m.is_outbound = TRUE AND m.sent_at >= %s
+               GROUP BY DATE(sent_at), COALESCE(NULLIF(m.manager_name,''), cm.manager, 'Неизвестно')""",
+            (since,)
+        )
+        calls = self._fetchall(
+            """SELECT DATE(called_at) as day, manager_name as manager, COUNT(*) as call_count
+               FROM call_transcripts
+               WHERE called_at >= %s AND manager_name IS NOT NULL AND manager_name != ''
+               GROUP BY DATE(called_at), manager_name""",
+            (since,)
+        )
+        # Объединяем
+        data = {}
+        for r in msgs:
+            key = (str(r["day"]), r["manager"])
+            data.setdefault(key, {"day": str(r["day"]), "manager": r["manager"], "msgs": 0, "calls": 0})
+            data[key]["msgs"] += r["msg_count"]
+        for r in calls:
+            key = (str(r["day"]), r["manager"])
+            data.setdefault(key, {"day": str(r["day"]), "manager": r["manager"], "msgs": 0, "calls": 0})
+            data[key]["calls"] += r["call_count"]
+        return list(data.values())
+
+    def get_contracts_today(self) -> list:
+        """Договоры созданные сегодня."""
+        return self._fetchall(
+            "SELECT * FROM contracts WHERE DATE(created_at) = CURRENT_DATE ORDER BY created_at"
+        )
+
     def get_pdz_results_today(self) -> list:
         return self._fetchall(
             "SELECT * FROM pdz_results WHERE work_date = CURRENT_DATE ORDER BY created_at"
