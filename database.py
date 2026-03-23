@@ -378,19 +378,15 @@ class Database:
         )
 
     def get_current_plans(self, date=None) -> list:
-        """Планы накопительным итогом — суммируем все периоды до текущей даты."""
+        """Последний актуальный план каждого менеджера."""
         from datetime import date as _date
         d = date or _date.today()
         return self._fetchall(
-            """SELECT manager,
-                      SUM(revenue) as revenue,
-                      SUM(shipments) as shipments,
-                      SUM(clients) as clients,
-                      MIN(period_start) as period_start,
-                      MAX(period_end) as period_end
+            """SELECT DISTINCT ON (manager)
+                      manager, revenue, shipments, clients, period_start, period_end
                FROM sales_plans
                WHERE period_start <= %s
-               GROUP BY manager""",
+               ORDER BY manager, period_start DESC""",
             (d,)
         )
 
