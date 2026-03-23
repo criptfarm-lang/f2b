@@ -3685,6 +3685,27 @@ async def _send_activity_chart(context, chat_id: int, activity: list):
         logger.warning(f"_send_activity_chart: {e}")
 
 
+async def cmd_delete_executor_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/del_tasks [имя] — удалить все открытые задачи конкретного исполнителя."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /del_tasks Голубева")
+        return
+    name = " ".join(context.args)
+    db._ensure_connection()
+    with db.conn.cursor() as cur:
+        cur.execute(
+            "UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено — сотрудник уволен' "
+            "WHERE LOWER(executor) LIKE LOWER(%s) AND status='open'",
+            (f"%{name}%",)
+        )
+        count = cur.rowcount
+    db.conn.commit()
+    await update.message.reply_text(f"✅ Закрыто задач для *{name}*: {count}", parse_mode="Markdown")
+
+
 async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/block [user_id] — заблокировать пользователя."""
     if not update.effective_user or update.effective_user.id != 360092495:
@@ -4155,6 +4176,7 @@ def main():
     # Команды
     app.add_handler(CallbackQueryHandler(handle_task_done_callback, pattern="^task_done\\|"))
     app.add_handler(CommandHandler("evening", cmd_evening))
+    app.add_handler(CommandHandler("del_tasks", cmd_delete_executor_tasks))
     app.add_handler(CommandHandler("block", cmd_block_user))
     app.add_handler(CommandHandler("unblock", cmd_unblock_user))
     app.add_handler(CommandHandler("stats", cmd_stats))
