@@ -3720,7 +3720,7 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _send_sales_plan_chart(context, chat_id: int):
-    """Горизонтальные прогресс-бары: план vs факт по трём показателям."""
+    """График выполнения плана продаж."""
     try:
         import io
         import matplotlib
@@ -3730,102 +3730,93 @@ async def _send_sales_plan_chart(context, chat_id: int):
         from moysklad import get_all_managers_fact
 
         MANAGERS = [
-            ("Инесса Скляр",     "скляр",     "Инесса"),
-            ("Карина Баласанян", "баласанян",  "Карина"),
-            ("Елена Мерзлякова", "мерзлякова", "Елена"),
-            ("Алексей Леонтьев", "леонтьев",   "Алексей"),
-            ("Сергей Черентаев", "черентаев",  "Сергей"),
+            ("Инесса Скляр",     "Инесса"),
+            ("Карина Баласанян", "Карина"),
+            ("Елена Мерзлякова", "Елена"),
+            ("Алексей Леонтьев", "Алексей"),
+            ("Сергей Черентаев", "Сергей"),
         ]
+        METRICS = [
+            ("revenue",   "Выручка",  1_000_000, "#4FC3F7"),
+            ("shipments", "Отгрузки", 1,          "#66BB6A"),
+            ("clients",   "АКБ",      1,          "#FFA726"),
+        ]
+
         plans_raw = db.get_current_plans()
         plans = {p["manager"]: p for p in plans_raw}
 
         today = date.today()
         month_start = today.replace(day=1).isoformat()
         today_str = today.isoformat()
-
         facts = await get_all_managers_fact(month_start, today_str)
 
-        METRICS = [
-            ("revenue",   "Выручка",   1_000_000, "#4FC3F7"),
-            ("shipments", "Отгрузки",  1,          "#66BB6A"),
-            ("clients",   "АКБ",       1,          "#FFA726"),
-        ]
+        # Размеры
+        n_mgr = len(MANAGERS)
+        n_met = len(METRICS)
+        bar_h = 0.2
+        bar_gap = 0.05      # между барами одного менеджера
+        mgr_gap = 0.4       # между менеджерами
 
-        n = len(MANAGERS)
-        # 3 бара на менеджера + отступы
-        row_height = 0.18
-        gap_between_managers = 0.35
-        total_rows = n * 3 + (n - 1)  # 3 бара + разделители
-        fig_height = total_rows * row_height + gap_between_managers * n + 1.2
-
-        fig, ax = plt.subplots(figsize=(10, fig_height))
+        fig_height = n_mgr * (n_met * (bar_h + bar_gap) + mgr_gap) + 0.8
+        fig, ax = plt.subplots(figsize=(11, fig_height))
         fig.patch.set_facecolor("#0d1117")
         ax.set_facecolor("#0d1117")
 
         y = 0
         ytick_pos = []
         ytick_labels = []
-        manager_label_y = []
+        mgr_centers = []
 
-        for mgr_i, (full_name, tag, short) in enumerate(reversed(MANAGERS)):
+        # Рисуем снизу вверх → Сергей внизу, Инесса вверху
+        for full_name, short in reversed(MANAGERS):
             plan = plans.get(full_name, {})
             fact = facts.get(full_name, {})
+            bar_ys = []
 
-            # Позиция метки менеджера — по центру трёх баров
-            center_y = y + 0.3  # средний из трёх баров (шаг 0.3)
-            manager_label_y.append((center_y, short))
-
-            for bar_i, (metric, label, divisor, color) in enumerate(reversed(METRICS)):
-                plan_val = float(plan.get(metric, 0) or 0) / divisor
-                fact_val = float(fact.get(metric, 0) or 0) / divisor
+            for metric, label, divisor, color in reversed(METRICS):
+                plan_val = float(plan.get(metric) or 0) / divisor
+                fact_val = float(fact.get(metric) or 0) / divisor
                 pct = min(fact_val / plan_val, 1.0) if plan_val > 0 else 0.0
 
-                # Фон (план = 100%)
-                ax.barh(y, 1.0, height=0.25, color="#21262d", left=0, zorder=1)
-                # Факт заштрихованный
-                ax.barh(y, max(pct, 0.008), height=0.25, color=color,
-                        left=0, alpha=0.85,
-                        hatch="///", edgecolor=color, zorder=2)
-
-                # Подпись процента
-                x_label = pct + 0.02
-                ax.text(min(x_label, 1.08), y, f"{pct*100:.0f}%",
+                # Фон
+                ax.barh(y, 1.0, height=bar_h, color="#21262d", left=0, zorder=1)
+                # Факт
+                ax.barh(y, max(pct, 0.005), height=bar_h, color=color,
+                        alpha=0.85, hatch="///", edgecolor=color, zorder=2)
+                # % подпись
+                ax.text(min(pct + 0.02, 1.12), y, f"{pct*100:.0f}%",
                         va="center", ha="left", color=color,
-                        fontsize=7.5, fontweight="bold")
-
-                # Значение факт/план
+                        fontsize=7, fontweight="bold")
+                # факт/план
                 if plan_val > 0:
-                    fs = f"{fact_val:.1f}/{plan_val:.1f}" if divisor == 1_000_000 else f"{fact_val:.0f}/{plan_val:.0f}"
-                else:
-                    fs = "—"
-                ax.text(1.18, y, fs, va="center", ha="left",
-                        color="#8b949e", fontsize=6.5)
+                    fv = f"{fact_val:.1f}" if divisor == 1_000_000 else f"{int(fact_val)}"
+                    pv = f"{plan_val:.1f}" if divisor == 1_000_000 else f"{int(plan_val)}"
+                    ax.text(1.35, y, f"{fv}/{pv}",
+                            va="center", ha="left", color="#8b949e", fontsize=6.5)
 
                 ytick_pos.append(y)
                 ytick_labels.append(label)
-                y += 0.3
+                bar_ys.append(y)
+                y += bar_h + bar_gap
 
-            y += 0.3  # отступ между менеджерами
+            mgr_centers.append((sum(bar_ys) / len(bar_ys), short))
+            y += mgr_gap
 
-        ax.set_xlim(0, 1.55)
-        ax.set_ylim(-0.3, y)
+        ax.set_xlim(0, 1.7)
+        ax.set_ylim(-bar_h, y)
         ax.set_yticks(ytick_pos)
         ax.set_yticklabels(ytick_labels, color="#8b949e", fontsize=7)
         ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
-        ax.set_xticklabels(["0%", "25%", "50%", "75%", "100%"],
-                           color="#555", fontsize=7)
+        ax.set_xticklabels(["0%", "25%", "50%", "75%", "100%"], color="#555", fontsize=7)
         ax.xaxis.grid(True, color="#21262d", linewidth=0.5, zorder=0)
-        ax.set_axisbelow(True)
-
-        # Вертикальная линия 100%
         ax.axvline(x=1.0, color="#444", linewidth=0.8, linestyle="--", zorder=3)
-
+        ax.set_axisbelow(True)
         for spine in ax.spines.values():
             spine.set_visible(False)
 
-        # Имена менеджеров слева
-        for cy, name in manager_label_y:
-            ax.text(-0.03, cy, name, va="center", ha="right",
+        # Имена менеджеров — справа от графика чтобы не перекрывать
+        for cy, name in mgr_centers:
+            ax.text(1.52, cy, name, va="center", ha="left",
                     color="#c9d1d9", fontsize=9, fontweight="bold",
                     transform=ax.transData)
 
@@ -3833,7 +3824,7 @@ async def _send_sales_plan_chart(context, chat_id: int):
                      color="#c9d1d9", fontsize=10, pad=8)
 
         plt.tight_layout()
-        plt.subplots_adjust(left=0.18)
+        plt.subplots_adjust(right=0.78)
 
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=130,
