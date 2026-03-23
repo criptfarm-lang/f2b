@@ -2581,104 +2581,78 @@ async def get_evening_stats() -> dict:
         return result
 
 
-async def get_counterparty_groups() -> dict:
-    """Возвращает словарь {название_группы: href} из МойСклад."""
-    import aiohttp
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{MS_BASE}/entity/counterparty/metadata",
-                headers=get_headers()
-            ) as r:
-                if r.status != 200:
-                    return {}
-                data = await r.json()
-                groups = {}
-                for g in data.get("groups", {}).get("rows", []):
-                    groups[g.get("name", "").lower()] = g.get("meta", {}).get("href", "")
-                logger.info(f"counterparty groups: {list(groups.keys())}")
-                return groups
-    except Exception as e:
-        logger.error(f"get_counterparty_groups: {e}")
-        return {}
-
-
 async def get_sales_fact(manager_name: str, date_from: str, date_to: str) -> dict:
     """
     Фактические показатели менеджера за период из отчёта прибыльности.
-    Фильтр: группа контрагента = фамилия менеджера.
+    Фильтр: контрагенты с тегом менеджера.
     """
     import aiohttp
     result = {"revenue": 0.0, "shipments": 0, "clients": 0}
 
-    # Маппинг имя → фамилия для поиска группы
-    NAME_TO_LAST = {
+    NAME_TO_TAG = {
         "Инесса Скляр":     "скляр",
         "Карина Баласанян": "баласанян",
         "Елена Мерзлякова": "мерзлякова",
         "Алексей Леонтьев": "леонтьев",
         "Сергей Черентаев": "черентаев",
     }
-    last_name = NAME_TO_LAST.get(manager_name, manager_name.split()[-1].lower())
+    tag = NAME_TO_TAG.get(manager_name, manager_name.split()[-1].lower())
 
     try:
         async with aiohttp.ClientSession() as session:
-            # Ищем группу контрагентов по фамилии менеджера
-            async with session.get(
-                f"{MS_BASE}/entity/counterparty/metadata",
-                headers=get_headers()
-            ) as r:
-                if r.status != 200:
-                    logger.error(f"get_sales_fact: metadata {r.status}")
-                    return result
-                meta = await r.json()
 
-            group_href = None
-            for g in meta.get("groups", {}).get("rows", []):
-                g_name = g.get("name", "").lower()
-                if last_name in g_name:
-                    group_href = g.get("meta", {}).get("href", "")
-                    logger.info(f"get_sales_fact {manager_name}: группа найдена '{g['name']}' href={group_href}")
-                    break
+            # 1. Получаем все href контрагентов с тегом менеджера
+            cp_hrefs = []
+            offset = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/counterparty",
+                    headers=get_headers(),
+                    params={"filter": f"tags={tag}", "limit": 100, "offset": offset, "fields": "id"}
+                ) as r:
+                    if r.status != 200:
+                        break
+                    data = await r.json()
+                    rows = data.get("rows", [])
+                    for row in rows:
+                        cp_hrefs.append(row.get("meta", {}).get("href", ""))
+                    if len(rows) < 100:
+                        break
+                    offset += 100
 
-            if not group_href:
-                logger.warning(f"get_sales_fact {manager_name}: группа '{last_name}' не найдена")
+            logger.info(f"get_sales_fact {manager_name}: тег={tag} контрагентов={len(cp_hrefs)}")
+
+            if not cp_hrefs:
                 return result
 
-            # Запрашиваем отчёт прибыльности по покупателям
-            offset = 0
+            # 2. Запрашиваем отчёт прибыльности по каждому контрагенту
             clients_set = set()
-            while True:
+            for cp_href in cp_hrefs:
+                if not cp_href:
+                    continue
+                cp_id = cp_href.split("/")[-1]
                 params = {
                     "momentFrom": f"{date_from} 00:00:00",
                     "momentTo":   f"{date_to} 23:59:59",
-                    "filter": f"counterpartyGroup={group_href}",
-                    "limit": 200,
-                    "offset": offset,
+                    "filter":     f"counterparty={cp_href}",
+                    "limit": 1,
                 }
                 async with session.get(
                     f"{MS_BASE}/report/profit/bycounterparty",
                     headers=get_headers(), params=params
                 ) as r:
                     if r.status != 200:
-                        body = await r.text()
-                        logger.error(f"get_sales_fact profit {r.status}: {body[:200]}")
-                        break
+                        continue
                     data = await r.json()
-
-                rows = data.get("rows", [])
-                for row in rows:
-                    result["revenue"]   += (row.get("sellSum", 0) or 0) / 100
-                    result["shipments"] += row.get("demandCount", 0) or 0
-                    cp = row.get("counterparty", {})
-                    cp_id = cp.get("meta", {}).get("href", "").split("/")[-1]
-                    if cp_id:
-                        clients_set.add(cp_id)
-
-                total = data.get("meta", {}).get("size", 0)
-                offset += len(rows)
-                if offset >= total or len(rows) < 200:
-                    break
+                    rows = data.get("rows", [])
+                    if rows:
+                        row = rows[0]
+                        rev = (row.get("sellSum", 0) or 0) / 100
+                        ship = row.get("demandCount", 0) or 0
+                        if rev > 0 or ship > 0:
+                            result["revenue"] += rev
+                            result["shipments"] += ship
+                            clients_set.add(cp_id)
 
             result["clients"] = len(clients_set)
             logger.info(f"get_sales_fact {manager_name}: revenue={result['revenue']:.0f} ship={result['shipments']} clients={result['clients']}")
