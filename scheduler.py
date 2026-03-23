@@ -315,7 +315,7 @@ async def check_aging_clients(app: Application):
             name = client["name"]
             tags = client.get("tags", [])
             last_date = client["last_demand_date"]
-            days = client.get("days_ago", 50)
+            days = client.get("days", client.get("days_ago", 50))
 
             # Определяем менеджера
             manager_name = "Без менеджера"
