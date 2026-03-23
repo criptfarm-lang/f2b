@@ -3720,7 +3720,7 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _send_sales_plan_chart(context, chat_id: int):
-    """График выполнения плана продаж — горизонтальные бары, имена слева, правая треть пустая."""
+    """График выполнения плана продаж."""
     try:
         import io
         import matplotlib
@@ -3795,8 +3795,9 @@ async def _send_sales_plan_chart(context, chat_id: int):
                 ytick_labels.append(label)
                 bar_ys.append(by)
 
-            top_y = gy_bottom + group_h + 0.04
-            mgr_label_data.append((BAR_END / 2, top_y, short))
+            cx = 0.5
+            top_y = gy_bottom + group_h + 0.15
+            mgr_label_data.append((cx, top_y, short))
 
         for lx, ly, name in mgr_label_data:
             ax.text(lx, ly, name, ha="center", va="bottom",
