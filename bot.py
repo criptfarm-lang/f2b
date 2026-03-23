@@ -3731,8 +3731,8 @@ async def _send_sales_plan_chart(context, chat_id: int):
 
         MANAGERS = [
             ("Инесса Скляр",     "скляр",     "Инесса"),
-            ("Елена Мерзлякова", "мерзлякова", "Елена"),
             ("Карина Баласанян", "баласанян",  "Карина"),
+            ("Елена Мерзлякова", "мерзлякова", "Елена"),
             ("Алексей Леонтьев", "леонтьев",   "Алексей"),
             ("Сергей Черентаев", "черентаев",  "Сергей"),
         ]
@@ -3746,9 +3746,9 @@ async def _send_sales_plan_chart(context, chat_id: int):
         facts = await get_all_managers_fact(month_start, today_str)
 
         METRICS = [
-            ("revenue",   "Выручка",  1_000_000, "#4FC3F7"),
-            ("shipments", "Отгрузки", 1,          "#66BB6A"),
-            ("clients",   "АКБ",      1,          "#FFA726"),
+            ("revenue",   "Выручка",   1_000_000, "#4FC3F7"),
+            ("shipments", "Отгрузки",  1,          "#66BB6A"),
+            ("clients",   "АКБ",       1,          "#FFA726"),
         ]
 
         n = len(MANAGERS)
