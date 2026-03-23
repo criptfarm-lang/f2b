@@ -2095,7 +2095,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. Автозакрытие задач — Claude анализирует контекст
     sender_name = update.effective_user.full_name if update.effective_user else ""
-    if not is_bot_addressed(text) and len(text) > 5:
+    text_lower_ac = text.lower().strip()
+    is_task_assignment = (
+        text_lower_ac.startswith("задача ") or
+        text_lower_ac.startswith("задачи ") or
+        "задач" in text_lower_ac and any(
+            name in text_lower_ac for name in
+            ["карин", "инесс", "скляр", "алексей", "леонтьев", "мерзляков", "черентаев", "баласанян"]
+        )
+    )
+    if not is_bot_addressed(text) and len(text) > 5 and not is_task_assignment:
         open_tasks = db.get_all_open_tasks()
         if open_tasks:
             completed_items = await detect_task_completion(text, open_tasks, author=sender_name)
