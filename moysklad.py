@@ -2693,8 +2693,11 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
             for b in buyers:
                 for tag, mgr_name in TAG_TO_NAME.items():
                     if tag in b["tags"]:
+                        ships = shipments_by_cp.get(b["id"], 0)
+                        if mgr_name == "Алексей Леонтьев":
+                            logger.info(f"Леонтьев клиент: id={b['id']} tags={b['tags']} ships={ships}")
                         result[mgr_name]["revenue"] += b["revenue"]
-                        result[mgr_name]["shipments"] += shipments_by_cp.get(b["id"], 0)
+                        result[mgr_name]["shipments"] += ships
                         result[mgr_name]["clients"].add(b["id"])
                         break
 
