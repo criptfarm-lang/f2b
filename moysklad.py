@@ -2602,47 +2602,63 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
 
     try:
         async with aiohttp.ClientSession() as session:
-            group_href_map = {}  # не используется, оставляем для совместимости
+            # Теги не приходят в expand — загружаем отгрузки, потом карточки агентов
+            offset = 0
+            agent_tags_cache = {}  # agent_id → [tags]
 
-            if not group_href_map:
-                # Теги приходят прямо в agent при expand — используем их
-                offset = 0
-                while True:
-                    params = {
-                        "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
-                        "expand": "agent",
-                        "limit":  200,
-                        "offset": offset,
-                    }
-                    async with session.get(
-                        f"{MS_BASE}/entity/demand",
-                        headers=get_headers(), params=params
-                    ) as r:
-                        if r.status != 200:
-                            logger.error(f"get_all_managers_fact demand: {r.status}")
-                            break
-                        data = await r.json()
-
-                    rows = data.get("rows", [])
-                    for row in rows:
-                        agent = row.get("agent", {})
-                        agent_id = agent.get("id", "")
-                        revenue = (row.get("sum", 0) or 0) / 100
-                        tags = [t.lower() for t in agent.get("tags", [])]
-
-                        for key, mgr_name in GROUP_TO_NAME.items():
-                            if key in tags:
-                                result[mgr_name]["revenue"] += revenue
-                                result[mgr_name]["shipments"] += 1
-                                if agent_id:
-                                    result[mgr_name]["clients"].add(agent_id)
-                                break
-
-                    if len(rows) < 200:
+            while True:
+                params = {
+                    "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
+                    "expand": "agent",
+                    "limit":  200,
+                    "offset": offset,
+                }
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(), params=params
+                ) as r:
+                    if r.status != 200:
+                        logger.error(f"get_all_managers_fact demand: {r.status}")
                         break
-                    offset += 200
+                    data = await r.json()
 
-                logger.info(f"get_all_managers_fact: загружено по тегам")
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent = row.get("agent", {})
+                    agent_id = agent.get("id", "")
+                    revenue = (row.get("sum", 0) or 0) / 100
+
+                    if not agent_id:
+                        continue
+
+                    # Берём теги из кэша или дозагружаем
+                    if agent_id not in agent_tags_cache:
+                        try:
+                            async with session.get(
+                                f"{MS_BASE}/entity/counterparty/{agent_id}",
+                                headers=get_headers()
+                            ) as r2:
+                                if r2.status == 200:
+                                    cp = await r2.json()
+                                    agent_tags_cache[agent_id] = [t.lower() for t in cp.get("tags", [])]
+                                else:
+                                    agent_tags_cache[agent_id] = []
+                        except Exception:
+                            agent_tags_cache[agent_id] = []
+
+                    tags = agent_tags_cache[agent_id]
+                    for key, mgr_name in GROUP_TO_NAME.items():
+                        if key in tags:
+                            result[mgr_name]["revenue"] += revenue
+                            result[mgr_name]["shipments"] += 1
+                            result[mgr_name]["clients"].add(agent_id)
+                            break
+
+                if len(rows) < 200:
+                    break
+                offset += 200
+
+            logger.info(f"get_all_managers_fact: обработано отгрузок, агентов в кэше={len(agent_tags_cache)}")
 
     except Exception as e:
         logger.error(f"get_all_managers_fact: {e}", exc_info=True)
