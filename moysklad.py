@@ -2603,28 +2603,37 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
     try:
         async with aiohttp.ClientSession() as session:
 
-            # Группы контрагентов — отдельный эндпоинт
-            group_href_map = {}
+            # Диагностика: смотрим структуру одной отгрузки и одного контрагента
             async with session.get(
-                f"{MS_BASE}/entity/counterpartygroup",
+                f"{MS_BASE}/entity/demand",
                 headers=get_headers(),
-                params={"limit": 100}
+                params={"filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
+                        "expand": "agent", "limit": 1}
             ) as r:
                 if r.status == 200:
                     data = await r.json()
-                    all_groups = data.get("rows", [])
-                    logger.info(f"get_all_managers_fact: все группы = {[g.get('name') for g in all_groups]}")
-                    for g in all_groups:
-                        g_name = g.get("name", "").lower().strip()
-                        for key in GROUP_TO_NAME:
-                            if key in g_name:
-                                group_href_map[key] = g.get("meta", {}).get("href", "")
-                                logger.info(f"  matched: '{g['name']}' → {key}")
-                                break
-                else:
-                    logger.error(f"get_all_managers_fact: counterpartygroup {r.status}")
+                    rows = data.get("rows", [])
+                    if rows:
+                        agent = rows[0].get("agent", {})
+                        agent_id = agent.get("id", "")
+                        agent_name = agent.get("name", "")
+                        agent_keys = list(agent.keys())
+                        logger.info(f"ДИАГНОСТИКА agent keys={agent_keys}")
+                        logger.info(f"ДИАГНОСТИКА agent name={agent_name} group={agent.get('group')} counterpartyGroup={agent.get('counterpartyGroup')}")
 
-            logger.info(f"get_all_managers_fact: групп найдено {len(group_href_map)}: {list(group_href_map.keys())}")
+                        # Дозагружаем полную карточку контрагента
+                        if agent_id:
+                            async with session.get(
+                                f"{MS_BASE}/entity/counterparty/{agent_id}",
+                                headers=get_headers()
+                            ) as r2:
+                                if r2.status == 200:
+                                    cp = await r2.json()
+                                    cp_keys = list(cp.keys())
+                                    logger.info(f"ДИАГНОСТИКА full cp keys={cp_keys}")
+                                    logger.info(f"ДИАГНОСТИКА group={cp.get('group')} tags={cp.get('tags')} counterpartyGroup={cp.get('counterpartyGroup')}")
+
+            group_href_map = {}
 
             if not group_href_map:
                 logger.warning("get_all_managers_fact: группы менеджеров не найдены в МойСклад")
