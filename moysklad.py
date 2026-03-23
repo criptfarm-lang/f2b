@@ -2584,7 +2584,9 @@ async def get_evening_stats() -> dict:
 
 async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
     """
-    Берёт все отгрузки за период, загружает теги агентов и группирует по менеджеру.
+    Берёт отчёт прибыльности по покупателям за период,
+    загружает теги каждого покупателя и группирует по менеджеру.
+    Использует ту же логику что работает в get_buyers_by_product.
     """
     import aiohttp
 
@@ -2599,67 +2601,72 @@ async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
     result = {name: {"revenue": 0.0, "shipments": 0, "clients": set()}
               for name in TAG_TO_NAME.values()}
 
+    STORE_ID = os.getenv("MS_STORE_ID", "0044d71e-9a9a-11f0-0a80-03a90002743d")
+    STORE_HREF = f"{MS_BASE}/entity/store/{STORE_ID}"
+
     try:
         async with aiohttp.ClientSession() as session:
 
-            # 1. Загружаем все отгрузки за период
-            demands = []
+            # 1. Отчёт прибыльности по покупателям за период
+            buyers = []
             offset = 0
             while True:
                 params = {
-                    "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
+                    "momentFrom": f"{date_from} 00:00:00",
+                    "momentTo":   f"{date_to} 23:59:59",
+                    "filter":     f"store={STORE_HREF}",
                     "limit": 200,
                     "offset": offset,
                 }
                 async with session.get(
-                    f"{MS_BASE}/entity/demand",
+                    f"{MS_BASE}/report/profit/bycounterparty",
                     headers=get_headers(), params=params
                 ) as r:
                     if r.status != 200:
-                        logger.error(f"get_all_managers_fact demand: {r.status}")
+                        body = await r.text()
+                        logger.error(f"get_all_managers_fact profit: {r.status} {body[:200]}")
                         break
                     data = await r.json()
 
                 rows = data.get("rows", [])
                 for row in rows:
-                    agent_meta = row.get("agent", {}).get("meta", {})
-                    agent_href = agent_meta.get("href", "")
-                    agent_id = agent_href.split("/")[-1] if agent_href else ""
-                    if agent_id:
-                        demands.append({
-                            "agent_id": agent_id,
-                            "agent_href": agent_href,
-                            "revenue": (row.get("sum", 0) or 0) / 100,
+                    cp = row.get("counterparty", {})
+                    cp_href = cp.get("meta", {}).get("href", "")
+                    cp_id = cp_href.split("/")[-1] if cp_href else ""
+                    if cp_id:
+                        buyers.append({
+                            "id": cp_id,
+                            "href": cp_href,
+                            "revenue": (row.get("sellSum", 0) or 0) / 100,
+                            "shipments": row.get("demandCount", 0) or 0,
                         })
-                if len(rows) < 200:
+
+                total = data.get("meta", {}).get("size", 0)
+                offset += len(rows)
+                if offset >= total or len(rows) < 200:
                     break
-                offset += 200
 
-            logger.info(f"get_all_managers_fact: отгрузок={len(demands)}")
+            logger.info(f"get_all_managers_fact: покупателей в отчёте={len(buyers)}")
 
-            # 2. Загружаем теги уникальных агентов
-            unique_agents = {d["agent_id"]: d["agent_href"] for d in demands}
-            agent_tags = {}
-
-            for agent_id, agent_href in unique_agents.items():
+            # 2. Загружаем теги для каждого покупателя (как в get_buyers_by_product)
+            for b in buyers:
                 try:
-                    async with session.get(agent_href, headers=get_headers()) as r:
+                    async with session.get(b["href"], headers=get_headers()) as r:
                         if r.status == 200:
-                            cp = await r.json()
-                            agent_tags[agent_id] = [t.lower() for t in cp.get("tags", [])]
+                            cp_data = await r.json()
+                            b["tags"] = [t.lower() for t in cp_data.get("tags", [])]
+                        else:
+                            b["tags"] = []
                 except Exception:
-                    agent_tags[agent_id] = []
-
-            logger.info(f"get_all_managers_fact: уникальных агентов={len(unique_agents)}")
+                    b["tags"] = []
 
             # 3. Группируем по менеджеру
-            for d in demands:
-                tags = agent_tags.get(d["agent_id"], [])
+            for b in buyers:
                 for tag, mgr_name in TAG_TO_NAME.items():
-                    if tag in tags:
-                        result[mgr_name]["revenue"] += d["revenue"]
-                        result[mgr_name]["shipments"] += 1
-                        result[mgr_name]["clients"].add(d["agent_id"])
+                    if tag in b["tags"]:
+                        result[mgr_name]["revenue"] += b["revenue"]
+                        result[mgr_name]["shipments"] += b["shipments"]
+                        result[mgr_name]["clients"].add(b["id"])
                         break
 
     except Exception as e:
