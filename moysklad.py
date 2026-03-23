@@ -1,5004 +1,2627 @@
 """
-F2B PRO — Telegram Bot
-Ассистент отдела продаж: задачи, фото, прайсы, дебиторка
+Интеграция с МойСклад API
+- Остатки товаров
+- Цены
+- Характеристики
+- Фото из карточек
 """
 
-import asyncio
-import logging
 import os
+import logging
 import re
-from datetime import datetime
+import aiohttp
+import asyncio
+from typing import Optional
 
-from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    TypeHandler,
-    ContextTypes,
-    filters,
-)
-
-from database import Database
-from scheduler import setup_scheduler, record_group_message, PDZ_MANAGERS, get_group_chat_id
-from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion, parse_product_query
-from amocrm import check_connection as amo_check  # оставляем для совместимости
-from moysklad import (search_products, search_products_filtered, get_price_list, format_products,
-    format_price_list, get_product_image, download_image, get_image_download_url,
-    get_counterparty_balance, get_all_debtors, format_debtors_ms, format_counterparty_balance,
-    find_counterparty_info, format_counterparty_info,
-    get_debtors_by_tag, get_clients_by_tag, resolve_tag,
-    format_debtors_by_tag, format_clients_by_tag,
-    get_overdue_demands, format_overdue_demands, format_overdue_summary,
-    format_reminders_for_manager, format_debt_reminder, fmt_money)
-
-# ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
-EMPLOYEES = {
-    "Белякова Александра": [
-        "александра", "александры", "александре", "александру",
-        "белякова", "беляковой", "белякову",
-        "саша", "саши", "саше", "сашу",
-    ],
-    "Алексей Леонтьев": [
-        "алексей", "алексея", "алексею", "алексеем",
-        "леонтьев", "леонтьева", "леонтьеву",
-        "лёша", "лёши", "лёше", "леша", "леши", "лёшу",
-    ],
-    "Ярослав": [
-        "ярослав", "ярослава", "ярославу", "ярославом",
-        "ярик", "ярика", "ярику",
-    ],
-    "Андрей Иванов": [
-        "андрей", "андрея", "андрею", "андреем",
-        "иванов", "иванова", "иванову",
-    ],
-    "Инесса Скляр": [
-        "инесса", "инессы", "инессе", "инессу", "инессой",
-        "скляр",
-    ],
-    "Маланчук Александр": [
-        "маланчук", "маланчука", "маланчуку",
-    ],
-    "Карина Баласанян": [
-        "карина", "карины", "карине", "карину", "кариной",
-        "баласанян",
-    ],
-    "Елена Мерзлякова": [
-        "елена", "елены", "елене", "елену", "еленой",
-        "мерзлякова", "мерзляковой", "мерзлякову",
-        "марзлякова", "марзляковой",
-        "лена", "лены", "лене", "лену", "леной",
-    ],
-    "Татьяна Голубева": [
-        "татьяна", "татьяны", "татьяне", "татьяну", "татьяной",
-        "голубева", "голубевой", "голубеву",
-        "таня", "тани", "тане", "таню", "таней",
-    ],
-    "Сергей Черентаев": [
-        "сергей", "сергея", "сергею", "сергеем",
-        "черентаев", "черентаева", "черентаеву",
-    ],
-}
-
-# Менеджеры отдела продаж — "всем менеджерам"
-MOP_MANAGERS = [
-    "Карина Баласанян",
-    "Елена Мерзлякова",
-    "Инесса Скляр",
-    "Татьяна Голубева",
-    "Алексей Леонтьев",
-    "Сергей Черентаев",
-]
-
-def find_employee(query: str) -> str | None:
-    """Ищет сотрудника по любому варианту имени/фамилии в запросе."""
-    query_lower = query.lower()
-    # Сначала ищем точное совпадение слова
-    for full_name, variants in EMPLOYEES.items():
-        for variant in variants:
-            # Проверяем что вариант встречается как отдельное слово
-            import re as _re
-            if _re.search(r"\b" + _re.escape(variant) + r"\b", query_lower):
-                return full_name
-    return None
-
-
-
-# ─── Логирование ────────────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
 logger = logging.getLogger(__name__)
 
-# ─── Инициализация БД ────────────────────────────────────────────────────────
-db = Database()
-
-# ─── Определяем обращение к боту ─────────────────────────────────────────────
-BOT_TRIGGERS = ["эф,", "эф ", "бот,", "бот ", "@эф", "bot,", "bot ", "@f2b_assistant_bot", "@f2b_assistant"]
-
-
-def is_bot_addressed(text: str) -> bool:
-    """Проверяет, обращаются ли к боту."""
-    if not text:
-        return False
-    text_lower = text.lower().strip()
-    # Реагируем на обращение в начале или @mention в любом месте
-    if any(text_lower.startswith(t) for t in BOT_TRIGGERS):
-        return True
-    # @mention может быть в любом месте сообщения
-    if "@f2b_assistant" in text_lower or "эф," in text_lower or text_lower.startswith("эф "):
-        return True
-    return False
-
-
-def clean_query(text: str) -> str:
-    """Убирает обращение к боту из текста."""
-    text_lower = text.lower()
-    for trigger in BOT_TRIGGERS:
-        if text_lower.startswith(trigger):
-            return text[len(trigger):].strip()
-    return text.strip()
-
-
-# ─── Команды ─────────────────────────────────────────────────────────────────
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    if user and chat_id == user.id:
-        db.save_manager_chat_id(user.id, user.full_name)
-        logger.info(f"cmd_start: сохранён chat_id={chat_id} name={user.full_name}")
-    await update.message.reply_text(
-        f"👋 Привет, *{user.full_name if user else 'друг'}*! Я Эф — ассистент F2B PRO.\n\n"
-        f"Используй меню ниже или обращайся: *Эф, [вопрос]*",
-        parse_mode="Markdown",
-        reply_markup=_user_menu_keyboard()
-    )
-
-
-def _user_menu_keyboard() -> InlineKeyboardMarkup:
-    """Общее меню для всех пользователей."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📸 Запросить фото товара", callback_data="user_photo"),
-            InlineKeyboardButton("💰 ПДЗ клиента", callback_data="user_pdz_client"),
-        ],
-        [
-            InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
-            InlineKeyboardButton("📋 Мои задачи", callback_data="user_my_tasks"),
-        ],
-    ])
-
-
-async def cmd_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/usermenu — общее меню."""
-    await update.message.reply_text(
-        "Выбери действие:",
-        reply_markup=_user_menu_keyboard()
-    )
-
-
-async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик общего меню пользователей."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    action = query.data
-
-    if action == "user_photo":
-        await query.message.reply_text(
-            "📸 Напиши название товара — пришлю фото.\n"
-            "Например: _форель охл трим С_",
-            parse_mode="Markdown"
-        )
-        _user_awaiting[query.from_user.id] = "photo"
-
-    elif action == "user_pdz_client":
-        await query.message.reply_text(
-            "💰 Напиши название клиента — покажу его дебиторку.\n"
-            "Например: _Атмосфера_ или _ИТФИШ_",
-            parse_mode="Markdown"
-        )
-        _user_awaiting[query.from_user.id] = "pdz_client"
-
-    elif action == "user_contract":
-        await query.message.reply_text(
-            "📄 Напиши название компании — сформирую договор поставки.\n"
-            "Например: _Атмосфера_ или _ИТФИШ_",
-            parse_mode="Markdown"
-        )
-        _user_awaiting[query.from_user.id] = "contract"
-
-    elif action == "user_my_tasks":
-        tasks = db.get_tasks_by_executor(user.full_name)
-        if not tasks:
-            await query.message.reply_text("✅ У тебя нет открытых задач.")
-        else:
-            lines = [f"📋 *Твои задачи ({len(tasks)}):*\n"]
-            for t in tasks:
-                deadline = t.get("deadline")
-                if deadline:
-                    from datetime import date as _d
-                    MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-                    try:
-                        d = _d.fromisoformat(str(deadline)[:10])
-                        dl = f" · до {d.day} {MONTHS[d.month-1]}"
-                    except Exception:
-                        dl = f" · до {deadline}"
-                else:
-                    dl = ""
-                lines.append(f"• {t.get('text','')}{dl}")
-            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает chat_id пользователя."""
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    if user and chat_id == user.id:
-        db.save_manager_chat_id(user.id, user.full_name)
-    await update.message.reply_text(
-        f"👤 *{user.full_name if user else 'Неизвестный'}*\n"
-        f"Твой chat_id: `{chat_id}`",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📋 *Все команды:*\n\n"
-        "*Задачи:*\n"
-        "/tasks — мои задачи\n"
-        "/all_tasks — все задачи команды\n"
-        "/overdue — просроченные задачи\n\n"
-        "*Отчёты:*\n"
-        "/report — недельный отчёт\n"
-        "/дебиторка — срез по дебиторке\n\n"
-        "*Управление:*\n"
-        "/menu — панель управления\n"
-        "/pdz — запустить работу с дебиторкой\n"
-        "/mychatid — мой chat ID\n"
-        "/clearall — очистить открытые задачи\n"
-        "/cleartasksall — очистить все задачи",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Панель управления — только для руководителя."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        # Для остальных — общее меню
-        await update.message.reply_text(
-            "Выбери действие:",
-            reply_markup=_user_menu_keyboard()
-        )
-        return
-
-    keyboard = InlineKeyboardMarkup([
-        # ── Доступно всем ──────────────────────────────────────────
-        [InlineKeyboardButton("── Общие функции ──", callback_data="menu_noop")],
-        [
-            InlineKeyboardButton("📸 Фото товара", callback_data="user_photo"),
-            InlineKeyboardButton("💰 ПДЗ клиента", callback_data="user_pdz_client"),
-        ],
-        [
-            InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
-            InlineKeyboardButton("📋 Мои задачи", callback_data="user_my_tasks"),
-        ],
-        # ── Только руководитель ────────────────────────────────────
-        [InlineKeyboardButton("── Только для меня ──", callback_data="menu_noop")],
-        [
-            InlineKeyboardButton("📋 Все задачи", callback_data="menu_all_tasks"),
-            InlineKeyboardButton("⏰ Просроченные", callback_data="menu_overdue"),
-        ],
-        [
-            InlineKeyboardButton("🚀 Запустить /pdz", callback_data="menu_pdz_run"),
-            InlineKeyboardButton("📊 Результат ПДЗ", callback_data="menu_pdz_results"),
-        ],
-        [
-            InlineKeyboardButton("📈 Активность", callback_data="menu_activity"),
-            InlineKeyboardButton("📊 Сводка", callback_data="menu_evening"),
-        ],
-        [
-            InlineKeyboardButton("📊 Статистика бота", callback_data="menu_stats"),
-            InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
-        ],
-        [
-            InlineKeyboardButton("🗑 Очистить открытые", callback_data="menu_clearopen"),
-            InlineKeyboardButton("💣 Очистить ВСЕ", callback_data="menu_clearall"),
-        ],
-    ])
-
-    await update.message.reply_text(
-        "🎛 *Панель управления Эф*\n\nВыбери действие:",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-
-
-async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок панели управления."""
-    query = update.callback_query
-    await query.answer()
-
-    if not query.from_user or query.from_user.id != 360092495:
-        await query.answer("⛔ Только для руководителя.", show_alert=True)
-        return
-
-    action = query.data
-
-    if action == "menu_noop":
-        return  # разделитель — ничего не делаем
-
-    elif action == "user_photo":
-        await query.message.reply_text(
-            "📸 Напиши название товара — пришлю фото.\nНапример: _форель охл трим С_",
-            parse_mode="Markdown"
-        )
-        _user_awaiting[query.from_user.id] = "photo"
-
-    elif action == "user_pdz_client":
-        await query.message.reply_text(
-            "💰 Напиши название клиента — покажу его дебиторку.\nНапример: _Атмосфера_",
-            parse_mode="Markdown"
-        )
-        _user_awaiting[query.from_user.id] = "pdz_client"
-
-    elif action == "menu_all_tasks":
-        from database import Database
-        tasks = db.get_all_open_tasks()
-        if not tasks:
-            await query.message.reply_text("✅ Открытых задач нет.")
-        else:
-            lines = [f"📋 *Все открытые задачи ({len(tasks)}):*\n"]
-            for t in tasks[:30]:
-                lines.append(f"• *{t.get('executor','')}*: {t.get('text','')[:60]}")
-            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    elif action == "menu_overdue":
-        tasks = db.get_overdue_tasks()
-        if not tasks:
-            await query.message.reply_text("✅ Просроченных задач нет.")
-        else:
-            lines = [f"⏰ *Просроченные задачи ({len(tasks)}):*\n"]
-            for t in tasks[:20]:
-                lines.append(f"• *{t.get('executor','')}*: {t.get('text','')[:60]}")
-            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    elif action == "menu_pdz_all":
-        await query.message.reply_text("⏳ Запрашиваю ПДЗ...")
-        from moysklad import get_overdue_demands, format_overdue_demands
-        items = await get_overdue_demands()
-        if not items:
-            await query.message.reply_text("✅ Просроченных долгов нет.")
-        else:
-            text = format_overdue_demands(items)
-            await query.message.reply_text(text, parse_mode="Markdown")
-
-    elif action == "menu_pdz_run":
-        await query.message.reply_text(
-            "🚀 Запускаю ПДЗ задачи?\nЭто разошлёт задачи всем менеджерам.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Да, запустить", callback_data="menu_pdz_confirm"),
-                InlineKeyboardButton("❌ Отмена", callback_data="menu_cancel"),
-            ]])
-        )
-
-    elif action == "menu_pdz_confirm":
-        import asyncio
-        from scheduler import pdz_morning_task, PDZ_MANAGERS, pdz_launched_today
-        from datetime import date as _date
-        today = _date.today().isoformat()
-        pdz_launched_today.add(today)
-        await query.message.reply_text(f"📋 Запускаю для {len(PDZ_MANAGERS)} менеджеров (2 мин интервал)...")
-        for i, mgr in enumerate(PDZ_MANAGERS):
-            try:
-                await pdz_morning_task(context.application, mgr)
-            except Exception as e:
-                await query.message.reply_text(f"❌ {mgr['name']}: {e}")
-            if i < len(PDZ_MANAGERS) - 1:
-                await asyncio.sleep(120)
-        await query.message.reply_text("✅ Готово. Сводка придёт в 17:00.")
-
-    elif action == "menu_pdz_results":
-        await cmd_pdz_results(update, context)
-
-    elif action == "menu_evening":
-        await query.answer()
-        await cmd_evening(update, context)
-
-    elif action == "menu_activity":
-        await query.message.reply_text(
-            "📊 Активность менеджеров:\nНапиши *Эф, активность за 7 дней*",
-            parse_mode="Markdown"
-        )
-
-    elif action == "menu_report":
-        await query.message.reply_text("⏳ Формирую отчёт...")
-        context2 = db.get_context_summary()
-        from claude_ai import smart_answer
-        text = await smart_answer("Дай краткий недельный отчёт по задачам команды", context2)
-        await query.message.reply_text(text, parse_mode="Markdown")
-
-    elif action == "menu_clearopen":
-        await query.message.reply_text(
-            "🗑 Очистить все ОТКРЫТЫЕ задачи?",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Да", callback_data="menu_clearopen_confirm"),
-                InlineKeyboardButton("❌ Нет", callback_data="menu_cancel"),
-            ]])
-        )
-
-    elif action == "menu_clearopen_confirm":
-        db._ensure_connection()
-        with db.conn.cursor() as cur:
-            cur.execute("UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE status='open'")
-            count = cur.rowcount
-        db.conn.commit()
-        await query.message.reply_text(f"✅ Очищено открытых задач: {count}")
-
-    elif action == "menu_clearall":
-        await query.message.reply_text(
-            "💣 Удалить ВСЕ задачи включая выполненные?\nЭто нельзя отменить!",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💣 Да, удалить всё", callback_data="menu_clearall_confirm"),
-                InlineKeyboardButton("❌ Отмена", callback_data="menu_cancel"),
-            ]])
-        )
-
-    elif action == "menu_clearall_confirm":
-        db._ensure_connection()
-        with db.conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as cnt FROM tasks")
-            row = cur.fetchone()
-            total = row["cnt"] if row else 0
-            cur.execute("TRUNCATE TABLE tasks RESTART IDENTITY")
-        db.conn.commit()
-        await query.message.reply_text(f"💣 Удалено задач: {total}. Таблица очищена.")
-
-    elif action == "menu_test":
-        await query.message.reply_text("🔍 Запускаю диагностику...")
-        fake_update = update
-        await cmd_test(fake_update, context)
-
-    elif action == "menu_contacts":
-        lines = ["📞 *Контакты менеджеров:*\n"]
-        for name, contact in MANAGERS_CONTACTS.items():
-            lines.append(f"• {name}: {contact}")
-        await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    elif action == "menu_stats":
-        stats = db.get_usage_stats()
-        if not stats:
-            await query.message.reply_text("📭 Статистики пока нет.")
-        else:
-            lines = ["📊 *Статистика использования бота*\n"]
-            for s in stats:
-                blocked = " 🔒" if s.get("is_blocked") else ""
-                last = s.get("last_seen")
-                last_str = last.strftime("%d.%m %H:%M") if last else "—"
-                lines.append(
-                    f"👤 *{s.get('full_name','?')}*{blocked}\n"
-                    f"   `{s.get('user_id')}` · {s.get('request_count',0)} зап. · {last_str}"
-                )
-            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    elif action == "menu_block":
-        stats = db.get_usage_stats()
-        if not stats:
-            await query.message.reply_text("Нет пользователей.")
-            return
-        buttons = []
-        for s in stats:
-            if s.get("user_id") == 360092495:
-                continue
-            status = "🔒" if s.get("is_blocked") else "✅"
-            cb = f"menu_toggleblock|{s['user_id']}"
-            buttons.append([InlineKeyboardButton(
-                f"{status} {s.get('full_name','?')} ({s.get('request_count',0)} зап.)",
-                callback_data=cb
-            )])
-        buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_cancel")])
-        await query.message.reply_text(
-            "🔒 *Управление доступом*\nНажми на пользователя чтобы заблокировать/разблокировать:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-    elif action.startswith("menu_toggleblock|"):
-        uid = int(action.split("|")[1])
-        row = db._fetchone("SELECT full_name, is_blocked FROM manager_chats WHERE user_id=%s", (uid,))
-        if row:
-            if row.get("is_blocked"):
-                db.unblock_user(uid)
-                await query.answer(f"🔓 {row['full_name']} разблокирован")
-            else:
-                db.block_user(uid)
-                await query.answer(f"🔒 {row['full_name']} заблокирован")
-        await query.message.delete()
-
-    elif action == "menu_cancel":
-        await query.message.delete()
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📋 *Все команды:*\n\n"
-        "*Задачи:*\n"
-        "/tasks — мои задачи\n"
-        "/all_tasks — все задачи команды\n"
-        "/overdue — просроченные задачи\n\n"
-        "*Отчёты:*\n"
-        "/report — недельный отчёт\n"
-        "/дебиторка — срез по дебиторке\n\n"
-        "*База знаний:*\n"
-        "/фото [товар] — найти фото\n"
-        "/прайс — актуальный прайс\n"
-        "/контакт [имя] — найти контакт\n\n"
-        "*Обращение в свободной форме:*\n"
-        "бот, [любой вопрос]",
-        parse_mode="Markdown"
-    )
-
-
-# Кэш уже отправленных уведомлений об идентификации — chat_id → True
-_wazzup_notified: set = set()
-
-
-
-_pending_links: dict = {}
-_pending_task_results: dict = {}  # user_id → {task_id, task_text, executor}
-_user_awaiting: dict = {}  # user_id → "photo" | "pdz_client"
-
-
-async def handle_wazzup_ignore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Помечает контакт как 'не наш клиент' — больше не присылать уведомления."""
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split("|")
-    chat_id_val = parts[1] if len(parts) > 1 else ""
-    if chat_id_val:
-        db.link_wazzup_contact(
-            chat_id=chat_id_val,
-            chat_type="telegram",
-            channel_id="",
-            company_name="__ignore__",
-            wazzup_name="",
-            role="игнор",
-        )
-    await query.message.edit_text("🚫 Контакт помечен как 'не наш клиент'. Уведомления больше не придут.")
-
-
-async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатие кнопки привязки Telegram контакта к компании."""
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split("|")
-
-    # Выбор компании из списка похожих: wazzup_pick|index|link_key
-    if parts[0] == "wazzup_pick":
-        idx = int(parts[1])
-        link_key = parts[2]
-        pending = _pending_links.get(link_key) or _pending_links.get(query.from_user.id)
-        if not pending:
-            await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
-            return
-        suggestions = pending.get("suggestions", [])
-        if idx >= len(suggestions):
-            await query.message.edit_text("❌ Ошибка выбора, попробуй снова.")
-            return
-        cp_name = suggestions[idx]
-        _pending_links.pop(link_key, None)
-        db.delete_pending_link(link_key)
-        _pending_links.pop(query.from_user.id, None)
-        ok = db.link_wazzup_contact(
-            chat_id=pending["chat_id"],
-            chat_type=pending["chat_type"],
-            channel_id=pending["channel_id"],
-            company_name=cp_name,
-            wazzup_name=pending["wazzup_name"],
-            role="рассылка",
-        )
-        if ok:
-            _wazzup_notified.discard(pending["chat_id"])
-            try:
-                from moysklad import find_counterparty_info
-                cp_list = await find_counterparty_info(cp_name)
-                if cp_list:
-                    cp_data = cp_list[0]
-                    db.update_wazzup_contact_tags(
-                        chat_id=pending["chat_id"],
-                        tags=cp_data.get("tags", []),
-                        manager=cp_data.get("manager", ""),
-                        segment=cp_data.get("buyer_type", ""),
-                    )
-            except Exception as e:
-                logger.warning(f"Теги МойСклад: {e}")
-            await query.message.edit_text(
-                f"✅ *{pending['wazzup_name']}* → *{cp_name}*\nЭф запомнил!",
-                parse_mode="Markdown"
-            )
-            await asyncio.sleep(3)
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
-        return
-
-    # Выбор сегмента: wazzup_seg|сегмент|link_key
-    if parts[0] == "wazzup_seg":
-        segment = parts[1]
-        link_key = parts[2]
-        pending = _pending_links.get(link_key)
-        if not pending:
-            for uid, v in _pending_links.items():
-                if isinstance(uid, int) and v.get("link_key") == link_key:
-                    pending = v
-                    break
-        if not pending:
-            await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
-            return
-        pending["segment"] = segment
-        # Спрашиваем менеджера
-        MANAGERS = ["Баласанян К.", "Леонтьев А.", "Мерзлякова Е.", "Скляр И.", "Иванов А."]
-        buttons = [[InlineKeyboardButton(m, callback_data=f"wazzup_mgr|{m}|{link_key}")] for m in MANAGERS]
-        await query.message.edit_text(
-            f"✅ Сегмент: *{segment}*\n\nОтветственный менеджер?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        return
-
-    # Выбор менеджера: wazzup_mgr|менеджер|link_key
-    if parts[0] == "wazzup_mgr":
-        manager = parts[1]
-        link_key = parts[2]
-        pending = _pending_links.get(link_key)
-        if not pending:
-            for uid, v in _pending_links.items():
-                if isinstance(uid, int) and v.get("link_key") == link_key:
-                    pending = v
-                    break
-        if not pending or "company_name" not in pending:
-            await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
-            return
-        # Очищаем
-        _pending_links.pop(link_key, None)
-        db.delete_pending_link(link_key)
-        for uid in [k for k, v in list(_pending_links.items()) if isinstance(k, int) and v.get("link_key") == link_key]:
-            _pending_links.pop(uid, None)
-        ok = db.link_wazzup_contact(
-            chat_id=pending["chat_id"],
-            chat_type=pending["chat_type"],
-            channel_id=pending["channel_id"],
-            company_name=pending["company_name"],
-            wazzup_name=pending["wazzup_name"],
-            role=role,
-        )
-        if ok:
-            # Подтягиваем теги из МойСклад
-            try:
-                from moysklad import find_counterparty_info
-                cp_list = await find_counterparty_info(pending["company_name"])
-                if cp_list:
-                    cp = cp_list[0]
-                    tags = cp.get("tags", [])
-                    manager_tag = cp.get("manager", "")
-                    buyer_type = cp.get("buyer_type", "")
-                    db.update_wazzup_contact_tags(
-                        chat_id=pending["chat_id"],
-                        tags=tags,
-                        manager=manager_tag,
-                        segment=buyer_type,
-                    )
-            except Exception as e:
-                logger.warning(f"Не удалось подтянуть теги из МойСклад: {e}")
-        if ok:
-            _wazzup_notified.discard(pending["chat_id"])
-            await query.message.edit_text(
-                f"✅ *{pending['wazzup_name']}* → *{pending['company_name']}* ({role})\nЭф запомнил!",
-                parse_mode="Markdown"
-            )
-            await asyncio.sleep(3)
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
-        return
-
-    # Выбор роли: wazzup_role|роль|link_key
-    if parts[0] == "wazzup_role":
-        role = parts[1]
-        link_key = parts[2]
-
-        # Отмена
-        if role == "отмена":
-            pending_data = _pending_links.get(link_key, {})
-            _wazzup_notified.discard(pending_data.get("chat_id", ""))
-            _pending_links.pop(link_key, None)
-            db.delete_pending_link(link_key)
-            for uid in [k for k, v in list(_pending_links.items()) if v.get("link_key") == link_key]:
-                _pending_links.pop(uid, None)
-            await query.message.delete()
-            return
-        pending = _pending_links.get(link_key)
-        # Если не нашли по link_key — ищем по user_id среди всех pending
-        if not pending or "company_name" not in pending:
-            for uid, v in _pending_links.items():
-                if isinstance(uid, int) and v.get("link_key") == link_key and "company_name" in v:
-                    pending = v
-                    break
-        if not pending or "company_name" not in pending:
-            await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
-            return
-        # После выбора роли — спрашиваем сегмент
-        pending["role"] = role
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🍣 Хорека", callback_data=f"wazzup_seg|хорека|{link_key}"),
-            InlineKeyboardButton("📦 Опт", callback_data=f"wazzup_seg|опт|{link_key}"),
-            InlineKeyboardButton("🚚 Поставщик", callback_data=f"wazzup_seg|поставщик|{link_key}"),
-        ]])
-        await query.message.edit_text(
-            f"✅ Роль: *{role}*\n\nСегмент клиента?",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-        return
-
-    # Первое нажатие — запрашиваем название компании: wazzup_link|link_key
-    if len(parts) < 2:
-        return
-    link_key = parts[1]
-    pending = _pending_links.get(link_key)
-    if not pending:
-        await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
-        return
-
-    # Помечаем что ждём ввода от этого пользователя — добавляем в стек
-    if query.from_user.id not in _pending_links:
-        _pending_links[query.from_user.id] = []
-    # Если уже есть такой link_key — не дублируем
-    existing_keys = [p.get("link_key") for p in _pending_links[query.from_user.id]] if isinstance(_pending_links.get(query.from_user.id), list) else []
-    if link_key not in existing_keys:
-        entry = {**pending, "link_key": link_key}
-        if isinstance(_pending_links[query.from_user.id], list):
-            _pending_links[query.from_user.id].append(entry)
-        else:
-            _pending_links[query.from_user.id] = [entry]
-    _pending_links[link_key] = {**pending, "link_key": link_key}
-
-    # Берём последний ожидающий контакт
-    current = _pending_links[query.from_user.id][-1] if isinstance(_pending_links[query.from_user.id], list) else _pending_links[query.from_user.id]
-
-    await query.message.edit_text(
-        f"👤 Контакт: *{current['wazzup_name']}*\n\n"
-        f"Как этот клиент называется в МойСклад?\n"
-        f"_(напиши название или часть названия)_",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_clear_wazzup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет запись из wazzup_contact_map по chat_id. Только для руководителя."""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-    chat_id_val = context.args[0] if context.args else ""
-    if not chat_id_val:
-        await update.message.reply_text("Укажи chat_id: /clearwazzup 360092495")
-        return
-    try:
-        with db.conn.cursor() as cur:
-            cur.execute("DELETE FROM wazzup_contact_map WHERE chat_id=%s", (chat_id_val,))
-            cur.execute("DELETE FROM wazzup_contacts WHERE chat_id=%s", (chat_id_val,))
-        db.conn.commit()
-        await update.message.reply_text(f"✅ Запись {chat_id_val} удалена.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-# Ожидающие данные для создания договора — user_id → {data, missing, missing_idx}
-_pending_contracts: dict = {}
-
-
-async def _create_and_send_contract(contract_data: dict, created_by: str,
-                                    message, context, force_number: str = None):
-    """Генерирует договор PDF и отправляет в группу."""
-    import io, sys, os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-    try:
-        from contract_generator import generate_contract_pdf, get_contract_number
-        from datetime import datetime
-
-        today = datetime.now()
-
-        if force_number:
-            contract_number = force_number
-        else:
-            contract_number = get_contract_number(today, db)
-
-        MONTHS_RU = ["января","февраля","марта","апреля","мая","июня",
-                     "июля","августа","сентября","октября","ноября","декабря"]
-        contract_data["contract_number"] = contract_number
-        contract_data["contract_date"] = f"{today.day} {MONTHS_RU[today.month-1]} {today.year} г."
-
-        pdf_bytes = generate_contract_pdf(contract_data)
-
-        # Сохраняем в БД с полными реквизитами
-        db.save_contract(contract_number, contract_data["buyer_name"], created_by,
-                         buyer_data=contract_data)
-
-        # Отправляем в группу
-        group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
-        target = group_chat_id or message.chat_id
-        caption = (
-            f"📄 *Договор поставки № {contract_number}*\n"
-            f"📅 {contract_data['contract_date']}\n"
-            f"🏢 {contract_data['buyer_name']}\n"
-            f"👤 Создал: {created_by}"
-        )
-        await context.bot.send_document(
-            chat_id=target,
-            document=io.BytesIO(pdf_bytes),
-            filename=f"Договор_{contract_number}_{contract_data['buyer_name'][:30]}.pdf",
-            caption=caption,
-            parse_mode="Markdown"
-        )
-        if target != message.chat_id:
-            await message.reply_text(f"✅ Договор № {contract_number} отправлен в группу.", parse_mode="Markdown")
-
-    except Exception as e:
-        logger.error(f"_create_and_send_contract: {e}", exc_info=True)
-        await message.reply_text(f"❌ Ошибка генерации договора: {e}")
-
-
-async def cmd_wazzup_enrich(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обогащает базу контактов тегами из МойСклад. /wazzup_enrich"""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-
-    rows = db._fetchall("SELECT chat_id, company_name FROM wazzup_contact_map WHERE company_name IS NOT NULL AND company_name != '__ignore__'")
-    if not rows:
-        await update.message.reply_text("База контактов пуста.")
-        return
-
-    await update.message.reply_text(f"🔍 Обогащаю {len(rows)} контактов из МойСклад...")
-    from moysklad import find_counterparty_info
-    updated = 0
-    for r in rows:
-        try:
-            cp_list = await find_counterparty_info(r["company_name"])
-            if cp_list:
-                cp = cp_list[0]
-                db.update_wazzup_contact_tags(
-                    chat_id=r["chat_id"],
-                    tags=cp.get("tags", []),
-                    manager=cp.get("manager", ""),
-                    segment=cp.get("buyer_type", ""),
-                )
-                updated += 1
-        except Exception as e:
-            logger.warning(f"wazzup_enrich {r['company_name']}: {e}")
-
-    await update.message.reply_text(f"✅ Обновлено: {updated}/{len(rows)} контактов.")
-
-
-async def cmd_wazzup_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выгружает базу идентифицированных контактов в Excel. /wazzup_export"""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-
-    rows = db._fetchall("SELECT company_name, wazzup_name, chat_type, manager, segment, tags, created_at FROM wazzup_contact_map WHERE company_name != '__ignore__' ORDER BY company_name")
-
-    if not rows:
-        await update.message.reply_text("База контактов пуста.")
-        return
-
-    import io, csv
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Компания", "Имя в мессенджере", "Канал", "Менеджер", "Сегмент", "Теги", "Дата"])
-    for r in rows:
-        writer.writerow([
-            r.get("company_name", ""),
-            r.get("wazzup_name", ""),
-            r.get("chat_type", ""),
-            r.get("manager", ""),
-            r.get("segment", ""),
-            r.get("tags", ""),
-            str(r.get("created_at", ""))[:10],
-        ])
-
-    output.seek(0)
-    await update.message.reply_document(
-        document=io.BytesIO(output.getvalue().encode("utf-8-sig")),
-        filename="wazzup_contacts.csv",
-        caption=f"📋 База контактов — {len(rows)} записей"
-    )
-
-
-async def cmd_wazzup_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сбрасывает привязку Wazzup контакта. /wazzup_reset <chat_id>"""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Использование: /wazzup_reset <chat_id>")
-        return
-    chat_id_val = args[0]
-    try:
-        with db.conn.cursor() as cur:
-            cur.execute("DELETE FROM wazzup_contact_map WHERE chat_id = %s", (chat_id_val,))
-        db.conn.commit()
-        await update.message.reply_text(f"✅ Привязка для `{chat_id_val}` сброшена.", parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-async def cmd_wazzup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает список каналов Wazzup с их ID."""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-
-    api_key = os.getenv("WAZZUP_API_KEY", "")
-    import aiohttp
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            "https://api.wazzup24.com/v3/channels",
-            headers={"Authorization": f"Bearer {api_key}"}
-        ) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                await update.message.reply_text(f"❌ Ошибка: {resp.status} {text[:200]}")
-                return
-            data = await resp.json()
-
-    channels = data.get("channels", data) if isinstance(data, dict) else data
-    if not channels:
-        await update.message.reply_text("Каналов не найдено.")
-        return
-
-    lines = ["📡 *Каналы Wazzup:*\n"]
-    for ch in channels if isinstance(channels, list) else [channels]:
-        ch_id = ch.get("id", ch.get("channelId", "?"))
-        name = ch.get("name", "")
-        transport = ch.get("transport", "")
-        status = ch.get("state", ch.get("status", ""))
-        lines.append(f"• `{ch_id}`\n  transport: *{transport}* name: {name} status: {status}\n")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_wazzup_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Настраивает вебхук Wazzup. /wazzup_setup"""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-
-    api_key = os.getenv("WAZZUP_API_KEY", "")
-    if not api_key:
-        await update.message.reply_text("❌ WAZZUP_API_KEY не задан в Railway.")
-        return
-
-    import aiohttp
-    webhook_url = "https://f2b-production.up.railway.app/webhook/wazzup"
-
-    async with aiohttp.ClientSession() as session:
-        # Устанавливаем вебхук
-        async with session.patch(
-            "https://api.wazzup24.com/v3/webhooks",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"webhooksUri": webhook_url, "subscriptions": {"messagesAndStatuses": True}}
-        ) as resp:
-            if resp.status == 200:
-                await update.message.reply_text(
-                    f"✅ Wazzup вебхук настроен!\n"
-                    f"📡 URL: `{webhook_url}`\n\n"
-                    f"Теперь все сообщения менеджеров будут сохраняться автоматически.",
-                    parse_mode="Markdown"
-                )
-            else:
-                text = await resp.text()
-                await update.message.reply_text(f"❌ Ошибка: {resp.status} {text[:200]}")
-
-
-async def cmd_clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет ВСЕ открытые задачи. Только для руководителя."""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-    try:
-        with db.conn.cursor() as cur:
-            cur.execute("UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE status='open'")
-        db.conn.commit()
-        await update.message.reply_text("✅ Все открытые задачи очищены.")
-    except Exception as e:
-        logger.error(f"cmd_clear_all error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-async def cmd_clear_tasks_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет ВСЕ задачи включая выполненные. Только для руководителя."""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-    try:
-        db._ensure_connection()
-        with db.conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as cnt FROM tasks")
-            row = cur.fetchone()
-            total = row["cnt"] if row else 0
-            cur.execute("TRUNCATE TABLE tasks RESTART IDENTITY")
-        db.conn.commit()
-        await update.message.reply_text(f"🗑 Удалено задач: {total}. Таблица очищена полностью.")
-    except Exception as e:
-        logger.error(f"cmd_clear_tasks_all error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет все основные функции Эфа. Только для руководителя."""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-
-    await update.message.reply_text("🔍 Запускаю диагностику...", parse_mode="Markdown")
-
-    results = []
-
-    async def check(name: str, coro, timeout: int = 8):
-        try:
-            result = await asyncio.wait_for(coro, timeout=timeout)
-            if result:
-                results.append(f"✅ {name}")
-            else:
-                results.append(f"⚠️ {name} — пустой результат")
-        except asyncio.TimeoutError:
-            results.append(f"⚠️ {name} — таймаут (>{timeout}с)")
-        except Exception as e:
-            results.append(f"❌ {name} — {str(e)[:60]}")
-
-    # 1. БД — задачи
-    try:
-        tasks = db.get_all_open_tasks()
-        results.append(f"✅ База данных — {len(tasks)} открытых задач")
-    except Exception as e:
-        results.append(f"❌ База данных — {e}")
-
-    # 2. МойСклад — токен и базовый запрос
-    async def test_ms():
-        from moysklad import get_headers, MS_BASE
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{MS_BASE}/entity/organization", headers=get_headers()) as resp:
-                return resp.status == 200
-    await check("МойСклад API", test_ms())
-
-    # 3. МойСклад — поиск товара
-    async def test_ms_search():
-        from moysklad import search_products
-        rows = await search_products("лосось")
-        return len(rows) > 0
-    await check("МойСклад поиск товаров", test_ms_search())
-
-    # 4. МойСклад — баланс контрагента
-    async def test_ms_balance():
-        from moysklad import get_counterparty_balance
-        rows = await get_counterparty_balance("джи")
-        return len(rows) > 0
-    await check("МойСклад баланс контрагента", test_ms_balance())
-
-    # 5. МойСклад — ПДЗ (лёгкая проверка — просто один запрос)
-    async def test_pdz():
-        from moysklad import get_headers, MS_BASE
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            url = f"{MS_BASE}/entity/customerorder?limit=1&expand=attributes"
-            async with session.get(url, headers=get_headers()) as resp:
-                return resp.status == 200
-    await check("МойСклад ПДЗ (заказы)", test_pdz())
-
-    # 6. Claude API — диспетчер
-    async def test_claude():
-        from claude_ai import dispatch
-        result = await dispatch("привет", "Test")
-        return result.get("action") is not None
-    await check("Claude AI диспетчер", test_claude())
-
-    # 7. Поиск фото
-    async def test_photo():
-        photos = db.search_media("лосось", media_type="photo")
-        return True  # просто проверяем что БД отвечает
-    await check("Поиск фото (канал Контент)", test_photo())
-
-    # 8. Геокодер
-    async def test_geocoder():
-        from moysklad import geocode_address
-        coords = await geocode_address("Истра, Московская область")
-        return coords is not None
-    await check("Яндекс геокодер", test_geocoder())
-
-    # 9. Webhook сервер
-    try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://f2b-production.up.railway.app/health") as resp:
-                if resp.status == 200:
-                    results.append("✅ Webhook сервер")
-                else:
-                    results.append(f"⚠️ Webhook сервер — статус {resp.status}")
-    except Exception as e:
-        results.append(f"❌ Webhook сервер — {e}")
-
-    # Итог
-    ok = sum(1 for r in results if r.startswith("✅"))
-    warn = sum(1 for r in results if r.startswith("⚠️"))
-    err = sum(1 for r in results if r.startswith("❌"))
-
-    header = f"📊 Диагностика Эфа\n✅ {ok} ок  ⚠️ {warn} предупреждений  ❌ {err} ошибок\n\n"
-    await update.message.reply_text(header + "\n".join(results))
-
-
-async def cmd_del_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет задачу по ID. /deltask 5"""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /deltask <ID>\nСписок ID: /cleartasks")
-        return
-    try:
-        task_id = int(context.args[0])
-        with db.conn.cursor() as cur:
-            cur.execute(
-                "UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE id=%s AND status='open'",
-                (task_id,)
-            )
-            deleted = cur.rowcount
-        db.conn.commit()
-        if deleted:
-            await update.message.reply_text(f"✅ Задача #{task_id} удалена.")
-        else:
-            await update.message.reply_text(f"❌ Задача #{task_id} не найдена или уже закрыта.")
-    except ValueError:
-        await update.message.reply_text("❌ Укажи числовой ID задачи.")
-
-
-async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок подтверждения создания договора."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "contract_cancel":
-        await query.message.edit_text("❌ Создание договора отменено.")
-        return
-
-    if data.startswith("contract_force|"):
-        cp_id = data.split("|")[1]
-        from moysklad import get_counterparty_requisites
-        await query.message.edit_text("🔍 Читаю реквизиты...")
-        reqs = await get_counterparty_requisites(cp_id)
-        contract_data = {
-            "buyer_name": reqs.get("buyer_legal_title") or reqs.get("buyer_name", ""),
-            "buyer_inn": reqs.get("buyer_inn", ""),
-            "buyer_ogrn": reqs.get("buyer_ogrn", ""),
-            "buyer_address": reqs.get("buyer_address", ""),
-            "buyer_bank": reqs.get("buyer_bank", ""),
-            "buyer_rs": reqs.get("buyer_rs", ""),
-            "buyer_bik": reqs.get("buyer_bik", ""),
-            "buyer_ks": reqs.get("buyer_ks", ""),
-            "buyer_phone": reqs.get("buyer_phone", ""),
-            "buyer_email": reqs.get("buyer_email", ""),
-            "buyer_representative": reqs.get("buyer_representative", ""),
-            "buyer_director_name": reqs.get("buyer_director_name", ""),
-            "buyer_basis": "Устава",
-        }
-        # Проверяем недостающие поля
-        ASK_REQUIRED = {
-            "buyer_representative": "ФИО директора и должность",
-            "buyer_basis": "основание полномочий",
-        }
-        INFO_REQUIRED = {
-            "buyer_inn": "ИНН", "buyer_ogrn": "ОГРН",
-            "buyer_address": "юридический адрес",
-            "buyer_rs": "расчётный счёт (р/с)", "buyer_bik": "БИК банка",
-            "buyer_bank": "название банка", "buyer_ks": "корреспондентский счёт (к/с)",
-        }
-        missing_ask = [(k, v) for k, v in ASK_REQUIRED.items() if not contract_data.get(k)]
-        missing_info = [(k, v) for k, v in INFO_REQUIRED.items() if not contract_data.get(k)]
-        user = query.from_user
-
-        msg = f"📄 *{contract_data['buyer_name']}*\n"
-        if missing_info:
-            names = ", ".join(v for _, v in missing_info)
-            msg += f"⚠️ В МойСклад не заведены: _{names}_\n\n"
-
-        if missing_ask:
-            _pending_contracts[user.id] = {
-                "data": contract_data,
-                "missing_keys": [m[0] for m in missing_ask],
-                "missing_labels": [m[1] for m in missing_ask],
-                "missing_idx": 0,
-            }
-            msg += f"*{missing_ask[0][1]}*?"
-            await query.message.edit_text(msg, parse_mode="Markdown")
-        else:
-            await _create_and_send_contract(
-                contract_data, user.full_name, query.message, context
-            )
-
-
-async def handle_task_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопки 'Выполнено' — запрашивает результат."""
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split("|")
-    task_id = int(parts[1]) if len(parts) > 1 else 0
-
-    task = db._fetchone("SELECT * FROM tasks WHERE id=%s", (task_id,))
-    if not task:
-        await query.edit_message_text("❌ Задача не найдена.")
-        return
-
-    if task.get("status") == "done":
-        await query.edit_message_text(
-            query.message.text + "\n\n✅ *Уже выполнено*",
-            parse_mode="Markdown"
-        )
-        return
-
-    # Сохраняем ожидание результата
-    _pending_task_results[query.from_user.id] = {
-        "task_id": task_id,
-        "task_text": task.get("text", ""),
-        "executor": task.get("executor", ""),
-        "msg_id": query.message.message_id,
-    }
-
-    await query.edit_message_text(
-        query.message.text + "\n\n✏️ *Напиши результат выполнения:*",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_deltask_by_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удалить задачу ответом 'удали' на сообщение бота с задачей."""
-    msg = update.message
-    if not msg or not msg.reply_to_message:
-        return
-    user = msg.from_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if not user or user.id not in manager_ids:
-        return
-    replied = msg.reply_to_message
-    # Проверяем что это сообщение бота
-    if not replied.from_user or not replied.from_user.is_bot:
-        return
-    bot_msg_id = replied.message_id
-    chat_id = msg.chat_id
-    deleted = db.delete_tasks_by_bot_message_id(bot_msg_id, chat_id)
-    if deleted:
-        names = [f"• *{t['executor']}*: {t['text']}" for t in deleted]
-        await msg.reply_text(
-            f"🗑 Задач удалено: {len(deleted)}\n" + "\n".join(names),
-            parse_mode="Markdown"
-        )
-        # Удаляем само сообщение бота о задачах
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=bot_msg_id)
-        except Exception:
-            pass
-    else:
-        await msg.reply_text("Задачи не найдены или уже закрыты.")
-
-
-async def cmd_clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет все открытые задачи кроме указанных ID. Только для руководителя."""
-    logger.info(f"cmd_clear_tasks вызван от {update.effective_user.id} args={context.args}")
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-    try:
-        args = context.args
-        if args and args[0] == "keep":
-            keep_ids = [int(x) for x in args[1:] if x.isdigit()]
-            db = Database()
-            with db.conn.cursor() as cur:
-                if keep_ids:
-                    placeholders = ",".join(["%s"] * len(keep_ids))
-                    cur.execute(f"UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE status='open' AND id NOT IN ({placeholders})", keep_ids)
-                else:
-                    cur.execute("UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE status='open'")
-            db.conn.commit()
-            db.conn.close()
-            await update.message.reply_text(f"✅ Все задачи очищены." if not keep_ids else f"✅ Задачи очищены. Оставлены ID: {keep_ids}")
-        else:
-            db = Database()
-            tasks = db.get_all_open_tasks()
-            if not tasks:
-                await update.message.reply_text("Нет открытых задач.")
-                return
-            lines = [f"ID {t['id']}: {t.get('executor','—')} — {t.get('text','')}" for t in tasks]
-            lines.append("\nЧтобы оставить только нужные: /cleartasks keep 5 12")
-            await update.message.reply_text("\n".join(lines))
-    except Exception as e:
-        logger.error(f"cmd_clear_tasks error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-async def cmd_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает задачи текущего пользователя."""
-    user = update.effective_user
-    name = user.full_name
-    tasks = db.get_tasks_for_user(name)
-
-    if not tasks:
-        await update.message.reply_text(f"✅ {name}, у тебя нет открытых задач!")
-        return
-
-    lines = [f"📋 *Задачи для {name}:*\n"]
-    for t in tasks:
-        deadline_str = f" — до {t['deadline']}" if t.get('deadline') else ""
-        status_icon = "🔴" if t.get('overdue') else "🟡"
-        lines.append(f"{status_icon} {t['text']}{deadline_str}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_all_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Все открытые и недавно выполненные задачи команды."""
-    tasks = db.get_all_open_tasks()
-    done_tasks = db.get_recently_done(hours=24)
-
-    if not tasks and not done_tasks:
-        await update.message.reply_text("✅ Нет открытых задач!")
-        return
-
-    lines = []
-
-    if tasks:
-        # Группируем открытые по исполнителю
-        by_user = {}
-        for t in tasks:
-            exe = t.get('executor') or 'Неизвестно'
-            by_user.setdefault(exe, []).append(t)
-
-        lines.append("📋 *Открытые задачи:*\n")
-        MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-        for user, utasks in by_user.items():
-            lines.append(f"*{user}* ({len(utasks)}):")
-            for t in utasks:
-                icon = "🔴" if t.get('overdue') else "🟡"
-                dl = t.get('deadline')
-                if dl:
-                    try:
-                        from datetime import date as _date
-                        d = _date.fromisoformat(str(dl)[:10])
-                        deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
-                    except Exception:
-                        deadline_str = f" · до {dl}"
-                else:
-                    deadline_str = ""
-                lines.append(f"  {icon} {t['text']}{deadline_str}")
-            lines.append("")
-
-    if done_tasks:
-        lines.append("✅ *Выполнено за 24 часа:*\n")
-        for t in done_tasks:
-            exe = t.get('executor') or ''
-            result = t.get('result') or ''
-            result_str = f" — {result}" if result else ""
-            lines.append(f"  ✅ *{exe}*: {t['text']}{result_str}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Просроченные задачи."""
-    tasks = db.get_overdue_tasks()
-    if not tasks:
-        await update.message.reply_text("✅ Просроченных задач нет!")
-        return
-
-    lines = [f"🔴 *Просроченные задачи ({len(tasks)}):*\n"]
-    for t in tasks:
-        lines.append(f"• *{t.get('executor', '?')}*: {t['text']} [срок: {t.get('deadline', '?')}]")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Недельный отчёт по команде."""
-    stats = db.get_weekly_stats()
-
-    lines = ["📊 *Отчёт за неделю:*\n"]
-    for user, s in stats.items():
-        pct = int(s['done'] / s['total'] * 100) if s['total'] > 0 else 0
-        bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-        lines.append(
-            f"*{user}*\n"
-            f"  {bar} {pct}%\n"
-            f"  ✅ {s['done']} выполнено  🔴 {s['overdue']} просрочено  📋 {s['total']} всего\n"
-        )
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Срез по дебиторке."""
-    debtors = db.get_debtors()
-    if not debtors:
-        await update.message.reply_text("✅ Просроченной дебиторки нет!")
-        return
-
-    lines = ["💰 *Дебиторка — требуют внимания:*\n"]
-    for d in debtors:
-        lines.append(f"• {d['client']} → *{d['manager']}* [{d['days']} дн.]")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поиск фото по команде /фото [товар]."""
-    query = " ".join(context.args) if context.args else ""
-    if not query:
-        await update.message.reply_text("Укажи товар: /photo тунец")
-        return
-    await search_and_send_photo(update, context, query)
-
-
-async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Последний актуальный прайс."""
-    price = db.get_latest_price()
-    if price:
-        await update.message.reply_document(
-            document=price['file_id'],
-            caption=f"📄 Прайс от {price['date']}"
-        )
-    else:
-        await update.message.reply_text("Прайс пока не загружен в базу. Скинь прайс в чат и я его сохраню!")
-
-
-async def cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поиск контакта."""
-    query = " ".join(context.args) if context.args else ""
-    if not query:
-        await update.message.reply_text("Укажи имя: /contact Малахов")
-        return
-
-    contacts = db.search_contacts(query)
-    if not contacts:
-        await update.message.reply_text(f"Контакт '{query}' не найден в базе.")
-        return
-
-    lines = [f"📞 *Контакты по запросу '{query}':*\n"]
-    for c in contacts:
-        lines.append(f"• *{c['name']}* — {c['phone']} ({c.get('company', '')})")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-# ─── Обработка обычных сообщений ──────────────────────────────────────────────
-
-async def process_sipuni_call(call_id: str, src_num: str, dst_num: str,
-                              short_dst: str, tree_name: str, record_link: str,
-                              call_start: str, call_answer: str, bot):
-    """Скачивает запись звонка и транскрибирует через Whisper. Сохраняет в БД."""
-    import aiohttp, tempfile, os as _os
-
-    openai_key = _os.getenv("OPENAI_API_KEY", "")
-    if not openai_key:
-        logger.warning("process_sipuni_call: OPENAI_API_KEY не задан")
-        return
-
-    try:
-        manager_name = tree_name or short_dst or dst_num
-
-        # Длительность
-        duration_sec = 0
-        try:
-            if call_start and call_answer and call_answer != "0":
-                duration_sec = int(call_answer) - int(call_start)
-                if duration_sec < 0:
-                    duration_sec = 0
-        except Exception:
-            pass
-
-        logger.info(f"Sipuni: транскрибирую звонок {call_id} от {src_num} ({duration_sec}с)")
-
-        # 1. Скачиваем запись
-        async with aiohttp.ClientSession() as session:
-            async with session.get(record_link) as resp:
-                if resp.status != 200:
-                    logger.warning(f"Sipuni: не удалось скачать запись {resp.status}")
-                    return
-                audio_data = await resp.read()
-
-        if len(audio_data) < 1000:
-            logger.warning(f"Sipuni: запись слишком короткая ({len(audio_data)} байт)")
-            return
-
-        # 2. Транскрипция через OpenAI Whisper
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            tmp.write(audio_data)
-            tmp_path = tmp.name
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                with open(tmp_path, "rb") as f:
-                    form = aiohttp.FormData()
-                    form.add_field("file", f, filename="call.mp3", content_type="audio/mpeg")
-                    form.add_field("model", "whisper-1")
-                    form.add_field("language", "ru")
-                    async with session.post(
-                        "https://api.openai.com/v1/audio/transcriptions",
-                        headers={"Authorization": f"Bearer {openai_key}"},
-                        data=form
-                    ) as resp:
-                        if resp.status != 200:
-                            body = await resp.text()
-                            logger.warning(f"Whisper error {resp.status}: {body[:200]}")
-                            return
-                        result = await resp.json()
-                        transcript = result.get("text", "")
-        finally:
-            _os.unlink(tmp_path)
-
-        if not transcript:
-            logger.warning("Sipuni: транскрипция пустая")
-            return
-
-        # 3. Сохраняем в БД
-        saved = db.save_call_transcript(
-            call_id=call_id,
-            src_num=src_num,
-            dst_num=dst_num,
-            manager_name=manager_name,
-            tree_name=tree_name,
-            transcript=transcript,
-            duration_sec=duration_sec,
-        )
-        logger.info(f"Sipuni: транскрипция сохранена call_id={call_id} saved={saved} ({len(transcript)} символов)")
-
-    except Exception as e:
-        logger.error(f"process_sipuni_call: {e}", exc_info=True)
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главный обработчик всех сообщений."""
-    message = update.message
-    if not message:
-        return
-
-    async def safe_reply(text, **kwargs):
-        """Отправляет ответ, при ошибке цитаты — без неё."""
-        try:
-            return await message.reply_text(text, **kwargs)
-        except Exception:
-            try:
-                return await context.bot.send_message(
-                    chat_id=message.chat_id, text=text,
-                    parse_mode=kwargs.get("parse_mode"),
-                    reply_markup=kwargs.get("reply_markup")
-                )
-            except Exception as e:
-                logger.warning(f"safe_reply failed: {e}")
-
-    # Команды обрабатываются отдельными CommandHandler — пропускаем
-    if message.text and message.text.startswith("/"):
-        return
-
-    chat_id = message.chat_id
-    user = message.from_user
-    text = message.text or message.caption or ""
-
-    # Проверяем блокировку
-    if user and db.is_user_blocked(user.id):
-        await message.reply_text("⛔ Доступ ограничен. Обратитесь к руководителю.")
-        return
-
-    # Логируем запрос
-    if user and text:
-        db.log_usage(user.id, user.full_name, text[:100], chat_id)
-
-    # Обработка ожидаемого ввода из меню (фото / ПДЗ клиента)
-    awaiting = _user_awaiting.get(user.id) if user else None
-    if awaiting and user and text and not text.startswith("/"):
-        _user_awaiting.pop(user.id, None)
-
-        if awaiting == "photo":
-            await message.reply_chat_action("upload_photo")
-            await search_and_send_photo(update, context, text)
-            await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
-            return
-
-        elif awaiting == "contract":
-            await message.reply_chat_action("typing")
-            # Обрабатываем как generate_contract напрямую
-            buyer_query = text
-            from moysklad import get_counterparty_requisites
-            from datetime import date as _date
-            counterparties = await get_counterparty_balance(buyer_query)
-            if not counterparties:
-                await message.reply_text(
-                    f"❌ Компания *{buyer_query}* не найдена в МойСклад.",
-                    parse_mode="Markdown"
-                )
-                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
-                return
-            cp = counterparties[0]
-            cp_id = cp.get("id", "")
-            cp_name = cp.get("name", buyer_query)
-            existing = db.find_contract_by_buyer(cp_name)
-            if existing:
-                await message.reply_text(
-                    f"📄 Договор с *{cp_name}* уже был сформирован.\n"
-                    f"Номер: *{existing['contract_number']}* от {existing['created_at'].strftime('%d.%m.%Y')}\n\n"
-                    f"Повторное формирование невозможно.\n"
-                    f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
-                    parse_mode="Markdown"
-                )
-                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
-                return
-            # Проверяем — клиент уже существует в МойСклад?
-            cp_updated = cp.get("updated") or cp.get("created") or ""
-            from datetime import date as _date2
-            today_str2 = _date2.today().isoformat()
-            if cp_updated and cp_updated[:10] < today_str2:
-                await message.reply_text(
-                    f"⚠️ Клиент *{cp_name}* уже существует в МойСклад.\n\n"
-                    f"Договор с давними клиентами не формируется через бота.\n"
-                    f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
-                    parse_mode="Markdown"
-                )
-                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
-                return
-            await message.reply_text(f"🔍 Читаю реквизиты *{cp_name}*...", parse_mode="Markdown")
-            reqs = await get_counterparty_requisites(cp_id)
-            contract_data = {
-                "buyer_name": reqs.get("buyer_legal_title") or reqs.get("buyer_name", buyer_query),
-                "buyer_inn": reqs.get("buyer_inn", ""),
-                "buyer_ogrn": reqs.get("buyer_ogrn", ""),
-                "buyer_address": reqs.get("buyer_address", ""),
-                "buyer_bank": reqs.get("buyer_bank", ""),
-                "buyer_rs": reqs.get("buyer_rs", ""),
-                "buyer_bik": reqs.get("buyer_bik", ""),
-                "buyer_ks": reqs.get("buyer_ks", ""),
-                "buyer_phone": reqs.get("buyer_phone", ""),
-                "buyer_email": reqs.get("buyer_email", ""),
-                "buyer_representative": reqs.get("buyer_representative", ""),
-                "buyer_director_name": reqs.get("buyer_director_name", ""),
-                "buyer_basis": "Устава",
-            }
-            REQUIRED = {
-                "buyer_inn": "ИНН", "buyer_ogrn": "ОГРН",
-                "buyer_address": "юридический адрес",
-                "buyer_rs": "расчётный счёт (р/с)", "buyer_bik": "БИК банка",
-                "buyer_bank": "название банка", "buyer_ks": "корреспондентский счёт (к/с)",
-                "buyer_representative": "ФИО директора и должность",
-                "buyer_basis": "основание полномочий",
-            }
-            missing = [(k, v) for k, v in REQUIRED.items() if not contract_data.get(k)]
-            if missing:
-                _pending_contracts[user.id] = {
-                    "data": contract_data,
-                    "missing_keys": [m[0] for m in missing],
-                    "missing_labels": [m[1] for m in missing],
-                    "missing_idx": 0,
-                }
-                await message.reply_text(
-                    f"📄 *{contract_data['buyer_name']}*\n\nНе хватает данных:\n*{missing[0][1]}*?",
-                    parse_mode="Markdown"
-                )
-            else:
-                await _create_and_send_contract(contract_data, user.full_name, message, context)
-            return
-
-        elif awaiting == "pdz_client":
-            await message.reply_chat_action("typing")
-            from moysklad import get_overdue_demands
-            counterparties = await get_counterparty_balance(text)
-            if not counterparties:
-                await message.reply_text(f"❌ Клиент *{text}* не найден.", parse_mode="Markdown")
-                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
-                return
-
-            cp = counterparties[0]
-            cp_name = cp.get("name", text)
-            balance = cp.get("balance", 0)
-            tags = cp.get("tags", [])
-
-            MANAGER_TAG_MAP = {
-                "баласанян": "Карина Баласанян", "мерзлякова": "Елена Мерзлякова",
-                "скляр": "Инесса Скляр", "леонтьев": "Алексей Леонтьев", "черентаев": "Сергей Черентаев",
-            }
-            manager = "Не назначен"
-            for tag in tags:
-                if tag.lower() in MANAGER_TAG_MAP:
-                    manager = MANAGER_TAG_MAP[tag.lower()]
-                    break
-
-            overdue_items = await get_overdue_demands(query=cp_name)
-            overdue_sum = sum(i.get("overdue_sum", 0) for i in overdue_items) if overdue_items else 0
-            overdue_lines = []
-            if overdue_items:
-                for item in overdue_items:
-                    for d in item.get("demands", []):
-                        overdue_lines.append(
-                            f"   └ {d.get('name','')} · {d.get('due','')} · "
-                            f"{d.get('unpaid',0):,.2f} руб. · {d.get('days',0)} дн."
-                        )
-
-            lines = [
-                f"📊 *{cp_name}*\n",
-                f"👤 Менеджер: *{manager}*",
-                f"🏷 Теги: {', '.join(tags) if tags else '—'}",
-                f"💵 Общий долг: *{abs(balance):,.2f} руб.*",
-            ]
-            if overdue_sum > 0:
-                lines.append(f"🔴 Просрочено: *{overdue_sum:,.2f} руб.*")
-                if overdue_lines:
-                    lines.append("\n*Просроченные заказы:*")
-                    lines.extend(overdue_lines[:5])
-            else:
-                lines.append("✅ Просроченных долгов нет")
-
-            await message.reply_text("\n".join(lines), parse_mode="Markdown",
-                                     reply_markup=_user_menu_keyboard())
-            return
-
-    # Ответ менеджера на алерт цены в личке — пересылаем Виктору
-    OWNER_ID = 360092495
-    if user and chat_id == user.id and chat_id != OWNER_ID and text:
-
-        # 1. Ожидаем результат выполнения задачи
-        if user.id in _pending_task_results:
-            pending_tr = _pending_task_results.pop(user.id)
-            task_id = pending_tr["task_id"]
-            task_text = pending_tr["task_text"]
-            executor = pending_tr["executor"]
-            db.complete_task(task_id, result=text, completed_by=user.full_name)
-            # Уведомляем Виктора
-            await context.bot.send_message(
-                chat_id=OWNER_ID,
-                text=(
-                    f"✅ *Задача выполнена*\n"
-                    f"👤 *{executor}*\n"
-                    f"📋 {task_text}\n\n"
-                    f"💬 Результат: {text}"
-                ),
-                parse_mode="Markdown"
-            )
-            # Обновляем в группе PRO
-            group_chat_id_tr = int(os.getenv("GROUP_CHAT_ID", "0"))
-            if group_chat_id_tr:
-                await context.bot.send_message(
-                    chat_id=group_chat_id_tr,
-                    text=(
-                        f"✅ *{executor}* выполнил задачу:\n"
-                        f"_{task_text}_\n\n"
-                        f"💬 {text}"
-                    ),
-                    parse_mode="Markdown"
-                )
-            await message.reply_text("✅ Результат сохранён, руководитель уведомлён.")
-            return
-
-        # 2. Ответ на алерт цены
-        replied = message.reply_to_message
-        if replied and replied.text and "#price_alert_" in replied.text:
-            import re
-            m = re.search(r"#price_alert_(\d+)", replied.text)
-            if m:
-                alert_id = int(m.group(1))
-                alert_data = db.get_price_alert(alert_id)
-                if alert_data:
-                    db.close_price_alert(alert_id, text)
-                    order_name = alert_data.get("order_name", "")
-                    mgr_name = alert_data.get("manager_name", user.full_name)
-                    await context.bot.send_message(
-                        chat_id=OWNER_ID,
-                        text=(
-                            f"💬 *Ответ по алерту цены*\n"
-                            f"👤 Менеджер: *{mgr_name}*\n"
-                            f"📋 Заказ: {order_name or 'см. выше'}\n\n"
-                            f"{text}"
-                        ),
-                        parse_mode="Markdown"
-                    )
-                    await message.reply_text("✅ Ответ отправлен руководителю.")
-                    return
-
-        # 3. Результат по ПДЗ — менеджер пишет в личку боту
-        from scheduler import pdz_launched_today
-        from datetime import date as _date
-        today_str = _date.today().isoformat()
-        if today_str in pdz_launched_today:
-            text_lower = text.lower()
-
-            # Фильтруем — НЕ сохраняем если это запрос к боту или нерелевантное сообщение
-            is_bot_request = (
-                text_lower.startswith("эф") or
-                text_lower.startswith("пришли фото") or
-                text_lower.startswith("фото ") or
-                "пдз пробка" in text_lower or
-                "/pdz" in text_lower or
-                len(text.strip()) < 5
-            )
-
-            # Признаки ПДЗ ответа — упоминание оплаты/суммы/клиента/даты
-            pdz_keywords = [
-                "оплат", "перевод", "платёж", "платеж", "платежк",
-                "тыс", "руб", "завтра", "пятниц", "понедельник",
-                "вторник", "среда", "четверг", "задолженност",
-                "ип ", "ооо ", "пришлёт", "пришлет", "перечислит",
-                "отсрочк", "просрочк", "долг"
-            ]
-            is_pdz_result = any(kw in text_lower for kw in pdz_keywords)
-
-            if not is_bot_request and is_pdz_result:
-                db.save_pdz_result(
-                    manager_name=user.full_name,
-                    manager_user_id=user.id,
-                    result_text=text
-                )
-                from scheduler import pdz_day_messages, PDZ_MANAGERS
-                if today_str not in pdz_day_messages:
-                    pdz_day_messages[today_str] = {}
-                mgr_tag = "_all"
-                for mgr in PDZ_MANAGERS:
-                    frag = mgr.get("name_fragment", mgr["name"]).lower()
-                    if frag in user.full_name.lower():
-                        mgr_tag = mgr["tag"]
-                        break
-                if mgr_tag not in pdz_day_messages[today_str]:
-                    pdz_day_messages[today_str][mgr_tag] = []
-                pdz_day_messages[today_str][mgr_tag].append(f"{user.full_name}: {text}")
-                await message.reply_text("✅ Принял, записал для отчёта.")
-            elif is_bot_request:
-                # Это запрос к боту — не отвечаем (обработается ниже)
-                pass
-            else:
-                await message.reply_text(
-                    "ℹ️ Не похоже на ответ по дебиторке.\n"
-                    "Напиши например: _«Атмосфера оплатит в пятницу»_",
-                    parse_mode="Markdown"
-                )
-            return
-
-        # 4. Прочие сообщения в личке — бот не реагирует
-        return
-
-    if message.forward_origin and chat_id == (user.id if user else None):
-        origin = message.forward_origin
-        logger.info(f"forward_origin type={type(origin).__name__} data={origin}")
-
-        fwd_id = None
-        fwd_name = None
-        chat_type = "telegram"
-
-        # Обычный пользователь с открытым профилем
-        fwd_user = getattr(origin, "sender_user", None)
-        if fwd_user:
-            fwd_id = str(fwd_user.id)
-            fwd_name = fwd_user.full_name or str(fwd_user.id)
-
-        # Скрытый пользователь — нет ID, писать нельзя
-        if not fwd_id:
-            fwd_name = getattr(origin, "sender_user_name", None)
-            if fwd_name:
-                await message.reply_text(
-                    f"😕 У контакта *{fwd_name}* закрыт профиль в Telegram.\n"
-                    f"Написать ему через бота не получится.",
-                    parse_mode="Markdown"
-                )
-            return
-
-        # Канал или чат
-        fwd_chat = getattr(origin, "sender_chat", None) or getattr(origin, "chat", None)
-        if not fwd_id and fwd_chat:
-            fwd_id = str(fwd_chat.id)
-            fwd_name = fwd_chat.title or fwd_chat.username or str(fwd_chat.id)
-
-        if not fwd_id or not fwd_name:
-            await message.reply_text("😕 Не удалось определить контакт — возможно у него закрыта приватность.")
-            return
-
-        if db.is_wazzup_contact_known(fwd_id):
-            rows = db._fetchall("SELECT company_name FROM wazzup_contact_map WHERE chat_id=%s", (fwd_id,))
-            if rows:
-                await message.reply_text(f"✅ Контакт *{fwd_name}* уже привязан к *{rows[0]['company_name']}*", parse_mode="Markdown")
-            return
-
-        import uuid as _uuid_fwd
-        link_key = str(_uuid_fwd.uuid4())[:8]
-        entry = {
-            "chat_id": fwd_id,
-            "channel_id": "ddd24a95-9304-4098-a320-3e47fcd1020a",
-            "wazzup_name": fwd_name,
-            "chat_type": chat_type,
-            "link_key": link_key,
-        }
-        _pending_links[link_key] = entry
-        # Используем стек как и везде
-        if user.id not in _pending_links or not isinstance(_pending_links.get(user.id), list):
-            _pending_links[user.id] = []
-        _pending_links[user.id].append(entry)
-        await message.reply_text(
-            f"👤 Контакт: *{fwd_name}*\n\nКак этот клиент называется в МойСклад?\n_(напиши название или часть названия)_",
-            parse_mode="Markdown"
-        )
-        return
-
-    # В группе ИДЕНТИФИКАЦИЯ — обрабатываем ввод названия компании
-    wazzup_id_chat = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
-    if wazzup_id_chat and chat_id == wazzup_id_chat:
-        if not text or text.startswith("/"):
-            return
-        # Удаляем сообщение менеджера чтобы не засорять группу
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        # Если у этого пользователя нет pending — ищем любой активный pending в группе
-        if user and user.id not in _pending_links:
-            for uid, pl in list(_pending_links.items()):
-                if isinstance(uid, int) and isinstance(pl, list) and pl:
-                    _pending_links[user.id] = pl
-                    break
-                elif isinstance(uid, int) and isinstance(pl, dict) and "wazzup_name" in pl:
-                    _pending_links[user.id] = [pl]
-                    break
-        logger.info(f"ИДЕНТИФИКАЦИЯ: user={user.id if user else None} pending={user.id in _pending_links if user else False} all_keys={[k for k in _pending_links.keys() if isinstance(k, int)]}")
-        if user and user.id not in _pending_links:
-            return
-
-    # Сохраняем все сообщения в историю чата
-    if text and user:
-        db.save_message(
-            chat_id=chat_id,
-            user_id=user.id,
-            user_name=user.full_name,
-            text=text[:1000],  # обрезаем очень длинные
-        )
-
-
-    # Записываем сообщения группы для анализа ПДЗ (пн/ср)
-    group_chat_id = get_group_chat_id()
-    if text and user and group_chat_id and chat_id == group_chat_id:
-        from datetime import date as _date
-        if _date.today().weekday() in (0, 2):  # 0=пн, 2=ср
-            sender_lower = user.full_name.lower()
-            matched = False
-            for mgr in PDZ_MANAGERS:
-                if mgr["name"].lower() in sender_lower or mgr["tag"] in sender_lower:
-                    record_group_message(user.full_name, mgr["tag"], text)
-                    matched = True
-                    break
-            if not matched:
-                record_group_message(user.full_name, "_all", text)
-    # 1. Сохраняем документы в базу (фото берём из МойСклад)
-    if message.document:
-        fname = message.document.file_name or ""
-        if any(fname.lower().endswith(ext) for ext in [".pdf", ".xlsx", ".xls", ".docx"]):
-            await save_media(message, "document")
-            # Если это прайс — помечаем отдельно
-            if any(w in fname.lower() for w in ["прайс", "price", "price-list"]):
-                db.save_price(
-                    file_id=message.document.file_id,
-                    filename=fname,
-                    chat_id=chat_id,
-                    uploader=user.full_name
-                )
-                await message.reply_text("✅ Прайс сохранён в базу!")
-
-    if not text:
-        return
-
-    # 2. Автоматическое извлечение задач (анализируем ВСЕ сообщения руководителя)
-    # Список ID руководителей — добавь в .env
-    manager_ids_str = os.getenv("MANAGER_IDS", "")
-    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
-
-    # Логируем ID для диагностики
-    logger.info(f"Message from user.id={user.id}, name={user.full_name}, chat_id={message.chat_id}, manager_ids={manager_ids}")
-
-    if user.id in manager_ids and len(text) > 5:
-        text_lower = text.lower()
-
-        # Задачи фиксируем ТОЛЬКО если в тексте есть слово "задача"
-        if "задач" in text_lower:
-            DATA_QUERY_KEYWORDS = [
-                "пдз", "долг", "дебитор", "остатк", "отчёт", "отчет",
-                "сводк", "покажи", "дай", "сколько", "кто",
-                "активност", "упоминани", "договор", "баланс", "прайс",
-                "задолженност", "статистик", "аналитик", "кратко", "итог",
-                "просрочка", "просроченн", "должник",
-            ]
-            if not any(kw in text_lower for kw in DATA_QUERY_KEYWORDS):
-                tasks = await extract_tasks_from_message(text, user.full_name)
-                group_chat_id_for_tasks = int(os.getenv("GROUP_CHAT_ID", "0"))
-
-                for task in tasks:
-                    executor = task.get("executor", "")
-                    if not task.get("task") or not executor:
-                        continue
-
-                    # Если "всем менеджерам" — разворачиваем в список МОП
-                    executors = []
-                    exec_lower = executor.lower()
-                    if any(w in exec_lower for w in ["всем", "все менеджер", "мop", "мoп", "отдел продаж", "команда"]):
-                        executors = MOP_MANAGERS
-                    else:
-                        executors = [executor]
-
-                    for exec_name in executors:
-                        task_id = db.save_task(
-                            text=task["task"],
-                            executor=exec_name,
-                            deadline=task.get("deadline"),
-                            source_chat=chat_id,
-                            source_message_id=message.message_id,
-                            created_by=user.full_name
-                        )
-
-                        deadline = task.get("deadline")
-                        if deadline:
-                            from datetime import date as _date
-                            MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-                            try:
-                                d = _date.fromisoformat(deadline)
-                                deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
-                            except Exception:
-                                deadline_str = f" · до {deadline}"
-                        else:
-                            deadline_str = ""
-
-                        # 1. Публикуем в группу PRO без кнопок
-                        if group_chat_id_for_tasks:
-                            pub_text = (
-                                f"📌 *Задача*\n"
-                                f"👤 *{exec_name}*{deadline_str}\n"
-                                f"{task['task']}\n\n"
-                                f"_От: {user.full_name}_"
-                            )
-                            sent = await context.bot.send_message(
-                                chat_id=group_chat_id_for_tasks,
-                                text=pub_text,
-                                parse_mode="Markdown"
-                            )
-                            if sent:
-                                db.set_task_bot_message_id(task_id, sent.message_id)
-
-                        # 2. Дублируем исполнителю в личку с кнопкой
-                        mgr_chat_id = db.get_manager_chat_id(exec_name.split()[0])
-                        if mgr_chat_id:
-                            personal_text = (
-                                f"📋 *Тебе задача*{deadline_str}:\n\n"
-                                f"{task['task']}\n\n"
-                                f"_От: {user.full_name}_"
-                            )
-                            await context.bot.send_message(
-                                chat_id=mgr_chat_id,
-                                text=personal_text,
-                                parse_mode="Markdown",
-                                reply_markup=InlineKeyboardMarkup([[
-                                    InlineKeyboardButton("✅ Выполнено", callback_data=f"task_done|{task_id}")
-                                ]])
-                            )
-
-                        logger.info(f"Задача #{task_id}: {exec_name} → {task['task']}")
-
-    # 3. Автозакрытие задач — Claude анализирует контекст
-    sender_name = update.effective_user.full_name if update.effective_user else ""
-    text_lower_ac = text.lower().strip()
-    is_task_assignment = (
-        text_lower_ac.startswith("задача ") or
-        text_lower_ac.startswith("задачи ") or
-        "задач" in text_lower_ac and any(
-            name in text_lower_ac for name in
-            ["карин", "инесс", "скляр", "алексей", "леонтьев", "мерзляков", "черентаев", "баласанян"]
-        )
-    )
-    if not is_bot_addressed(text) and len(text) > 5 and not is_task_assignment:
-        open_tasks = db.get_all_open_tasks()
-        if open_tasks:
-            completed_items = await detect_task_completion(text, open_tasks, author=sender_name)
-            if completed_items:
-                closed = []
-                for item in completed_items:
-                    task_id = item["id"]
-                    result = item.get("result", "")
-                    task = next((t for t in open_tasks if t['id'] == task_id), None)
-                    if task:
-                        db.complete_task(task_id, result=result, completed_by=sender_name)
-                        executor = task.get('executor', '')
-                        result_str = f" — {result}" if result else ""
-                        closed.append(f"✅ *{executor}*: {task['text']}{result_str}")
-                        logger.info(f"Автозакрытие задачи {task_id}: {task['text']} | результат: {result}")
-                if closed:
-                    lines = ["🤖 Эф зафиксировал выполнение:\n"] + closed
-                    await message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    # 4. Реагируем на обращение к боту
-    # Автоматически реагируем на IT-проблемы даже без обращения "Эф,"
-    IT_KEYWORDS = [
-        "телеграм не", "telegram не", "амо не", "амосрм", "amocrm",
-        "crm не", "срм не", "не отправляется", "не загружается",
-        "не проходят звонки", "звонки не", "почта не", "не приходит письмо",
-        "не работает телеграм", "не работает амо", "не работает crm",
-        "слетела интеграция", "нет сообщений в амо", "не открывается амо",
-    ]
-    text_lower_it = text.lower()
-    if not is_bot_addressed(text) and any(kw in text_lower_it for kw in IT_KEYWORDS):
-        await message.reply_text(
-            "По техническим вопросам (Telegram, amoCRM, звонки, почта) "
-            "пишите в группу **IT8 & ОП ФИШ ТУ БИЗНЕС** 🛠",
-            parse_mode="Markdown"
-        )
-        return
-
-    # Проверяем ожидание привязки Wazzup контакта — ТОЛЬКО из группы ИДЕНТИФИКАЦИИ
-    wazzup_id_chat_for_ident = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
-    is_ident_chat = (chat_id == wazzup_id_chat_for_ident)
-    if user and user.id in _pending_links and not is_bot_addressed(text) and is_ident_chat:
-        _pl = _pending_links[user.id]
-        pending_link = _pl[0] if isinstance(_pl, list) and _pl else (_pl if isinstance(_pl, dict) else None)
-        if not pending_link:
-            _pending_links.pop(user.id, None)
-        else:
-            logger.info(f"pending_links: user={user.id} contact={pending_link.get('wazzup_name')} text={text[:30]}")
-            if "company_name" not in pending_link:
-                # Если уже показали варианты — просим нажать кнопку
-                if pending_link.get("suggestions") and text.strip() == pending_link.get("last_query", ""):
-                    await safe_reply("👆 Выбери компанию из списка выше или нажми «Не привязывать».")
-                    return
-                # Сбрасываем старые варианты при новом вводе
-                pending_link.pop("suggestions", None)
-                pending_link["last_query"] = text.strip()
-                # Ищем компанию в МойСклад
-                company_query = text.strip()
-                counterparties = await get_counterparty_balance(company_query)
-                if not counterparties:
-                    words = company_query.split()
-                    suggestions = []
-                    for word in words:
-                        if len(word) >= 3:
-                            found = await get_counterparty_balance(word)
-                            for c in found:
-                                if c not in suggestions:
-                                    suggestions.append(c)
-                    if suggestions:
-                        link_key = pending_link.get("link_key", str(user.id))
-                        pending_link["suggestions"] = [c.get("name","") for c in suggestions[:5]]
-                        buttons = []
-                        for i, c in enumerate(suggestions[:5]):
-                            cp_name = c.get("name", "")
-                            buttons.append([InlineKeyboardButton(
-                                cp_name[:40],
-                                callback_data=f"wazzup_pick|{i}|{link_key}"
-                            )])
-                        buttons.append([InlineKeyboardButton(
-                            "🚫 Не привязывать",
-                            callback_data=f"wazzup_role|отмена|{link_key}"
-                        )])
-                        await safe_reply(
-                            f"❓ *{company_query}* не найдена точно.\n\nВозможно имеется в виду:",
-                            parse_mode="Markdown",
-                            reply_markup=InlineKeyboardMarkup(buttons)
-                        )
-                    else:
-                        keyboard = InlineKeyboardMarkup([[
-                            InlineKeyboardButton("🚫 Не привязывать", callback_data=f"wazzup_role|отмена|{pending_link.get('link_key', str(user.id))}")
-                        ]])
-                        await safe_reply(
-                            f"❌ Компания *{company_query}* не найдена в МойСклад.\n"
-                            f"Попробуй написать название точнее или отмени привязку.",
-                            parse_mode="Markdown",
-                            reply_markup=keyboard
-                        )
-                    return
-                cp = counterparties[0]
-                cp_name = cp.get("name", company_query)
-                pending_link["company_name"] = cp_name
-                link_key = pending_link.get("link_key", str(user.id))
-                # Удаляем из стека
-                if isinstance(_pending_links.get(user.id), list):
-                    _pending_links[user.id] = [p for p in _pending_links[user.id] if p.get("link_key") != link_key]
-                    if not _pending_links[user.id]:
-                        _pending_links.pop(user.id, None)
-                else:
-                    _pending_links.pop(user.id, None)
-                _pending_links.pop(link_key, None)
-                db.delete_pending_link(link_key)
-                ok = db.link_wazzup_contact(
-                    chat_id=pending_link["chat_id"],
-                    chat_type=pending_link["chat_type"],
-                    channel_id=pending_link["channel_id"],
-                    company_name=cp_name,
-                    wazzup_name=pending_link["wazzup_name"],
-                    role="рассылка",
-                )
-                if ok:
-                    _wazzup_notified.discard(pending_link["chat_id"])
-                    try:
-                        from moysklad import find_counterparty_info
-                        cp_list = await find_counterparty_info(cp_name)
-                        if cp_list:
-                            cp_data = cp_list[0]
-                            db.update_wazzup_contact_tags(
-                                chat_id=pending_link["chat_id"],
-                                tags=cp_data.get("tags", []),
-                                manager=cp_data.get("manager", ""),
-                                segment=cp_data.get("buyer_type", ""),
-                            )
-                    except Exception as e:
-                        logger.warning(f"Теги МойСклад: {e}")
-                    await safe_reply(
-                        f"✅ *{pending_link['wazzup_name']}* → *{cp_name}*\nЭф запомнил!",
-                        parse_mode="Markdown"
-                    )
-                # Если есть ещё ожидающие в стеке — спрашиваем следующего
-                next_pl = _pending_links.get(user.id)
-                next_pending = next_pl[0] if isinstance(next_pl, list) and next_pl else None
-                if next_pending:
-                    await safe_reply(
-                        f"👤 Следующий контакт: *{next_pending['wazzup_name']}*\n\n"
-                        f"Как этот клиент называется в МойСклад?\n"
-                        f"_(напиши название или часть названия)_",
-                        parse_mode="Markdown"
-                    )
-            return
-
-    # Проверяем ожидание данных для договора (ПОСЛЕ идентификации)
-    if user and user.id in _pending_contracts and not is_bot_addressed(text):
-        pending_c = _pending_contracts[user.id]
-        keys = pending_c["missing_keys"]
-        labels = pending_c["missing_labels"]
-        idx = pending_c["missing_idx"]
-        data = pending_c["data"]
-
-        field_key = keys[idx]
-        data[field_key] = text.strip()
-
-        if field_key == "buyer_representative":
-            parts = text.strip().split()
-            if len(parts) >= 2:
-                data["buyer_director_name"] = " ".join(parts[-2:])
-
-        idx += 1
-        pending_c["missing_idx"] = idx
-
-        if idx < len(keys):
-            await message.reply_text(f"✅ Принято.\n\n*{labels[idx]}*?", parse_mode="Markdown")
-        else:
-            _pending_contracts.pop(user.id, None)
-            await message.reply_text("✅ Все данные получены. Генерирую договор...")
-            await _create_and_send_contract(data, user.full_name, message, context)
-        return
-
-    if not is_bot_addressed(text):
-        # Автореакция на ПДЗ-запросы без обращения "Эф,"
-        text_lower_pdz = text.lower().strip()
-        PDZ_TRIGGER = ["просрочка", "пдз", "должник", "дебиторка"]
-        if any(kw in text_lower_pdz for kw in PDZ_TRIGGER) and user and user.id in manager_ids:
-            pass  # продолжаем — обработаем как PDZ запрос
-        else:
-            return
-
-    query = clean_query(text)
-
-    # ── Всё через Claude — он сам разбирается что нужно ──
-    await message.reply_chat_action("typing")
-    context_data = db.get_context_summary()
-    chat_history = db.format_history(chat_id, limit=40)
-    memories = db.format_memories()
-
-    logger.info(f"Dispatching query='{query}' from '{user.full_name}'")
-    result = await dispatch(query, user.full_name, context_data,
-                            chat_history=chat_history, memories=memories)
-    logger.info(f"Dispatch result: {result}")
-    action = result.get("action", "answer")
-    params = result.get("params", {})
-
-    if action == "get_tasks":
-        employee = params.get("employee")
-        if employee:
-            tasks = db.get_tasks_for_user(employee)
-            done = [t for t in db.get_recently_done(hours=24)
-                    if employee.lower() in (t.get('executor') or '').lower()]
-            if not tasks and not done:
-                await message.reply_text(f"✅ У *{employee}* нет задач.", parse_mode="Markdown")
-            else:
-                lines = [f"📋 *Задачи — {employee}:*\n"]
-                for t in tasks:
-                    deadline_str = f" — до {t['deadline']}" if t.get("deadline") else ""
-                    icon = "🔴" if t.get("overdue") else "🟡"
-                    lines.append(f"{icon} {t['text']}{deadline_str}")
-                if done:
-                    lines.append("")
-                    for t in done:
-                        result_str = f" — {t['result']}" if t.get('result') else ""
-                        lines.append(f"✅ {t['text']}{result_str}")
-                await message.reply_text("\n".join(lines), parse_mode="Markdown")
-        else:
-            await cmd_all_tasks(update, context)
-
-    elif action == "get_all_tasks":
-        await cmd_all_tasks(update, context)
-
-    elif action == "get_report":
-        await cmd_report(update, context)
-
-    elif action == "get_debtors":
-        await message.reply_chat_action("typing")
-        debtors = await get_all_debtors()
-        text = format_debtors_ms(debtors)
-        await message.reply_text(text, parse_mode="Markdown")
-
-    elif action == "get_debt":
-        debt_query = params.get("query", "")
-        await message.reply_chat_action("typing")
-        counterparties = await get_counterparty_balance(debt_query)
-        text = format_counterparty_balance(counterparties, debt_query)
-        await message.reply_text(text, parse_mode="Markdown")
-
-    elif action == "find_counterparty":
-        cp_query = params.get("query", "")
-        await message.reply_chat_action("typing")
-        counterparties = await find_counterparty_info(cp_query)
-        text = format_counterparty_info(counterparties, cp_query)
-        await message.reply_text(text, parse_mode="Markdown")
-
-    elif action == "get_group_debts":
-        raw_tag = params.get("tag", "")
-        tag = resolve_tag(raw_tag)
-        await message.reply_chat_action("typing")
-        items = await get_debtors_by_tag(tag)
-        text = format_debtors_by_tag(items, tag)
-        if len(text) > 4000:
-            text = text[:3900] + "\n\n_...уточни запрос_"
-        await message.reply_text(text, parse_mode="Markdown")
-
-    elif action == "get_group_clients":
-        raw_tag = params.get("tag", "")
-        tag = resolve_tag(raw_tag)
-        await message.reply_chat_action("typing")
-        items = await get_clients_by_tag(tag)
-        text = format_clients_by_tag(items, tag)
-        if len(text) > 4000:
-            text = text[:3900] + "\n\n_...слишком много, уточни_"
-        await message.reply_text(text, parse_mode="Markdown")
-
-    elif action == "get_overdue_debt":
-        raw_tag = params.get("tag", "")
-        raw_query = params.get("query", "")
-        brief = params.get("brief", False)
-        tag = resolve_tag(raw_tag) if raw_tag else None
-        await message.reply_chat_action("typing")
-        items = await get_overdue_demands(tag=tag, query=raw_query)
-
-        # None означает что клиент не найден в МойСклад
-        if items is None:
-            await message.reply_text(
-                f"❌ Клиент *{raw_query}* не найден в МойСклад.\n"
-                f"Уточни название — например, часть названия компании.",
-                parse_mode="Markdown"
-            )
-            return
-
-        label = raw_query or (tag or None)
-        if brief and not raw_query:
-            text = format_overdue_summary(items)
-        else:
-            text = format_overdue_demands(items, tag=label)
-        if len(text) > 4000:
-            text = text[:3900] + "\n\n_...уточни запрос_"
-        await message.reply_text(text, parse_mode="Markdown")
-
-    elif action == "prepare_reminders":
-        USER_MANAGER_TAGS = {
-            "карина": "баласанян", "баласанян": "баласанян",
-            "инесса": "скляр", "скляр": "скляр",
-            "елена": "мерзлякова", "мерзлякова": "мерзлякова",
-                        "алексей": "леонтьев", "леонтьев": "леонтьев",
-        }
-        USER_MANAGER_DISPLAY = {
-            "баласанян": "Карина Баласанян",
-            "скляр": "Инесса Скляр",
-            "мерзлякова": "Елена Мерзлякова",
-            "леонтьев": "Алексей Леонтьев",
-        }
-        full_name_lower = user.full_name.lower()
-        manager_tag = None
-        manager_display = user.full_name
-        for key, tag in USER_MANAGER_TAGS.items():
-            if key in full_name_lower:
-                manager_tag = tag
-                manager_display = USER_MANAGER_DISPLAY.get(tag, user.full_name)
-                break
-        # Руководитель может указать тег явно
-        if not manager_tag and params.get("tag"):
-            manager_tag = resolve_tag(params["tag"])
-            manager_display = USER_MANAGER_DISPLAY.get(manager_tag, params["tag"].capitalize())
-        raw_query = params.get("query", "")
-        await message.reply_chat_action("typing")
-        items = await get_overdue_demands(tag=manager_tag, query=raw_query)
-        if not items:
-            await message.reply_text("✅ Просроченных клиентов нет — напоминания не нужны.")
-        else:
-            header = (
-                f"📋 *Напоминания об оплате — {manager_display}*\n"
-                f"{len(items)} клиентов · скопируй и отправь каждому"
-            )
-            await message.reply_text(header, parse_mode="Markdown")
-            for c in sorted(items, key=lambda x: x["overdue_sum"], reverse=True):
-                reminder = format_debt_reminder(c)
-                label = f"💬 {c['name']} — {fmt_money(c['overdue_sum'])}\n\n{reminder}"
-                await message.reply_text(label)
-
-    elif action == "find_photo":
-        photo_query = params.get("query", query)
-        await search_and_send_photo(update, context, photo_query)
-
-    elif action == "get_price":
-        # Сначала пробуем МойСклад
-        ms_token = os.getenv("MOYSKLAD_TOKEN")
-        if ms_token:
-            await message.reply_chat_action("typing")
-            products = await get_price_list(limit=50)
-            if products:
-                text = format_price_list(products)
-                # Telegram ограничивает 4096 символов
-                if len(text) > 4000:
-                    text = text[:3900] + "\n\n_...показаны первые позиции_"
-                await message.reply_text(text, parse_mode="Markdown")
-                return
-        await cmd_price(update, context)
-
-    elif action == "ms_search":
-        # Поиск товара в МойСклад — Claude разбирает запрос на фильтры
-        ms_query = params.get("query", query)
-        await message.reply_chat_action("typing")
-        parsed = await parse_product_query(ms_query)
-        logger.info(f"parse_product_query result: {parsed}")
-        
-        # Принудительный in_stock если пользователь явно спросил "в наличии" / "есть на складе"
-        stock_keywords = ["в наличии", "на складе", "есть ли", "что есть", "имеется"]
-        if any(kw in ms_query.lower() for kw in stock_keywords):
-            parsed.setdefault("filters", {})["in_stock"] = True
-            logger.info("Forced in_stock=True based on query keywords")
-        
-        products = await search_products_filtered(parsed)
-        if not products:
-            products = await search_products(ms_query)
-        text = format_products(products, ms_query)
-        if len(text) > 4000:
-            text = text[:3900] + "\n\n_...слишком много результатов, уточни запрос_"
-        await message.reply_text(text, parse_mode="Markdown")
-
-        # Если один товар и есть фото — пробуем прислать
-        if len(products) == 1 and products[0].get("image_href"):
-            try:
-                img_bytes = await download_image(products[0]["image_href"])
-                if img_bytes:
-                    import io as _io
-                    await message.reply_photo(
-                        photo=_io.BytesIO(img_bytes),
-                        caption=f"📸 {products[0]['name']}"
-                    )
-            except Exception as e:
-                logger.warning(f"Не удалось отправить фото из МойСклад: {e}")
-
-    elif action == "find_buyers":
-        product = params.get("product", "")
-        period_days = params.get("period_days", 30)
-        if not product:
-            await message.reply_text("❌ Не указан товар.")
-            return
-        await message.reply_chat_action("typing")
-        await message.reply_text(f"🔍 Ищу покупателей *{product}* за последние {period_days} дней...", parse_mode="Markdown")
-        from moysklad import get_buyers_by_product
-        result = await get_buyers_by_product(product, period_days=period_days)
-        buyers = result.get("buyers", []) if isinstance(result, dict) else result
-        found_name = result.get("product_name", product) if isinstance(result, dict) else product
-        if not buyers:
-            await message.reply_text(
-                f"❌ Покупателей *{found_name}* за последние {period_days} дней не найдено.\n"
-                f"_Искал товар: {found_name}_", parse_mode="Markdown")
-            return
-        lines = [f"👥 *Покупатели {found_name}* за {period_days} дней ({len(buyers)}):\n"]
-
-        MANAGER_TAG_MAP = {
-            "баласанян": "Карина Баласанян", "мерзлякова": "Елена Мерзлякова",
-            "скляр": "Инесса Скляр", "леонтьев": "Алексей Леонтьев", "черентаев": "Сергей Черентаев",
-        }
-        SPEC_TAGS = {"опт", "хорека", "розница"}
-
-        for b in buyers:
-            tags = b.get("tags", [])
-            tags_lower = [t.lower() for t in tags]
-            spec = next((t.capitalize() for t in tags_lower if t in SPEC_TAGS), "—")
-            manager = next((MANAGER_TAG_MAP[t] for t in tags_lower if t in MANAGER_TAG_MAP), "Не назначен")
-            lines.append(
-                f"👤 *{b['name']}*\n"
-                f"   👔 Менеджер: {manager}\n"
-                f"   🏷 Категория: {spec}"
-            )
-        text = "\n\n".join(lines)
-        if len(text) > 4000:
-            text = text[:3900] + "\n\n_...и ещё_"
-        await message.reply_text(text, parse_mode="Markdown")
-
-    elif action == "get_delivery_days":
-        address = params.get("address", "")
-        if not address:
-            await message.reply_text("❌ Укажи адрес или город.")
-            return
-        await message.reply_chat_action("typing")
-        from moysklad import check_delivery_schedule, DELIVERY_CITIES_COORDS, _CITY_INDEX, WEEKDAYS_RU, geocode_address, _haversine
-
-        # Текстовый поиск по городу
-        address_lower = address.lower()
-        found_keyword = None
-        for keyword in sorted(_CITY_INDEX.keys(), key=len, reverse=True):
-            if keyword in address_lower:
-                found_keyword = keyword
-                break
-
-        if found_keyword:
-            info = _CITY_INDEX[found_keyword]
-            canonical = info["canonical"]
-            days = [WEEKDAYS_RU[d] for d in sorted(info["days"])]
-            days_str = ", ".join(days)
-            await message.reply_text(
-                f"🚛 *{canonical}*\n📅 Дни доставки: *{days_str}*",
-                parse_mode="Markdown"
-            )
-            return
-
-        # Московский адрес?
-        if "москва" in address_lower or "moscow" in address_lower:
-            await message.reply_text("🚛 *Москва* — доставляем в любой рабочий день.", parse_mode="Markdown")
-            return
-
-        # Геокодируем
-        coords = await geocode_address(address)
-        if not coords:
-            await message.reply_text(f"😕 Не удалось определить направление для адреса: {address}")
-            return
-
-        lat, lon = coords
-        dist_from_moscow = _haversine(lat, lon, 55.7558, 37.6173)
-        if dist_from_moscow < 35:
-            await message.reply_text("🚛 Адрес в московской агломерации — доставляем в любой рабочий день.", parse_mode="Markdown")
-            return
-
-        # Ищем ближайший город
-        nearest_city = None
-        nearest_dist = float("inf")
-        for city, (clat, clon) in DELIVERY_CITIES_COORDS.items():
-            dist = _haversine(lat, lon, clat, clon)
-            if dist < nearest_dist:
-                nearest_dist = dist
-                nearest_city = city
-
-        if nearest_dist > 25 or not nearest_city:
-            await message.reply_text(
-                f"😕 Адрес *{address}* не входит ни в одно наше направление МО.\n"
-                f"Уточни у руководителя.",
-                parse_mode="Markdown"
-            )
-            return
-
-        # Нашли ближайший город — берём его дни
-        days = []
-        for keyword, info in _CITY_INDEX.items():
-            if info["canonical"] == nearest_city:
-                days = [WEEKDAYS_RU[d] for d in sorted(info["days"])]
-                break
-
-        days_str = ", ".join(days) if days else "уточни у руководителя"
-        await message.reply_text(
-            f"🚛 Адрес близко к *{nearest_city}* ({round(nearest_dist)} км)\n"
-            f"📅 Дни доставки: *{days_str}*",
-            parse_mode="Markdown"
-        )
-
-    elif action == "send_message_to_client":
-        client_query = params.get("client", "")
-        msg_text = params.get("message", "")
-
-        if not client_query:
-            await message.reply_text("❌ Укажи клиента.")
-            return
-
-        await message.reply_chat_action("typing")
-
-        # Находим контрагента в МойСклад
-        from moysklad import get_counterparty_phones
-        counterparties = await get_counterparty_balance(client_query)
-        if not counterparties:
-            await message.reply_text(f"❌ Клиент *{client_query}* не найден в МойСклад.", parse_mode="Markdown")
-            return
-
-        cp = counterparties[0]
-        cp_name = cp.get("name", client_query)
-
-        # Берём телефон
-        phones = await get_counterparty_phones([{"id": cp.get("id",""), "name": cp_name, "href": cp.get("href","")}])
-        phone = phones[0].get("phone") if phones else None
-
-        if not phone:
-            await message.reply_text(f"❌ У клиента *{cp_name}* нет телефона в МойСклад.", parse_mode="Markdown")
-            return
-
-        # Если текст не задан — формируем напоминание об оплате
-        if not msg_text:
-            balance = cp.get("balance", 0)
-            debt = abs(balance) if balance < 0 else 0
-            if debt > 0:
-                from moysklad import fmt_money
-                msg_text = f"Добрый день! Напоминаем о задолженности перед компанией F2B в размере {fmt_money(debt)}. Просьба произвести оплату. Спасибо!"
-            else:
-                await message.reply_text(f"❌ У *{cp_name}* нет долга. Укажи текст сообщения явно.", parse_mode="Markdown")
-                return
-
-        # Определяем каналы в порядке приоритета TG → Max → WhatsApp
-        CHANNEL_MAP = {
-            "telegram": "ddd24a95-9304-4098-a320-3e47fcd1020a",
-            "tgapi":    "ddd24a95-9304-4098-a320-3e47fcd1020a",
-            "max":      "1d5bc70a-7ca6-4895-8d1f-9690cf448214",
-            "whatsapp": "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03",
-        }
-        PRIORITY = ["telegram", "tgapi", "max", "whatsapp"]
-
-        # Ищем известные каналы клиента из вебхуков — по имени или телефону
-        known = db.get_wazzup_contacts(cp_name)
-        # Также ищем по номеру телефона
-        if phone and not known:
-            known = db.get_wazzup_contacts(phone[-10:])  # последние 10 цифр
-        channels_to_try = []
-        for p in PRIORITY:
-            for k in known:
-                if k.get("chat_type") in (p,):
-                    channels_to_try.append({
-                        "channel_id": k["channel_id"],
-                        "chat_type": k["chat_type"],
-                        "chat_id": k["chat_id"],
-                    })
-                    break
-
-        # Fallback — WhatsApp по номеру телефона если нет известных каналов
-        if not any(c["chat_type"] in ("whatsapp",) for c in channels_to_try):
-            channels_to_try.append({
-                "channel_id": CHANNEL_MAP["whatsapp"],
-                "chat_type": "whatsapp",
-                "chat_id": phone,
-            })
-
-        # Показываем превью с кнопками — ждём подтверждения
-        import uuid as _uuid
-        msg_key = str(_uuid.uuid4())[:8]
-        _pending_sends[msg_key] = {
-            "channels": channels_to_try,
-            "name": cp_name,
-            "text": msg_text,
-        }
-
-        group_chat_id = get_group_chat_id()
-        target_chat = group_chat_id or chat_id
-
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Отправить", callback_data=f"send_confirm|{msg_key}"),
-            InlineKeyboardButton("❌ Отменить", callback_data=f"send_cancel|{msg_key}"),
-        ]])
-        await context.bot.send_message(
-            chat_id=target_chat,
-            text=(
-                f"📤 *Сообщение клиенту*\n\n"
-                f"👤 *{cp_name}*\n"
-                f"📱 {phone}\n\n"
-                f"💬 _{msg_text}_"
-            ),
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-
-    elif action == "reconciliation":
-        buyer_query = params.get("buyer", "")
-        date_from = params.get("date_from", f"{datetime.now().year}-01-01")
-        date_to = params.get("date_to", datetime.now().strftime("%Y-%m-%d"))
-
-        await message.reply_chat_action("typing")
-
-        # Ищем контрагента
-        counterparties = await get_counterparty_balance(buyer_query)
-        if not counterparties:
-            await message.reply_text(
-                f"❌ Компания *{buyer_query}* не найдена в МойСклад.",
-                parse_mode="Markdown"
-            )
-            return
-
-        cp = counterparties[0]
-        cp_id = cp.get("id", "")
-        cp_name = cp.get("name", buyer_query)
-
-        await message.reply_text(
-            f"📊 Формирую акт сверки *{cp_name}*\n"
-            f"📅 Период: {date_from} — {date_to}\n"
-            f"⏳ Запрашиваю данные из МойСклад...",
-            parse_mode="Markdown"
-        )
-
-        try:
-            import io as _io
-            from reconciliation_generator import generate_reconciliation_pdf
-            from moysklad import get_reconciliation_data
-
-            # Получаем данные
-            rec_data = await get_reconciliation_data(cp_id, date_from, date_to)
-
-            if not rec_data or not rec_data.get("rows"):
-                await message.reply_text(
-                    f"😕 За период {date_from} — {date_to} операций с *{cp_name}* не найдено.",
-                    parse_mode="Markdown"
-                )
-                return
-
-            pdf_bytes = generate_reconciliation_pdf(rec_data)
-
-            # Отправляем в группу
-            group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
-            target = group_chat_id or message.chat_id
-            closing = rec_data.get("closing_balance", 0)
-            if closing > 0:
-                balance_str = f"💰 Долг клиента: *{closing:,.2f} руб.*"
-            elif closing < 0:
-                balance_str = f"💰 Переплата: *{abs(closing):,.2f} руб.*"
-            else:
-                balance_str = "✅ Взаиморасчёты согласованы"
-            caption = (
-                f"📊 *Акт сверки — {cp_name}*\n"
-                f"📅 {date_from} — {date_to}\n"
-                f"{balance_str}"
-            )
-            await context.bot.send_document(
-                chat_id=target,
-                document=_io.BytesIO(pdf_bytes),
-                filename=f"Акт_сверки_{cp_name[:30]}_{date_to}.pdf",
-                caption=caption,
-                parse_mode="Markdown"
-            )
-            if target != message.chat_id:
-                await message.reply_text("✅ Акт сверки отправлен в группу.")
-
-        except Exception as e:
-            logger.error(f"reconciliation error: {e}", exc_info=True)
-            await message.reply_text(f"❌ Ошибка формирования акта: {e}")
-        return
-
-    elif action == "generate_contract":
-        buyer_query = params.get("buyer", "")
-        await message.reply_chat_action("typing")
-
-        from moysklad import get_counterparty_requisites
-        from datetime import date as _date
-
-        # Ищем контрагента
-        counterparties = await get_counterparty_balance(buyer_query)
-        if not counterparties:
-            await message.reply_text(
-                f"❌ Компания *{buyer_query}* не найдена в МойСклад.",
-                parse_mode="Markdown"
-            )
-            return
-
-        cp = counterparties[0]
-        cp_id = cp.get("id", "")
-        cp_name = cp.get("name", buyer_query)
-
-        # 1. Проверяем — есть ли уже договор с этим клиентом
-        existing = db.find_contract_by_buyer(cp_name)
-        if existing:
-            await message.reply_text(
-                f"📄 Договор с *{cp_name}* уже был сформирован.\n"
-                f"Номер: *{existing['contract_number']}* от {existing['created_at'].strftime('%d.%m.%Y')}\n\n"
-                f"Повторное формирование договора невозможно.\n"
-                f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
-                parse_mode="Markdown"
-            )
-            return
-
-        # 2. Проверяем дату создания клиента в МойСклад
-        # Если клиент создан ДО сегодня — договор уже должен существовать
-        cp_updated = cp.get("updated") or cp.get("created") or ""
-        today_str = _date.today().isoformat()
-        if cp_updated and cp_updated[:10] < today_str:
-            await message.reply_text(
-                f"⚠️ Клиент *{cp_name}* уже существует в МойСклад.\n\n"
-                f"Договор с давними клиентами не формируется через бота.\n"
-                f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
-                parse_mode="Markdown"
-            )
-            return
-
-        # Читаем полные реквизиты
-        await message.reply_text(f"🔍 Читаю реквизиты *{cp.get('name','')}*...", parse_mode="Markdown")
-        reqs = await get_counterparty_requisites(cp_id)
-
-        contract_data = {
-            "buyer_name": reqs.get("buyer_legal_title") or reqs.get("buyer_name", buyer_query),
-            "buyer_inn": reqs.get("buyer_inn", ""),
-            "buyer_ogrn": reqs.get("buyer_ogrn", ""),
-            "buyer_address": reqs.get("buyer_address", ""),
-            "buyer_bank": reqs.get("buyer_bank", ""),
-            "buyer_rs": reqs.get("buyer_rs", ""),
-            "buyer_bik": reqs.get("buyer_bik", ""),
-            "buyer_ks": reqs.get("buyer_ks", ""),
-            "buyer_phone": reqs.get("buyer_phone", ""),
-            "buyer_email": reqs.get("buyer_email", ""),
-            "buyer_representative": reqs.get("buyer_representative", ""),
-            "buyer_director_name": reqs.get("buyer_director_name", ""),
-            "buyer_basis": "Устава",  # по умолчанию
-        }
-
-        # Проверяем чего не хватает
-        # Разделяем: что спрашиваем у менеджера, что просто сообщаем как отсутствующее
-        ASK_REQUIRED = {
-            "buyer_representative": "ФИО директора и должность (напр. 'генерального директора Иванова И.И.')",
-            "buyer_basis": "основание полномочий (напр. 'Устава' или 'доверенности № 1 от 01.01.2026')",
-        }
-        INFO_REQUIRED = {
-            "buyer_inn": "ИНН",
-            "buyer_ogrn": "ОГРН",
-            "buyer_address": "юридический адрес",
-            "buyer_rs": "расчётный счёт (р/с)",
-            "buyer_bik": "БИК банка",
-            "buyer_bank": "название банка",
-            "buyer_ks": "корреспондентский счёт (к/с)",
-        }
-
-        missing_ask = [(k, v) for k, v in ASK_REQUIRED.items() if not contract_data.get(k)]
-        missing_info = [(k, v) for k, v in INFO_REQUIRED.items() if not contract_data.get(k)]
-
-        if missing_ask or missing_info:
-            _pending_contracts[user.id] = {
-                "data": contract_data,
-                "missing_keys": [m[0] for m in missing_ask],
-                "missing_labels": [m[1] for m in missing_ask],
-                "missing_idx": 0,
-            }
-            found_info = []
-            if contract_data["buyer_inn"]: found_info.append(f"ИНН: {contract_data['buyer_inn']}")
-            if contract_data["buyer_ogrn"]: found_info.append(f"ОГРН: {contract_data['buyer_ogrn']}")
-            if contract_data["buyer_bank"]: found_info.append(f"Банк: {contract_data['buyer_bank']}")
-            found_str = " · ".join(found_info) if found_info else "реквизиты не найдены"
-
-            msg = f"📄 *{contract_data['buyer_name']}*\n_{found_str}_\n\n"
-
-            if missing_info:
-                names = ", ".join(v for _, v in missing_info)
-                msg += f"⚠️ В МойСклад не заведены: _{names}_\n_(попроси клиента предоставить)_\n\n"
-
-            if missing_ask:
-                msg += f"*{missing_ask[0][1]}*?"
-            else:
-                # Только инфо-поля отсутствуют — сразу генерируем
-                await message.reply_text(msg.rstrip(), parse_mode="Markdown")
-                await message.reply_text("⏳ Генерирую договор с имеющимися данными...")
-                await _create_and_send_contract(contract_data, user.full_name, message, context)
-                return
-
-            await message.reply_text(msg, parse_mode="Markdown")
-            return
-
-        # Все данные есть — генерируем сразу
-        await message.reply_text("✅ Все реквизиты найдены. Генерирую договор...")
-        await _create_and_send_contract(contract_data, user.full_name, message, context)
-
-    elif action == "manager_activity":
-        days = int(params.get("days", 7))
-        manager_filter = params.get("manager", "")
-        if manager_filter.lower() in ("все", "all", ""):
-            manager_filter = None
-
-        # Маппинг имён → фамилий для поиска в БД
-        NAME_MAP = {
-            "инесса": "скляр", "скляр": "скляр", "скляр инесса ионасовна": "скляр",
-            "карина": "баласанян", "баласанян": "баласанян", "баласанян карина владимировна": "баласанян",
-                        "алексей": "леонтьев", "леонтьев": "леонтьев", "леонтьев алексей вадимович": "леонтьев",
-            "елена": "мерзлякова", "лена": "мерзлякова", "мерзлякова": "мерзлякова", "мерзлякова елена владимировна": "мерзлякова",
-        }
-        if manager_filter:
-            manager_filter = NAME_MAP.get(manager_filter.lower(), manager_filter.split()[0].lower() if manager_filter else manager_filter)
-
-        await message.reply_chat_action("typing")
-        rows = db.get_manager_activity(days=days, manager_name=manager_filter)
-
-        if not rows:
-            await message.reply_text(f"😕 Нет данных за последние {days} дней.")
-            return
-
-        from moysklad import get_manager_stats_ms, MANAGER_TAGS
-
-        lines = [f"📊 *Активность менеджеров за {days} дней*\n"]
-        for r in rows:
-            mgr = r["manager"]
-            msg_count = r.get("msg_count", 0)
-            msg_clients = r.get("msg_clients", 0)
-            call_count = r.get("call_count", 0)
-            call_clients = r.get("call_clients", 0)
-            avg_dur = r.get("avg_duration", 0)
-            avg_str = f" · ср. {avg_dur//60}:{avg_dur%60:02d}" if avg_dur else ""
-
-            # Уникальные клиенты по всем каналам
-            total_unique = len(set(list(range(msg_clients)) + list(range(msg_clients, msg_clients + call_clients))))
-            # Упрощённо: берём максимум из двух (точнее не посчитать без JOIN)
-            total_unique = max(msg_clients, call_clients)
-
-            # Ищем тег менеджера для запроса в МойСклад
-            ms_tag = None
-            for tag_key, tag_name in MANAGER_TAGS.items():
-                if tag_key.lower() in mgr.lower() or mgr.lower() in tag_name.lower():
-                    ms_tag = tag_key
-                    break
-
-            lines.append(f"👤 *{mgr}*")
-            if msg_count:
-                lines.append(f"  💬 Сообщений: {msg_count} ({msg_clients} клиентов)")
-            if call_count:
-                lines.append(f"  📞 Звонков: {call_count} ({call_clients} клиентов){avg_str}")
-            lines.append(f"  🤝 Всего контактов за период: {total_unique}")
-
-            # Данные из МойСклад
-            if ms_tag:
-                try:
-                    ms_stats = await get_manager_stats_ms(ms_tag)
-                    lines.append(f"  📋 База МойСклад: {ms_stats['total']} компаний")
-                    lines.append(f"  🔥 Активных (60 дн): {ms_stats['active']} компаний")
-                except Exception:
-                    pass
-            lines.append("")
-
-        await message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    elif action == "search_mentions":
-        product = params.get("product", "")
-        days = int(params.get("days", 7))
-        manager_filter = params.get("manager", "")
-
-        if not product:
-            await message.reply_text("❌ Укажи товар для поиска.")
-            return
-
-        await message.reply_chat_action("typing")
-
-        # Разбиваем на несколько товаров если через запятую
-        keywords = [p.strip().lower() for p in product.replace(" и ", ",").split(",") if p.strip()]
-
-        rows = db.search_wazzup_mentions(keywords, days=days, manager_name=manager_filter or None)
-        call_rows = db.search_call_mentions(keywords, days=days, manager_name=manager_filter or None)
-
-        if not rows and not call_rows:
-            await message.reply_text(
-                f"😕 Упоминаний *{product}* за последние {days} дней не найдено.\n"
-                f"_Данные накапливаются с момента подключения._",
-                parse_mode="Markdown"
-            )
-            return
-
-        lines = [f"🔍 *Упоминания «{product}»* за {days} дней\n"]
-
-        # Переписки
-        if rows:
-            by_manager = {}
-            for row in rows:
-                mgr = row.get("manager_name") or "Неизвестно"
-                by_manager.setdefault(mgr, []).append(row)
-
-            lines.append("💬 *Переписки:*")
-            for mgr, msgs in sorted(by_manager.items()):
-                clients = list({r.get("client_name") or r.get("contact_name", "") for r in msgs if r.get("client_name") or r.get("contact_name")})
-                lines.append(f"👤 *{mgr}* — {len(msgs)} сообщений, {len(clients)} клиентов:")
-                for c in clients[:10]:
-                    lines.append(f"  • {c}")
-                if len(clients) > 10:
-                    lines.append(f"  _...и ещё {len(clients)-10}_")
-                lines.append("")
-
-        # Звонки
-        if call_rows:
-            by_manager_calls = {}
-            for row in call_rows:
-                mgr = row.get("manager_name") or "Неизвестно"
-                by_manager_calls.setdefault(mgr, []).append(row)
-
-            lines.append("📞 *Звонки:*")
-            for mgr, calls in sorted(by_manager_calls.items()):
-                clients = list({r.get("src_num", "") for r in calls if r.get("src_num")})
-                lines.append(f"👤 *{mgr}* — {len(calls)} звонков, {len(clients)} клиентов:")
-                for c in clients[:10]:
-                    lines.append(f"  • {c}")
-                if len(clients) > 10:
-                    lines.append(f"  _...и ещё {len(clients)-10}_")
-                lines.append("")
-
-        text = "\n".join(lines)
-        if len(text) > 4000:
-            text = text[:3900] + "\n\n_...уточни запрос_"
-        await message.reply_text(text, parse_mode="Markdown")
-
-    elif action == "broadcast":
-        product = params.get("product", "")
-        broadcast_text = params.get("message", "")
-        manager_filter = params.get("manager", "")
-
-        if not product or not broadcast_text:
-            await message.reply_text("❌ Не указан товар или текст сообщения.")
-            return
-
-        await message.reply_chat_action("typing")
-        period_days = params.get("period_days", 180)
-        await message.reply_text(
-            f"🔍 Ищу клиентов которые покупали *{product}* за последние {period_days} дней...",
-            parse_mode="Markdown"
-        )
-
-        # 1. Находим покупателей через МойСклад
-        from moysklad import get_buyers_by_product, get_counterparty_phones
-        result = await get_buyers_by_product(product, period_days=period_days)
-        buyers = result.get("buyers", []) if isinstance(result, dict) else result
-        found_name = result.get("product_name", product) if isinstance(result, dict) else product
-
-        if not buyers:
-            await message.reply_text(f"❌ Не найдено покупателей *{found_name}* за последние {period_days} дней.", parse_mode="Markdown")
-            return
-
-        await message.reply_text(f"📋 Найдено {len(buyers)} покупателей. Получаю телефоны...", parse_mode="Markdown")
-
-        # 2. Получаем телефоны из МойСклад
-        contacts = await get_counterparty_phones(buyers)
-        with_phone = [c for c in contacts if c.get("phone")]
-        no_phone = [c for c in contacts if not c.get("phone")]
-
-        if not with_phone:
-            await message.reply_text("❌ Ни у одного клиента нет телефона в МойСклад.")
-            return
-
-        # 3. Показываем список и просим подтверждение
-        duration_min = len(with_phone)
-        names_preview = "\n".join(f"• {c['name']} ({c['phone']})" for c in with_phone[:10])
-        if len(with_phone) > 10:
-            names_preview += f"\n_...и ещё {len(with_phone) - 10}_"
-
-        no_phone_note = f"\n⚠️ Без телефона ({len(no_phone)}): {', '.join(c['name'] for c in no_phone[:5])}" if no_phone else ""
-
-        confirm_text = (
-            f"📣 *Рассылка готова*\n\n"
-            f"*Товар:* {found_name}\n"
-            f"*Текст:* _{broadcast_text}_\n\n"
-            f"*Получатели ({len(with_phone)}):*\n{names_preview}{no_phone_note}\n\n"
-            f"⏱ Рассылка займёт ~{duration_min} мин (1 сообщение в минуту)\n\n"
-            f"Для подтверждения напиши: *да, рассылай*"
-        )
-        await message.reply_text(confirm_text, parse_mode="Markdown")
-
-        # Сохраняем и показываем кнопку подтверждения
-        import uuid as _uuid
-        broadcast_key = str(_uuid.uuid4())[:8]
-        _pending_sends[f"broadcast_{broadcast_key}"] = {
-            "contacts": with_phone,
-            "text": broadcast_text,
-            "product": found_name,
-            "is_broadcast": True,
-        }
-
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Начать рассылку", callback_data=f"send_confirm|broadcast_{broadcast_key}"),
-            InlineKeyboardButton("❌ Отменить", callback_data=f"send_cancel|broadcast_{broadcast_key}"),
-        ]])
-        await message.reply_text(confirm_text, parse_mode="Markdown", reply_markup=keyboard)
-
-    elif action == "find_contact":
-        contact_query = params.get("query", "")
-        contacts = db.search_contacts(contact_query)
-        if contacts:
-            lines = [f"📞 *{c['name']}* — {c['phone']} ({c.get('company', '')})" for c in contacts]
-            await message.reply_text("\n".join(lines), parse_mode="Markdown")
-        else:
-            await message.reply_text(f"Контакт '{contact_query}' не найден в базе.")
-
-    elif action == "answer":
-        text = params.get("text")
-        if text:
-            await message.reply_text(text)
-        else:
-            # Claude не дал готовый ответ — спрашиваем отдельно
-            response = await smart_answer(query, user.full_name, context_data)
-            await message.reply_text(response)
-
-    else:
-        # Неизвестное действие — текстовый ответ
-        response = await smart_answer(query, user.full_name, context_data)
-        await message.reply_text(response)
-
-
-async def save_media(message: Message, media_type: str):
-    """Сохраняет фото/документ в базу с тегами из подписи."""
-    caption = message.caption or ""
-    chat_id = message.chat_id
-    user = message.from_user.full_name if message.from_user else "unknown"
-
-    if media_type == "photo":
-        file_id = message.photo[-1].file_id  # берём наибольшее разрешение
-        if not caption:
-            # Уведомляем что фото сохранено без тега
-            await message.reply_text(
-                "Фото сохранено в базу без подписи.\n"
-                "Чтобы его можно было найти, напиши следующим сообщением название товара — например: форель трим С",
-            )
-    else:
-        file_id = message.document.file_id
-        caption = caption or message.document.file_name or ""
-
-    db.save_media(
-        file_id=file_id,
-        media_type=media_type,
-        caption=caption,
-        chat_id=chat_id,
-        uploader=user,
-        date=datetime.now().isoformat()
-    )
-
-
-async def search_photo_in_content_channel(context: ContextTypes.DEFAULT_TYPE, query: str) -> list:
-    """Ищет фото в канале Контент F2B по ключевым словам."""
-    content_chat_id = int(os.getenv("CONTENT_CHAT_ID", "-1001433042091"))
-    query_lower = query.lower()
-    results = []
-    seen = set()
-
-    # Сначала ищем по полному запросу
-    photos = db.search_media(query_lower, media_type="photo")
-    logger.info(f"search_photo: query='{query_lower}' total_in_db={len(photos)}")
-    for p in photos:
-        logger.info(f"search_photo: chat_id={p.get('chat_id')} expected={content_chat_id} caption='{(p.get('caption') or '')[:40]}'")
-        if p.get("chat_id") == content_chat_id and p["file_id"] not in seen:
-            results.append({"file_id": p["file_id"], "caption": p.get("caption", "")})
-            seen.add(p["file_id"])
-
-    # Если не нашли — ищем по каждому значимому слову
-    if not results:
-        words = [w for w in query_lower.split() if len(w) >= 4]
-        for word in words:
-            photos = db.search_media(word, media_type="photo")
-            logger.info(f"search_photo: word='{word}' found={len(photos)}")
-            for p in photos:
-                if p.get("chat_id") == content_chat_id and p["file_id"] not in seen:
-                    results.append({"file_id": p["file_id"], "caption": p.get("caption", "")})
-                    seen.add(p["file_id"])
-            if results:
-                break
-
-    logger.info(f"search_photo: returning {len(results)} for '{query}'")
-    return results
-
-
-async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
-    """Ищет фото товара в канале Контент F2B."""
-    await update.message.reply_chat_action("upload_photo")
-
-    content_photos = await search_photo_in_content_channel(context, query)
-    if content_photos:
-        sent = 0
-        for p in content_photos[:3]:
-            try:
-                await update.message.reply_photo(
-                    photo=p["file_id"],
-                    caption=f"📸 {p['caption']}" if p["caption"] else f"📸 {query}"
-                )
-                sent += 1
-            except Exception as e:
-                logger.warning(f"Не удалось отправить фото из Контент: {e}")
-        if sent > 0:
-            return
-
-    await update.message.reply_text(f"😕 Фото *{query}* не найдено в канале Контент.", parse_mode="Markdown")
-
-
-async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает посты из канала Контент F2B — сохраняет фото в БД."""
-    message = update.channel_post
-    if not message:
-        return
-
-    # Логируем chat_id для диагностики (можно удалить после настройки)
-    logger.info(f"channel_post from chat_id={message.chat_id}, title='{message.chat.title}', caption='{message.caption or message.text or ''}'")
-
-    content_chat_id = int(os.getenv("CONTENT_CHAT_ID", "-1001433042091"))
-    if message.chat_id != content_chat_id:
-        logger.info(f"channel_post: chat_id {message.chat_id} != CONTENT_CHAT_ID {content_chat_id}, пропускаем")
-        return
-
-    caption = message.caption or message.text or ""
-
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        db.save_media(
-            file_id=file_id,
-            media_type="photo",
-            caption=caption,
-            chat_id=message.chat_id,
-            uploader="Контент F2B",
-            date=datetime.now().isoformat()
-        )
-        logger.info(f"Сохранено фото из канала Контент: '{caption}' file_id={file_id}")
-
-    elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
-        file_id = message.document.file_id
-        db.save_media(
-            file_id=file_id,
-            media_type="photo",
-            caption=caption or message.document.file_name or "",
-            chat_id=message.chat_id,
-            uploader="Контент F2B",
-            date=datetime.now().isoformat()
-        )
-        logger.info(f"Сохранено фото-документ из канала Контент: '{caption}'")
-
-
-# ─── Запуск ──────────────────────────────────────────────────────────────────
-
-async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает что Эф помнит."""
-    memories = db.get_all_memories()
-    if not memories:
-        await update.message.reply_text("🧠 Долгосрочная память пуста.")
-        return
-    lines = ["🧠 *Что я помню:*\n"]
-    for m in memories[:20]:
-        lines.append(f"• *{m['key']}*: {m['value']}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Явно запомнить факт: /remember ключ: значение"""
-    args = " ".join(context.args) if context.args else ""
-    if ":" not in args:
-        await update.message.reply_text(
-            "Формат: /remember ключ: значение\n"
-            "Например: /remember скидка Иванову: 5%"
-        )
-        return
-    key, value = args.split(":", 1)
-    db.remember(key.strip(), value.strip())
-    await update.message.reply_text(f"✅ Запомнил: *{key.strip()}* → {value.strip()}", parse_mode="Markdown")
-
-
-async def cmd_add_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Создаёт вебхуки в МойСклад. /add_webhook"""
-    user = update.message.from_user
-    manager_ids_str = os.getenv("MANAGER_IDS", "")
-    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
-    if user.id not in manager_ids:
-        await update.message.reply_text("⛔ Только для руководителей.")
-        return
-
-    import aiohttp
-    token = os.getenv("MOYSKLAD_TOKEN")
-    webhook_url = "https://f2b-production.up.railway.app/webhook/moysklad"
-    api_url = "https://api.moysklad.ru/api/remap/1.2/entity/webhook"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-    results = []
-    async with aiohttp.ClientSession() as session:
-        for action, extra in [("CREATE", {}), ("UPDATE", {"diffType": "NONE"})]:
-            payload = {"url": webhook_url, "action": action, "entityType": "customerorder", **extra}
-            async with session.post(api_url, headers=headers, json=payload) as resp:
-                data = await resp.json()
-                if resp.status in (200, 201):
-                    results.append(f"✅ {action}: id={data.get('id')}")
-                else:
-                    results.append(f"❌ {action}: {data}")
-
-    await update.message.reply_text("Вебхуки МойСклад:\n" + "\n".join(results))
-    """Тестовый запуск утренних задач ПДЗ. /pdz_test [имя|all]"""
-    user = update.message.from_user
-    manager_ids_str = os.getenv("MANAGER_IDS", "")
-    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
-    if user.id not in manager_ids:
-        await update.message.reply_text("⛔ Только для руководителей.")
-        return
-
-    arg = (context.args[0].lower() if context.args else "all")
-
-    from scheduler import pdz_morning_task, PDZ_MANAGERS
-    app = update.get_bot()  # используем контекст
-
-    targets = PDZ_MANAGERS if arg == "all" else [
-        m for m in PDZ_MANAGERS if m["name"].lower() == arg or m["tag"] == arg
-    ]
-
-    if not targets:
-        names = ", ".join(m["name"].lower() for m in PDZ_MANAGERS)
-        await update.message.reply_text(f"Не найдено. Варианты: all, {names}")
-        return
-
-    await update.message.reply_text(
-        f"🧪 Запускаю тест ПДЗ для: {', '.join(m['name'] for m in targets)}..."
-    )
-
-    for mgr in targets:
-        try:
-            await pdz_morning_task(context.application, mgr)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка для {mgr['name']}: {e}")
-
-
-# Хранилище ожидающих отправки сообщений — message_key → {phone, name, text, chat_type}
-_pending_sends: dict = {}
-
-
-async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатие кнопки Отправить / Отменить для сообщений клиентам."""
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        await query.answer("⛔ Только для руководителей.", show_alert=True)
-        return
-
-    parts = query.data.split("|")
-    action = parts[0]
-    msg_key = parts[1] if len(parts) > 1 else ""
-
-    if action == "send_cancel":
-        _pending_sends.pop(msg_key, None)
-        await query.message.edit_text("❌ Отправка отменена.")
-        return
-
-    if action != "send_confirm":
-        return
-
-    pending = _pending_sends.pop(msg_key, None)
-    if not pending:
-        await query.message.edit_text("❌ Сообщение устарело — попробуй снова.")
-        return
-
-    api_key = os.getenv("WAZZUP_API_KEY", "")
-    import aiohttp, uuid as _uuid
-
-    # Каналы в порядке приоритета: WhatsApp → Max → Telegram
-    CHANNEL_PRIORITY = [
-        {"id": "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03", "type": "whatsapp"},
-        {"id": "1d5bc70a-7ca6-4895-8d1f-9690cf448214", "type": "max"},
-        {"id": "ddd24a95-9304-4098-a320-3e47fcd1020a", "type": "telegram"},
-    ]
-
-    # Рассылка (несколько клиентов)
-    if pending.get("is_broadcast"):
-        contacts = pending["contacts"]
-        product = pending["product"]
-        broadcast_text = pending["text"]
-        count = len(contacts)
-        await query.message.edit_text(
-            f"🚀 Начинаю рассылку по *{product}*\n📨 {count} получателей · ~{count} мин",
-            parse_mode="Markdown"
-        )
-
-        async def run_wazzup_broadcast():
-            sent, failed = 0, 0
-            async with aiohttp.ClientSession() as session:
-                for c in contacts:
-                    phone = c.get("phone", "")
-                    if not phone:
-                        failed += 1
-                        continue
-                    try:
-                        async with session.post(
-                            "https://api.wazzup24.com/v3/message",
-                            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                            json={
-                                "channelId": channel_id,
-                                "chatType": c.get("chat_type", "whatsapp"),
-                                "chatId": phone,
-                                "crmMessageId": str(_uuid.uuid4()),
-                                "text": broadcast_text,
-                            }
-                        ) as resp:
-                            if resp.status in (200, 201):
-                                sent += 1
-                            else:
-                                failed += 1
-                    except Exception:
-                        failed += 1
-                    await asyncio.sleep(60)
-
-            result_text = f"✅ *Рассылка завершена!*\n📨 Отправлено: {sent}/{count}\n"
-            if failed:
-                result_text += f"❌ Не отправлено: {failed}\n"
-            group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
-            await context.bot.send_message(chat_id=group_chat_id or query.message.chat_id, text=result_text, parse_mode="Markdown")
-
-        asyncio.create_task(run_wazzup_broadcast())
-        return
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            sent_channel = None
-            last_error = ""
-            channels = pending.get("channels") or []
-            for ch in channels:
-                try:
-                    async with session.post(
-                        "https://api.wazzup24.com/v3/message",
-                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                        json={
-                            "channelId": ch["channel_id"],
-                            "chatType": ch["chat_type"],
-                            "chatId": ch["chat_id"],
-                            "crmMessageId": str(_uuid.uuid4()),
-                            "text": pending["text"],
-                        }
-                    ) as resp:
-                        if resp.status in (200, 201):
-                            sent_channel = ch["chat_type"]
-                            break
-                        else:
-                            body = await resp.text()
-                            last_error = f"{resp.status}: {body[:100]}"
-                            logger.warning(f"Wazzup {ch['chat_type']} failed: {last_error}")
-                except Exception as e:
-                    last_error = str(e)
-                    logger.warning(f"Wazzup {ch['chat_type']} exception: {e}")
-
-            if sent_channel:
-                await query.message.edit_text(
-                    f"✅ Сообщение отправлено *{pending['name']}* через {sent_channel}",
-                    parse_mode="Markdown"
-                )
-                logger.info(f"Wazzup: отправлено {pending['name']} ({pending['phone']}) через {sent_channel}")
-            else:
-                await query.message.edit_text(f"❌ Не удалось отправить ни через один канал.\nПоследняя ошибка: {last_error}")
-    except Exception as e:
-        await query.message.edit_text(f"❌ Ошибка: {e}")
-
-
-async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/pdz — ПДЗ в группу + задача менеджерам в личку."""
-    user = update.message.from_user
-    manager_ids_str = os.getenv("MANAGER_IDS", "")
-    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
-    if user.id not in manager_ids:
-        await update.message.reply_text("⛔ Только для руководителей.")
-        return
-
-    from scheduler import pdz_morning_task, PDZ_MANAGERS, pdz_launched_today
-    import asyncio
-    from datetime import date as _date
-
-    today = _date.today().isoformat()
-    pdz_launched_today.add(today)
-
-    # Подтягиваем chat_id менеджеров из БД
-    managers_with_ids = []
-    for mgr in PDZ_MANAGERS:
-        mgr_copy = dict(mgr)
-        cid = db.get_manager_chat_id(mgr.get("name_fragment", mgr["name"]))
-        mgr_copy["chat_id"] = cid
-        if not cid:
-            logger.warning(f"cmd_pdz: нет chat_id для {mgr['name']}")
-        managers_with_ids.append(mgr_copy)
-
-    await update.message.reply_text(
-        f"📋 Запускаю ПДЗ для {len(managers_with_ids)} менеджеров.\n"
-        f"Интервал: 2 минуты. Результаты — боту в личку."
-    )
-
-    for i, mgr in enumerate(managers_with_ids):
-        try:
-            await pdz_morning_task(context.application, mgr)
-        except Exception as e:
-            logger.error(f"cmd_pdz ошибка для {mgr['name']}: {e}")
-        if i < len(managers_with_ids) - 1:
-            await asyncio.sleep(120)
-
-    await update.message.reply_text("✅ Готово. Сводка результатов придёт в 17:00.")
-
-
-async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/plan — подать план на неделю (только по понедельникам или руководитель в любой день).
-    Формат: /plan выручка отгрузки клиенты
-    Пример: /plan 5000000 150 28
-    """
-    user = update.effective_user
-    if not user:
-        return
-
-    # Определяем менеджера
-    MANAGER_BY_ID = {}  # заполняется из БД
-    MANAGER_TAG_MAP = {
-        "Карина Баласанян":  "баласанян",
-        "Елена Мерзлякова":  "мерзлякова",
-        "Инесса Скляр":      "скляр",
-        "Алексей Леонтьев":  "леонтьев",
-        "Сергей Черентаев":  "черентаев",
-    }
-
-    from datetime import date, timedelta
-
-    # Руководитель может задать план любому: /plan Карина 5000000 150 28
-    is_owner = (user.id == 360092495)
-    args = context.args or []
-
-    if is_owner and args and args[0] in [n.split()[0] for n in MANAGER_TAG_MAP]:
-        # /plan Карина 5000000 150 28
-        first_name = args[0]
-        manager = next((n for n in MANAGER_TAG_MAP if n.startswith(first_name)), None)
-        args = args[1:]
-    else:
-        # Определяем менеджера по chat_id
-        row = db._fetchone("SELECT full_name FROM manager_chats WHERE user_id=%s", (user.id,))
-        manager = row["full_name"] if row else None
-        if manager not in MANAGER_TAG_MAP:
-            await update.message.reply_text(
-                "⛔ Не удалось определить твой профиль менеджера.\n"
-                "Напиши /mychatid чтобы зарегистрироваться."
-            )
-            return
-
-    if len(args) < 3:
-        await update.message.reply_text(
-            "📋 Формат плана:\n"
-            "/plan [выручка] [отгрузки] [клиенты]\n\n"
-            "Пример: `/plan 5000000 150 28`\n"
-            "Руководитель: `/plan Карина 5000000 150 28`",
-            parse_mode="Markdown"
-        )
-        return
-
-    try:
-        revenue = float(args[0].replace(",", "."))
-        shipments = int(args[1])
-        clients = int(args[2])
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат. Пример: `/plan 5000000 150 28`", parse_mode="Markdown")
-        return
-
-    # Период: текущая неделя (пн–вс)
-    today = date.today()
-    monday = today - timedelta(days=today.weekday())
-    sunday = monday + timedelta(days=6)
-
-    db.save_sales_plan(
-        manager=manager,
-        period_start=monday,
-        period_end=sunday,
-        revenue=revenue,
-        shipments=shipments,
-        clients=clients,
-        created_by=user.full_name
-    )
-
-    short = manager.split()[0]
-    await update.message.reply_text(
-        f"✅ *План {short} на {monday.strftime('%d.%m')}–{sunday.strftime('%d.%m')} сохранён:*\n"
-        f"💰 Выручка: {revenue:,.0f} руб.\n"
-        f"🚚 Отгрузок: {shipments}\n"
-        f"👥 Клиентов: {clients}",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/evening — вечерняя сводка дня."""
-    OWNER_ID = 360092495
-    user = update.effective_user
-    if not user or user.id != OWNER_ID:
-        return
-
-    chat_id = update.effective_chat.id
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    from moysklad import get_evening_stats
-    from datetime import datetime, timedelta
-
-    # Собираем данные параллельно
-    stats = await get_evening_stats()
-    activity = db.get_activity_by_day(days=7)
-    contracts = db.get_contracts_today()
-    activity_today = db.get_manager_activity(days=1)
-
-    MANAGERS = ["Карина Баласанян", "Елена Мерзлякова", "Инесса Скляр",
-                "Алексей Леонтьев", "Сергей Черентаев"]
-    SHORT = {
-        "Карина Баласанян": "Карина",
-        "Елена Мерзлякова": "Елена",
-        "Инесса Скляр": "Инесса",
-        "Алексей Леонтьев": "Алексей",
-        "Сергей Черентаев": "Сергей",
-    }
-
-    today = datetime.now().strftime("%d.%m.%Y")
-    lines = [f"📊 *Сводка — {today}*\n"]
-
-    # ── 1. Активность сегодня — только известные менеджеры ────────
-    lines.append("📞 *Активность сегодня:*")
-    activity_today = [m for m in activity_today if m.get("manager","") in MANAGERS]
-    for mgr_data in sorted(activity_today, key=lambda x: x.get("msg_count",0)+x.get("call_count",0), reverse=True):
-        mgr = mgr_data.get("manager","")
-        short = SHORT.get(mgr, mgr)
-        calls = mgr_data.get("call_count", 0)
-        msgs = mgr_data.get("msg_count", 0)
-        total = calls + msgs
-        bar = "▓" * min(total // 5, 10)
-        lines.append(f"  {short}: {bar} {calls}📞 {msgs}💬")
-    if not activity_today:
-        lines.append("  — нет данных")
-    lines.append("")
-
-    # ── 2. Созданные заказы ───────────────────────────────────────
-    created = stats.get("created_orders", {})
-    if created:
-        lines.append("📝 *Созданные заказы:*")
-        for mgr, cnt in sorted(created.items(), key=lambda x: x[1], reverse=True):
-            if mgr not in MANAGERS: continue
-            short = SHORT[mgr]
-            lines.append(f"  {short}: {cnt} заказ{'ов' if cnt>4 else 'а' if cnt>1 else ''}")
-        lines.append("")
-
-    # ── 3. Отгруженные заказы ─────────────────────────────────────
-    shipped = stats.get("shipped_orders", {})
-    if shipped:
-        lines.append("🚚 *Отгрузки:*")
-        for mgr, cnt in sorted(shipped.items(), key=lambda x: x[1], reverse=True):
-            if mgr not in MANAGERS: continue
-            short = SHORT[mgr]
-            lines.append(f"  {short}: {cnt} отгруз{'ок' if cnt>4 else 'ки' if cnt>1 else 'ка'}")
-        lines.append("")
-
-    # ── 4. Новые договоры ─────────────────────────────────────────
-    if contracts:
-        lines.append(f"📄 *Новые договоры ({len(contracts)}):*")
-        for c in contracts:
-            lines.append(f"  • {c.get('buyer_name','?')} — {c.get('contract_number','?')}")
-        lines.append("")
-
-    # ── 5. 🎉 Первые отгрузки новым клиентам ─────────────────────
-    new_clients = stats.get("new_clients", [])
-    if new_clients:
-        for nc in new_clients:
-            mgr = nc.get("manager", "")
-            short = SHORT.get(mgr, mgr)
-            lines.append(
-                f"🎉 *Первая отгрузка новому клиенту!*\n"
-                f"👤 *{nc['name']}*\n"
-                f"🏆 Отличная работа, *{short}*! Новый клиент в семье F2B!"
-            )
-        lines.append("")
-
-
-    text = "\n".join(lines)
-
-    # Отправляем основную сводку
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode="Markdown"
-    )
-
-    # ── График планов продаж ───────────────────────────────────────
-    await _send_sales_plan_chart(context, chat_id)
-
-    # ── График активности за 7 дней — только известные менеджеры ──
-    known_activity = [r for r in activity if r.get("manager","") in MANAGERS]
-    if known_activity:
-        await _send_activity_chart(context, chat_id, known_activity)
-
-
-async def _send_sales_plan_chart(context, chat_id: int):
-    """Горизонтальные прогресс-бары: план vs факт по трём показателям."""
-    try:
-        import io
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from datetime import date
-        from moysklad import get_sales_fact
-
-        MANAGERS = [
-            ("Инесса Скляр",     "скляр",     "Инесса"),
-            ("Карина Баласанян", "баласанян",  "Карина"),
-            ("Елена Мерзлякова", "мерзлякова", "Елена"),
-            ("Алексей Леонтьев", "леонтьев",   "Алексей"),
-            ("Сергей Черентаев", "черентаев",  "Сергей"),
-        ]
-
-        plans_raw = db.get_current_plans()
-        plans = {p["manager"]: p for p in plans_raw}
-
-        today = date.today()
-        month_start = today.replace(day=1).isoformat()
-        today_str = today.isoformat()
-
-        facts = {}
-        for full_name, tag, short in MANAGERS:
-            f = await get_sales_fact(tag, month_start, today_str)
-            facts[full_name] = f
-            logger.info(f"sales_fact {short}: revenue={f['revenue']:.0f} ship={f['shipments']} clients={f['clients']}")
-
-        METRICS = [
-            ("revenue",   "Выручка",  1_000_000, "#4FC3F7"),
-            ("shipments", "Отгрузки", 1,          "#66BB6A"),
-            ("clients",   "АКБ",      1,          "#FFA726"),
-        ]
-
-        n = len(MANAGERS)
-        # 3 бара на менеджера + отступы
-        row_height = 0.18
-        gap_between_managers = 0.35
-        total_rows = n * 3 + (n - 1)  # 3 бара + разделители
-        fig_height = total_rows * row_height + gap_between_managers * n + 1.2
-
-        fig, ax = plt.subplots(figsize=(10, fig_height))
-        fig.patch.set_facecolor("#0d1117")
-        ax.set_facecolor("#0d1117")
-
-        y = 0
-        ytick_pos = []
-        ytick_labels = []
-        manager_label_y = []
-
-        for mgr_i, (full_name, tag, short) in enumerate(MANAGERS):
-            plan = plans.get(full_name, {})
-            fact = facts.get(full_name, {})
-
-            # Позиция метки менеджера — по центру трёх баров
-            center_y = y + 1  # средний из трёх баров
-            manager_label_y.append((center_y, short))
-
-            for bar_i, (metric, label, divisor, color) in enumerate(METRICS):
-                plan_val = float(plan.get(metric, 0) or 0) / divisor
-                fact_val = float(fact.get(metric, 0) or 0) / divisor
-                pct = min(fact_val / plan_val, 1.0) if plan_val > 0 else 0.0
-
-                # Фон (план = 100%)
-                ax.barh(y, 1.0, height=0.25, color="#21262d", left=0, zorder=1)
-                # Факт заштрихованный
-                ax.barh(y, max(pct, 0.008), height=0.25, color=color,
-                        left=0, alpha=0.85,
-                        hatch="///", edgecolor=color, zorder=2)
-
-                # Подпись процента
-                x_label = pct + 0.02
-                ax.text(min(x_label, 1.08), y, f"{pct*100:.0f}%",
-                        va="center", ha="left", color=color,
-                        fontsize=7.5, fontweight="bold")
-
-                # Значение факт/план
-                if plan_val > 0:
-                    fs = f"{fact_val:.1f}/{plan_val:.1f}" if divisor == 1_000_000 else f"{fact_val:.0f}/{plan_val:.0f}"
-                else:
-                    fs = "—"
-                ax.text(1.18, y, fs, va="center", ha="left",
-                        color="#8b949e", fontsize=6.5)
-
-                ytick_pos.append(y)
-                ytick_labels.append(label)
-                y += 0.3
-
-            y += 0.3  # отступ между менеджерами
-
-        ax.set_xlim(0, 1.55)
-        ax.set_ylim(-0.3, y)
-        ax.set_yticks(ytick_pos)
-        ax.set_yticklabels(ytick_labels, color="#8b949e", fontsize=7)
-        ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
-        ax.set_xticklabels(["0%", "25%", "50%", "75%", "100%"],
-                           color="#555", fontsize=7)
-        ax.xaxis.grid(True, color="#21262d", linewidth=0.5, zorder=0)
-        ax.set_axisbelow(True)
-
-        # Вертикальная линия 100%
-        ax.axvline(x=1.0, color="#444", linewidth=0.8, linestyle="--", zorder=3)
-
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-
-        # Имена менеджеров слева
-        for cy, name in manager_label_y:
-            ax.text(-0.03, cy, name, va="center", ha="right",
-                    color="#c9d1d9", fontsize=9, fontweight="bold",
-                    transform=ax.transData)
-
-        ax.set_title(f"Выполнение плана — {today.strftime('%d.%m.%Y')}",
-                     color="#c9d1d9", fontsize=10, pad=8)
-
-        plt.tight_layout()
-        plt.subplots_adjust(left=0.18)
-
-        buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=130,
-                    facecolor=fig.get_facecolor(), bbox_inches="tight")
-        buf.seek(0)
-        plt.close()
-
-        await context.bot.send_photo(
-            chat_id=chat_id, photo=buf,
-            caption="📊 Выполнение плана продаж"
-        )
-    except Exception as e:
-        logger.warning(f"_send_sales_plan_chart: {e}", exc_info=True)
-
-
-async def _send_activity_chart(context, chat_id: int, activity: list):
-    """Линейный график активности менеджеров за 7 дней."""
-    try:
-        import io
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from datetime import datetime
-        from collections import defaultdict
-
-        MANAGERS_SHORT = {
-            "Карина Баласанян": "Карина",
-            "Елена Мерзлякова": "Елена",
-            "Инесса Скляр": "Инесса",
-            "Алексей Леонтьев": "Алексей",
-            "Сергей Черентаев": "Сергей",
-        }
-        COLORS = {
-            "Карина Баласанян":  "#4FC3F7",
-            "Елена Мерзлякова":  "#EF5350",
-            "Инесса Скляр":      "#66BB6A",
-            "Алексей Леонтьев":  "#AB47BC",
-            "Сергей Черентаев":  "#FFA726",
-        }
-
-        # Данные по дням
-        days_set = sorted(set(str(r["day"]) for r in activity))[-7:]
-        data = defaultdict(lambda: defaultdict(int))
-        for r in activity:
-            day = str(r["day"])
-            mgr = r["manager"]
-            if mgr in MANAGERS_SHORT and day in days_set:
-                data[mgr][day] += r.get("msgs", 0) + r.get("calls", 0)
-
-        day_labels = [datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m") for d in days_set]
-        x = list(range(len(days_set)))
-
-        fig, ax = plt.subplots(figsize=(11, 5))
-        fig.patch.set_facecolor("#0d1117")
-        ax.set_facecolor("#0d1117")
-
-        has_data = False
-        for mgr, short in MANAGERS_SHORT.items():
-            vals = [data[mgr].get(d, 0) for d in days_set]
-            if any(v > 0 for v in vals):
-                has_data = True
-            ax.plot(x, vals,
-                    marker="o", linewidth=2, markersize=5,
-                    label=short, color=COLORS[mgr], alpha=0.9)
-            # Подписи значений на точках
-            for xi, v in zip(x, vals):
-                if v > 0:
-                    ax.annotate(str(v), (xi, v),
-                                textcoords="offset points", xytext=(0, 6),
-                                ha="center", fontsize=7, color=COLORS[mgr])
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(day_labels, color="#c9d1d9", fontsize=9)
-        ax.tick_params(axis="y", colors="#c9d1d9", labelsize=8)
-        ax.tick_params(axis="x", colors="#c9d1d9")
-        for spine in ax.spines.values():
-            spine.set_color("#30363d")
-        ax.yaxis.grid(True, color="#21262d", linewidth=0.7)
-        ax.set_axisbelow(True)
-        ax.set_title("Активность менеджеров · звонки + сообщения",
-                     color="#c9d1d9", fontsize=11, pad=12)
-        ax.set_ylabel("Контактов", color="#8b949e", fontsize=9)
-        ax.legend(facecolor="#161b22", labelcolor="#c9d1d9",
-                  edgecolor="#30363d", fontsize=9, loc="upper left")
-
-        buf = io.BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf, format="png", dpi=130, facecolor=fig.get_facecolor())
-        buf.seek(0)
-        plt.close()
-
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=buf,
-            caption="📈 Активность за 7 дней"
-        )
-    except Exception as e:
-        logger.warning(f"_send_activity_chart: {e}")
-
-
-async def cmd_delete_executor_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/del_tasks [имя] — удалить все открытые задачи конкретного исполнителя."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /del_tasks Голубева")
-        return
-    name = " ".join(context.args)
-    db._ensure_connection()
-    with db.conn.cursor() as cur:
-        cur.execute(
-            "UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено — сотрудник уволен' "
-            "WHERE LOWER(executor) LIKE LOWER(%s) AND status='open'",
-            (f"%{name}%",)
-        )
-        count = cur.rowcount
-    db.conn.commit()
-    await update.message.reply_text(f"✅ Закрыто задач для *{name}*: {count}", parse_mode="Markdown")
-
-
-async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/block [user_id] — заблокировать пользователя."""
-    if not update.effective_user or update.effective_user.id != 360092495:
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /block [user_id]")
-        return
-    try:
-        uid = int(context.args[0])
-        db.block_user(uid)
-        await update.message.reply_text(f"🔒 Пользователь {uid} заблокирован.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
-
-
-async def cmd_unblock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/unblock [user_id] — разблокировать пользователя."""
-    if not update.effective_user or update.effective_user.id != 360092495:
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /unblock [user_id]")
-        return
-    try:
-        uid = int(context.args[0])
-        db.unblock_user(uid)
-        await update.message.reply_text(f"🔓 Пользователь {uid} разблокирован.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
-
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/stats — статистика использования бота."""
-    if not update.effective_user or update.effective_user.id != 360092495:
-        return
-    stats = db.get_usage_stats()
-    if not stats:
-        await update.message.reply_text("📭 Статистики пока нет.")
-        return
-    lines = ["📊 *Статистика использования бота*\n"]
-    for s in stats:
-        blocked = " 🔒" if s.get("is_blocked") else ""
-        last = s.get("last_seen")
-        last_str = last.strftime("%d.%m %H:%M") if last else "—"
-        lines.append(
-            f"👤 *{s.get('full_name','?')}*{blocked}\n"
-            f"   ID: `{s.get('user_id')}` · Запросов: {s.get('request_count',0)} · "
-            f"Был: {last_str}"
-        )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    """/pdz_results — результаты ПДЗ в личку по каждому менеджеру."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-
-    OWNER_ID = 360092495
-    from scheduler import PDZ_MANAGERS
-    from moysklad import get_overdue_demands
-
-    # Берём сегодняшние результаты, если нет — последние доступные
-    today_results = db.get_pdz_results_today()
-    if today_results:
-        all_results = today_results
-        date_label = "сегодня"
-    else:
-        last_date, all_results = db.get_pdz_results_last()
-        if not all_results:
-            await context.bot.send_message(chat_id=OWNER_ID, text="📭 Результатов по ПДЗ пока нет.")
-            return
-        date_label = last_date.strftime("%d.%m.%Y") if hasattr(last_date, "strftime") else str(last_date)
-
-    sent_any = False
-    for mgr in PDZ_MANAGERS:
-        frag = mgr.get("name_fragment", mgr["name"]).lower()
-        mgr_results = [
-            r.get("result_text", "") for r in all_results
-            if frag in r.get("manager_name", "").lower()
-        ]
-
-        # Текущая просрочка
-        items = await get_overdue_demands(tag=mgr["tag"])
-        overdue_clients = [i.get("name", "") for i in items] if items else []
-
-        # Клиенты с ответами
-        answered_clients = []
-        for res_text in mgr_results:
-            res_lower = res_text.lower()
-            for client in overdue_clients:
-                if any(w.lower() in res_lower for w in client.split() if len(w) >= 4):
-                    if client not in answered_clients:
-                        answered_clients.append(client)
-
-        unanswered = [c for c in overdue_clients if c not in answered_clients]
-
-        lines = [f"📊 *{mgr['name']} — ПДЗ* ({date_label})\n"]
-
-        if not overdue_clients:
-            lines.append("✅ Просроченных долгов нет")
-        else:
-            if mgr_results:
-                lines.append("💬 *Ответы менеджера:*")
-                for r in mgr_results:
-                    lines.append(f"   — {r}")
-                lines.append("")
-            if unanswered:
-                lines.append("❓ *Без ответа:*")
-                for c in unanswered:
-                    lines.append(f"   • {c}")
-            else:
-                lines.append("✅ По всем клиентам есть ответы")
-
-        text = "\n".join(lines)
-
-        keyboard = None
-        if unanswered:
-            mgr_chat_id = db.get_manager_chat_id(mgr.get("name_fragment", mgr["name"]))
-            if mgr_chat_id:
-                alert_id = db.save_price_alert(
-                    order_id=f"pdz_{mgr['tag']}",
-                    order_name=", ".join(unanswered[:3]),
-                    client_name=", ".join(unanswered[:3]),
-                    manager_name=mgr["name"],
-                    manager_user_id=mgr_chat_id,
-                    alert_text=text
-                )
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📨 Запросить комментарии",
-                                         callback_data=f"pdz_request|{alert_id}")
-                ]])
-
-        await context.bot.send_message(
-            chat_id=OWNER_ID, text=text,
-            parse_mode="Markdown", reply_markup=keyboard
-        )
-        sent_any = True
-
-    if not sent_any:
-        await context.bot.send_message(chat_id=OWNER_ID, text="📭 Просроченных долгов нет.")
-
-
-async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/pdz_results — результаты ПДЗ в личку по каждому менеджеру."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-
-    OWNER_ID = 360092495
-    from scheduler import PDZ_MANAGERS
-    from moysklad import get_overdue_demands
-
-    today_results = db.get_pdz_results_today()
-    if today_results:
-        all_results = today_results
-        date_label = "сегодня"
-    else:
-        last_date, all_results = db.get_pdz_results_last()
-        if not all_results:
-            await context.bot.send_message(chat_id=OWNER_ID, text="📭 Результатов по ПДЗ пока нет.")
-            return
-        date_label = last_date.strftime("%d.%m.%Y") if hasattr(last_date, "strftime") else str(last_date)
-
-    sent_any = False
-    for mgr in PDZ_MANAGERS:
-        frag = mgr.get("name_fragment", mgr["name"]).lower()
-        mgr_results = [
-            r.get("result_text", "") for r in all_results
-            if frag in r.get("manager_name", "").lower()
-        ]
-
-        items = await get_overdue_demands(tag=mgr["tag"])
-        overdue_clients = [i.get("name", "") for i in items] if items else []
-
-        answered_clients = []
-        for res_text in mgr_results:
-            res_lower = res_text.lower()
-            for client in overdue_clients:
-                if any(w.lower() in res_lower for w in client.split() if len(w) >= 4):
-                    if client not in answered_clients:
-                        answered_clients.append(client)
-
-        unanswered = [c for c in overdue_clients if c not in answered_clients]
-
-        lines = [f"📊 *{mgr['name']} — ПДЗ* ({date_label})\n"]
-        if not overdue_clients:
-            lines.append("✅ Просроченных долгов нет")
-        else:
-            if mgr_results:
-                lines.append("💬 *Ответы менеджера:*")
-                for r in mgr_results:
-                    lines.append(f"   — {r}")
-                lines.append("")
-            if unanswered:
-                lines.append("❓ *Без ответа:*")
-                for c in unanswered:
-                    lines.append(f"   • {c}")
-            else:
-                lines.append("✅ По всем клиентам есть ответы")
-
-        text = "\n".join(lines)
-        keyboard = None
-        if unanswered:
-            mgr_chat_id = db.get_manager_chat_id(mgr.get("name_fragment", mgr["name"]))
-            if mgr_chat_id:
-                alert_id = db.save_price_alert(
-                    order_id=f"pdz_{mgr['tag']}",
-                    order_name=", ".join(unanswered[:3]),
-                    client_name=", ".join(unanswered[:3]),
-                    manager_name=mgr["name"],
-                    manager_user_id=mgr_chat_id,
-                    alert_text=text
-                )
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📨 Запросить комментарии",
-                                         callback_data=f"pdz_request|{alert_id}")
-                ]])
-
-        await context.bot.send_message(
-            chat_id=OWNER_ID, text=text,
-            parse_mode="Markdown", reply_markup=keyboard
-        )
-        sent_any = True
-
-    if not sent_any:
-        await context.bot.send_message(chat_id=OWNER_ID, text="📭 Просроченных долгов нет.")
-
-
-async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Тестовый запуск утренних задач ПДЗ. /pdz_test [имя|all]"""
-    user = update.message.from_user
-    manager_ids_str = os.getenv("MANAGER_IDS", "")
-    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
-    if user.id not in manager_ids:
-        await update.message.reply_text("⛔ Только для руководителей.")
-        return
-
-    arg = (context.args[0].lower() if context.args else "all")
-
-    from scheduler import pdz_morning_task, PDZ_MANAGERS
-    app = update.get_bot()
-
-    targets = PDZ_MANAGERS if arg == "all" else [
-        m for m in PDZ_MANAGERS if m["name"].lower() == arg or m["tag"] == arg
-    ]
-
-    if not targets:
-        names = ", ".join(m["name"].lower() for m in PDZ_MANAGERS)
-        await update.message.reply_text(f"Не найдено. Варианты: all, {names}")
-        return
-
-    await update.message.reply_text(
-        f"🧪 Запускаю тест ПДЗ для: {', '.join(m['name'] for m in targets)}..."
-    )
-
-    for mgr in targets:
-        try:
-            await pdz_morning_task(context.application, mgr)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка для {mgr['name']}: {e}")
-
-
-async def cmd_pdz_evening_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Тестовый запуск вечерней сводки ПДЗ. /pdz_evening"""
-    user = update.message.from_user
-    manager_ids_str = os.getenv("MANAGER_IDS", "")
-    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
-    if user.id not in manager_ids:
-        await update.message.reply_text("⛔ Только для руководителей.")
-        return
-
-    await update.message.reply_text("🧪 Запускаю тест вечерней сводки ПДЗ...")
-    from scheduler import pdz_evening_summary
-    try:
-        await pdz_evening_summary(context.application)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия кнопок на алерте о цене."""
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-
-    # Только руководители могут нажимать
-    manager_ids_str = os.getenv("MANAGER_IDS", "")
-    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
-    if user.id not in manager_ids:
-        await query.answer("⛔ Только для руководителей.", show_alert=True)
-        return
-
-    parts = query.data.split("|")
-    action = parts[0]
-    order_href = parts[1] if len(parts) > 1 else ""
-
-    # Имя менеджера берём из текста сообщения (строка "Менеджер: ...")
-    manager_name = ""
-    for line in query.message.text.split("\n"):
-        if line.startswith("Менеджер:"):
-            manager_name = line.replace("Менеджер:", "").strip()
-            break
-
-    group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
-
-    MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
-
-    if action == "price_ok":
-        from moysklad import set_order_state
-        order_id = parts[1] if len(parts) > 1 else ""
-        if order_id:
-            await set_order_state(order_id, MS_STATE_AGREED)
-        await query.message.delete()
-
-    elif action == "price_comment":
-        order_id_val = parts[1] if len(parts) > 1 else ""
-        alert_id = int(parts[2]) if len(parts) > 2 else 0
-        alert_data = db.get_price_alert(alert_id) if alert_id else {}
-        mgr_name = alert_data.get("manager_name", "") if alert_data else manager_name
-
-        # Ищем chat_id менеджера
-        mgr_chat_id = None
-        if mgr_name:
-            # Пробуем найти по фамилии
-            for part in mgr_name.split():
-                cid = db.get_manager_chat_id(part)
-                if cid:
-                    mgr_chat_id = cid
-                    break
-
-        alert_text = query.message.text
-
-        if mgr_chat_id:
-            await context.bot.send_message(
-                chat_id=mgr_chat_id,
-                text=(
-                    f"⚠️ *Виктор просит пояснить занижение цены:*\n\n"
-                    f"{alert_text}\n\n"
-                    f"Ответь на это сообщение — ответ уйдёт Виктору. "
-                    f"#price_alert_{alert_id}"
-                ),
-                parse_mode="Markdown"
-            )
-            await query.edit_message_text(
-                query.message.text + f"\n\n💬 *Запрошен комментарий у {mgr_name}*",
-                parse_mode="Markdown"
-            )
-        else:
-            # Нет chat_id — пишем в группу
-            group_chat_id_val = int(os.getenv("GROUP_CHAT_ID", "0"))
-            if group_chat_id_val:
-                contact = MANAGERS_CONTACTS.get(mgr_name, f"*{mgr_name}*")
-                await context.bot.send_message(
-                    chat_id=group_chat_id_val,
-                    text=f"{contact}, Виктор просит пояснить занижение цены по заказу.",
-                    parse_mode="Markdown"
-                )
-            await query.edit_message_text(
-                query.message.text + f"\n\n💬 *Запрошен комментарий у {mgr_name}*",
-                parse_mode="Markdown"
-            )
-
-    elif action == "pdz_ok":
-        from moysklad import set_order_state
-        order_id = parts[1] if len(parts) > 1 else ""
-        logger.info(f"pdz_ok: order_id={order_id}")
-        if order_id:
-            success = await set_order_state(order_id, MS_STATE_AGREED)
-            logger.info(f"pdz_ok: set_order_state result={success}")
-        await query.answer("✅ Принято")
-        await query.message.delete()
-
-    elif action == "pdz_request":
-        # Запрашиваем комментарии у менеджера по клиентам без ответа
-        alert_id = int(parts[1]) if len(parts) > 1 else 0
-        alert_data = db.get_price_alert(alert_id) if alert_id else {}
-        if not alert_data:
-            await query.answer("Данные не найдены.", show_alert=True)
-            return
-
-        mgr_chat_id = alert_data.get("manager_user_id")
-        mgr_name = alert_data.get("manager_name", "")
-        clients_str = alert_data.get("client_name", "")
-
-        if not mgr_chat_id:
-            await query.answer("Нет chat_id менеджера — пусть напишет /mychatid боту.", show_alert=True)
-            return
-
-        clients_list = [c.strip() for c in clients_str.split(",") if c.strip()]
-        clients_text = "\n".join(f"• {c}" for c in clients_list)
-
-        try:
-            await context.bot.send_message(
-                chat_id=mgr_chat_id,
-                text=(
-                    f"📋 *{mgr_name}, нужны комментарии по дебиторке*\n\n"
-                    f"По следующим клиентам пока нет информации:\n"
-                    f"{clients_text}\n\n"
-                    f"Напиши боту в личку — кто и когда оплатит."
-                ),
-                parse_mode="Markdown"
-            )
-            await query.edit_message_reply_markup(reply_markup=None)
-            await query.answer("✅ Запрос отправлен менеджеру.")
-            await context.bot.send_message(
-                chat_id=360092495,
-                text=f"✅ Запрос комментариев отправлен *{mgr_name}*.",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            await query.answer(f"Ошибка: {e}", show_alert=True)
-
-    elif action == "pdz_comment":
-        order_id = parts[1] if len(parts) > 1 else ""
-        pdz_data = _pdz_alert_data.get(order_id, {})
-        client = pdz_data.get("client", "")
-        manager_name_pdz = pdz_data.get("manager", manager_name)
-        order_name_pdz = pdz_data.get("order_name", "")
-        debt_amount = pdz_data.get("debt_amount", 0)
-        debt_days = pdz_data.get("debt_days", 0)
-
-        # Сохраняем в БД
-        db.save_pdz_comment(
-            client=client,
-            manager=manager_name_pdz,
-            order_name=order_name_pdz,
-            debt_amount=debt_amount,
-            debt_days=debt_days,
-            comment="Запрошен комментарий руководителем",
-            commented_by=user.first_name,
-        )
-
-        new_text = query.message.text + f"\n\n💬 *{user.first_name} ждёт комментарий менеджера*"
-        await query.edit_message_text(new_text, parse_mode="Markdown")
-
-        if group_chat_id:
-            contact = MANAGERS_CONTACTS.get(manager_name_pdz)
-            mgr_mention = contact if contact else f"*{manager_name_pdz}*" if manager_name_pdz else "Менеджер"
-            await context.bot.send_message(
-                chat_id=group_chat_id,
-                text=f"{mgr_mention}, дай комментарий по заказу *{order_name_pdz}* — у клиента просрочка {debt_days} дней.",
-                parse_mode="Markdown"
-            )
-
-
-def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise ValueError("Не задан TELEGRAM_BOT_TOKEN в переменных окружения!")
-
-    app = Application.builder().token(token).build()
-
-    # Восстанавливаем ожидающие идентификации из БД после рестарта
-    try:
-        pending_rows = db.get_pending_idents()
-        for row in pending_rows:
-            lk = row["link_key"]
-            _pending_links[lk] = {
-                "chat_id": row["chat_id"],
-                "channel_id": row["channel_id"],
-                "wazzup_name": row["wazzup_name"],
-                "chat_type": row["chat_type"],
-                "link_key": lk,
-            }
-        if pending_rows:
-            logger.info(f"Восстановлено {len(pending_rows)} ожидающих идентификаций из БД")
-    except Exception as e:
-        logger.warning(f"Не удалось восстановить pending_idents: {e}")
-
-    # Команды
-    app.add_handler(CallbackQueryHandler(handle_task_done_callback, pattern="^task_done\\|"))
-    app.add_handler(CommandHandler("plan", cmd_plan))
-    app.add_handler(CommandHandler("evening", cmd_evening))
-    app.add_handler(CommandHandler("del_tasks", cmd_delete_executor_tasks))
-    app.add_handler(CommandHandler("block", cmd_block_user))
-    app.add_handler(CommandHandler("unblock", cmd_unblock_user))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("usermenu", cmd_user_menu))
-    app.add_handler(CallbackQueryHandler(handle_user_menu_callback, pattern="^user_"))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CallbackQueryHandler(handle_menu_callback, pattern="^menu_"))
-    app.add_handler(CommandHandler("mychatid", cmd_mychatid))
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("clearwazzup", cmd_clear_wazzup))
-    app.add_handler(CommandHandler("wazzup_enrich", cmd_wazzup_enrich))
-    app.add_handler(CommandHandler("wazzup_export", cmd_wazzup_export))
-    app.add_handler(CommandHandler("wazzup_reset", cmd_wazzup_reset))
-    app.add_handler(CommandHandler("wazzup_channels", cmd_wazzup_channels))
-    app.add_handler(CommandHandler("wazzup_setup", cmd_wazzup_setup))
-    app.add_handler(CommandHandler("clearall", cmd_clear_all))
-    app.add_handler(CommandHandler("cleartasksall", cmd_clear_tasks_all))
-    app.add_handler(CommandHandler("test", cmd_test))
-    app.add_handler(CommandHandler("deltask", cmd_del_task))
-    app.add_handler(MessageHandler(
-        filters.REPLY & filters.Regex(r"(?i)^(удали|удалить|отмени|отменить|убери)"),
-        cmd_deltask_by_reply
-    ))
-    app.add_handler(MessageHandler(filters.StatusUpdate.MESSAGE_AUTO_DELETE_TIMER_CHANGED, handle_message))
-    app.add_handler(CommandHandler("cleartasks", cmd_clear_tasks))
-    app.add_handler(CommandHandler("all_tasks", cmd_all_tasks))
-    app.add_handler(CommandHandler("overdue", cmd_overdue))
-    app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("debts", cmd_debtors))
-    app.add_handler(CommandHandler("photo", cmd_photo))
-    app.add_handler(CommandHandler("price", cmd_price))
-    app.add_handler(CommandHandler("contact", cmd_contact))
-    app.add_handler(CommandHandler("memory", cmd_memory))
-    app.add_handler(CommandHandler("remember", cmd_remember))
-    app.add_handler(CommandHandler("add_webhook", cmd_add_webhook))
-    app.add_handler(CommandHandler("pdz_results", cmd_pdz_results))
-    app.add_handler(CommandHandler("pdz", cmd_pdz))
-    app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
-    app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
-    app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
-    app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
-    app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
-    app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr)"))
-    app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
-    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
-
-    # Планировщик
-    setup_scheduler(app, db)
-
-    # Запускаем webhook-сервер и polling параллельно
-    import aiohttp.web as web
-
-    async def handle_sipuni_webhook(request):
-        """Принимает события от Sipuni АТС."""
-        try:
-            params = dict(request.rel_url.query)
-            event = params.get("event", "")
-            call_id = params.get("call_id", "")
-            src_num = params.get("src_num", "")
-            dst_num = params.get("dst_num", "")
-            short_dst = params.get("short_dst_num", "")
-            tree_name = params.get("treeName", "")
-            status = params.get("status", "")
-            record_link = params.get("call_record_link", "")
-            call_start = params.get("call_start_timestamp", "")
-            call_answer = params.get("call_answer_timestamp", "0")
-
-            logger.info(f"Sipuni event={event} call_id={call_id} src={src_num} dst={dst_num} tree={tree_name} status={status}")
-
-            # event=2 — звонок завершён
-            if event == "2" and record_link and status == "ANSWER":
-                asyncio.create_task(process_sipuni_call(
-                    call_id=call_id,
-                    src_num=src_num,
-                    dst_num=dst_num,
-                    short_dst=short_dst,
-                    tree_name=tree_name,
-                    record_link=record_link,
-                    call_start=call_start,
-                    call_answer=call_answer,
-                    bot=app.bot,
-                ))
-
-            return web.Response(text="ok")
-        except Exception as e:
-            logger.error(f"Sipuni webhook error: {e}")
-            return web.Response(text="error", status=500)
-
-    async def handle_wazzup_webhook(request):
-        """Принимает webhook от Wazzup — сохраняет сообщения и chatId клиентов."""
-        try:
-            data = await request.json()
-            messages = data.get("messages", [])
-            saved = 0
-            for msg in messages:
-                text = msg.get("text", "")
-                chat_type = msg.get("chatType", "")
-                chat_id_val = msg.get("chatId", "")
-                channel_id_val = msg.get("channelId", "")
-                contact = msg.get("contact", {})
-                contact_name = contact.get("name", chat_id_val)
-                is_outbound = msg.get("isEcho", False)
-                manager_id = msg.get("crmUserId", "")
-                manager_name = WAZZUP_MANAGERS.get(manager_id, manager_id)
-                sent_at = msg.get("dateTime", "")
-
-                logger.info(f"Wazzup msg: isEcho={is_outbound} channel={channel_id_val} chatType={chat_type} chatId={chat_id_val} contact='{contact_name}' text='{text[:60]}'")
-
-                # Сохраняем маппинг контакта → chatId/channel для последующей отправки
-                if chat_id_val and contact_name and not is_outbound:
-                    db.save_wazzup_contact(
-                        contact_name=contact_name,
-                        chat_id=chat_id_val,
-                        chat_type=chat_type,
-                        channel_id=channel_id_val,
-                    )
-                    # Для Telegram — уведомляем руководителя если контакт неизвестен
-                    is_known = db.is_wazzup_contact_known(chat_id_val)
-                    logger.info(f"Wazzup: chat_id={chat_id_val} is_known={is_known}")
-                    if chat_type in ("telegram", "tgapi", "max") and not is_known and chat_id_val not in _wazzup_notified:
-                        # Проверяем что контакт не помечен как игнорируемый
-                        ignored = db._fetchone(
-                            "SELECT id FROM wazzup_contact_map WHERE chat_id=%s AND company_name='__ignore__'",
-                            (chat_id_val,)
-                        )
-                        if ignored:
-                            continue
-                        group_chat_id = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
-                        logger.info(f"Wazzup: отправляю уведомление в группу {group_chat_id}")
-                        if group_chat_id:
-                            try:
-                                import uuid as _uuid2
-                                link_key = str(_uuid2.uuid4())[:8]
-                                _pending_links[link_key] = {
-                                    "chat_id": chat_id_val,
-                                    "channel_id": channel_id_val,
-                                    "wazzup_name": contact_name,
-                                    "chat_type": chat_type,
-                                }
-                                # Сохраняем в БД чтобы пережить рестарт
-                                db.save_pending_link(
-                                    link_key=link_key,
-                                    chat_id=chat_id_val,
-                                    channel_id=channel_id_val,
-                                    wazzup_name=contact_name,
-                                    chat_type=chat_type,
-                                )
-                                keyboard = InlineKeyboardMarkup([[
-                                    InlineKeyboardButton("🏢 Привязать компанию", callback_data=f"wazzup_link|{link_key}"),
-                                    InlineKeyboardButton("🚫 Не привязывать", callback_data=f"wazzup_ignore|{chat_id_val}")
-                                ]])
-                                preview = (text or "").replace("\n", " ").strip()
-                                if len(preview) > 120:
-                                    preview = preview[:120] + "..."
-                                CHANNEL_NAMES = {"telegram": "Telegram", "tgapi": "Telegram", "max": "Max", "whatsapp": "WhatsApp"}
-                                channel_label = CHANNEL_NAMES.get(chat_type, chat_type)
-                                await app.bot.send_message(
-                                    chat_id=group_chat_id,
-                                    text=(
-                                        f"📩 *Новый неизвестный контакт — {channel_label}*\n\n"
-                                        f"👤 Имя: *{contact_name}*\n"
-                                        f"💬 _{preview}_\n\n"
-                                        f"Чей клиент? Нажми и напиши как он называется в МойСклад"
-                                    ),
-                                    parse_mode="Markdown",
-                                    reply_markup=keyboard
-                                )
-                                _wazzup_notified.add(chat_id_val)
-                            except Exception as e:
-                                logger.error(f"Не удалось отправить уведомление в группу: {e}", exc_info=True)
-
-                if not text:
-                    continue
-                ok = db.save_wazzup_message(
-                    message_id=msg.get("messageId", ""),
-                    channel_id=channel_id_val,
-                    chat_type=chat_type,
-                    chat_id=chat_id_val,
-                    contact_name=contact_name,
-                    manager_id=manager_id,
-                    manager_name=manager_name,
-                    text=text,
-                    is_outbound=is_outbound,
-                    sent_at=sent_at,
-                )
-                if ok:
-                    saved += 1
-            logger.info(f"Wazzup webhook: получено {len(messages)} сообщений, сохранено {saved}")
-            return web.Response(text="ok")
-        except Exception as e:
-            logger.error(f"Wazzup webhook error: {e}")
-            return web.Response(text="error", status=500)
-
-    async def handle_ms_webhook(request):
-        """Принимает webhook от МойСклад — новые/обновлённые заказы."""
-        try:
-            data = await request.json()
-            asyncio.create_task(process_ms_webhook(data, app.bot))
-            return web.Response(text="ok")
-        except Exception as e:
-            logger.error(f"Webhook error: {e}")
-            return web.Response(text="error", status=500)
-
-    async def handle_health(request):
-        return web.Response(text="ok")
-
-    async def run_web():
-        web_app = web.Application()
-        web_app.router.add_post("/webhook/moysklad", handle_ms_webhook)
-        web_app.router.add_post("/webhook/wazzup", handle_wazzup_webhook)
-        web_app.router.add_get("/webhook/sipuni", handle_sipuni_webhook)
-        web_app.router.add_post("/webhook/sipuni", handle_sipuni_webhook)
-        web_app.router.add_get("/health", handle_health)
-        port = int(os.getenv("PORT", "8080"))
-        runner = web.AppRunner(web_app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
-        logger.info(f"🌐 Webhook сервер запущен на порту {port}")
-
-    async def run_all():
-        await run_web()
-        await app.initialize()
-        await app.start()
-
-        # Ждём завершения старого инстанса и принудительно сбрасываем webhook
-        import asyncio as _asyncio
-        for attempt in range(5):
-            try:
-                await app.bot.delete_webhook(drop_pending_updates=True)
-                break
-            except Exception as e:
-                logger.warning(f"delete_webhook attempt {attempt+1}: {e}")
-                await _asyncio.sleep(2)
-
-        await app.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post", "callback_query"]
-        )
-        logger.info("🤖 Бот запущен!")
-        # Восстанавливаем pending_links из БД после рестарта
-        try:
-            pending_rows = db.load_pending_links()
-            for row in pending_rows:
-                lk = row["link_key"]
-                entry = {
-                    "link_key": lk,
-                    "chat_id": row["chat_id"],
-                    "channel_id": row["channel_id"],
-                    "wazzup_name": row["wazzup_name"],
-                    "chat_type": row["chat_type"],
-                }
-                _pending_links[lk] = entry
-            if pending_rows:
-                logger.info(f"Восстановлено {len(pending_rows)} pending_links из БД")
-        except Exception as e:
-            logger.warning(f"load_pending_links: {e}")
-        # Держим бота запущенным
-        try:
-            import signal
-            loop = asyncio.get_event_loop()
-            stop = loop.create_future()
-            loop.add_signal_handler(signal.SIGTERM, stop.set_result, None)
-            loop.add_signal_handler(signal.SIGINT, stop.set_result, None)
-            await stop
-        finally:
-            await app.updater.stop()
-            await app.stop()
-            await app.shutdown()
-
-    asyncio.run(run_all())
-
-
-# Маппинг менеджеров МойСклад → Telegram (username или телефон)
-MANAGERS_CONTACTS = {
-    "Леонтьев Алексей Вадимович":      "@EL_Aliexbox",
-    "Мерзлякова Елена Владимировна":   "+79920035102",
-    "Баласанян Карина Владимировна":   "@fatbob183",
-    "Скляр Инесса Ионасовна":          "+79622522903",
+YANDEX_GEOCODER_KEY = os.getenv("YANDEX_GEOCODER_KEY", "5a133f74-30f1-4296-9dc4-a780332987cc")
+
+# Координаты центров направлений (lat, lon)
+DELIVERY_CITIES_COORDS = {
+    "Звенигород":       (55.7324, 36.8519),
+    "Истра":            (55.9167, 36.8667),
+    "Солнечногорск":    (56.1833, 36.9833),
+    "Королёв":          (55.9167, 37.8333),
+    "Мытищи":           (55.9108, 37.7297),
+    "Одинцово":         (55.6833, 37.2833),
+    "Подольск":         (55.4167, 37.5500),
+    "Серпухов":         (54.9167, 37.4000),
+    "Чехов":            (55.1500, 37.4667),
+    "Щелково":          (55.9167, 38.0167),
+    "Домодедово":       (55.4333, 37.7667),
+    "Орехово-Зуево":    (55.8000, 38.9833),
+    "Павловский Посад": (55.7833, 38.6500),
+    "Сергиев Посад":    (56.3000, 38.1333),
+    "Красноармейск":    (56.1000, 38.1500),
+    "Пушкино":          (56.0167, 37.8500),
+    "Апрелевка":        (55.5500, 37.0667),
+    "Наро-Фоминск":     (55.3833, 36.7333),
+    "Егорьевск":        (55.3833, 39.0333),
+    "Воскресенск":      (55.3167, 38.6667),
+    "Каширское шоссе":  (55.3000, 37.6167),
 }
 
-# Маппинг crmUserId Wazzup → имя менеджера (заполним после первых вебхуков)
-WAZZUP_MANAGERS: dict = {}
-# Кэш для дедупликации webhook — order_id → timestamp последней проверки
-_price_check_cache: dict = {}
-# Хранилище данных алертов ПДЗ — order_id → {client, manager, debt_amount, debt_days, order_name}
-_pdz_alert_data: dict = {}
+# Радиус (км) в котором адрес считается относящимся к направлению
+DELIVERY_RADIUS_KM = 25
 
 
-async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
-    """Проверяет есть ли у клиента просрочка > 5 дней при новом заказе."""
+def _haversine(lat1, lon1, lat2, lon2) -> float:
+    """Расстояние между двумя точками в км."""
+    import math
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+async def geocode_address(address: str) -> tuple:
+    """Геокодирует адрес через Яндекс. Возвращает (lat, lon) или None."""
     try:
-        import aiohttp
-        from moysklad import get_headers, MS_BASE
-        from datetime import date
-
+        import urllib.parse
+        params = urllib.parse.urlencode({
+            "apikey": YANDEX_GEOCODER_KEY,
+            "geocode": address,
+            "format": "json",
+            "results": 1,
+            "ll": "37.6173,55.7558",
+            "spn": "2.0,2.0",
+        })
+        url = f"https://geocode-maps.yandex.ru/1.x/?{params}"
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                order_href, headers=get_headers(),
-                params={"expand": "agent,owner"}
-            ) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status != 200:
-                    return
-                order = await resp.json()
+                    return None
+                data = await resp.json()
+        pos = (data["response"]["GeoObjectCollection"]
+               ["featureMember"][0]["GeoObject"]["Point"]["pos"])
+        lon, lat = map(float, pos.split())
+        return lat, lon
+    except Exception as e:
+        logger.warning(f"geocode_address error: {e}")
+        return None
 
-        agent = order.get("agent", {})
-        agent_meta = agent.get("meta", {})
-        agent_href = agent_meta.get("href", "")
-        agent_id = agent.get("id") or (agent_href.split("/")[-1] if agent_href else "")
-        agent_name = agent.get("name", "")
-        order_name = order.get("name", "")
-        owner = order.get("owner", {})
-        manager_name = owner.get("name", "не указан")
+def fmt_money(amount: float) -> str:
+    """Форматирует сумму в рублях: 192 850,45 руб."""
+    return f"{amount:,.2f}".replace(",", " ").replace(".", ",").rstrip("0").rstrip(",") + " руб."
 
-        logger.info(f"check_debtor_alert: agent_id={agent_id} agent_name={agent_name} order={order_name}")
 
-        if not agent_id:
-            logger.warning("check_debtor_alert: agent_id пустой, пропускаем")
-            return
+MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 
-        # Проверяем долг и просрочку через заказы контрагента
-        from moysklad import get_counterparty_debt
-        logger.info(f"check_debtor_alert: запрашиваю долг для {agent_id}")
-        debt_info = await get_counterparty_debt(agent_id)
-        logger.info(f"check_debtor_alert: debt_info={debt_info}")
 
-        if not debt_info:
-            logger.info("check_debtor_alert: debt_info пустой — нет долга или ошибка")
-            return
+def get_headers():
+    token = os.getenv("MOYSKLAD_TOKEN")
+    if not token:
+        raise ValueError("MOYSKLAD_TOKEN не задан!")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept-Encoding": "gzip",
+        "Content-Type": "application/json",
+    }
 
-        debt_amount = debt_info.get("debt", 0)
-        debt_days = debt_info.get("overdue_days", 0)
-        logger.info(f"check_debtor_alert: debt={debt_amount} days={debt_days}")
 
-        if debt_days <= 5 or debt_amount <= 0:
-            logger.info(f"check_debtor_alert: просрочка {debt_days} дней — ниже порога или долга нет")
-            return
-
-        order_id = order_href.split("/")[-1]
-        _pdz_alert_data[order_id] = {
-            "client": agent_name,
-            "manager": manager_name,
-            "order_name": order_name,
-            "debt_amount": debt_amount,
-            "debt_days": debt_days,
+async def search_products(query: str, limit: int = 20) -> list:
+    """Ищет товары по названию с поддержкой сокращений и синонимов."""
+    try:
+        # ── Словарь сокращений ──────────────────────────────────────────
+        # Термин обработки / состояния
+        ABBR = {
+            "хк":      ["х/к", "холодн"],
+            "х/к":     ["х/к", "холодн"],
+            "гк":      ["г/к", "горяч"],
+            "г/к":     ["г/к", "горяч"],
+            "сс":      ["с/с", "слабосол"],
+            "с/с":     ["с/с", "слабосол"],
+            "охл":     ["охл"],
+            "зам":     ["заморож"],
+            "заморож": ["заморож"],
+            # СМ = сырой мороженый: есть заморож, нет х/к и с/с
+            # Обрабатывается отдельно в score()
+            "см":      ["__СМ__"],
+            "с/м":     ["__СМ__"],
+            
+            "мрм":     ["мурманск", "мурм", "мрм"],
+            "мурманск": ["мурманск"],
+            # Вид разделки
+            "пр":      ["пр"],
+            "тримпр":  ["трим пр"],
+            "трим":    ["трим"],
+            # Виды разделки (буква) — только "трим X"
+            "а":       ["трим а"],
+            "б":       ["трим б"],
+            "д":       ["трим д"],
+            "е":       ["трим е"],
+            "с":       ["трим с"],
+        }
+        # Синонимы названий рыб
+        SYNONYMS = {
+            "семга":   "лосось",
+            "сёмга":   "лосось",
+            "сёмга":   "лосось",
+            "форель":  "форель",
+            "масляная": "масляная",
+            "маслян":  "масляная",
+            "угорь":   "угорь",
+            "осьминог": "осьминог",
+            "палтус":  "палтус",
+            "треска":  "треска",
+            "минтай":  "минтай",
+            "горбуша": "горбуша",
+            "кета":    "кета",
+            "чавыча":  "чавыча",
+            "кижуч":   "кижуч",
+            "нерка":   "нерка",
+            "сибас":   "сибас",
+            "дорада":  "дорада",
+            "тунец":   "тунец",
+            "скумбрия": "скумбрия",
+            "сельдь":  "сельдь",
+            "мойва":   "мойва",
+            "краб":    "краб",
+            "креветка": "крев",
+            "крев":    "крев",
+            "кальмар": "кальмар",
         }
 
-        text = (
-            f"🔴 *Новый заказ от клиента с просрочкой!*\n\n"
-            f"*{agent_name}* | Заказ *{order_name}*\n"
-            f"Менеджер: {manager_name}\n\n"
-            f"Просрочка: *{debt_days} дней* | Сумма: *{debt_amount:,.0f} руб*"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Согласовано", callback_data=f"pdz_ok|{order_id}"),
-                InlineKeyboardButton("💬 Требуется комментарий", callback_data=f"pdz_comment|{order_id}"),
-            ]
-        ])
-        await bot.send_message(
-            chat_id=group_chat_id,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-        logger.info(f"ПДЗ алерт: {agent_name}, просрочка {debt_days} дней, заказ {order_name}")
+        stop_words = {"с", "в", "на", "по", "из", "от", "до", "и", "а", "кг", "гр", "г", "филе"}
 
-    except Exception as e:
-        logger.error(f"check_debtor_alert: {e}")
-# Кэш позиций заказа — order_id → frozenset(позиций) для отслеживания изменений цен/номенклатуры
-_order_positions_cache: dict = {}
+        raw_words = query.lower().split()
 
+        # Нормализуем каждое слово
+        search_tokens = []   # что ищем в МойСклад (для API запроса — основное слово)
+        match_tokens  = []   # что проверяем в названии (может быть несколько вариантов)
 
-async def process_ms_webhook(data: dict, bot):
-    """Обрабатывает webhook от МойСклад — проверяет цены в заказе."""
-    import time
-    try:
-        from moysklad import check_order_prices
-        group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
-        if not group_chat_id:
-            return
-
-        events = data.get("events", [])
-        for event in events:
-            meta = event.get("meta", {})
-            entity_type = meta.get("type", "")
-            if entity_type != "customerorder":
+        for w in raw_words:
+            w = w.strip(".,;:()/-")
+            if not w or w in stop_words:
                 continue
 
-            order_href = meta.get("href", "")
-            if not order_href:
+            # Числа-диапазоны (1.6-2.0) — пропускаем
+            if re.match(r'^[0-9.,\-]+$', w):
                 continue
 
-            # Дедупликация — один заказ не чаще раза в 10 секунд
-            order_id = order_href.split("/")[-1]
-            now = time.time()
-            last_check = _price_check_cache.get(order_id, 0)
-            already_checked = now - last_check < 10
-            _price_check_cache[order_id] = now
+            # Синоним
+            canon = SYNONYMS.get(w, w)
 
-            action = event.get("action", "")
-            logger.info(f"Webhook: заказ {order_id} action={action} already_checked={already_checked}")
+            # Сокращение → варианты для матчинга
+            if w in ABBR:
+                variants = ABBR[w]
+                match_tokens.append(variants)
+                # Не добавляем в API поиск — аббревиатура не поможет
+            else:
+                match_tokens.append([canon])
+                if len(canon) > 2 or canon.isupper():
+                    search_tokens.append(canon)
 
-            # ПДЗ алерт — только для новых заказов, только один раз
-            if action == "CREATE" and not already_checked:
-                await check_debtor_alert(order_href, bot, group_chat_id)
+        # Если search_tokens пустые — берём первые слова из match_tokens
+        if not search_tokens:
+            for mt in match_tokens:
+                if len(mt[0]) > 2:
+                    search_tokens.append(mt[0])
+                    break
 
-            if already_checked:
-                logger.info(f"Webhook: заказ {order_id} уже проверялся, пропускаем цены/логистику")
-                continue
-
-            # Получаем снапшот позиций (товар + цена) и сравниваем с предыдущим
-            from moysklad import get_order_positions_snapshot
-            snapshot = await get_order_positions_snapshot(order_href)
-            prev_snapshot = _order_positions_cache.get(order_id)
-            _order_positions_cache[order_id] = snapshot
-
-            if prev_snapshot is not None and snapshot == prev_snapshot:
-                logger.info(f"Webhook: заказ {order_id} — цены/номенклатура не изменились, пропускаем")
-                continue
-
-            logger.info(f"Webhook: проверяю цены заказа {order_id}")
-            alerts = await check_order_prices(order_href)
-
-            if alerts:
-                owner_chat_id = 360092495  # Виктор Васильев
-                text = "⚠️ *Цена ниже минимальной!*\n\n" + "\n\n".join(alerts)
-
-                # Получаем имя менеджера из данных заказа
-                mgr_name = ""
-                for a in alerts:
-                    for line in a.split("\n"):
-                        if "Менеджер:" in line:
-                            mgr_name = line.replace("Менеджер:", "").strip()
-                            break
-
-                # Сохраняем алерт в БД
-                alert_id = db.save_price_alert(
-                    order_id=order_id,
-                    order_name="",
-                    client_name="",
-                    manager_name=mgr_name,
-                    manager_user_id=0,
-                    alert_text=text
-                )
-
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Согласовано", callback_data=f"price_ok|{order_id}"),
-                    InlineKeyboardButton("💬 Комментарий менеджеру", callback_data=f"price_comment|{order_id}|{alert_id}"),
-                ]])
-                await bot.send_message(
-                    chat_id=owner_chat_id,
-                    text=text,
-                    parse_mode="Markdown",
-                    reply_markup=keyboard
-                )
-
-            # Проверяем логистику — только при создании заказа
-            if action == "CREATE":
-                await check_logistics_alert(order_href, bot, group_chat_id)
-
-    except Exception as e:
-        logger.error(f"process_ms_webhook: {e}")
-
-
-async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
-    """Проверяет адрес доставки заказа на соответствие расписанию логистики."""
-    try:
-        from moysklad import check_delivery_schedule, get_headers, MS_BASE
-        import aiohttp
+        logger.info(f"search_products: query='{query}' search_tokens={search_tokens} match_tokens={match_tokens}")
 
         async with aiohttp.ClientSession() as session:
-            url = order_href.split("?")[0]
+            all_products = []
+            seen_ids = set()
+            url = f"{MS_BASE}/entity/product"
+
+            # Ищем по первым 2 токенам
+            for term in search_tokens[:2]:
+                params = {"filter": f"name~{term}", "limit": 50}
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                for p in data.get("rows", []):
+                    if p["id"] not in seen_ids:
+                        seen_ids.add(p["id"])
+                        all_products.append(p)
+
+            # Скоринг: считаем сколько match_tokens встречается в названии
+            def score(p):
+                name = p.get("name", "").lower()
+                def norm(w): return w[:-2] if len(w) > 5 else w
+                hits = 0
+                for variants in match_tokens:
+                    if "__СМ__" in variants:
+                        # СМ = заморож + НЕ х/к + НЕ с/с
+                        if "заморож" in name and "х/к" not in name and "с/с" not in name:
+                            hits += 1
+                    elif any(norm(v) in name or v in name for v in variants):
+                        hits += 1
+                return hits
+
+            total = len(match_tokens)
+            if total == 0:
+                products = all_products[:limit]
+            else:
+                # Строгий: все токены совпали
+                strict = [p for p in all_products if score(p) == total]
+                def sort_key(p):
+                    # Сначала те что в наличии, потом по релевантности
+                    in_stock = 1 if p.get("stock", 0) > 0 else 0
+                    return (in_stock, score(p))
+
+                if strict:
+                    products = sorted(strict, key=sort_key, reverse=True)[:limit]
+                else:
+                    # Мягкий: хотя бы половина
+                    threshold = max(1, total // 2)
+                    soft = [p for p in all_products if score(p) >= threshold]
+                    products = sorted(soft, key=sort_key, reverse=True)[:limit]
+
+            logger.info(f"МойСклад found {len(products)} products for query='{query}' tokens={search_tokens}")
+            if not products:
+                return []
+
+            # Получаем остатки
+            product_ids = [p["id"] for p in products]
+            stocks = await get_stocks(session, product_ids)
+
+            result = []
+            for p in products:
+                pid = p["id"]
+                stock_info = stocks.get(pid, {})
+                sale_price = None
+                for price in p.get("salePrices", []):
+                    if price.get("value", 0) > 0:
+                        sale_price = price["value"] / 100
+                        break
+                result.append({
+                    "id": pid,
+                    "name": p.get("name", ""),
+                    "sale_price": sale_price,
+                    "stock": stock_info.get("stock", 0),
+                    "reserve": stock_info.get("reserve", 0),
+                    "image_href": p.get("images", {}).get("meta", {}).get("href") if p.get("images") else None,
+                })
+
+            return result
+
+    except Exception as e:
+        logger.error(f"МойСклад search_products error: {e}")
+        return []
+
+
+async def get_stocks(session: aiohttp.ClientSession, product_ids: list) -> dict:
+    """Получает остатки для списка товаров."""
+    try:
+        url = f"{MS_BASE}/report/stock/all/current"
+        # Формируем фильтр по product ids
+        filter_str = ";".join([
+            f"assortmentId={pid}" for pid in product_ids[:50]
+        ])
+        params = {"filter": filter_str}
+
+        async with session.get(url, headers=get_headers(), params=params) as resp:
+            if resp.status != 200:
+                return {}
+            data = await resp.json()
+
+        stocks = {}
+        for row in data:
+            pid = row.get("assortmentId")
+            if pid:
+                stocks[pid] = row
+        return stocks
+
+    except Exception as e:
+        logger.error(f"get_stocks error: {e}")
+        return {}
+
+
+async def get_product_image(product_id: str) -> Optional[str]:
+    """Получает URL первого фото товара."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/product/{product_id}/images"
             async with session.get(url, headers=get_headers()) as resp:
                 if resp.status != 200:
-                    return
-                order = await resp.json()
+                    return None
+                data = await resp.json()
 
-        address = order.get("shipmentAddress", "")
-        delivery_date = order.get("deliveryPlannedMoment", "")
-        order_name = order.get("name", "")
-
-        if not address or not delivery_date:
-            return
-
-        # Не алертим старые заказы (старше 3 дней)
-        from datetime import datetime, timezone, timedelta
-        try:
-            delivery_dt = datetime.fromisoformat(delivery_date.replace("Z", "+00:00"))
-            if delivery_dt.tzinfo is None:
-                delivery_dt = delivery_dt.replace(tzinfo=timezone.utc)
-            if delivery_dt < datetime.now(timezone.utc) - timedelta(days=3):
-                logger.info(f"check_logistics_alert: заказ {order_name} слишком старый ({delivery_date}), пропускаем")
-                return
-        except Exception:
-            pass
-
-        result = await check_delivery_schedule(address, delivery_date)
-        if result.get("ok"):
-            return
-
-        # Получаем имя клиента и менеджера
-        agent_href = order.get("agent", {}).get("meta", {}).get("href", "")
-        owner_href = order.get("owner", {}).get("meta", {}).get("href", "")
-        client_name = ""
-        manager_name = ""
-
-        async with aiohttp.ClientSession() as session:
-            from moysklad import get_headers
-            if agent_href:
-                async with session.get(agent_href, headers=get_headers()) as r:
-                    if r.status == 200:
-                        d = await r.json()
-                        client_name = d.get("name", "")
-            if owner_href:
-                async with session.get(owner_href, headers=get_headers()) as r:
-                    if r.status == 200:
-                        d = await r.json()
-                        manager_name = d.get("name", "")
-
-        city = result["city"].capitalize()
-        weekday = result["weekday"]  # строка: "среда", "пятница" и т.д.
-        allowed = ", ".join(result["allowed_days"]) or "не запланирован"
-
-        # Винительный падеж для "не едем в ..."
-        WEEKDAY_ACCUSATIVE = {
-            "понедельник": "понедельник",
-            "вторник": "вторник",
-            "среда": "среду",
-            "четверг": "четверг",
-            "пятница": "пятницу",
-            "суббота": "субботу",
-            "воскресенье": "воскресенье",
-        }
-        weekday_acc = WEEKDAY_ACCUSATIVE.get(weekday.lower(), weekday)
-        from datetime import date
-        MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-        try:
-            d = date.fromisoformat(result["date"])
-            date_str = f"{d.day} {MONTHS[d.month-1]}"
-        except Exception:
-            date_str = result["date"]
-
-        text = (
-            f"🚛 *Несоответствие логистики*\n\n"
-            f"👤 {client_name} | Заказ №{order_name}\n"
-            f"👔 Менеджер: {manager_name}\n"
-            f"📍 Адрес: {address}\n\n"
-            f"📅 Дата отгрузки: *{date_str} ({weekday})*\n"
-            f"❌ В {city} мы не едем в {weekday_acc}\n"
-            f"✅ {city} доступен: *{allowed}*"
-        )
-
-        await bot.send_message(
-            chat_id=group_chat_id,
-            text=text,
-            parse_mode="Markdown"
-        )
-        logger.info(f"Логистика алерт: заказ {order_name}, {city}, {weekday}")
+            rows = data.get("rows", [])
+            if rows:
+                # Возвращаем miniature URL
+                meta = rows[0].get("meta", {})
+                return meta.get("downloadHref") or meta.get("href")
+            return None
 
     except Exception as e:
-        logger.error(f"check_logistics_alert: {e}", exc_info=True)
+        logger.error(f"get_product_image error: {e}")
+        return None
 
 
-if __name__ == "__main__":
-    main()
+async def get_image_download_url(url: str) -> Optional[str]:
+    """Возвращает прямую ссылку на скачивание фото из МойСклад."""
+    try:
+        logger.info(f"get_image_download_url: url={url}")
+        async with aiohttp.ClientSession() as session:
+            if "/images" in url and "downloadHref" not in url:
+                async with session.get(url, headers=get_headers()) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                rows = data.get("rows", [])
+                if not rows:
+                    return None
+                meta = rows[0].get("meta", {})
+                download_url = meta.get("downloadHref") or meta.get("href")
+                logger.info(f"get_image_download_url: resolved={download_url}")
+                return download_url
+            return url
+    except Exception as e:
+        logger.error(f"get_image_download_url error: {e}")
+        return None
+
+
+async def download_image(url: str) -> Optional[bytes]:
+    """Скачивает фото товара из МойСклад."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+
+            # Шаг 1: получаем href первого изображения если передан /images URL
+            if "/images" in url and "download" not in url and "miniature" not in url:
+                async with session.get(url, headers=get_headers()) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                rows = data.get("rows", [])
+                if not rows:
+                    return None
+                img_href = rows[0].get("meta", {}).get("href")
+                if not img_href:
+                    return None
+                logger.info(f"download_image: img_href={img_href}")
+            else:
+                img_href = url
+
+            # Шаг 2: пробуем /download (полный размер)
+            for suffix in ["/download", "/miniature"]:
+                try_url = img_href + suffix
+                logger.info(f"download_image: trying {try_url}")
+                async with session.get(try_url, headers=get_headers(),
+                                       allow_redirects=True) as resp:
+                    logger.info(f"download_image: {suffix} status={resp.status} type={resp.content_type}")
+                    if resp.status == 200 and "image" in (resp.content_type or ""):
+                        data = await resp.read()
+                        logger.info(f"download_image: got {len(data)} bytes via {suffix}")
+                        return data
+
+        logger.error("download_image: все способы не сработали")
+        return None
+    except asyncio.TimeoutError:
+        logger.error(f"download_image: TIMEOUT url={url}")
+        return None
+    except Exception as e:
+        logger.error(f"download_image error: {e}", exc_info=True)
+        return None
+
+
+async def search_products_filtered(parsed: dict, limit: int = 20) -> list:
+    """Поиск товаров используя разобранные Claude фильтры."""
+    search_term = parsed.get("search_term", "")
+    filters = parsed.get("filters", {})
+    raw_tokens = parsed.get("raw_tokens", [])
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/product"
+            params = {"filter": f"name~{search_term}", "limit": 100}
+            
+            async with session.get(url, headers=get_headers(), params=params) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+            
+            # Исключаем нерыбные товары (красители, упаковка и т.п.)
+            NON_FISH = ["краситель", "упаковк", "пакет", "контейнер", "лоток", "соус", "маринад"]
+            all_products = [
+                p for p in data.get("rows", [])
+                if not any(kw in p.get("name", "").lower() for kw in NON_FISH)
+            ]
+            
+            def matches(p):
+                name = p.get("name", "").lower()
+
+                # Исключаем нерыбные товары
+                junk_words = ["краситель", "упаковк", "пакет", "лоток", "соус", "маринад"]
+                if any(j in name for j in junk_words):
+                    return False
+
+                # Тип разделки (тушка/филе)
+                cut = filters.get("cut")
+                if cut == "псг":
+                    if "псг" not in name:
+                        return False
+                elif cut == "филе":
+                    if "филе" not in name or "псг" in name:
+                        return False
+
+                # Вид разделки
+                trim = filters.get("trim")
+                if trim:
+                    if f"трим {trim}" not in name:
+                        return False
+                
+                # Обработка
+                processing = filters.get("processing")
+                if processing == "хк":
+                    if "х/к" not in name:
+                        return False
+                elif processing == "гк":
+                    if "г/к" not in name:
+                        return False
+                elif processing == "сс":
+                    if "с/с" not in name:
+                        return False
+                elif processing == "см":
+                    # Сырой мороженый — нет копчения, нет засолки
+                    if "х/к" in name or "г/к" in name or "с/с" in name:
+                        return False
+                    if "заморож" not in name:
+                        return False
+                
+                # Состояние
+                state = filters.get("state")
+                if state == "охл":
+                    if "охл" not in name:
+                        return False
+                elif state == "заморож":
+                    if "заморож" not in name:
+                        return False
+                
+                # Регион
+                region = filters.get("region")
+                if region == "мурманск":
+                    if "мурманск" not in name and "мрм" not in name:
+                        return False
+                elif region == "чили":
+                    if "чили" not in name:
+                        return False
+                    if "чили" not in name:
+                        return False
+                
+                # Калибр
+                caliber = filters.get("caliber")
+                if caliber and caliber not in name:
+                    return False
+                
+                return True
+            
+            products = [p for p in all_products if matches(p)]
+            
+            if not products:
+                logger.info(f"search_products_filtered: no strict matches, falling back")
+                products = [p for p in all_products if not any(
+                    j in p.get("name","").lower() for j in ["краситель","упаковк","пакет","лоток"]
+                )]
+            
+            products = products[:limit]
+            logger.info(f"search_products_filtered: '{search_term}' filters={filters} → {len(products)} products")
+            
+            if not products:
+                return []
+            
+            # Получаем остатки
+            product_ids = [p["id"] for p in products]
+            stocks = await get_stocks(session, product_ids)
+            
+            result = []
+            for p in products:
+                pid = p["id"]
+                stock_info = stocks.get(pid, {})
+                sale_price = None
+                for price in p.get("salePrices", []):
+                    if price.get("value", 0) > 0:
+                        sale_price = price["value"] / 100
+                        break
+                result.append({
+                    "id": pid,
+                    "name": p.get("name", ""),
+                    "sale_price": sale_price,
+                    "stock": stock_info.get("stock", 0),
+                    "reserve": stock_info.get("reserve", 0),
+                    "image_href": p.get("images", {}).get("meta", {}).get("href") if p.get("images") else None,
+                })
+            
+            # Фильтр "только в наличии"
+            if filters.get("in_stock"):
+                result = [r for r in result if r["stock"] > 0]
+
+            # Сортируем: в наличии первыми
+            result.sort(key=lambda x: (1 if x["stock"] > 0 else 0), reverse=True)
+            return result
+            
+    except Exception as e:
+        logger.error(f"search_products_filtered error: {e}")
+        return []
+
+
+
+async def get_counterparty_balance(query: str) -> list:
+    """Ищет контрагента по имени и возвращает баланс через /report/counterparty."""
+    import re as _re
+
+    def _strip_legal(q: str) -> str:
+        return _re.sub(r'^\s*(ооо|ип|зао|ао|пао|оао|нко|снт)\s+', '', q.strip(), flags=_re.IGNORECASE).strip()
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/counterparty"
+            rows = []
+            stripped = _strip_legal(query)
+            queries = [query, query.upper(), query.lower(), query.capitalize(),
+                       query.replace(" ", "-"), query.replace(" ", "-").upper()]
+            if stripped and stripped.lower() != query.lower():
+                queries += [stripped, stripped.upper(), stripped.lower(),
+                            stripped.replace(" ", "-"), stripped.replace(" ", "-").upper()]
+            # Также пробуем по первому значимому слову
+            words = [w for w in query.split() if len(w) >= 4]
+            queries += words
+
+            for q in queries:
+                params = {"filter": f"name~{q}", "limit": 10}
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        rows = data.get("rows", [])
+                        if rows:
+                            logger.info(f"counterparty found with query variant '{q}'")
+                            break
+            if not rows:
+                logger.info(f"counterparty not found for query='{query}'")
+                return []
+
+            # Шаг 2: для каждого контрагента получить баланс через report
+            result = []
+            for c in rows:
+                cid = c["id"]
+                report_url = f"{MS_BASE}/report/counterparty/{cid}"
+                async with session.get(report_url, headers=get_headers()) as resp2:
+                    if resp2.status != 200:
+                        body = await resp2.text()
+                        logger.error(f"counterparty report {resp2.status}: {body[:200]}")
+                        balance = 0
+                    else:
+                        rdata = await resp2.json()
+                        # МойСклад хранит деньги в копейках — делим на 100
+                        raw_balance = rdata.get("balance", 0) or 0
+                        balance = raw_balance / 100
+
+                # Для покупателей: баланс < 0 = нам должны, баланс > 0 = мы должны
+                debt = -balance if balance < 0 else 0
+                result.append({
+                    "id": cid,
+                    "name": c.get("name", ""),
+                    "balance": balance,
+                    "debt": debt,
+                    "tags": c.get("tags", []),
+                    "href": c.get("meta", {}).get("href", f"{MS_BASE}/entity/counterparty/{cid}"),
+                })
+                logger.info(f"get_counterparty_balance: {c.get('name')} tags={c.get('tags', [])}")
+            return result
+
+    except Exception as e:
+        logger.error(f"get_counterparty_balance error: {e}", exc_info=True)
+        return []
+
+
+async def get_all_debtors() -> list:
+    """Получает всех контрагентов с долгами через /report/counterparty."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # /report/counterparty возвращает список с балансами
+            url = f"{MS_BASE}/report/counterparty"
+            params = {"limit": 100}
+            async with session.get(url, headers=get_headers(), params=params) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.error(f"report/counterparty {resp.status}: {body[:200]}")
+                    return []
+                data = await resp.json()
+
+            result = []
+            for c in data.get("rows", []):
+                balance = (c.get("balance", 0) or 0) / 100
+                if balance < 0:  # отрицательный = нам должны (покупатели)
+                    name = c.get("counterparty", {}).get("name", c.get("name", ""))
+                    result.append({
+                        "id": c.get("counterparty", {}).get("id", ""),
+                        "name": name,
+                        "debt": -balance,
+                    })
+
+            result.sort(key=lambda x: x["debt"], reverse=True)
+            logger.info(f"get_all_debtors: found {len(result)} debtors")
+            return result
+
+    except Exception as e:
+        logger.error(f"get_all_debtors error: {e}")
+        return []
+
+
+def format_debtors_ms(debtors: list) -> str:
+    """Форматирует список должников из МойСклад."""
+    if not debtors:
+        return "\u2705 \u0414\u0435\u0431\u0438\u0442\u043e\u0440\u0441\u043a\u043e\u0439 \u0437\u0430\u0434\u043e\u043b\u0436\u0435\u043d\u043d\u043e\u0441\u0442\u0438 \u043d\u0435\u0442."
+
+    total = sum(d["debt"] for d in debtors)
+    lines = [
+        f"\U0001f4b0 *\u0414\u0435\u0431\u0438\u0442\u043e\u0440\u0441\u043a\u0430\u044f \u0437\u0430\u0434\u043e\u043b\u0436\u0435\u043d\u043d\u043e\u0441\u0442\u044c \u2014 {len(debtors)} \u043a\u043b\u0438\u0435\u043d\u0442\u043e\u0432*",
+        f"\u0418\u0442\u043e\u0433\u043e: *{fmt_money(total)}*\n",
+    ]
+    for d in debtors:
+        lines.append(f"\u2022 {d['name']} \u2014 *{fmt_money(d['debt'])}*")
+
+    return "\n".join(lines)
+
+
+def format_counterparty_balance(counterparties: list, query: str) -> str:
+    """Форматирует баланс конкретного контрагента."""
+    if not counterparties:
+        return f"\u041a\u043e\u043d\u0442\u0440\u0430\u0433\u0435\u043d\u0442 \u00ab{query}\u00bb \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d \u0432 \u041c\u043e\u0439\u0421\u043a\u043b\u0430\u0434."
+
+    lines = []
+    for c in counterparties:
+        balance = c["balance"]
+        name = c["name"]
+        if balance < 0:
+            lines.append(f"\U0001f534 *{name}*\n\u0414\u043e\u043b\u0433 \u043f\u0435\u0440\u0435\u0434 \u043d\u0430\u043c\u0438: *{fmt_money(-balance)}*")
+        elif balance > 0:
+            lines.append(f"\U0001f7e2 *{name}*\n\u041c\u044b \u0434\u043e\u043b\u0436\u043d\u044b \u0438\u043c: *{fmt_money(balance)}*")
+        else:
+            lines.append(f"\u2705 *{name}*\n\u0411\u0430\u043b\u0430\u043d\u0441 \u043d\u0443\u043b\u0435\u0432\u043e\u0439, \u0434\u043e\u043b\u0433\u043e\u0432 \u043d\u0435\u0442.")
+
+    return "\n\n".join(lines)
+
+# Карта тегов → менеджер
+MANAGER_TAGS = {
+    "баласанян": "Карина Баласанян",
+    "леонтьев":  "Алексей Леонтьев",
+    "черентаев": "Сергей Черентаев",
+    "мерзлякова": "Елена Мерзлякова",
+    "скляр":     "Инесса Скляр",
+}
+
+# Тип покупателя
+BUYER_TYPE_TAGS = {
+    "хорека": "ХОРЕКА (рестораны)",
+    "опт":    "ОПТ (оптовые покупатели)",
+    "покупатели": "Покупатель",
+}
+
+
+async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
+    """
+    Статистика менеджера из МойСклад:
+    - total: всего компаний с тегом менеджера
+    - active: уникальные компании с заказами за active_days дней
+    """
+    import aiohttp
+    from datetime import datetime, timedelta
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 1. Всего компаний с тегом менеджера
+            url = f"{MS_BASE}/entity/counterparty"
+            async with session.get(url, headers=get_headers(),
+                                   params={"filter": f"tags={manager_tag}", "limit": 1}) as resp:
+                if resp.status != 200:
+                    return {"total": 0, "active": 0}
+                data = await resp.json()
+                total = data.get("meta", {}).get("size", 0)
+
+            if not total:
+                return {"total": 0, "active": 0}
+
+            # 2. Получаем ID всех контрагентов с тегом
+            cp_ids = set()
+            offset = 0
+            while True:
+                async with session.get(url, headers=get_headers(),
+                                       params={"filter": f"tags={manager_tag}", "limit": 100, "offset": offset}) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+                    rows = data.get("rows", [])
+                    for r in rows:
+                        cp_ids.add(r["id"])
+                    if len(rows) < 100:
+                        break
+                    offset += 100
+
+            logger.info(f"get_manager_stats_ms: tag={manager_tag} total={total} cp_ids={len(cp_ids)}")
+
+            # 3. Для каждого клиента проверяем был ли заказ за period
+            since = (datetime.now() - timedelta(days=active_days)).strftime("%Y-%m-%d %H:%M:%S")
+            active_ids = set()
+            orders_url = f"{MS_BASE}/entity/customerorder"
+
+            # Батчами по 5 параллельных запросов
+            import asyncio as _asyncio
+            cp_list = list(cp_ids)
+
+            async def check_cp(cp_id):
+                filter_str = (
+                    f"agent=https://api.moysklad.ru/api/remap/1.2/entity/counterparty/{cp_id}"
+                    f";moment>{since}"
+                )
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(orders_url, headers=get_headers(),
+                                     params={"filter": filter_str, "limit": 1}) as r:
+                        if r.status == 200:
+                            d = await r.json()
+                            if d.get("meta", {}).get("size", 0) > 0:
+                                return cp_id
+                return None
+
+            # Запускаем батчами по 10
+            for i in range(0, len(cp_list), 10):
+                batch = cp_list[i:i+10]
+                results = await _asyncio.gather(*[check_cp(cp_id) for cp_id in batch])
+                for r in results:
+                    if r:
+                        active_ids.add(r)
+
+            logger.info(f"get_manager_stats_ms: active={len(active_ids)}")
+            return {"total": total, "active": len(active_ids)}
+
+    except Exception as e:
+        logger.error(f"get_manager_stats_ms: {e}")
+        return {"total": 0, "active": 0}
+
+
+async def get_counterparty_requisites(counterparty_id: str) -> dict:
+    """
+    Читает полные реквизиты контрагента из МойСклад:
+    ИНН, ОГРН, адрес, банковские реквизиты, телефон, email, директор.
+    """
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Основные реквизиты
+            url = f"{MS_BASE}/entity/counterparty/{counterparty_id}"
+            async with session.get(url, headers=get_headers()) as resp:
+                if resp.status != 200:
+                    return {}
+                cp = await resp.json()
+
+            # Банковские реквизиты
+            accounts_url = f"{MS_BASE}/entity/counterparty/{counterparty_id}/accounts"
+            accounts = []
+            async with session.get(accounts_url, headers=get_headers()) as resp:
+                if resp.status == 200:
+                    adata = await resp.json()
+                    accounts = adata.get("rows", [])
+
+        # Основной банковский счёт
+        bank_data = {}
+        for acc in accounts:
+            if acc.get("isDefault") or not bank_data:
+                bank_data = {
+                    "buyer_rs": acc.get("accountNumber", ""),
+                    "buyer_bank": acc.get("bankName", ""),
+                    "buyer_bik": acc.get("bic", ""),
+                    "buyer_ks": acc.get("correspondentAccount", ""),
+                }
+                if acc.get("isDefault"):
+                    break
+
+        # Адрес — сначала юридический, потом фактический
+        legal = cp.get("legalAddress", "") or ""
+        actual = cp.get("actualAddress", "") or ""
+
+        # Директор из legalFirstName + legalLastName или contactPersons
+        director = ""
+        lf = cp.get("legalFirstName", "") or ""
+        lm = cp.get("legalMiddleName", "") or ""
+        ll = cp.get("legalLastName", "") or ""
+        if ll:
+            # Формируем "Иванов И.И."
+            initials = ""
+            if lf:
+                initials += lf[0] + "."
+            if lm:
+                initials += lm[0] + "."
+            director = f"{ll} {initials}".strip()
+
+        result = {
+            "buyer_inn": cp.get("inn", "") or "",
+            "buyer_ogrn": cp.get("ogrn", "") or cp.get("ogrnip", "") or "",
+            "buyer_address": legal or actual,
+            "buyer_phone": cp.get("phone", "") or "",
+            "buyer_email": cp.get("email", "") or "",
+            "buyer_director_name": director,
+            "buyer_name": cp.get("name", ""),
+            "buyer_legal_title": cp.get("legalTitle", "") or cp.get("name", ""),
+            "href": f"{MS_BASE}/entity/counterparty/{counterparty_id}",
+            "id": counterparty_id,
+        }
+        result.update(bank_data)
+
+        # Представитель для договора
+        if director:
+            # Определяем должность по типу контрагента
+            cp_type = cp.get("companyType", "")
+            if cp_type == "entrepreneur":
+                result["buyer_representative"] = f"индивидуального предпринимателя {director}"
+            else:
+                result["buyer_representative"] = f"генерального директора {director}"
+
+        logger.info(f"get_counterparty_requisites: {cp.get('name')} inn={result['buyer_inn']} bank={result.get('buyer_bank','')[:20]}")
+        return result
+
+    except Exception as e:
+        logger.error(f"get_counterparty_requisites: {e}", exc_info=True)
+        return {}
+
+
+async def find_counterparty_info(query: str) -> list:
+    """Находит контрагента и возвращает его теги, менеджера, тип покупателя и баланс."""
+    import re as _re
+
+    def _strip_legal(q: str) -> str:
+        """Убирает юр.форму из запроса: ООО, ИП, ЗАО, АО, ПАО и т.д."""
+        return _re.sub(r'^\s*(ооо|ип|зао|ао|пао|оао|нко|снт)\s+', '', q.strip(), flags=_re.IGNORECASE).strip()
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/counterparty"
+            rows = []
+            stripped = _strip_legal(query)
+            queries = [query, query.upper(), query.lower(), query.capitalize()]
+            # Добавляем вариант без юр.формы если он отличается
+            if stripped and stripped.lower() != query.lower():
+                queries += [stripped, stripped.upper(), stripped.lower()]
+
+            for q in queries:
+                params = {"filter": f"name~{q}", "limit": 10}
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        rows = data.get("rows", [])
+                        if rows:
+                            break
+
+            result = []
+            for c in rows:
+                tags = [t.lower() for t in c.get("tags", [])]
+
+                # Определяем менеджера по тегам
+                manager = None
+                for tag in tags:
+                    for key, name in MANAGER_TAGS.items():
+                        if key in tag:
+                            manager = name
+                            break
+
+                # Определяем тип покупателя
+                buyer_type = None
+                for tag in tags:
+                    for key, label in BUYER_TYPE_TAGS.items():
+                        if key in tag:
+                            buyer_type = label
+                            break
+
+                # Получаем баланс через report
+                balance = 0
+                try:
+                    report_url = f"{MS_BASE}/report/counterparty/{c['id']}"
+                    async with session.get(report_url, headers=get_headers()) as r2:
+                        if r2.status == 200:
+                            rdata = await r2.json()
+                            balance = (rdata.get("balance", 0) or 0) / 100
+                except Exception:
+                    pass
+
+                result.append({
+                    "id": c["id"],
+                    "name": c.get("name", ""),
+                    "tags": c.get("tags", []),
+                    "manager": manager,
+                    "buyer_type": buyer_type,
+                    "balance": balance,
+                })
+            return result
+
+    except Exception as e:
+        logger.error(f"find_counterparty_info error: {e}", exc_info=True)
+        return []
+
+
+def format_counterparty_info(counterparties: list, query: str) -> str:
+    """Форматирует информацию о контрагенте."""
+    if not counterparties:
+        return f"Контрагент «{query}» не найден в МойСклад."
+
+    lines = []
+    for c in counterparties:
+        name = c["name"]
+        parts = [f"*{name}*"]
+
+        if c.get("buyer_type"):
+            parts.append(f"Тип: {c['buyer_type']}")
+
+        if c.get("manager"):
+            parts.append(f"Менеджер: {c['manager']}")
+        else:
+            parts.append("Менеджер: не указан")
+
+        balance = c["balance"]
+        if balance < 0:
+            parts.append(f"Долг перед нами: *{fmt_money(-balance)}*")
+        elif balance > 0:
+            parts.append(f"Мы должны им: *{fmt_money(balance)}*")
+        else:
+            parts.append("Баланс нулевой")
+
+        if c.get("tags"):
+            parts.append(f"Теги: {', '.join(c['tags'])}")
+
+        lines.append("\n".join(parts))
+
+    return "\n\n".join(lines)
+
+
+async def get_debtors_by_tag(tag: str, limit: int = 100) -> list:
+    """Возвращает должников с определённым тегом (менеджер, хорека, опт и т.д.)"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # МойСклад не поддерживает filter=tag — грузим всех, фильтруем локально
+            url = f"{MS_BASE}/entity/counterparty"
+            all_rows = []
+            offset = 0
+            while True:
+                params = {"limit": 100, "offset": offset}
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+                    batch = data.get("rows", [])
+                    all_rows.extend(batch)
+                    if len(batch) < 100:
+                        break
+                    offset += 100
+                    if offset >= 1000:
+                        break
+
+            tag_lower = tag.lower()
+            rows = [c for c in all_rows if any(tag_lower in t.lower() for t in c.get("tags", []))]
+            logger.info(f"get_debtors_by_tag tag='{tag}': {len(rows)}/{len(all_rows)} counterparties match")
+
+            # Получаем балансы через report параллельно
+            result = []
+            for c in rows:
+                try:
+                    report_url = f"{MS_BASE}/report/counterparty/{c['id']}"
+                    async with session.get(report_url, headers=get_headers()) as r2:
+                        balance = 0
+                        if r2.status == 200:
+                            rdata = await r2.json()
+                            balance = (rdata.get("balance", 0) or 0) / 100
+                except Exception:
+                    balance = 0
+
+                result.append({
+                    "id": c["id"],
+                    "name": c.get("name", ""),
+                    "tags": c.get("tags", []),
+                    "balance": balance,
+                    "debt": -balance if balance < 0 else 0,
+                })
+
+            return result
+
+    except Exception as e:
+        logger.error(f"get_debtors_by_tag error: {e}", exc_info=True)
+        return []
+
+
+async def get_clients_by_tag(tag: str, limit: int = 1000) -> list:
+    """Возвращает всех контрагентов с тегом (список клиентов менеджера).
+    МойСклад не поддерживает filter=tag, поэтому грузим всех и фильтруем локально.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/counterparty"
+            all_rows = []
+            offset = 0
+            while True:
+                params = {"limit": 100, "offset": offset}
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+                    rows = data.get("rows", [])
+                    all_rows.extend(rows)
+                    if len(rows) < 100:
+                        break
+                    offset += 100
+                    if offset >= limit:
+                        break
+
+            logger.info(f"get_clients_by_tag: loaded {len(all_rows)} total, filtering by tag='{tag}'")
+            tag_lower = tag.lower()
+            result = []
+            for c in all_rows:
+                tags = [t.lower() for t in c.get("tags", [])]
+                if any(tag_lower in t for t in tags):
+                    result.append({
+                        "id": c["id"],
+                        "name": c.get("name", ""),
+                        "tags": c.get("tags", []),
+                    })
+            logger.info(f"get_clients_by_tag: {len(result)} matching tag='{tag}'")
+            return result
+
+    except Exception as e:
+        logger.error(f"get_clients_by_tag error: {e}")
+        return []
+
+
+def resolve_tag(query: str) -> str:
+    """Определяет тег МойСклад по запросу пользователя."""
+    q = query.lower().strip()
+    # Менеджеры
+    manager_map = {
+        "баласанян": "баласанян",
+        "карина": "баласанян",
+        "леонтьев": "леонтьев",
+        "алексей": "леонтьев",
+        "черентаев": "черентаев",
+        "сергей": "черентаев",
+        "мерзлякова": "мерзлякова",
+        "елена": "мерзлякова",
+        "лена": "мерзлякова",
+        "скляр": "скляр",
+        "инесса": "скляр",
+    }
+    # Типы
+    type_map = {
+        "хорека": "хорека",
+        "рестораны": "хорека",
+        "ресторан": "хорека",
+        "опт": "опт",
+        "оптовые": "опт",
+        "покупатели": "покупатели",
+    }
+    for key, tag in {**manager_map, **type_map}.items():
+        if key in q:
+            return tag
+    return q  # вернуть как есть
+
+
+def format_debtors_by_tag(items: list, tag: str) -> str:
+    """Форматирует долги по группе/менеджеру."""
+    debtors = [i for i in items if i["debt"] > 0]
+    tag_label = tag.capitalize()
+
+    if not debtors:
+        return f"✅ По группе *{tag_label}* долгов нет."
+
+    total = sum(d["debt"] for d in debtors)
+    lines = [
+        f"💰 *Долги по группе {tag_label}* — {len(debtors)} клиентов",
+        f"Итого: *{fmt_money(total)}*\n",
+    ]
+    for d in sorted(debtors, key=lambda x: x["debt"], reverse=True):
+        lines.append(f"• {d['name']} — *{fmt_money(d['debt'])}*")
+    return "\n".join(lines)
+
+
+def format_clients_by_tag(items: list, tag: str) -> str:
+    """Форматирует список клиентов группы."""
+    tag_label = tag.capitalize()
+    if not items:
+        return f"По группе *{tag_label}* клиентов не найдено."
+
+    lines = [f"📋 *Клиенты группы {tag_label}* — {len(items)} шт.\n"]
+    for c in items:
+        lines.append(f"• {c['name']}")
+    return "\n".join(lines)
+
+
+
+async def get_overdue_demands(tag: str = None, query: str = None) -> list:
+    """Просроченная дебиторка через Заказы покупателей.
+    Грузим все заказы (или конкретного агента), фильтруем локально:
+    - paymentPlannedMoment < сегодня
+    - payedSum < sum (не оплачен)
+    """
+    try:
+        from datetime import datetime, timezone
+        today_dt = datetime.now(timezone.utc)
+
+        async with aiohttp.ClientSession() as session:
+
+            # Если query — найдём href контрагента для фильтра
+            agent_filter = ""
+            if query:
+                cp_url = f"{MS_BASE}/entity/counterparty"
+                found_cp = False
+                # Варианты запроса: оригинал, с дефисом, без пробелов, части слов
+                queries = [query, query.upper(), query.lower(), query.capitalize(),
+                           query.replace(" ", "-"), query.replace(" ", "")]
+                # Добавляем отдельные слова для поиска
+                words = [w for w in query.split() if len(w) >= 3]
+                queries.extend(words)
+
+                for q in queries:
+                    async with session.get(cp_url, headers=get_headers(),
+                                           params={"filter": f"name~{q}", "limit": 5}) as cr:
+                        if cr.status == 200:
+                            cp_rows = (await cr.json()).get("rows", [])
+                            if cp_rows:
+                                agent_href = cp_rows[0].get("meta", {}).get("href", "")
+                                agent_name_found = cp_rows[0].get("name", "")
+                                if agent_href:
+                                    agent_filter = f";agent={agent_href}"
+                                    found_cp = True
+                                    logger.info(f"get_overdue_demands: найден контрагент '{agent_name_found}' по запросу '{q}'")
+                                    break
+                    if found_cp:
+                        break
+
+                if not found_cp:
+                    logger.info(f"get_overdue_demands: контрагент '{query}' не найден")
+                    return None
+
+            # Грузим ЗАКАЗЫ покупателей — дата оплаты стоит именно в заказе
+            url = f"{MS_BASE}/entity/customerorder"
+            all_orders = []
+            offset = 0
+
+            # Если query задан но контрагент не найден — возвращаем None
+            if query and not agent_filter:
+                logger.info(f"get_overdue_demands: '{query}' не найден, прерываем")
+                return None
+
+            while True:
+                params = {
+                    "limit": 100,
+                    "offset": offset,
+                    "expand": "agent,attributes",
+                    "order": "moment,asc",
+                }
+                if agent_filter:
+                    params["filter"] = agent_filter.lstrip(";")
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error(f"customerorder {resp.status}: {body[:200]}")
+                        break
+                    data = await resp.json()
+                    batch = data.get("rows", [])
+                    all_orders.extend(batch)
+                    logger.info(f"customerorder loaded {len(all_orders)} orders (offset={offset})")
+                    if len(batch) < 100:
+                        break
+                    offset += 100
+
+            logger.info(f"get_overdue_demands: {len(all_orders)} заказов загружено")
+
+            by_agent = {}
+            agent_not_overdue = {}
+
+            for order in all_orders:
+                # Дата планируемой оплаты — кастомный атрибут заказа
+                ppm = ""
+                for attr in order.get("attributes", []):
+                    if attr.get("name") == "Дата планируемой оплаты":
+                        ppm = attr.get("value", "")
+                        break
+                if not ppm:
+                    continue
+
+                try:
+                    due_dt = datetime.fromisoformat(ppm.replace(".000", "").replace("Z", ""))
+                    if due_dt.tzinfo is None:
+                        due_dt = due_dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+
+                total_sum = (order.get("sum", 0) or 0) / 100
+                payed_sum = (order.get("payedSum", 0) or 0) / 100
+                unpaid = round(max(0, total_sum - payed_sum), 2)
+                if unpaid <= 0:
+                    continue
+
+                agent = order.get("agent", {})
+                agent_id = agent.get("id", "")
+                agent_name = agent.get("name", "неизвестно")
+                agent_tags = agent.get("tags", [])
+
+                if not agent_id:
+                    continue
+
+                # Пропускаем розничных покупателей
+                if "розничный покупатель" in agent_name.lower():
+                    continue
+
+                # Фильтр по тегу
+                if tag:
+                    tags_lower = [t.lower() for t in agent_tags]
+                    if not any(tag.lower() in t for t in tags_lower):
+                        continue
+
+                # Непросроченные — откладываем отдельно
+                if due_dt >= today_dt:
+                    agent_not_overdue[agent_id] = agent_not_overdue.get(agent_id, 0) + total_sum
+                    continue
+
+                # Просроченный заказ
+                days_overdue = (today_dt - due_dt).days
+
+                # Определяем менеджера по тегам
+                MANAGER_TAG_MAP = {
+                    "баласанян": "Карина Баласанян",
+                    "скляр": "Инесса Скляр",
+                    "мерзлякова": "Елена Мерзлякова",
+                            "леонтьев": "Алексей Леонтьев",
+                    "черентаев": "Сергей Черентаев",
+                }
+                manager_name = "Без менеджера"
+                for t in agent_tags:
+                    if t.lower() in MANAGER_TAG_MAP:
+                        manager_name = MANAGER_TAG_MAP[t.lower()]
+                        break
+
+                if agent_id not in by_agent:
+                    by_agent[agent_id] = {
+                        "id": agent_id,
+                        "name": agent_name,
+                        "overdue_sum": 0,
+                        "max_days": 0,
+                        "demands": [],
+                        "manager": manager_name,
+                    }
+                by_agent[agent_id]["overdue_sum"] += unpaid
+                by_agent[agent_id]["max_days"] = max(by_agent[agent_id]["max_days"], days_overdue)
+                by_agent[agent_id]["demands"].append({
+                    "name": order.get("name", ""),
+                    "due": ppm[:10],
+                    "unpaid": unpaid,
+                    "days": days_overdue,
+                })
+
+            result = list(by_agent.values())
+
+            # Пересчитываем просрочку с учётом реального баланса
+            # Логика: оплаты покрывают свежие заказы первыми
+            filtered = []
+            for agent in result:
+                try:
+                    report_url = f"{MS_BASE}/report/counterparty/{agent['id']}"
+                    async with session.get(report_url, headers=get_headers()) as rr:
+                        if rr.status == 200:
+                            rdata = await rr.json()
+                            real_balance = (rdata.get("balance", 0) or 0) / 100
+                            real_debt = abs(min(real_balance, 0))
+                        else:
+                            real_debt = agent["overdue_sum"]
+
+                    if real_debt <= 0:
+                        logger.info(f"Excluding {agent['name']}: no real debt")
+                        continue
+
+                    # Правильная логика:
+                    # просрочка = реальный долг - сумма НЕпросроченных заказов
+                    # Непросроченные заказы уже "зарезервированы" под будущие оплаты
+                    not_overdue_sum = agent_not_overdue.get(agent["id"], 0)
+                    # Из просроченных берём только то что покрыто реальным долгом
+                    # после вычета непросроченных
+                    effective_overdue = max(0, real_debt - not_overdue_sum)
+
+                    if effective_overdue <= 0:
+                        logger.info(f"Excluding {agent['name']}: covered by non-overdue {not_overdue_sum:.2f}")
+                        continue
+
+                    # Распределяем effective_overdue по просроченным заказам (старые первые)
+                    overdue_only = sorted(
+                        [d for d in agent["demands"] if d.get("days", 0) > 0],
+                        key=lambda x: x.get("due", "")
+                    )
+                    remaining = effective_overdue
+                    overdue_demands = []
+                    overdue_sum = 0
+                    for d in overdue_only:
+                        if remaining <= 0:
+                            break
+                        amount = min(remaining, d["unpaid"])
+                        remaining -= amount
+                        overdue_demands.append({**d, "unpaid": round(amount, 2)})
+                        overdue_sum += amount
+
+                    overdue_sum = round(overdue_sum, 2)
+                    if overdue_sum <= 0:
+                        logger.info(f"Excluding {agent['name']}: overdue covered by payments real_debt={real_debt:.2f}")
+                        continue
+
+                    agent["overdue_sum"] = overdue_sum
+                    agent["demands"] = overdue_demands
+                    agent["max_days"] = max((d["days"] for d in overdue_demands), default=0)
+                    filtered.append(agent)
+                    logger.info(f"{agent['name']}: real_debt={real_debt:.2f} overdue={overdue_sum:.2f}")
+
+                except Exception as e:
+                    logger.warning(f"balance check failed for {agent.get('name')}: {e}")
+                    filtered.append(agent)
+
+            filtered.sort(key=lambda x: x["overdue_sum"], reverse=True)
+            logger.info(f"get_overdue_demands: {len(filtered)} agents with overdue debt (after balance check)")
+            return filtered
+
+    except Exception as e:
+        logger.error(f"get_overdue_demands error: {e}", exc_info=True)
+        return []
+
+
+def format_overdue_summary(items: list) -> str:
+    """Краткий формат ПДЗ: итог + по менеджерам со списком клиентов."""
+    if not items:
+        return "✅ Просроченных долгов нет."
+
+    total_all = sum(c["overdue_sum"] for c in items)
+    lines = [
+        f"⚠️ *Просроченная дебиторка* — {len(items)} клиентов · *{fmt_money(total_all)}*\n"
+    ]
+
+    by_manager = {}
+    for c in items:
+        manager = c.get("manager", "Без менеджера")
+        if manager not in by_manager:
+            by_manager[manager] = {"total": 0, "clients": []}
+        by_manager[manager]["total"] += c["overdue_sum"]
+        by_manager[manager]["clients"].append(c)
+
+    for manager, data in sorted(by_manager.items(), key=lambda x: x[1]["total"], reverse=True):
+        lines.append(f"👤 *{manager}* — {fmt_money(data['total'])}")
+        for c in sorted(data["clients"], key=lambda x: x["overdue_sum"], reverse=True):
+            lines.append(f"   • {c['name']} — {fmt_money(c['overdue_sum'])}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+def format_overdue_demands(items: list, tag: str = None) -> str:
+    """Форматирует просроченную дебиторку."""
+    if not items:
+        label = f" по *{tag.capitalize()}*" if tag else ""
+        return f"✅ Просроченных долгов{label} нет."
+
+    total = sum(i["overdue_sum"] for i in items)
+    label = f" — {tag.capitalize()}" if tag else ""
+    lines = [
+        f"⚠️ *Просроченная дебиторка{label}*",
+        f"{len(items)} клиентов · Итого: *{fmt_money(total)}*\n",
+    ]
+    for c in items:
+        header = f"🔴 *{c['name']}* — {fmt_money(c['overdue_sum'])}"
+        lines.append(header)
+        demands = c.get("demands", [])
+        for d in demands:
+            due_fmt = '.'.join(reversed(d['due'].split('-'))) if d['due'] else d['due']
+            days = d.get("days", 0)
+            days_str = f" · {days} дн." if days > 0 else ""
+            lines.append(f"   └ {d['name']} · {due_fmt} · {fmt_money(d['unpaid'])}{days_str}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+def format_debt_reminder(client: dict) -> str:
+    """Готовит текст напоминания клиенту об оплате."""
+    demands = client.get("demands", [])
+    lines = [
+        "Добрый день!",
+        "",
+        'Напоминаем о наличии просроченной задолженности перед компанией АО "ФИШ ТУ БИЗНЕС":',
+        "",
+    ]
+    for d in demands:
+        due_fmt = '.'.join(reversed(d['due'].split('-'))) if d['due'] else d['due']
+        lines.append(f"• Заказ {d['name']} от {due_fmt} — {fmt_money(d['unpaid'])}")
+    lines += [
+        "",
+        f"Итого к оплате: {fmt_money(client['overdue_sum'])}",
+        "",
+        "Просим произвести оплату в ближайшее время.",
+    ]
+    return "\n".join(lines)
+
+
+def format_reminders_for_manager(items: list, manager_display: str) -> str:
+    """Форматирует пакет напоминаний для менеджера — по одному на клиента."""
+    if not items:
+        return "✅ Просроченных клиентов нет — напоминания не нужны."
+
+    lines = [
+        f"📋 *Напоминания об оплате — {manager_display}*",
+        f"{len(items)} клиентов · скопируй и отправь каждому\n",
+    ]
+    for c in sorted(items, key=lambda x: x["overdue_sum"], reverse=True):
+        lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"*{c['name']}* — {fmt_money(c['overdue_sum'])}")
+        lines.append("```")
+        lines.append(format_debt_reminder(c))
+        lines.append("```")
+    return "\n".join(lines)
+
+
+async def get_price_list(limit: int = 100) -> list:
+    """Получает прайс-лист — все товары с ценами и остатками."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/product"
+            params = {"limit": limit, "filter": "archived=false"}
+
+            async with session.get(url, headers=get_headers(), params=params) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+
+            products = data.get("rows", [])
+            product_ids = [p["id"] for p in products]
+            stocks = await get_stocks(session, product_ids)
+
+            result = []
+            for p in products:
+                pid = p["id"]
+                stock_info = stocks.get(pid, {})
+                sale_price = None
+                for price in p.get("salePrices", []):
+                    if price.get("value", 0) > 0:
+                        sale_price = price["value"] / 100
+                        break
+
+                if sale_price or stock_info.get("stock", 0) > 0:
+                    result.append({
+                        "name": p.get("name", ""),
+                        "price": sale_price,
+                        "stock": stock_info.get("stock", 0),
+                        "unit": "кг",
+                    })
+
+            return sorted(result, key=lambda x: x["name"])
+
+    except Exception as e:
+        logger.error(f"get_price_list error: {e}")
+        return []
+
+
+def format_products(products: list, query: str = "") -> str:
+    """Форматирует список товаров для отправки в Telegram."""
+    if not products:
+        return f"Товары по запросу «{query}» не найдены в МойСклад."
+
+    lines = [f"📦 *Найдено в МойСклад: {len(products)} товар(ов)*\n"]
+
+    for p in products:
+        name = p["name"]
+        stock = p.get("stock", 0)
+        price = p.get("sale_price") or p.get("price")
+        reserve = p.get("reserve", 0)
+
+        # Статус наличия
+        if stock > 0:
+            stock_icon = "🟢"
+            stock_str = f"{stock:,.1f} {p.get('unit', 'кг')}"
+        elif p.get("in_transit", 0) > 0:
+            stock_icon = "🟡"
+            stock_str = f"в пути: {p['in_transit']:,.1f} {p.get('unit', 'кг')}"
+        else:
+            stock_icon = "🔴"
+            stock_str = "нет в наличии"
+
+        price_str = f" · {price:,.0f} руб/{p.get('unit', 'кг')}" if price else ""
+        reserve_str = f" (резерв: {reserve:,.1f})" if reserve > 0 else ""
+
+        lines.append(f"{stock_icon} *{name}*{price_str}")
+        lines.append(f"   {stock_str}{reserve_str}")
+
+        if p.get("article"):
+            lines[-1] += f" · арт. {p['article']}"
+
+    return "\n".join(lines)
+
+
+def format_price_list(products: list) -> str:
+    """Форматирует прайс-лист."""
+    if not products:
+        return "Прайс-лист пуст."
+
+    lines = ["📋 *Актуальный прайс-лист МойСклад*\n"]
+    for p in products:
+        stock = p.get("stock", 0)
+        price = p.get("sale_price") or p.get("price")
+        icon = "🟢" if stock > 0 else "🔴"
+        price_str = f"{price:,.0f} руб" if price else "цена не указана"
+        lines.append(f"{icon} {p['name']} — {price_str}")
+
+    return "\n".join(lines)
+
+
+async def get_counterparties_by_product(product_query: str, period_days: int = 180) -> list:
+    """
+    Находит всех контрагентов которые покупали товар по названию.
+    Возвращает список: [{"id": ..., "name": ..., "phone": ...}]
+    """
+    import aiohttp
+    from datetime import datetime, timedelta
+
+    product_lower = product_query.lower()
+    found = {}  # id -> {name, phone}
+    date_from = (datetime.now() - timedelta(days=period_days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            offset = 0
+            limit = 100
+            while True:
+                url = f"{MS_BASE}/entity/customerorder"
+                params = {
+                    "limit": limit,
+                    "offset": offset,
+                    "expand": "agent,positions.assortment",
+                    "filter": f"moment>{date_from}",
+                }
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+
+                rows = data.get("rows", [])
+                if not rows:
+                    break
+
+                for order in rows:
+                    agent = order.get("agent", {})
+                    agent_id = agent.get("id", "")
+                    agent_name = agent.get("name", "")
+
+                    if not agent_id or not agent_name:
+                        continue
+                    if "розничный покупатель" in agent_name.lower():
+                        continue
+                    if agent_id in found:
+                        continue
+
+                    positions = order.get("positions", {})
+                    pos_rows = positions.get("rows", []) if isinstance(positions, dict) else []
+
+                    for pos in pos_rows:
+                        assortment = pos.get("assortment", {})
+                        pos_name = assortment.get("name", "").lower()
+                        if product_lower in pos_name:
+                            found[agent_id] = {
+                                "name": agent_name,
+                                "phone": None,
+                                "tags": agent.get("tags", []),
+                            }
+                            break
+
+                offset += limit
+                if len(rows) < limit:
+                    break
+
+            # Загружаем телефоны контрагентов
+            for agent_id in list(found.keys()):
+                try:
+                    url = f"{MS_BASE}/entity/counterparty/{agent_id}"
+                    async with session.get(url, headers=get_headers()) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            # Телефон может быть в phone или actualAddress
+                            phone = data.get("phone", "")
+                            if not phone:
+                                # Ищем в контактах
+                                contacts_data = data.get("contactpersons", {})
+                                if isinstance(contacts_data, dict):
+                                    cp_rows = contacts_data.get("rows", [])
+                                    for cp in cp_rows:
+                                        if cp.get("phone"):
+                                            phone = cp["phone"]
+                                            break
+                            if phone:
+                                found[agent_id]["phone"] = phone
+                except Exception:
+                    pass
+
+        logger.info(f"get_counterparties_by_product: '{product_query}' за {period_days} дней → {len(found)} контрагентов")
+
+    except Exception as e:
+        logger.error(f"get_counterparties_by_product: {e}")
+
+    return list(found.values())
+
+
+async def get_buyers_by_product(product_query: str, period_days: int = 180) -> list:
+    """
+    Быстрый поиск покупателей через отчёт "Прибыльность по покупателям".
+    Фильтрует по товару и основному складу за указанный период.
+    Возвращает список: [{"id": ..., "name": ..., "href": ...}]
+    """
+    import aiohttp
+    from datetime import datetime, timedelta
+
+    STORE_ID = os.getenv("MS_STORE_ID", "0044d71e-9a9a-11f0-0a80-03a90002743d")
+    STORE_HREF = f"{MS_BASE}/entity/store/{STORE_ID}"
+
+    date_to = datetime.now()
+    date_from = date_to - timedelta(days=period_days)
+    moment_from = date_from.strftime("%Y-%m-%d %H:%M:%S")
+    moment_to = date_to.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. Ищем товар по названию
+    products = await search_products(product_query, limit=5)
+    if not products:
+        logger.warning(f"get_buyers_by_product: товар '{product_query}' не найден")
+        return []
+
+    # Берём первый подходящий товар
+    product = products[0]
+    product_id = product.get("id")
+    product_name = product.get("name", product_query)
+    if not product_id:
+        logger.warning(f"get_buyers_by_product: нет ID у товара '{product_name}'")
+        return []
+
+    product_href = f"{MS_BASE}/entity/product/{product_id}"
+    logger.info(f"get_buyers_by_product: товар '{product_name}' id={product_id}")
+
+    # 2. Запрашиваем отчёт прибыльности по покупателям
+    buyers = []
+    offset = 0
+    limit = 100
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            while True:
+                url = f"{MS_BASE}/report/profit/bycounterparty"
+                params = {
+                    "momentFrom": moment_from,
+                    "momentTo": moment_to,
+                    "filter": f"store={STORE_HREF};product={product_href}",
+                    "limit": limit,
+                    "offset": offset,
+                }
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.error(f"get_buyers_by_product: {resp.status} {text[:200]}")
+                        break
+                    data = await resp.json()
+
+                rows = data.get("rows", [])
+                total = data.get("meta", {}).get("size", 0)
+
+                for row in rows:
+                    cp = row.get("counterparty", {})
+                    cp_name = cp.get("name", "")
+                    cp_href = cp.get("meta", {}).get("href", "")
+                    cp_id = cp_href.split("/")[-1] if cp_href else ""
+                    if cp_name and cp_id:
+                        buyers.append({
+                            "id": cp_id,
+                            "name": cp_name,
+                            "href": cp_href,
+                        })
+
+                offset += limit
+                if offset >= total or len(rows) < limit:
+                    break
+
+        logger.info(f"get_buyers_by_product: '{product_name}' за {period_days} дней → {len(buyers)} покупателей")
+
+        # Загружаем теги для каждого покупателя
+        async with aiohttp.ClientSession() as session:
+            for b in buyers:
+                try:
+                    href = b.get("href", "")
+                    if href:
+                        async with session.get(href, headers=get_headers()) as r:
+                            if r.status == 200:
+                                cp_data = await r.json()
+                                b["tags"] = cp_data.get("tags", [])
+                except Exception:
+                    b["tags"] = []
+
+    except Exception as e:
+        logger.error(f"get_buyers_by_product: {e}")
+
+    return {"buyers": buyers, "product_name": product_name}
+
+
+async def get_counterparty_phones(buyers: list) -> list:
+    """
+    Получает телефоны контрагентов из МойСклад.
+    buyers — список dict с полями id, name, href.
+    Возвращает список {name, phone, id}.
+    """
+    result = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            for b in buyers:
+                href = b.get("href", "")
+                if not href:
+                    result.append({"name": b.get("name", ""), "phone": None, "id": b.get("id", "")})
+                    continue
+                try:
+                    async with session.get(href, headers=get_headers()) as resp:
+                        if resp.status != 200:
+                            result.append({"name": b.get("name", ""), "phone": None, "id": b.get("id", "")})
+                            continue
+                        data = await resp.json()
+                    # Телефон в поле phone (строка) или в массиве phones
+                    phone = data.get("phone", "") or ""
+                    if not phone:
+                        phones = data.get("phones", [])
+                        if phones:
+                            phone = phones[0].get("value", "")
+                    logger.info(f"get_counterparty_phones: {data.get('name')} raw_phone='{phone}'")
+                    # Нормализуем — оставляем только цифры
+                    phone_clean = "".join(c for c in phone if c.isdigit())
+                    if len(phone_clean) == 11 and phone_clean.startswith("8"):
+                        phone_clean = "7" + phone_clean[1:]
+                    elif len(phone_clean) == 10:
+                        phone_clean = "7" + phone_clean
+                    elif len(phone_clean) == 11 and phone_clean.startswith("7"):
+                        pass  # уже правильный формат
+                    else:
+                        phone_clean = None  # неизвестный формат
+                    result.append({
+                        "name": data.get("name", b.get("name", "")),
+                        "phone": phone_clean if phone_clean else None,
+                        "id": b.get("id", ""),
+                        "chat_type": "whatsapp",
+                    })
+                except Exception as e:
+                    logger.warning(f"get_counterparty_phones: {b.get('name')} error: {e}")
+                    result.append({"name": b.get("name", ""), "phone": None, "id": b.get("id", "")})
+    except Exception as e:
+        logger.error(f"get_counterparty_phones: {e}")
+    return result
+
+
+async def check_order_prices(order_href: str) -> list:
+    """
+    Проверяет цены в заказе покупателя.
+    Пропускает заказы в финальных статусах.
+    """
+    SKIP_STATES = {
+        "005f3651-9a9a-11f0-0a80-03a900027474",  # Согласован
+        "267fdfbc-a2a7-11f0-0a80-0f640047fcaa",  # Собирается
+        "70999fb0-a2b6-11f0-0a80-1c830049f367",  # Собран без охл
+        "005f376a-9a9a-11f0-0a80-03a900027475",  # Собран
+        "ee088f23-df45-11f0-0a80-1670003a954a",  # ИЗМЕНЕН
+        "6edbfa00-dfdb-11f0-0a80-104e0008a4d4",  # Документы готовы
+        "005f383a-9a9a-11f0-0a80-03a900027476",  # Отгружен
+        "005f3938-9a9a-11f0-0a80-03a900027478",  # Возврат
+        "005f398e-9a9a-11f0-0a80-03a900027479",  # Отменен
+    }
+    import aiohttp
+    alerts = []
+
+    try:
+        async with aiohttp.ClientSession() as session:
+
+            # 1. Загружаем заказ с позициями и контрагентом
+            async with session.get(
+                order_href,
+                headers=get_headers(),
+                params={"expand": "agent,positions.assortment,owner,state"}
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"check_order_prices: не удалось загрузить заказ {order_href}")
+                    return []
+                order = await resp.json()
+
+            # Пропускаем если заказ в финальном статусе
+            state = order.get("state", {})
+            if state.get("id") in SKIP_STATES:
+                logger.info(f"check_order_prices: заказ в статусе '{state.get('name', '')}' — пропускаем")
+                return []
+
+            agent = order.get("agent", {})
+            agent_name = agent.get("name", "неизвестно")
+            agent_id = agent.get("id", "")
+            order_name = order.get("name", "")
+
+            # Менеджер (владелец заказа)
+            owner = order.get("owner", {})
+            manager_name = owner.get("name", "не указан")
+
+            # 2. Определяем тег контрагента (хорека или опт)
+            agent_tags = agent.get("tags", [])
+            tags_lower = [t.lower() for t in agent_tags]
+
+            if "хорека" in tags_lower:
+                price_type_name = "Цена продажи"
+                client_type = "хорека"
+            elif "опт" in tags_lower:
+                price_type_name = "Цена опт"
+                client_type = "опт"
+            else:
+                # Нет тега — не проверяем
+                logger.info(f"check_order_prices: контрагент '{agent_name}' без тега хорека/опт — пропускаем")
+                return []
+
+            logger.info(f"check_order_prices: заказ {order_name}, клиент '{agent_name}' ({client_type}), тип цены: {price_type_name}")
+
+            # 3. Проверяем позиции заказа
+            positions = order.get("positions", {})
+            pos_rows = positions.get("rows", []) if isinstance(positions, dict) else []
+
+            for pos in pos_rows:
+                assortment = pos.get("assortment", {})
+                product_name = assortment.get("name", "")
+                product_id = assortment.get("id", "")
+                order_price = pos.get("price", 0) / 100  # цена в копейках
+
+                if not product_id or order_price <= 0:
+                    continue
+
+                # 4. Загружаем эталонную цену из карточки товара
+                product_url = f"{MS_BASE}/entity/product/{product_id}"
+                async with session.get(product_url, headers=get_headers()) as resp:
+                    if resp.status != 200:
+                        continue
+                    product_data = await resp.json()
+
+                # Ищем нужный тип цены
+                sale_prices = product_data.get("salePrices", [])
+                min_price = None
+                for sp in sale_prices:
+                    pt = sp.get("priceType", {})
+                    if pt.get("name", "") == price_type_name:
+                        min_price = sp.get("value", 0) / 100
+                        break
+
+                if min_price is None or min_price <= 0:
+                    continue  # Цена не установлена — пропускаем
+
+                # 5. Сравниваем
+                if order_price < min_price:
+                    diff = min_price - order_price
+                    alerts.append(
+                        f"📦 *{agent_name}* | Заказ *{order_name}*\n"
+                        f"Менеджер: {manager_name}\n\n"
+                        f"*{product_name}*\n"
+                        f"Цена в заказе: {order_price:,.0f} руб | Минимальная ({client_type}): {min_price:,.0f} руб\n"
+                        f"*Занижена на: {diff:,.0f} руб*"
+                    )
+
+    except Exception as e:
+        logger.error(f"check_order_prices: {e}")
+
+    return alerts
+
+
+async def get_order_manager(order_href: str) -> dict:
+    """
+    Возвращает имя и Telegram ID менеджера-владельца заказа.
+    Маппинг имён на Telegram ID берётся из переменной окружения MANAGER_TG_IDS
+    формат: "Иванов Андрей:123456789,Баласанян Карина:987654321"
+    """
+    import aiohttp
+    import re
+
+    manager_info = {"name": "", "telegram_id": None}
+
+    # Маппинг имя → telegram_id из переменной окружения
+    mapping_str = os.getenv("MANAGER_TG_IDS", "")
+    mapping = {}
+    for item in mapping_str.split(","):
+        item = item.strip()
+        if ":" in item:
+            name, tg_id = item.rsplit(":", 1)
+            try:
+                mapping[name.strip().lower()] = int(tg_id.strip())
+            except ValueError:
+                pass
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(order_href, headers=get_headers(), params={"expand": "owner"}) as resp:
+                if resp.status != 200:
+                    return manager_info
+                order = await resp.json()
+
+        owner = order.get("owner", {})
+        owner_name = owner.get("name", "")
+        manager_info["name"] = owner_name
+
+        # Ищем telegram_id по имени (частичное совпадение)
+        owner_lower = owner_name.lower()
+        for mapped_name, tg_id in mapping.items():
+            if mapped_name in owner_lower or owner_lower in mapped_name:
+                manager_info["telegram_id"] = tg_id
+                break
+
+    except Exception as e:
+        logger.error(f"get_order_manager: {e}")
+
+    return manager_info
+
+
+async def get_order_positions_snapshot(order_href: str) -> frozenset:
+    """
+    Возвращает frozenset позиций заказа в виде (product_id, price).
+    Используется для отслеживания изменений цен и номенклатуры.
+    """
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                order_href,
+                headers=get_headers(),
+                params={"expand": "positions.assortment"}
+            ) as resp:
+                if resp.status != 200:
+                    return frozenset()
+                order = await resp.json()
+
+        positions = order.get("positions", {})
+        pos_rows = positions.get("rows", []) if isinstance(positions, dict) else []
+
+        snapshot = frozenset(
+            (
+                pos.get("assortment", {}).get("id", ""),
+                pos.get("price", 0),
+                pos.get("quantity", 0),
+            )
+            for pos in pos_rows
+        )
+        return snapshot
+
+    except Exception as e:
+        logger.error(f"get_order_positions_snapshot: {e}")
+        return frozenset()
+
+
+async def get_counterparty_debt(counterparty_id: str) -> dict:
+    """
+    Просрочка контрагента: правильная логика через текущий баланс.
+    1. Берём текущий долг (balance) из отчёта МойСклад
+    2. Берём все заказы с датой оплаты, сортируем от свежих к старым
+    3. Вычитаем долг из заказов начиная со свежих — они покрыты последними оплатами
+    4. Просроченные = только заказы у которых дата прошла И долг не покрыт
+    """
+    import aiohttp
+    from datetime import datetime, timezone
+
+    today_dt = datetime.now(timezone.utc)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            cp_href = f"{MS_BASE}/entity/counterparty/{counterparty_id}"
+
+            # 1. Текущий баланс (отрицательный = клиент должен нам)
+            async with session.get(
+                f"{MS_BASE}/report/counterparty/{counterparty_id}",
+                headers=get_headers()
+            ) as resp:
+                if resp.status != 200:
+                    return {}
+                rdata = await resp.json()
+
+            balance = (rdata.get("balance", 0) or 0) / 100
+            # balance < 0 означает что клиент должен нам
+            total_debt = abs(min(balance, 0))
+            logger.info(f"get_counterparty_debt: id={counterparty_id} balance={balance} total_debt={total_debt}")
+
+            if total_debt <= 0:
+                return {}
+
+            # 2. Все заказы с датой планируемой оплаты
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder",
+                headers=get_headers(),
+                params={
+                    "filter": f"agent={cp_href}",
+                    "expand": "attributes",
+                    "limit": 200,
+                    "order": "moment,desc",  # от свежих к старым
+                }
+            ) as resp:
+                if resp.status != 200:
+                    return {"debt": total_debt, "overdue_days": 0}
+                data = await resp.json()
+
+        orders = data.get("rows", [])
+
+        # 3. Собираем заказы с датой оплаты и неоплаченным остатком
+        order_list = []
+        for order in orders:
+            ppm = ""
+            for attr in order.get("attributes", []):
+                if attr.get("name") == "Дата планируемой оплаты":
+                    ppm = attr.get("value", "")
+                    break
+            if not ppm:
+                continue
+
+            try:
+                due_dt = datetime.fromisoformat(ppm.replace(".000", "").replace("Z", ""))
+                if due_dt.tzinfo is None:
+                    due_dt = due_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+            total_sum = (order.get("sum", 0) or 0) / 100
+            payed_sum = (order.get("payedSum", 0) or 0) / 100
+            unpaid = round(total_sum - payed_sum, 2)
+            if unpaid <= 0:
+                continue
+
+            order_list.append({
+                "name": order.get("name", ""),
+                "due_dt": due_dt,
+                "unpaid": unpaid,
+                "overdue": due_dt < today_dt,
+            })
+
+        # Сортируем: свежие (большая дата оплаты) первыми
+        order_list.sort(key=lambda x: x["due_dt"], reverse=True)
+
+        # 4. Вычитаем текущий долг начиная со свежих заказов
+        # Логика: оплаты покрывают самые свежие заказы первыми
+        remaining_debt = total_debt
+        overdue_sum = 0
+        max_overdue_days = 0
+
+        for o in order_list:
+            if remaining_debt <= 0:
+                break
+            covered = min(remaining_debt, o["unpaid"])
+            remaining_debt -= covered
+            uncovered = round(o["unpaid"] - covered, 2)
+
+            if uncovered > 0 and o["overdue"]:
+                days = (today_dt - o["due_dt"]).days
+                overdue_sum += uncovered
+                if days > max_overdue_days:
+                    max_overdue_days = days
+                logger.info(f"get_counterparty_debt: просрочен {o['name']} due={o['due_dt'].date()} uncovered={uncovered} days={days}")
+
+        overdue_sum = round(overdue_sum, 2)
+        logger.info(f"get_counterparty_debt: overdue_sum={overdue_sum} max_days={max_overdue_days}")
+
+        if overdue_sum <= 0:
+            return {}
+
+        return {"debt": overdue_sum, "overdue_days": max_overdue_days}
+
+    except Exception as e:
+        logger.error(f"get_counterparty_debt: {e}", exc_info=True)
+        return {}
+
+
+async def set_order_state(order_id: str, state_id: str) -> bool:
+    """Меняет статус заказа покупателя."""
+    import aiohttp
+    url = f"{MS_BASE}/entity/customerorder/{order_id}"
+    payload = {
+        "state": {
+            "meta": {
+                "href": f"{MS_BASE}/entity/customerorder/metadata/states/{state_id}",
+                "type": "state",
+                "mediaType": "application/json"
+            }
+        }
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(url, headers=get_headers(), json=payload) as resp:
+                if resp.status == 200:
+                    logger.info(f"Статус заказа {order_id} изменён на {state_id}")
+                    return True
+                else:
+                    text = await resp.text()
+                    logger.error(f"set_order_state: {resp.status} {text[:200]}")
+                    return False
+    except Exception as e:
+        logger.error(f"set_order_state: {e}")
+        return False
+
+
+# Расписание доставки по МО
+# Каждый город — список вариантов написания (все в нижнем регистре)
+DELIVERY_SCHEDULE_RAW = {
+    0: {  # Понедельник
+        "Звенигород": ["звенигород", "звенигородский"],
+        "Истра": ["истра", "истринский"],
+        "Солнечногорск": ["солнечногорск", "солнечногорский"],
+    },
+    1: {  # Вторник
+        "Королёв": ["королёв", "королев", "королевский"],
+        "Мытищи": ["мытищи", "мытищинский"],
+        "Одинцово": ["одинцово", "одинцовский"],
+        "Подольск": ["подольск", "подольский"],
+        "Серпухов": ["серпухов", "серпуховский"],
+        "Чехов": ["чехов", "чеховский"],
+        "Щелково": ["щелково", "щёлково", "щелковский", "щёлковский"],
+    },
+    2: {  # Среда
+        "Домодедово": ["домодедово", "домодедовский"],
+        "Королёв": ["королёв", "королев", "королевский"],
+        "Мытищи": ["мытищи", "мытищинский"],
+        "Орехово-Зуево": ["орехово-зуево", "орехово зуево", "ореховозуево", "орехово-зуевский"],
+        "Павловский Посад": ["павловский посад", "павлово-посадский", "павловопосадский"],
+        "Сергиев Посад": ["сергиев посад", "сергиево-посадский", "сергиевопосадский"],
+        "Щелково": ["щелково", "щёлково", "щелковский", "щёлковский"],
+        "Красноармейск": ["красноармейск"],
+        "Пушкино": ["пушкино", "пушкинский"],
+    },
+    3: {  # Четверг
+        "Апрелевка": ["апрелевка", "апрелевский"],
+        "Королёв": ["королёв", "королев", "королевский"],
+        "Мытищи": ["мытищи", "мытищинский"],
+        "Наро-Фоминск": ["наро-фоминск", "наро фоминск", "нарофоминск", "наро-фоминский"],
+        "Щелково": ["щелково", "щёлково", "щелковский", "щёлковский"],
+    },
+    4: {  # Пятница
+        "Егорьевск": ["егорьевск", "егорьевский"],
+        "Воскресенск": ["воскресенск", "воскресенский"],
+        "Королёв": ["королёв", "королев", "королевский"],
+        "Мытищи": ["мытищи", "мытищинский"],
+        "Щелково": ["щелково", "щёлково", "щелковский", "щёлковский"],
+        "Каширское шоссе": ["каширское шоссе", "кашира", "каширский"],
+    },
+}
+
+WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+WEEKDAYS_RU_IN = ["понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
+
+# Плоский словарь: вариант написания → (канонический город, список дней)
+def _build_city_index():
+    index = {}  # keyword → {"canonical": str, "days": set}
+    for day, cities in DELIVERY_SCHEDULE_RAW.items():
+        for canonical, variants in cities.items():
+            for v in variants:
+                if v not in index:
+                    index[v] = {"canonical": canonical, "days": set()}
+                index[v]["days"].add(day)
+    return index
+
+_CITY_INDEX = _build_city_index()
+# Все города МО из расписания (все варианты написания)
+ALL_MO_CITIES = list(_CITY_INDEX.keys())
+
+
+async def check_delivery_schedule(address: str, delivery_date_str: str) -> dict:
+    """
+    Проверяет соответствие адреса доставки и дня недели расписанию.
+    Сначала текстовый поиск, потом геокодирование через Яндекс.
+    Московские адреса всегда OK.
+    """
+    if not address or not delivery_date_str:
+        return {"ok": True}
+
+    address_lower = address.lower()
+
+    # Московские адреса — не проверяем
+    if "москва" in address_lower or "moscow" in address_lower:
+        return {"ok": True}
+
+    # Определяем день недели даты отгрузки
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(delivery_date_str[:10])
+        weekday = dt.weekday()
+    except Exception:
+        return {"ok": True}
+
+    # Шаг 1: текстовый поиск по известным городам
+    found_keyword = None
+    for keyword in sorted(_CITY_INDEX.keys(), key=len, reverse=True):
+        if keyword in address_lower:
+            found_keyword = keyword
+            break
+
+    if found_keyword:
+        city_info = _CITY_INDEX[found_keyword]
+        canonical = city_info["canonical"]
+        allowed_days_nums = city_info["days"]
+        if weekday in allowed_days_nums:
+            return {"ok": True}
+        allowed_days = [WEEKDAYS_RU[d] for d in sorted(allowed_days_nums)]
+        return {
+            "ok": False,
+            "city": canonical,
+            "date": delivery_date_str[:10],
+            "weekday": WEEKDAYS_RU[weekday],
+            "allowed_days": allowed_days,
+        }
+
+    # Шаг 2: геокодирование — ищем ближайший город из расписания
+    coords = await geocode_address(address)
+    if not coords:
+        return {"ok": True}  # Не смогли геокодировать — не блокируем
+
+    lat, lon = coords
+
+    # Адреса ближе 35 км от центра Москвы — возим в любой день
+    dist_from_moscow = _haversine(lat, lon, 55.7558, 37.6173)
+    if dist_from_moscow < 35:
+        return {"ok": True}
+
+    # Ищем ближайший город в радиусе DELIVERY_RADIUS_KM
+    nearest_city = None
+    nearest_dist = float("inf")
+    for city, (clat, clon) in DELIVERY_CITIES_COORDS.items():
+        dist = _haversine(lat, lon, clat, clon)
+        if dist < nearest_dist:
+            nearest_dist = dist
+            nearest_city = city
+
+    if nearest_dist > DELIVERY_RADIUS_KM:
+        return {"ok": True}  # Далеко от всех наших направлений
+
+    # Нашли ближайший город — ищем его в индексе
+    found_keyword = None
+    for keyword, info in _CITY_INDEX.items():
+        if info["canonical"] == nearest_city:
+            found_keyword = keyword
+            break
+
+    if not found_keyword:
+        return {"ok": True}
+
+    city_info = _CITY_INDEX[found_keyword]
+    allowed_days_nums = city_info["days"]
+    if weekday in allowed_days_nums:
+        return {"ok": True}
+
+    allowed_days = [WEEKDAYS_RU[d] for d in sorted(allowed_days_nums)]
+    return {
+        "ok": False,
+        "city": nearest_city,
+        "date": delivery_date_str[:10],
+        "weekday": WEEKDAYS_RU[weekday],
+        "allowed_days": allowed_days,
+        "distance_km": round(nearest_dist, 1),
+    }
+
+
+async def get_reconciliation_data(counterparty_id: str, date_from: str, date_to: str) -> dict:
+    """
+    Получает данные для акта сверки по контрагенту за период.
+    date_from, date_to: 'YYYY-MM-DD'
+    Возвращает: {
+        counterparty_name, opening_balance,
+        rows: [{date, doc_type, doc_number, debit, credit}],
+        closing_balance
+    }
+    """
+    import aiohttp
+    from datetime import datetime
+
+    dt_from = f"{date_from} 00:00:00"
+    dt_to   = f"{date_to} 23:59:59"
+    cp_href = f"{MS_BASE}/entity/counterparty/{counterparty_id}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Имя контрагента
+            async with session.get(f"{cp_href}", headers=get_headers()) as r:
+                cp = await r.json() if r.status == 200 else {}
+            cp_name = cp.get("name", "")
+
+            rows = []
+
+            async def fetch_docs(entity, label, is_payment=False, is_return=False):
+                url = f"{MS_BASE}/entity/{entity}"
+                params = {
+                    "filter": f"agent={cp_href};moment>={dt_from};moment<={dt_to}",
+                    "limit": 200,
+                    "order": "moment,asc",
+                }
+                async with session.get(url, headers=get_headers(), params=params) as r:
+                    if r.status != 200:
+                        return
+                    data = await r.json()
+                    for doc in data.get("rows", []):
+                        date_str = doc.get("moment", "")[:10]
+                        num = doc.get("name", doc.get("id", ""))
+                        amount = round((doc.get("sum", 0) or 0) / 100, 2)
+                        if amount <= 0:
+                            continue
+                        rows.append({
+                            "date": date_str,
+                            "doc_type": label,
+                            "doc_number": num,
+                            "amount": amount,
+                            # is_payment=True → кредит (уменьшает долг клиента)
+                            # is_return=True → тоже кредит (возврат уменьшает долг)
+                            "is_payment": is_payment or is_return,
+                        })
+
+            # Дебет покупателя (он должен нам)
+            await fetch_docs("demand",    "Отгрузка",      is_payment=False)
+            await fetch_docs("invoiceout","Счёт",           is_payment=False)
+
+            # Кредит покупателя (он платит или мы возвращаем)
+            await fetch_docs("paymentin", "Оплата б/н",    is_payment=True)
+            await fetch_docs("cashin",    "Оплата нал.",   is_payment=True)
+            await fetch_docs("salesreturn","Возврат",      is_return=True)
+            await fetch_docs("paymentout","Выплата",       is_payment=True)
+            await fetch_docs("cashout",   "Выплата нал.",  is_payment=True)
+
+            # Убираем счета из расчёта сальдо (они информационные)
+            rows_for_calc = [r for r in rows if r["doc_type"] != "Счёт"]
+
+            # Сортируем по дате
+            rows.sort(key=lambda x: x["date"])
+
+            # Считаем сальдо
+            debit_total  = round(sum(r["amount"] for r in rows_for_calc if not r["is_payment"]), 2)
+            credit_total = round(sum(r["amount"] for r in rows_for_calc if r["is_payment"]), 2)
+
+            # Сверяем с реальным балансом МойСклад
+            async with session.get(
+                f"{MS_BASE}/report/counterparty/{counterparty_id}",
+                headers=get_headers()
+            ) as rb:
+                if rb.status == 200:
+                    rb_data = await rb.json()
+                    real_balance = (rb_data.get("balance", 0) or 0) / 100
+                    # balance < 0 → клиент должен нам
+                    real_debt = round(abs(min(real_balance, 0)), 2)
+                else:
+                    real_debt = round(debit_total - credit_total, 2)
+
+            closing = real_debt  # используем реальный баланс из МойСклад
+
+            # ИНН и адрес контрагента
+            cp_inn = cp.get("inn", "")
+            legal_addr = cp.get("legalAddress", "") or ""
+            actual_addr = cp.get("actualAddress", "") or ""
+            cp_address = legal_addr or actual_addr
+
+            return {
+                "counterparty_name": cp_name,
+                "buyer_inn": cp_inn,
+                "buyer_address": cp_address,
+                "date_from": date_from,
+                "date_to": date_to,
+                "rows": rows,
+                "debit_total": debit_total,
+                "credit_total": credit_total,
+                "closing_balance": closing,
+            }
+
+    except Exception as e:
+        logger.error(f"get_reconciliation_data: {e}", exc_info=True)
+        return {}
+
+
+async def get_aging_clients(days: int = 50) -> list:
+    """
+    Возвращает клиентов у которых последняя отгрузка была 50+ дней назад.
+    Логика: берём все отгрузки за последние 50 дней — у кого нет = стареющий.
+    """
+    import aiohttp
+    from datetime import datetime, timezone, timedelta
+
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = today - timedelta(days=days)
+    cutoff_str = cutoff.strftime("%Y-%m-%d 00:00:00")
+    today_str = today.strftime("%Y-%m-%d 23:59:59")
+
+    # Дата начала истории (берём последние 2 года для нахождения активных клиентов)
+    history_from = (today - timedelta(days=730)).strftime("%Y-%m-%d 00:00:00")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+
+            # 1. Клиенты у которых ЕСТЬ отгрузки за последние 50 дней — исключаем их
+            recent_params = {
+                "filter": f"moment>={cutoff_str};moment<={today_str}",
+                "expand": "agent",
+                "limit": 1000,
+            }
+            async with session.get(f"{MS_BASE}/entity/demand",
+                                   headers=get_headers(), params=recent_params) as resp:
+                if resp.status != 200:
+                    return []
+                recent_data = await resp.json()
+
+            active_ids = set()
+            for doc in recent_data.get("rows", []):
+                agent = doc.get("agent", {})
+                if agent.get("id"):
+                    active_ids.add(agent["id"])
+
+            logger.info(f"get_aging_clients: активных за {days} дней = {len(active_ids)}")
+
+            # 2. Все клиенты с отгрузками за последние 2 года
+            all_agents = {}
+            offset = 0
+            while True:
+                hist_params = {
+                    "filter": f"moment>={history_from};moment<={cutoff_str}",
+                    "expand": "agent",
+                    "limit": 200,
+                    "offset": offset,
+                    "order": "moment,desc",
+                }
+                async with session.get(f"{MS_BASE}/entity/demand",
+                                       headers=get_headers(), params=hist_params) as resp:
+                    if resp.status != 200:
+                        break
+                    hist_data = await resp.json()
+                    rows = hist_data.get("rows", [])
+                    for doc in rows:
+                        agent = doc.get("agent", {})
+                        agent_id = agent.get("id", "")
+                        if not agent_id or agent_id in active_ids:
+                            continue
+                        if "розничный покупатель" in agent.get("name", "").lower():
+                            continue
+                        if agent_id not in all_agents:
+                            doc_date = doc.get("moment", "")[:10]
+                            days_ago = (today.date() - datetime.strptime(doc_date, "%Y-%m-%d").date()).days
+                            all_agents[agent_id] = {
+                                "id": agent_id,
+                                "name": agent.get("name", ""),
+                                "tags": agent.get("tags", []),
+                                "last_demand_date": doc_date,
+                                "days": days_ago,
+                            }
+                    if len(rows) < 200:
+                        break
+                    offset += 200
+
+            result = list(all_agents.values())
+            result.sort(key=lambda x: x["days"], reverse=True)
+            logger.info(f"get_aging_clients: стареющих клиентов = {len(result)}")
+            return result
+
+    except Exception as e:
+        logger.error(f"get_aging_clients: {e}", exc_info=True)
+        return []
+
+
+async def get_evening_stats() -> dict:
+    """
+    Статистика за сегодня для вечерней сводки:
+    - Созданные заказы по менеджерам
+    - Отгруженные заказы по менеджерам
+    - Первые отгрузки новым клиентам
+    """
+    import aiohttp
+    from datetime import datetime, timezone
+
+    today_from = datetime.now().strftime("%Y-%m-%d 00:00:00")
+    today_to   = datetime.now().strftime("%Y-%m-%d 23:59:59")
+
+    MANAGER_TAG_MAP = {
+        "баласанян": "Карина Баласанян",
+        "мерзлякова": "Елена Мерзлякова",
+        "скляр": "Инесса Скляр",
+        "леонтьев": "Алексей Леонтьев",
+        "черентаев": "Сергей Черентаев",
+    }
+
+    def get_manager(tags):
+        for tag in tags:
+            if tag.lower() in MANAGER_TAG_MAP:
+                return MANAGER_TAG_MAP[tag.lower()]
+        return "Без менеджера"
+
+    result = {
+        "created_orders": {},   # manager → count
+        "shipped_orders": {},   # manager → count
+        "new_clients": [],      # [{name, manager}]
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+
+            # 1. Созданные заказы сегодня
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder",
+                headers=get_headers(),
+                params={"filter": f"moment>={today_from};moment<={today_to}",
+                        "expand": "agent,owner", "limit": 200}
+            ) as r:
+                if r.status == 200:
+                    for order in (await r.json()).get("rows", []):
+                        agent = order.get("agent", {})
+                        tags = agent.get("tags", [])
+                        mgr = get_manager(tags)
+                        result["created_orders"][mgr] = result["created_orders"].get(mgr, 0) + 1
+
+            # 2. Отгрузки сегодня
+            async with session.get(
+                f"{MS_BASE}/entity/demand",
+                headers=get_headers(),
+                params={"filter": f"moment>={today_from};moment<={today_to}",
+                        "expand": "agent", "limit": 200}
+            ) as r:
+                if r.status == 200:
+                    for demand in (await r.json()).get("rows", []):
+                        agent = demand.get("agent", {})
+                        tags = agent.get("tags", [])
+                        mgr = get_manager(tags)
+                        result["shipped_orders"][mgr] = result["shipped_orders"].get(mgr, 0) + 1
+
+                        # Первая отгрузка нового клиента?
+                        agent_id = agent.get("id", "")
+                        agent_name = agent.get("name", "")
+                        if agent_id and "розничный покупатель" not in agent_name.lower():
+                            # Проверяем были ли отгрузки раньше
+                            async with session.get(
+                                f"{MS_BASE}/entity/demand",
+                                headers=get_headers(),
+                                params={
+                                    "filter": f"agent={MS_BASE}/entity/counterparty/{agent_id};"
+                                              f"moment<{today_from}",
+                                    "limit": 1
+                                }
+                            ) as prev:
+                                if prev.status == 200:
+                                    prev_data = await prev.json()
+                                    if not prev_data.get("rows"):
+                                        result["new_clients"].append({
+                                            "name": agent_name,
+                                            "manager": mgr
+                                        })
+
+        return result
+
+    except Exception as e:
+        logger.error(f"get_evening_stats: {e}", exc_info=True)
+        return result
+
+
+async def get_sales_fact(manager_tag: str, date_from: str, date_to: str) -> dict:
+    """
+    Фактические показатели менеджера за период:
+    - revenue: выручка (сумма отгрузок)
+    - shipments: количество отгрузок
+    - clients: уникальные клиенты (АКБ)
+    """
+    import aiohttp
+    result = {"revenue": 0.0, "shipments": 0, "clients": set()}
+    try:
+        async with aiohttp.ClientSession() as session:
+            offset = 0
+            while True:
+                params = {
+                    "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
+                    "expand": "agent",
+                    "limit": 200,
+                    "offset": offset,
+                }
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(), params=params
+                ) as r:
+                    if r.status != 200:
+                        break
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent = row.get("agent", {})
+                    tags = [t.lower() for t in agent.get("tags", [])]
+                    if manager_tag.lower() not in tags:
+                        continue
+                    result["shipments"] += 1
+                    result["revenue"] += (row.get("sum", 0) or 0) / 100
+                    agent_id = agent.get("id", "")
+                    if agent_id:
+                        result["clients"].add(agent_id)
+                if len(rows) < 200:
+                    break
+                offset += 200
+    except Exception as e:
+        logger.error(f"get_sales_fact {manager_tag}: {e}")
+    result["clients"] = len(result["clients"])
+    return result
