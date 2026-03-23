@@ -4636,10 +4636,9 @@ async def process_ms_webhook(data: dict, bot):
                     reply_markup=keyboard
                 )
 
-            # Проверяем логистику — адрес vs день недели
-            await check_logistics_alert(order_href, bot, group_chat_id)
-
-            # ПДЗ алерт для новых заказов уже отправлен выше
+            # Проверяем логистику — только при создании заказа
+            if action == "CREATE":
+                await check_logistics_alert(order_href, bot, group_chat_id)
 
     except Exception as e:
         logger.error(f"process_ms_webhook: {e}")
