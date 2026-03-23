@@ -3736,7 +3736,6 @@ async def _send_sales_plan_chart(context, chat_id: int):
             ("Алексей Леонтьев", "леонтьев",   "Алексей"),
             ("Сергей Черентаев", "черентаев",  "Сергей"),
         ]
-
         plans_raw = db.get_current_plans()
         plans = {p["manager"]: p for p in plans_raw}
 
