@@ -5,3 +5,4 @@ apscheduler==3.10.4
 aiohttp==3.9.5
 psycopg2-binary
 reportlab
+matplotlib
