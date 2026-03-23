@@ -2581,47 +2581,109 @@ async def get_evening_stats() -> dict:
         return result
 
 
-async def get_sales_fact(manager_tag: str, date_from: str, date_to: str) -> dict:
-    """
-    Фактические показатели менеджера за период:
-    - revenue: выручка (сумма отгрузок)
-    - shipments: количество отгрузок
-    - clients: уникальные клиенты (АКБ)
-    """
+async def get_counterparty_groups() -> dict:
+    """Возвращает словарь {название_группы: href} из МойСклад."""
     import aiohttp
-    result = {"revenue": 0.0, "shipments": 0, "clients": set()}
     try:
         async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/counterparty/metadata",
+                headers=get_headers()
+            ) as r:
+                if r.status != 200:
+                    return {}
+                data = await r.json()
+                groups = {}
+                for g in data.get("groups", {}).get("rows", []):
+                    groups[g.get("name", "").lower()] = g.get("meta", {}).get("href", "")
+                logger.info(f"counterparty groups: {list(groups.keys())}")
+                return groups
+    except Exception as e:
+        logger.error(f"get_counterparty_groups: {e}")
+        return {}
+
+
+async def get_sales_fact(manager_name: str, date_from: str, date_to: str) -> dict:
+    """
+    Фактические показатели менеджера за период из отчёта прибыльности.
+    Фильтр: группа контрагента = фамилия менеджера.
+    """
+    import aiohttp
+    result = {"revenue": 0.0, "shipments": 0, "clients": 0}
+
+    # Маппинг имя → фамилия для поиска группы
+    NAME_TO_LAST = {
+        "Инесса Скляр":     "скляр",
+        "Карина Баласанян": "баласанян",
+        "Елена Мерзлякова": "мерзлякова",
+        "Алексей Леонтьев": "леонтьев",
+        "Сергей Черентаев": "черентаев",
+    }
+    last_name = NAME_TO_LAST.get(manager_name, manager_name.split()[-1].lower())
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Ищем группу контрагентов по фамилии менеджера
+            async with session.get(
+                f"{MS_BASE}/entity/counterparty/metadata",
+                headers=get_headers()
+            ) as r:
+                if r.status != 200:
+                    logger.error(f"get_sales_fact: metadata {r.status}")
+                    return result
+                meta = await r.json()
+
+            group_href = None
+            for g in meta.get("groups", {}).get("rows", []):
+                g_name = g.get("name", "").lower()
+                if last_name in g_name:
+                    group_href = g.get("meta", {}).get("href", "")
+                    logger.info(f"get_sales_fact {manager_name}: группа найдена '{g['name']}' href={group_href}")
+                    break
+
+            if not group_href:
+                logger.warning(f"get_sales_fact {manager_name}: группа '{last_name}' не найдена")
+                return result
+
+            # Запрашиваем отчёт прибыльности по покупателям
             offset = 0
+            clients_set = set()
             while True:
                 params = {
-                    "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
-                    "expand": "agent",
+                    "momentFrom": f"{date_from} 00:00:00",
+                    "momentTo":   f"{date_to} 23:59:59",
+                    "filter": f"counterpartyGroup={group_href}",
                     "limit": 200,
                     "offset": offset,
                 }
                 async with session.get(
-                    f"{MS_BASE}/entity/demand",
+                    f"{MS_BASE}/report/profit/bycounterparty",
                     headers=get_headers(), params=params
                 ) as r:
                     if r.status != 200:
+                        body = await r.text()
+                        logger.error(f"get_sales_fact profit {r.status}: {body[:200]}")
                         break
                     data = await r.json()
+
                 rows = data.get("rows", [])
                 for row in rows:
-                    agent = row.get("agent", {})
-                    tags = [t.lower() for t in agent.get("tags", [])]
-                    if manager_tag.lower() not in tags:
-                        continue
-                    result["shipments"] += 1
-                    result["revenue"] += (row.get("sum", 0) or 0) / 100
-                    agent_id = agent.get("id", "")
-                    if agent_id:
-                        result["clients"].add(agent_id)
-                if len(rows) < 200:
+                    result["revenue"]   += (row.get("sellSum", 0) or 0) / 100
+                    result["shipments"] += row.get("demandCount", 0) or 0
+                    cp = row.get("counterparty", {})
+                    cp_id = cp.get("meta", {}).get("href", "").split("/")[-1]
+                    if cp_id:
+                        clients_set.add(cp_id)
+
+                total = data.get("meta", {}).get("size", 0)
+                offset += len(rows)
+                if offset >= total or len(rows) < 200:
                     break
-                offset += 200
+
+            result["clients"] = len(clients_set)
+            logger.info(f"get_sales_fact {manager_name}: revenue={result['revenue']:.0f} ship={result['shipments']} clients={result['clients']}")
+
     except Exception as e:
-        logger.error(f"get_sales_fact {manager_tag}: {e}")
-    result["clients"] = len(result["clients"])
+        logger.error(f"get_sales_fact {manager_name}: {e}", exc_info=True)
+
     return result
