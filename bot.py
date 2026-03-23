@@ -3628,11 +3628,8 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from moysklad import get_evening_stats
     from datetime import datetime, timedelta
 
-    # Собираем данные параллельно
     stats = await get_evening_stats()
-    activity = db.get_activity_by_day(days=7)
     contracts = db.get_contracts_today()
-    activity_today = db.get_manager_activity(days=1)
 
     MANAGERS = ["Карина Баласанян", "Елена Мерзлякова", "Инесса Скляр",
                 "Алексей Леонтьев", "Сергей Черентаев"]
@@ -3647,78 +3644,28 @@ async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now().strftime("%d.%m.%Y")
     lines = [f"📊 *Сводка — {today}*\n"]
 
-    # ── 1. Активность сегодня — только известные менеджеры ────────
-    lines.append("📞 *Активность сегодня:*")
-    activity_today = [m for m in activity_today if m.get("manager","") in MANAGERS]
-    for mgr_data in sorted(activity_today, key=lambda x: x.get("msg_count",0)+x.get("call_count",0), reverse=True):
-        mgr = mgr_data.get("manager","")
-        short = SHORT.get(mgr, mgr)
-        calls = mgr_data.get("call_count", 0)
-        msgs = mgr_data.get("msg_count", 0)
-        total = calls + msgs
-        bar = "▓" * min(total // 5, 10)
-        lines.append(f"  {short}: {bar} {calls}📞 {msgs}💬")
-    if not activity_today:
-        lines.append("  — нет данных")
-    lines.append("")
-
-    # ── 2. Созданные заказы ───────────────────────────────────────
-    created = stats.get("created_orders", {})
-    if created:
-        lines.append("📝 *Созданные заказы:*")
-        for mgr, cnt in sorted(created.items(), key=lambda x: x[1], reverse=True):
-            if mgr not in MANAGERS: continue
-            short = SHORT[mgr]
-            lines.append(f"  {short}: {cnt} заказ{'ов' if cnt>4 else 'а' if cnt>1 else ''}")
-        lines.append("")
-
-    # ── 3. Отгруженные заказы ─────────────────────────────────────
-    shipped = stats.get("shipped_orders", {})
-    if shipped:
-        lines.append("🚚 *Отгрузки:*")
-        for mgr, cnt in sorted(shipped.items(), key=lambda x: x[1], reverse=True):
-            if mgr not in MANAGERS: continue
-            short = SHORT[mgr]
-            lines.append(f"  {short}: {cnt} отгруз{'ок' if cnt>4 else 'ки' if cnt>1 else 'ка'}")
-        lines.append("")
-
-    # ── 4. Новые договоры ─────────────────────────────────────────
+    # ── Новые договоры ────────────────────────────────────────────
     if contracts:
         lines.append(f"📄 *Новые договоры ({len(contracts)}):*")
         for c in contracts:
             lines.append(f"  • {c.get('buyer_name','?')} — {c.get('contract_number','?')}")
         lines.append("")
 
-    # ── 5. 🎉 Первые отгрузки новым клиентам ─────────────────────
-    new_clients = stats.get("new_clients", [])
-    if new_clients:
-        for nc in new_clients:
-            mgr = nc.get("manager", "")
-            short = SHORT.get(mgr, mgr)
-            lines.append(
-                f"🎉 *Первая отгрузка новому клиенту!*\n"
-                f"👤 *{nc['name']}*\n"
-                f"🏆 Отличная работа, *{short}*! Новый клиент в семье F2B!"
-            )
-        lines.append("")
-
+    # ── Первые отгрузки новым клиентам ────────────────────────────
+    new_clients = [nc for nc in stats.get("new_clients", []) if nc.get("manager","") in MANAGERS]
+    for nc in new_clients:
+        short = SHORT.get(nc.get("manager",""), "")
+        lines.append(
+            f"🎉 *Первая отгрузка новому клиенту!*\n"
+            f"👤 *{nc['name']}*\n"
+            f"🏆 Отличная работа, *{short}*!"
+        )
 
     text = "\n".join(lines)
-
-    # Отправляем основную сводку
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode="Markdown"
-    )
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
 
     # ── График планов продаж ───────────────────────────────────────
     await _send_sales_plan_chart(context, chat_id)
-
-    # ── График активности за 7 дней — только известные менеджеры ──
-    known_activity = [r for r in activity if r.get("manager","") in MANAGERS]
-    if known_activity:
-        await _send_activity_chart(context, chat_id, known_activity)
 
 
 async def _send_sales_plan_chart(context, chat_id: int):
@@ -3728,7 +3675,6 @@ async def _send_sales_plan_chart(context, chat_id: int):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
         from datetime import date
         from moysklad import get_sales_fact
 
@@ -3740,85 +3686,108 @@ async def _send_sales_plan_chart(context, chat_id: int):
             ("Сергей Черентаев", "черентаев",  "Сергей"),
         ]
 
-        # Планы накопительным итогом
         plans_raw = db.get_current_plans()
         plans = {p["manager"]: p for p in plans_raw}
 
-        # Факт из МойСклад за период с начала первого плана
         today = date.today()
-        # Берём с начала текущего месяца
         month_start = today.replace(day=1).isoformat()
         today_str = today.isoformat()
 
         facts = {}
         for full_name, tag, short in MANAGERS:
-            facts[full_name] = await get_sales_fact(tag, month_start, today_str)
-
-        # Строим график
-        n_managers = len(MANAGERS)
-        fig, axes = plt.subplots(n_managers, 3, figsize=(13, n_managers * 1.6 + 1))
-        fig.patch.set_facecolor("#0d1117")
+            f = await get_sales_fact(full_name, month_start, today_str)
+            facts[full_name] = f
+            logger.info(f"sales_fact {short}: revenue={f['revenue']:.0f} ship={f['shipments']} clients={f['clients']}")
 
         METRICS = [
-            ("revenue",   "Выручка, млн ₽",  1_000_000),
-            ("shipments", "Отгрузки",         1),
-            ("clients",   "Клиенты (АКБ)",    1),
+            ("revenue",   "Выручка",  1_000_000, "#4FC3F7"),
+            ("shipments", "Отгрузки", 1,          "#66BB6A"),
+            ("clients",   "АКБ",      1,          "#FFA726"),
         ]
-        COL_COLORS = ["#4FC3F7", "#66BB6A", "#FFA726"]
 
-        for row_i, (full_name, tag, short) in enumerate(MANAGERS):
+        n = len(MANAGERS)
+        # 3 бара на менеджера + отступы
+        row_height = 0.18
+        gap_between_managers = 0.35
+        total_rows = n * 3 + (n - 1)  # 3 бара + разделители
+        fig_height = total_rows * row_height + gap_between_managers * n + 1.2
+
+        fig, ax = plt.subplots(figsize=(10, fig_height))
+        fig.patch.set_facecolor("#0d1117")
+        ax.set_facecolor("#0d1117")
+
+        y = 0
+        ytick_pos = []
+        ytick_labels = []
+        manager_label_y = []
+
+        for mgr_i, (full_name, tag, short) in enumerate(MANAGERS):
             plan = plans.get(full_name, {})
             fact = facts.get(full_name, {})
 
-            for col_i, (metric, label, divisor) in enumerate(METRICS):
-                ax = axes[row_i][col_i]
-                ax.set_facecolor("#0d1117")
+            # Позиция метки менеджера — по центру трёх баров
+            center_y = y + 1  # средний из трёх баров
+            manager_label_y.append((center_y, short))
 
+            for bar_i, (metric, label, divisor, color) in enumerate(METRICS):
                 plan_val = float(plan.get(metric, 0) or 0) / divisor
                 fact_val = float(fact.get(metric, 0) or 0) / divisor
                 pct = min(fact_val / plan_val, 1.0) if plan_val > 0 else 0.0
 
-                # Фоновый бар (план)
-                ax.barh(0, 1.0, color="#21262d", height=0.6, left=0)
-                # Заштрихованный бар (факт)
-                ax.barh(0, pct, color=COL_COLORS[col_i], height=0.6,
+                # Фон (план = 100%)
+                ax.barh(y, 1.0, height=0.25, color="#21262d", left=0, zorder=1)
+                # Факт заштрихованный
+                ax.barh(y, max(pct, 0.008), height=0.25, color=color,
                         left=0, alpha=0.85,
-                        hatch="////" if pct < 1.0 else "",
-                        edgecolor=COL_COLORS[col_i])
+                        hatch="///", edgecolor=color, zorder=2)
 
-                # Подпись %
-                pct_label = f"{pct*100:.0f}%"
-                ax.text(min(pct + 0.02, 0.98), 0, pct_label,
-                        va="center", ha="left", color="white",
-                        fontsize=8, fontweight="bold")
+                # Подпись процента
+                x_label = pct + 0.02
+                ax.text(min(x_label, 1.08), y, f"{pct*100:.0f}%",
+                        va="center", ha="left", color=color,
+                        fontsize=7.5, fontweight="bold")
 
-                # Значения
+                # Значение факт/план
                 if plan_val > 0:
-                    fact_str = f"{fact_val:.1f}" if divisor == 1_000_000 else f"{fact_val:.0f}"
-                    plan_str = f"{plan_val:.1f}" if divisor == 1_000_000 else f"{plan_val:.0f}"
-                    ax.set_xlabel(f"{fact_str} / {plan_str}", color="#8b949e",
-                                  fontsize=7, labelpad=2)
+                    fs = f"{fact_val:.1f}/{plan_val:.1f}" if divisor == 1_000_000 else f"{fact_val:.0f}/{plan_val:.0f}"
                 else:
-                    ax.set_xlabel("план не задан", color="#555", fontsize=7, labelpad=2)
+                    fs = "—"
+                ax.text(1.18, y, fs, va="center", ha="left",
+                        color="#8b949e", fontsize=6.5)
 
-                # Заголовок колонки только в первой строке
-                if row_i == 0:
-                    ax.set_title(label, color="#c9d1d9", fontsize=8, pad=4)
+                ytick_pos.append(y)
+                ytick_labels.append(label)
+                y += 0.3
 
-                # Имя менеджера только в первой колонке
-                if col_i == 0:
-                    ax.set_ylabel(short, color="#c9d1d9", fontsize=9,
-                                  rotation=0, labelpad=40, va="center")
+            y += 0.3  # отступ между менеджерами
 
-                ax.set_xlim(0, 1.15)
-                ax.set_yticks([])
-                ax.set_xticks([])
-                for spine in ax.spines.values():
-                    spine.set_visible(False)
+        ax.set_xlim(0, 1.55)
+        ax.set_ylim(-0.3, y)
+        ax.set_yticks(ytick_pos)
+        ax.set_yticklabels(ytick_labels, color="#8b949e", fontsize=7)
+        ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
+        ax.set_xticklabels(["0%", "25%", "50%", "75%", "100%"],
+                           color="#555", fontsize=7)
+        ax.xaxis.grid(True, color="#21262d", linewidth=0.5, zorder=0)
+        ax.set_axisbelow(True)
 
-        fig.suptitle(f"📊 Выполнение плана — {today.strftime('%d.%m.%Y')}",
-                     color="#c9d1d9", fontsize=11, y=1.01)
-        plt.tight_layout(rect=[0.07, 0, 1, 1])
+        # Вертикальная линия 100%
+        ax.axvline(x=1.0, color="#444", linewidth=0.8, linestyle="--", zorder=3)
+
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        # Имена менеджеров слева
+        for cy, name in manager_label_y:
+            ax.text(-0.03, cy, name, va="center", ha="right",
+                    color="#c9d1d9", fontsize=9, fontweight="bold",
+                    transform=ax.transData)
+
+        ax.set_title(f"Выполнение плана — {today.strftime('%d.%m.%Y')}",
+                     color="#c9d1d9", fontsize=10, pad=8)
+
+        plt.tight_layout()
+        plt.subplots_adjust(left=0.18)
 
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=130,
@@ -3827,8 +3796,7 @@ async def _send_sales_plan_chart(context, chat_id: int):
         plt.close()
 
         await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=buf,
+            chat_id=chat_id, photo=buf,
             caption="📊 Выполнение плана продаж"
         )
     except Exception as e:
