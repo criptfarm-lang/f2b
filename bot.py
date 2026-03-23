@@ -552,6 +552,7 @@ _wazzup_notified: set = set()
 _pending_links: dict = {}
 _pending_task_results: dict = {}  # user_id → {task_id, task_text, executor}
 _user_awaiting: dict = {}  # user_id → "photo" | "pdz_client"
+_pending_price_comments: dict = {}  # manager_user_id → {alert_id, order_id, mgr_name}
 
 
 async def handle_wazzup_ignore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1850,7 +1851,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("✅ Результат сохранён, руководитель уведомлён.")
             return
 
-        # 2. Ответ на алерт цены
+        # 2. Ответ на запрос комментария по цене
+        if user.id in _pending_price_comments:
+            pending = _pending_price_comments.pop(user.id)
+            alert_id = pending.get("alert_id", 0)
+            order_id = pending.get("order_id", "")
+            mgr_name = pending.get("mgr_name", user.full_name)
+            if alert_id:
+                db.close_price_alert(alert_id, text)
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=(
+                    f"💬 *Комментарий по занижению цены*\n"
+                    f"👤 Менеджер: *{mgr_name}*\n\n"
+                    f"{text}"
+                ),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Согласовано", callback_data=f"price_ok|{order_id}"),
+                ]])
+            )
+            await message.reply_text("✅ Комментарий отправлен руководителю.")
+            return
+
+        # 3. Ответ на алерт цены через reply
         replied = message.reply_to_message
         if replied and replied.text and "#price_alert_" in replied.text:
             import re
@@ -4273,11 +4297,16 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 text=(
                     f"⚠️ *Виктор просит пояснить занижение цены:*\n\n"
                     f"{alert_text}\n\n"
-                    f"Ответь на это сообщение — ответ уйдёт Виктору. "
-                    f"#price_alert_{alert_id}"
+                    f"Напиши пояснение — оно уйдёт Виктору."
                 ),
                 parse_mode="Markdown"
             )
+            # Сохраняем ожидание ответа
+            _pending_price_comments[mgr_chat_id] = {
+                "alert_id": alert_id,
+                "order_id": order_id_val,
+                "mgr_name": mgr_name,
+            }
             await query.edit_message_text(
                 query.message.text + f"\n\n💬 *Запрошен комментарий у {mgr_name}*",
                 parse_mode="Markdown"
