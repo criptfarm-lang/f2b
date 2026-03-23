@@ -4515,7 +4515,15 @@ def main():
                 is_outbound = msg.get("isEcho", False)
                 manager_id = msg.get("crmUserId", "")
                 manager_name = WAZZUP_MANAGERS.get(manager_id, manager_id)
-                sent_at = msg.get("dateTime", "")
+                raw_dt = msg.get("dateTime", "")
+                try:
+                    from datetime import datetime, timezone
+                    if raw_dt and str(raw_dt).isdigit():
+                        sent_at = datetime.fromtimestamp(int(raw_dt), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        sent_at = str(raw_dt)
+                except Exception:
+                    sent_at = str(raw_dt)
 
                 logger.info(f"Wazzup msg: isEcho={is_outbound} channel={channel_id_val} chatType={chat_type} chatId={chat_id_val} contact='{contact_name}' text='{text[:60]}'")
 
