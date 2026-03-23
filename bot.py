@@ -1652,17 +1652,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cp_name = cp.get("name", buyer_query)
             existing = db.find_contract_by_buyer(cp_name)
             if existing:
-                saved_data = existing.get("buyer_data")
-                if saved_data and isinstance(saved_data, dict):
-                    await message.reply_text(
-                        f"📄 Договор с *{cp_name}* уже создавался.\n"
-                        f"Номер: *{existing['contract_number']}* от {existing['created_at'].strftime('%d.%m.%Y')}\n"
-                        f"Регенерирую...", parse_mode="Markdown"
-                    )
-                    await _create_and_send_contract(
-                        saved_data, user.full_name, message, context,
-                        force_number=existing["contract_number"]
-                    )
+                await message.reply_text(
+                    f"📄 Договор с *{cp_name}* уже был сформирован.\n"
+                    f"Номер: *{existing['contract_number']}* от {existing['created_at'].strftime('%d.%m.%Y')}\n\n"
+                    f"Повторное формирование невозможно.\n"
+                    f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
+                    parse_mode="Markdown"
+                )
+                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+                return
+            # Проверяем — клиент уже существует в МойСклад?
+            cp_updated = cp.get("updated") or cp.get("created") or ""
+            from datetime import date as _date2
+            today_str2 = _date2.today().isoformat()
+            if cp_updated and cp_updated[:10] < today_str2:
+                await message.reply_text(
+                    f"⚠️ Клиент *{cp_name}* уже существует в МойСклад.\n\n"
+                    f"Договор с давними клиентами не формируется через бота.\n"
+                    f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
+                    parse_mode="Markdown"
+                )
+                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
                 return
             await message.reply_text(f"🔍 Читаю реквизиты *{cp_name}*...", parse_mode="Markdown")
             reqs = await get_counterparty_requisites(cp_id)
@@ -2521,28 +2531,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"👥 *Покупатели {found_name}* за {period_days} дней ({len(buyers)}):\n"]
 
         MANAGER_TAG_MAP = {
-            "баласанян": "Карина", "мерзлякова": "Елена",
-            "скляр": "Инесса", "леонтьев": "Алексей", "черентаев": "Сергей",
+            "баласанян": "Карина Баласанян", "мерзлякова": "Елена Мерзлякова",
+            "скляр": "Инесса Скляр", "леонтьев": "Алексей Леонтьев", "черентаев": "Сергей Черентаев",
         }
         SPEC_TAGS = {"опт", "хорека", "розница"}
 
         for b in buyers:
             tags = b.get("tags", [])
             tags_lower = [t.lower() for t in tags]
-
-            # Специализация
-            spec = next((t.capitalize() for t in tags_lower if t in SPEC_TAGS), "")
-            # Менеджер
-            manager = next((MANAGER_TAG_MAP[t] for t in tags_lower if t in MANAGER_TAG_MAP), "")
-
-            suffix = ""
-            if spec:
-                suffix += f" · {spec}"
-            if manager:
-                suffix += f" · {manager}"
-
-            lines.append(f"• {b['name']}{suffix}")
-        text = "\n".join(lines)
+            spec = next((t.capitalize() for t in tags_lower if t in SPEC_TAGS), "—")
+            manager = next((MANAGER_TAG_MAP[t] for t in tags_lower if t in MANAGER_TAG_MAP), "Не назначен")
+            lines.append(
+                f"👤 *{b['name']}*\n"
+                f"   👔 Менеджер: {manager}\n"
+                f"   🏷 Категория: {spec}"
+            )
+        text = "\n\n".join(lines)
         if len(text) > 4000:
             text = text[:3900] + "\n\n_...и ещё_"
         await message.reply_text(text, parse_mode="Markdown")
@@ -2819,41 +2823,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 1. Проверяем — есть ли уже договор с этим клиентом
         existing = db.find_contract_by_buyer(cp_name)
         if existing:
-            # Регенерируем PDF с тем же номером
-            saved_data = existing.get("buyer_data")
-            if saved_data and isinstance(saved_data, dict):
-                await message.reply_text(
-                    f"📄 Договор с *{cp_name}* уже создавался.\n"
-                    f"Номер: *{existing['contract_number']}* от {existing['created_at'].strftime('%d.%m.%Y')}\n"
-                    f"Регенерирую...",
-                    parse_mode="Markdown"
-                )
-                await _create_and_send_contract(
-                    saved_data, user.full_name, message, context,
-                    force_number=existing["contract_number"]
-                )
-            else:
-                await message.reply_text(
-                    f"📄 Договор с *{cp_name}* уже создавался.\n"
-                    f"Номер: *{existing['contract_number']}* от {existing['created_at'].strftime('%d.%m.%Y')}\n"
-                    f"Реквизиты не сохранены — создаю новый.",
-                    parse_mode="Markdown"
-                )
+            await message.reply_text(
+                f"📄 Договор с *{cp_name}* уже был сформирован.\n"
+                f"Номер: *{existing['contract_number']}* от {existing['created_at'].strftime('%d.%m.%Y')}\n\n"
+                f"Повторное формирование договора невозможно.\n"
+                f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
+                parse_mode="Markdown"
+            )
             return
 
         # 2. Проверяем дату создания клиента в МойСклад
-        # Если клиент создан ДО сегодня — договор уже существовал в прошлом
+        # Если клиент создан ДО сегодня — договор уже должен существовать
         cp_updated = cp.get("updated") or cp.get("created") or ""
         today_str = _date.today().isoformat()
         if cp_updated and cp_updated[:10] < today_str:
             await message.reply_text(
-                f"⚠️ Клиент *{cp_name}* заведён в МойСклад {cp_updated[:10]}.\n"
-                f"Договор с ним уже должен существовать. Создать новый?",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Да, создать", callback_data=f"contract_force|{cp_id}"),
-                    InlineKeyboardButton("❌ Отмена", callback_data="contract_cancel"),
-                ]])
+                f"⚠️ Клиент *{cp_name}* уже существует в МойСклад.\n\n"
+                f"Договор с давними клиентами не формируется через бота.\n"
+                f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
+                parse_mode="Markdown"
             )
             return
 
