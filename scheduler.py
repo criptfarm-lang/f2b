@@ -70,7 +70,7 @@ def setup_scheduler(app: Application, db):
     # 12:00 МСК — проверка стареющих клиентов
     scheduler.add_job(
         check_aging_clients,
-        CronTrigger(hour=12, minute=0),
+        CronTrigger(hour=9, minute=0, timezone="UTC"),
         args=[app],
         id="aging_clients"
     )
