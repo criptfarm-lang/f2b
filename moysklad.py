@@ -2581,83 +2581,75 @@ async def get_evening_stats() -> dict:
         return result
 
 
-async def get_sales_fact(manager_name: str, date_from: str, date_to: str) -> dict:
+async def get_all_managers_fact(date_from: str, date_to: str) -> dict:
     """
-    Фактические показатели менеджера за период из отчёта прибыльности.
-    Фильтр: контрагенты с тегом менеджера.
+    Берёт все отгрузки за период и группирует по тегу менеджера.
+    Возвращает {manager_name: {revenue, shipments, clients}}
     """
     import aiohttp
-    result = {"revenue": 0.0, "shipments": 0, "clients": 0}
 
-    NAME_TO_TAG = {
-        "Инесса Скляр":     "скляр",
-        "Карина Баласанян": "баласанян",
-        "Елена Мерзлякова": "мерзлякова",
-        "Алексей Леонтьев": "леонтьев",
-        "Сергей Черентаев": "черентаев",
+    TAG_TO_NAME = {
+        "скляр":      "Инесса Скляр",
+        "мерзлякова": "Елена Мерзлякова",
+        "баласанян":  "Карина Баласанян",
+        "леонтьев":   "Алексей Леонтьев",
+        "черентаев":  "Сергей Черентаев",
     }
-    tag = NAME_TO_TAG.get(manager_name, manager_name.split()[-1].lower())
+
+    result = {name: {"revenue": 0.0, "shipments": 0, "clients": set()}
+              for name in TAG_TO_NAME.values()}
 
     try:
         async with aiohttp.ClientSession() as session:
-
-            # 1. Получаем все href контрагентов с тегом менеджера
-            cp_hrefs = []
             offset = 0
             while True:
-                async with session.get(
-                    f"{MS_BASE}/entity/counterparty",
-                    headers=get_headers(),
-                    params={"filter": f"tags={tag}", "limit": 100, "offset": offset, "fields": "id"}
-                ) as r:
-                    if r.status != 200:
-                        break
-                    data = await r.json()
-                    rows = data.get("rows", [])
-                    for row in rows:
-                        cp_hrefs.append(row.get("meta", {}).get("href", ""))
-                    if len(rows) < 100:
-                        break
-                    offset += 100
-
-            logger.info(f"get_sales_fact {manager_name}: тег={tag} контрагентов={len(cp_hrefs)}")
-
-            if not cp_hrefs:
-                return result
-
-            # 2. Запрашиваем отчёт прибыльности по каждому контрагенту
-            clients_set = set()
-            for cp_href in cp_hrefs:
-                if not cp_href:
-                    continue
-                cp_id = cp_href.split("/")[-1]
                 params = {
-                    "momentFrom": f"{date_from} 00:00:00",
-                    "momentTo":   f"{date_to} 23:59:59",
-                    "filter":     f"counterparty={cp_href}",
-                    "limit": 1,
+                    "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
+                    "expand": "agent",
+                    "limit":  200,
+                    "offset": offset,
                 }
                 async with session.get(
-                    f"{MS_BASE}/report/profit/bycounterparty",
+                    f"{MS_BASE}/entity/demand",
                     headers=get_headers(), params=params
                 ) as r:
                     if r.status != 200:
-                        continue
+                        logger.error(f"get_all_managers_fact: {r.status}")
+                        break
                     data = await r.json()
-                    rows = data.get("rows", [])
-                    if rows:
-                        row = rows[0]
-                        rev = (row.get("sellSum", 0) or 0) / 100
-                        ship = row.get("demandCount", 0) or 0
-                        if rev > 0 or ship > 0:
-                            result["revenue"] += rev
-                            result["shipments"] += ship
-                            clients_set.add(cp_id)
 
-            result["clients"] = len(clients_set)
-            logger.info(f"get_sales_fact {manager_name}: revenue={result['revenue']:.0f} ship={result['shipments']} clients={result['clients']}")
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent = row.get("agent", {})
+                    tags = [t.lower() for t in agent.get("tags", [])]
+                    agent_id = agent.get("id", "")
+                    revenue = (row.get("sum", 0) or 0) / 100
+
+                    for tag, name in TAG_TO_NAME.items():
+                        if tag in tags:
+                            result[name]["revenue"] += revenue
+                            result[name]["shipments"] += 1
+                            if agent_id:
+                                result[name]["clients"].add(agent_id)
+                            break
+
+                if len(rows) < 200:
+                    break
+                offset += 200
 
     except Exception as e:
-        logger.error(f"get_sales_fact {manager_name}: {e}", exc_info=True)
+        logger.error(f"get_all_managers_fact: {e}", exc_info=True)
+
+    # Конвертируем set в count
+    for name in result:
+        result[name]["clients"] = len(result[name]["clients"])
+        logger.info(f"fact {name}: revenue={result[name]['revenue']:.0f} "
+                    f"ship={result[name]['shipments']} clients={result[name]['clients']}")
 
     return result
+
+
+async def get_sales_fact(manager_name: str, date_from: str, date_to: str) -> dict:
+    """Обёртка для совместимости — берёт данные из get_all_managers_fact."""
+    all_facts = await get_all_managers_fact(date_from, date_to)
+    return all_facts.get(manager_name, {"revenue": 0.0, "shipments": 0, "clients": 0})
