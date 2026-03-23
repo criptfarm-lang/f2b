@@ -3676,7 +3676,7 @@ async def _send_sales_plan_chart(context, chat_id: int):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from datetime import date
-        from moysklad import get_sales_fact
+        from moysklad import get_all_managers_fact
 
         MANAGERS = [
             ("Инесса Скляр",     "скляр",     "Инесса"),
@@ -3693,11 +3693,7 @@ async def _send_sales_plan_chart(context, chat_id: int):
         month_start = today.replace(day=1).isoformat()
         today_str = today.isoformat()
 
-        facts = {}
-        for full_name, tag, short in MANAGERS:
-            f = await get_sales_fact(full_name, month_start, today_str)
-            facts[full_name] = f
-            logger.info(f"sales_fact {short}: revenue={f['revenue']:.0f} ship={f['shipments']} clients={f['clients']}")
+        facts = await get_all_managers_fact(month_start, today_str)
 
         METRICS = [
             ("revenue",   "Выручка",  1_000_000, "#4FC3F7"),
