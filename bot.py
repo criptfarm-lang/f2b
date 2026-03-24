@@ -3123,6 +3123,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             by_manager = {}
             for row in rows:
                 mgr = row.get("manager_name") or "Неизвестно"
+                if mgr == "Неизвестно":
+                    continue  # пропускаем неидентифицированных
                 by_manager.setdefault(mgr, []).append(row)
 
             lines.append("💬 *Переписки:*")
