@@ -3672,6 +3672,35 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text(f"Контрагентов с тегом *{tag}*: {len(cp_ids)}", parse_mode="Markdown")
 
+            # Диагностика: смотрим первую отгрузку за март
+            async with session.get(
+                f"{MS_BASE}/entity/demand",
+                headers=get_headers(),
+                params={
+                    "filter": f"moment>={month_start} 00:00:00;moment<={month_end} 23:59:59",
+                    "expand": "agent",
+                    "limit": 1,
+                }
+            ) as r:
+                sample = await r.json()
+            if sample.get("rows"):
+                row = sample["rows"][0]
+                agent = row.get("agent", {})
+                agent_id = agent.get("id", "")
+                agent_name = agent.get("name", "")
+                agent_tags = agent.get("tags", [])
+                # Проверяем есть ли этот ID в нашем списке
+                in_list = agent_id in cp_ids
+                await update.message.reply_text(
+                    f"🔍 *Первая отгрузка:*\n"
+                    f"Клиент: {agent_name}\n"
+                    f"ID агента: `{agent_id}`\n"
+                    f"Теги агента: {agent_tags}\n"
+                    f"Есть в списке скляр: {in_list}\n\n"
+                    f"Пример ID из списка скляр: `{list(cp_ids)[:1]}`",
+                    parse_mode="Markdown"
+                )
+
             # 2. Отгрузки за период
             shipments = 0
             revenue = 0.0
