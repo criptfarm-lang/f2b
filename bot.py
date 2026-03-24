@@ -3697,8 +3697,7 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     agent_id0 = agent0.get("id", "НЕТУ")
                     agent_keys = list(agent0.keys())
                     await update.message.reply_text(
-                        f"DEBUG первая отгрузка:\nagent keys: {agent_keys}\nagent.id: `{agent_id0}`\nЕсть в cp_ids: {agent_id0 in cp_ids}",
-                        parse_mode="Markdown"
+                        f"DEBUG первая отгрузка:\nagent keys: {agent_keys}\nagent.id: {agent_id0}\nЕсть в cp_ids: {agent_id0 in cp_ids}"
                     )
                 for row in rows:
                     agent_id = row.get("agent", {}).get("id", "")
