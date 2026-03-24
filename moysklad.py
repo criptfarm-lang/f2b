@@ -2532,6 +2532,8 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                     offset += 100
                 tag_to_ids[tag] = ids
                 logger.info(f"get_manager_shipments: {tag} — {len(ids)} контрагентов")
+                if tag == "леонтьев":
+                    logger.info(f"леонтьев IDs: {ids}")
             # 2. Все отгрузки за период
             offset = 0
             while True:
@@ -2553,6 +2555,8 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                     revenue = (row.get("sum", 0) or 0) / 100
                     for tag, mgr_name in MANAGERS.items():
                         if agent_id in tag_to_ids.get(tag, set()):
+                            if tag == "леонтьев":
+                                logger.info(f"леонтьев совпадение: agent_id={agent_id} rev={revenue}")
                             result[mgr_name]["shipments"] += 1
                             result[mgr_name]["revenue"] += revenue
                             result[mgr_name]["clients"].add(agent_id)
