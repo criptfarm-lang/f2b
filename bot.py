@@ -5285,19 +5285,7 @@ async def check_order_agreed(order_href: str, bot):
         )
 
         if not contact:
-            # Нет мессенджера — уведомляем менеджера
-            mgr_chat_id = db.get_manager_chat_id(owner_name.split()[0]) if owner_name else None
-            if mgr_chat_id:
-                await bot.send_message(
-                    chat_id=mgr_chat_id,
-                    text=(
-                        f"⚠️ Заказ *{order_name}* согласован, но мессенджер клиента "
-                        f"*{agent_name}* не найден в базе.\n"
-                        f"Отправь клиенту вручную."
-                    ),
-                    parse_mode="Markdown"
-                )
-            logger.info(f"check_order_agreed: мессенджер {agent_name} не найден, уведомлён {owner_name}")
+            logger.info(f"check_order_agreed: мессенджер {agent_name} не найден, пропускаем")
             db.save_agreed_notification(order_id_check)
             return
         # Отправляем через Wazzup
