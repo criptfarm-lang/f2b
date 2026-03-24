@@ -2489,3 +2489,84 @@ async def get_aging_clients(days: int = 50) -> list:
         return []
 
 
+
+
+async def get_manager_shipments(date_from: str, date_to: str) -> dict:
+    """
+    Берёт отгрузки за период для всех менеджеров ОП.
+    Для каждого менеджера: кол-во отгрузок, выручка, кол-во клиентов.
+    """
+    import aiohttp
+
+    MANAGERS = {
+        "скляр":      "Инесса Скляр",
+        "мерзлякова": "Елена Мерзлякова",
+        "баласанян":  "Карина Баласанян",
+        "леонтьев":   "Алексей Леонтьев",
+        "черентаев":  "Сергей Черентаев",
+    }
+
+    result = {name: {"shipments": 0, "revenue": 0.0, "clients": set()}
+              for name in MANAGERS.values()}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+
+            # 1. Загружаем всех контрагентов каждого менеджера
+            tag_to_ids = {}
+            for tag in MANAGERS:
+                ids = set()
+                offset = 0
+                while True:
+                    async with session.get(
+                        f"{MS_BASE}/entity/counterparty",
+                        headers=get_headers(),
+                        params={"filter": f"tags={tag}", "limit": 100, "offset": offset}
+                    ) as r:
+                        data = await r.json()
+                    rows = data.get("rows", [])
+                    for cp in rows:
+                        ids.add(cp.get("id", ""))
+                    if len(rows) < 100:
+                        break
+                    offset += 100
+                tag_to_ids[tag] = ids
+                logger.info(f"get_manager_shipments: {tag} — {len(ids)} контрагентов")
+
+            # 2. Все отгрузки за период
+            offset = 0
+            while True:
+                params = {
+                    "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
+                    "expand": "agent",
+                    "limit": 200,
+                    "offset": offset,
+                }
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(), params=params
+                ) as r:
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
+                    agent_id = agent_href.split("/")[-1] if agent_href else ""
+                    revenue = (row.get("sum", 0) or 0) / 100
+                    for tag, mgr_name in MANAGERS.items():
+                        if agent_id in tag_to_ids.get(tag, set()):
+                            result[mgr_name]["shipments"] += 1
+                            result[mgr_name]["revenue"] += revenue
+                            result[mgr_name]["clients"].add(agent_id)
+                            break
+                if len(rows) < 200:
+                    break
+                offset += 200
+
+    except Exception as e:
+        logger.error(f"get_manager_shipments: {e}", exc_info=True)
+
+    for name in result:
+        result[name]["clients"] = len(result[name]["clients"])
+        logger.info(f"get_manager_shipments {name}: ship={result[name]['shipments']} rev={result[name]['revenue']:.0f} cl={result[name]['clients']}")
+
+    return result
