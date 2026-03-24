@@ -75,11 +75,19 @@ def setup_scheduler(app: Application, db):
         id="aging_clients"
     )
 
-    # 03:00 — очистка старых задач
+    # 03:00 UTC — очистка старых задач
     scheduler.add_job(
         cleanup_done_tasks,
         CronTrigger(hour=3, minute=0),
         id="cleanup_done_tasks"
+    )
+
+    # 02:00 UTC — синхронизация менеджеров в wazzup_contact_map
+    scheduler.add_job(
+        sync_managers_job,
+        CronTrigger(hour=2, minute=0),
+        args=[app],
+        id="sync_managers"
     )
 
     scheduler.start()
@@ -281,6 +289,16 @@ def cleanup_done_tasks():
         logger.info("cleanup_done_tasks: старые выполненные задачи удалены")
     except Exception as e:
         logger.error(f"cleanup_done_tasks: {e}")
+
+
+async def sync_managers_job(app: Application):
+    """Ночная синхронизация менеджеров в wazzup_contact_map."""
+    try:
+        from bot import sync_contact_managers
+        updated = await sync_contact_managers()
+        logger.info(f"sync_managers_job: обновлено {updated} контактов")
+    except Exception as e:
+        logger.error(f"sync_managers_job: {e}", exc_info=True)
 
 
 async def check_aging_clients(app: Application):
