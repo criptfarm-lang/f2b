@@ -255,6 +255,10 @@ class Database:
                 name TEXT,
                 alerted_at DATE DEFAULT CURRENT_DATE
             )""",
+            """CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )""",
             """CREATE TABLE IF NOT EXISTS bot_usage_log (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT,
@@ -376,6 +380,25 @@ class Database:
     def clear_aging_alerts(self):
         """Очищает алерты (вызывать в начале нового цикла если нужно)."""
         self._execute("DELETE FROM aging_alerts")
+
+    def get_promo(self, segment: str = None) -> str:
+        """Возвращает промо-текст для сегмента (хорека/опт) или общий."""
+        if segment:
+            key = f"promo_{segment.lower()}"
+            row = self._fetchone("SELECT value FROM bot_settings WHERE key=%s", (key,))
+            if row and row["value"]:
+                return row["value"]
+        row = self._fetchone("SELECT value FROM bot_settings WHERE key='promo_text'", ())
+        return row["value"] if row else ""
+
+    def set_promo(self, text: str, segment: str = None):
+        """Сохраняет промо-текст для сегмента или общий."""
+        key = f"promo_{segment.lower()}" if segment else "promo_text"
+        self._execute(
+            """INSERT INTO bot_settings (key, value) VALUES (%s, %s)
+               ON CONFLICT (key) DO UPDATE SET value=%s""",
+            (key, text, text)
+        )
 
     def save_manager_chat_id(self, user_id: int, full_name: str):
         self._execute(
