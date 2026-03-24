@@ -2536,6 +2536,7 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                     logger.info(f"леонтьев IDs: {ids}")
             # 2. Все отгрузки за период
             offset = 0
+            total_demands = 0
             while True:
                 params = {
                     "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
@@ -2549,6 +2550,7 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                 ) as r:
                     data = await r.json()
                 rows = data.get("rows", [])
+                total_demands += len(rows)
                 for row in rows:
                     agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
                     agent_id = agent_href.split("/")[-1] if agent_href else ""
@@ -2564,6 +2566,7 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                 if len(rows) < 200:
                     break
                 offset += 200
+            logger.info(f"get_manager_shipments: всего отгрузок за период={total_demands}")
 
     except Exception as e:
         logger.error(f"get_manager_shipments: {e}", exc_info=True)
