@@ -3651,7 +3651,6 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     facts = await get_manager_shipments(month_start, month_end)
 
-    # Планы — заданные вручную (TODO: брать из БД)
     PLANS = {
         "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29},
         "Карина Баласанян": {"shipments": 150, "revenue": 5_000_000,  "clients": 38},
@@ -3674,51 +3673,55 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ("Сергей Черентаев", "Сергей"),
         ]
         METRICS = [
-            ("revenue",   "Выручка",  1_000_000, "#4FC3F7"),
-            ("shipments", "Отгрузки", 1,          "#66BB6A"),
-            ("clients",   "Клиенты",  1,          "#FFA726"),
+            ("revenue",   "Выручка, млн",  1_000_000, "#7c3aed"),
+            ("shipments", "Отгрузки",      1,          "#a855f7"),
+            ("clients",   "Клиенты",       1,          "#c084fc"),
         ]
 
-        bar_h = 0.2
-        bar_gap = 0.05
-        mgr_gap = 0.4
+        BG     = "#ffffff"
+        BG_AX  = "#f8f7ff"
+        BAR_BG = "#e8e5f5"
+        TEXT   = "#1e1b4b"
+        SUBTEXT= "#6b7280"
+        GRID   = "#e5e7eb"
+        LINE100= "#7c3aed"
+
+        bar_h   = 0.18
+        bar_gap = 0.04
+        mgr_gap = 0.55
         group_h = len(METRICS) * bar_h + (len(METRICS) - 1) * bar_gap
-        step = group_h + mgr_gap
+        step    = group_h + mgr_gap
 
-        fig_h = len(MANAGERS) * step + 0.5
-        fig, ax = plt.subplots(figsize=(7, fig_h))
-        fig.patch.set_facecolor("#0d1117")
-        ax.set_facecolor("#0d1117")
+        fig_h = len(MANAGERS) * step + 1.2
+        fig, ax = plt.subplots(figsize=(8, fig_h))
+        fig.patch.set_facecolor(BG)
+        ax.set_facecolor(BG_AX)
 
-        BAR_END = 1.0
-        XLIM = 1.5
         ytick_pos = []
         ytick_labels = []
-        mgr_label_data = []
+        mgr_labels = []
 
         for mgr_i, (full_name, short) in enumerate(MANAGERS):
             plan = PLANS.get(full_name, {})
             fact = facts.get(full_name, {})
-            gy_bottom = mgr_i * step
+            gy   = mgr_i * step
             bar_ys = []
 
             for met_i, (metric, label, divisor, color) in enumerate(METRICS):
                 plan_val = float(plan.get(metric) or 0) / divisor
                 fact_val = float(fact.get(metric) or 0) / divisor
-                pct = min(fact_val / plan_val, 1.0) if plan_val > 0 else 0.0
-                by = gy_bottom + met_i * (bar_h + bar_gap)
+                pct      = min(fact_val / plan_val, 1.0) if plan_val > 0 else 0.0
+                by       = gy + met_i * (bar_h + bar_gap)
 
-                # Полный бар = план
-                ax.barh(by, BAR_END, height=bar_h, color="#21262d", left=0, zorder=1)
-                # Заштрихованный = факт
-                ax.barh(by, max(pct * BAR_END, 0.005), height=bar_h,
-                        color=color, alpha=0.85, hatch="///", edgecolor=color, zorder=2)
+                ax.barh(by, 1.0, height=bar_h, color=BAR_BG, left=0, zorder=1)
+                ax.barh(by, max(pct, 0.006), height=bar_h,
+                        color=color, alpha=0.85, hatch="///",
+                        edgecolor=color, zorder=2)
 
-                # Данные факт/план на баре
                 if plan_val > 0:
                     fv = f"{fact_val:.1f}" if divisor == 1_000_000 else f"{int(fact_val)}"
                     pv = f"{plan_val:.1f}" if divisor == 1_000_000 else f"{int(plan_val)}"
-                    ax.text(pct * BAR_END / 2, by, f"{fv}/{pv}",
+                    ax.text(max(pct * 0.5, 0.05), by, f"{fv} / {pv}",
                             va="center", ha="center", color="white",
                             fontsize=6.5, fontweight="bold", zorder=3)
 
@@ -3726,33 +3729,32 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ytick_labels.append(label)
                 bar_ys.append(by)
 
-            cx = 0.5
-            top_y = gy_bottom + group_h + 0.15
-            mgr_label_data.append((cx, top_y, short))
+            mgr_labels.append((0.5, gy + group_h + 0.17, short))
 
-        for lx, ly, name in mgr_label_data:
+        for lx, ly, name in mgr_labels:
             ax.text(lx, ly, name, ha="center", va="bottom",
-                    color="#c9d1d9", fontsize=9, fontweight="bold")
+                    color=TEXT, fontsize=9, fontweight="bold")
 
-        ax.set_xlim(0, XLIM)
+        ax.set_xlim(0, 1.5)
         ax.set_ylim(-bar_h, len(MANAGERS) * step)
         ax.set_yticks(ytick_pos)
-        ax.set_yticklabels(ytick_labels, color="#8b949e", fontsize=7)
+        ax.set_yticklabels(ytick_labels, color=SUBTEXT, fontsize=7)
         ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
-        ax.set_xticklabels(["0%", "25%", "50%", "75%", "100%"], color="#555", fontsize=7)
-        ax.xaxis.grid(True, color="#21262d", linewidth=0.5, zorder=0)
-        ax.axvline(x=BAR_END, color="#444", linewidth=0.8, linestyle="--", zorder=3)
+        ax.set_xticklabels(["0%", "25%", "50%", "75%", "100%"], color=SUBTEXT, fontsize=7)
+        ax.xaxis.grid(True, color=GRID, linewidth=0.6, zorder=0)
+        ax.axvline(x=1.0, color=LINE100, linewidth=1.0, linestyle="--", zorder=3)
         ax.set_axisbelow(True)
         for spine in ax.spines.values():
-            spine.set_visible(False)
+            spine.set_color(GRID)
 
-        ax.set_title(f"Отчёт ОП — {today.strftime('%d.%m.%Y')}",
-                     color="#c9d1d9", fontsize=10, pad=8)
+        ax.set_title(
+            f"Отчёт ОП · {today.strftime('%d.%m.%Y')}  |  план: неделя = месяц (накопительно)",
+            color=TEXT, fontsize=9, pad=10
+        )
+
         plt.tight_layout()
-
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=130,
-                    facecolor=fig.get_facecolor(), bbox_inches="tight")
+        plt.savefig(buf, format="png", dpi=130, facecolor=BG, bbox_inches="tight")
         buf.seek(0)
         plt.close()
 
@@ -3760,8 +3762,7 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"cmd_op_report: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка графика: {e}")
-
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_fact [тег] — тест получения отгрузок по тегу за текущий месяц."""
