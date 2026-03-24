@@ -772,11 +772,11 @@ class Database:
 
     def search_wazzup_mentions(self, keywords: list, days: int = 7,
                                manager_name: str = None) -> list:
-        """Ищет исходящие сообщения менеджеров с упоминанием ключевых слов."""
+        """Ищет сообщения с упоминанием ключевых слов (входящие и исходящие)."""
         from datetime import datetime, timedelta
         since = datetime.utcnow() - timedelta(days=days)
 
-        conditions = ["is_outbound = TRUE", "sent_at >= %s", "text IS NOT NULL"]
+        conditions = ["sent_at >= %s", "text IS NOT NULL"]
         params = [since]
 
         if manager_name:
@@ -838,6 +838,19 @@ class Database:
         except Exception as e:
             self.conn.rollback()
             logger.warning(f"delete_pending_ident: {e}")
+
+    def update_contact_manager(self, company_name: str, manager: str):
+        """Обновляет поле manager у контакта по имени компании."""
+        self._execute(
+            "UPDATE wazzup_contact_map SET manager=%s WHERE LOWER(company_name) LIKE LOWER(%s)",
+            (manager, f"%{company_name}%")
+        )
+
+    def get_all_contacts_with_company(self) -> list:
+        """Возвращает все контакты с заполненным company_name."""
+        return self._fetchall(
+            "SELECT DISTINCT company_name, manager FROM wazzup_contact_map WHERE company_name IS NOT NULL AND company_name != '' AND company_name != '__ignore__'"
+        )
 
     def save_wazzup_contact(self, contact_name: str, chat_id: str,
                             chat_type: str, channel_id: str):
