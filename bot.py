@@ -3957,57 +3957,6 @@ async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     off += 100
                 tag_to_ids[tag] = ids
 
-            # 4. Отгрузки за период — ищем позиции из нужной группы
-            mgr_sums = {tag: 0.0 for tag in TAGS}
-            total_sum = 0.0
-            offset = 0
-            while True:
-                async with session.get(
-                    f"{MS_BASE}/entity/demand",
-                    headers=get_headers(),
-                    params={
-                        "filter": f"moment>={month_start} 00:00:00;moment<={month_end} 23:59:59",
-                        "expand": "agent,positions.assortment",
-                        "limit": 100,
-                        "offset": offset,
-                    }
-                ) as r:
-                    data = await r.json()
-                rows = data.get("rows", [])
-                for row in rows:
-                    agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
-                    agent_id = agent_href.split("/")[-1] if agent_href else ""
-
-                    # Определяем менеджера
-                    mgr_tag = None
-                    for tag, ids in tag_to_ids.items():
-                        if agent_id in ids:
-                            mgr_tag = tag
-                            break
-
-                    # Считаем сумму позиций из нужной группы
-                    positions = row.get("positions", {}).get("rows", [])
-                    for pos in positions:
-                        assortment = pos.get("assortment", {})
-                        prod_id = assortment.get("id", "") or assortment.get("meta", {}).get("href", "").split("/")[-1]
-                        if prod_id in product_ids:
-                            pos_sum = (pos.get("price", 0) * pos.get("quantity", 0)) / 100
-                            total_sum += pos_sum
-                            if mgr_tag:
-                                mgr_sums[mgr_tag] += pos_sum
-
-                if len(rows) < 100:
-                    break
-                offset += 100
-
-            lines = [f"📊 *ПРИВЛЕЧЕННЫЕ ТОВАРЫ* за март\n"]
-            lines.append(f"Итого: *{total_sum:,.0f} руб.*\n")
-            lines.append("По менеджерам:")
-            for tag, short in TAGS.items():
-                lines.append(f"  {short}: {mgr_sums[tag]:,.0f} руб.")
-
-            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
