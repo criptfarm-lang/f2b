@@ -4145,6 +4145,66 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
+async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/set_promo — задать рекламный текст для отправки клиентам при согласовании заказа."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if not context.args:
+        current = db.get_promo()
+        if current:
+            await update.message.reply_text(f"Текущий промо-текст:\n\n{current}\n\nЧтобы изменить: /set_promo [новый текст]")
+        else:
+            await update.message.reply_text("Промо-текст не задан.\nИспользование: /set_promo [текст]")
+        return
+    text = " ".join(context.args)
+    db.set_promo(text)
+    await update.message.reply_text(f"✅ Промо-текст сохранён:\n\n{text}")
+
+
+async def cmd_test_publink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/test_publink [order_id] — проверяет публичную ссылку на заказ в МойСклад."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+
+    import aiohttp
+    from moysklad import get_headers, MS_BASE
+
+    # Берём ID из аргумента или используем тестовый
+    order_id = context.args[0] if context.args else None
+    if not order_id:
+        await update.message.reply_text("Использование: /test_publink [order_id]\nПример: /test_publink b9ef038f-2740-11f1-0a80-16cd000335c6")
+        return
+
+    await update.message.reply_text(f"🔍 Проверяю публичную ссылку для заказа {order_id}...")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+
+            # 1. Пробуем получить публичную ссылку через API
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder/{order_id}/publications",
+                headers=get_headers()
+            ) as r:
+                status = r.status
+                body = await r.json() if r.status == 200 else await r.text()
+                await update.message.reply_text(f"GET publications: {status}\n{str(body)[:300]}")
+
+            # 2. Пробуем создать публикацию
+            async with session.post(
+                f"{MS_BASE}/entity/customerorder/{order_id}/publications",
+                headers=get_headers(),
+                json={"template": {"meta": {"href": f"{MS_BASE}/entity/customerorder/metadata/customtemplate", "type": "customtemplate", "mediaType": "application/json"}}}
+            ) as r:
+                status2 = r.status
+                body2 = await r.json() if r.status in (200, 201) else await r.text()
+                await update.message.reply_text(f"POST publications: {status2}\n{str(body2)[:300]}")
+
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+
 async def cmd_sync_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sync_managers — обновляет менеджеров в базе по тегам МойСклад."""
     user = update.effective_user
@@ -4760,6 +4820,8 @@ def main():
     app.add_handler(CommandHandler("op_report", cmd_op_report))
     app.add_handler(CommandHandler("test_group", cmd_test_group))
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
+    app.add_handler(CommandHandler("set_promo", cmd_set_promo))
+    app.add_handler(CommandHandler("test_publink", cmd_test_publink))
     app.add_handler(CommandHandler("sync_managers", cmd_sync_managers))
     app.add_handler(CommandHandler("search_msg", cmd_search_msg))
     app.add_handler(CommandHandler("aging", cmd_aging))
@@ -5088,6 +5150,97 @@ _price_check_cache: dict = {}
 _pdz_alert_data: dict = {}
 
 
+async def check_order_agreed(order_href: str, bot):
+    """При смене статуса заказа на Согласовано — отправляем клиенту в мессенджер."""
+    MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
+    try:
+        import aiohttp
+        from moysklad import get_headers
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                order_href,
+                headers=get_headers(),
+                params={"expand": "agent,state,owner"}
+            ) as r:
+                if r.status != 200:
+                    return
+                order = await r.json()
+
+        state = order.get("state", {})
+        state_id = state.get("meta", {}).get("href", "").split("/")[-1]
+
+        if state_id != MS_STATE_AGREED:
+            return
+
+        order_name = order.get("name", "")
+        order_sum = (order.get("sum", 0) or 0) / 100
+        agent = order.get("agent", {})
+        agent_name = agent.get("name", "")
+        agent_id = agent.get("meta", {}).get("href", "").split("/")[-1]
+        owner = order.get("owner", {})
+        owner_name = owner.get("name", "")
+
+        logger.info(f"check_order_agreed: заказ {order_name} клиент={agent_name} статус=Согласовано")
+
+        # Ищем мессенджер клиента
+        contact = db._fetchone(
+            """SELECT chat_id, channel_id, chat_type, manager
+               FROM wazzup_contact_map
+               WHERE LOWER(company_name) LIKE LOWER(%s)
+               LIMIT 1""",
+            (f"%{agent_name}%",)
+        )
+
+        promo = db.get_promo()
+        msg = (
+            f"✅ Ваш заказ *{order_name}* согласован!\n"
+            f"💰 Сумма: *{order_sum:,.0f} руб.*\n\n"
+        )
+        if promo:
+            msg += f"{promo}"
+
+        if not contact:
+            # Нет мессенджера — уведомляем менеджера
+            mgr_chat_id = db.get_manager_chat_id(owner_name.split()[0]) if owner_name else None
+            if mgr_chat_id:
+                await bot.send_message(
+                    chat_id=mgr_chat_id,
+                    text=(
+                        f"⚠️ Заказ *{order_name}* согласован, но мессенджер клиента "
+                        f"*{agent_name}* не найден в базе.\n"
+                        f"Отправь клиенту вручную."
+                    ),
+                    parse_mode="Markdown"
+                )
+            logger.info(f"check_order_agreed: мессенджер {agent_name} не найден, уведомлён {owner_name}")
+            return
+
+        # Отправляем через Wazzup
+        import aiohttp as _aio
+        api_key = os.getenv("WAZZUP_API_KEY", "")
+        async with _aio.ClientSession() as session:
+            payload = {
+                "channelId": contact["channel_id"],
+                "chatType": contact["chat_type"],
+                "chatId": contact["chat_id"],
+                "text": msg,
+            }
+            async with session.post(
+                "https://api.wazzup24.com/v3/message",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload
+            ) as r:
+                if r.status in (200, 201):
+                    logger.info(f"check_order_agreed: отправлено {agent_name} в {contact['chat_type']}")
+                else:
+                    body = await r.text()
+                    logger.error(f"check_order_agreed: ошибка отправки {r.status} {body[:100]}")
+
+    except Exception as e:
+        logger.error(f"check_order_agreed: {e}", exc_info=True)
+
+
 async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
     """Проверяет есть ли у клиента просрочка > 5 дней при новом заказе."""
     try:
@@ -5201,6 +5354,10 @@ async def process_ms_webhook(data: dict, bot):
 
             action = event.get("action", "")
             logger.info(f"Webhook: заказ {order_id} action={action} already_checked={already_checked}")
+
+            # Смена статуса на "Согласовано" — отправляем клиенту
+            if action == "UPDATE" and not already_checked:
+                await check_order_agreed(order_href, bot)
 
             # ПДЗ алерт — только для новых заказов, только один раз
             if action == "CREATE" and not already_checked:
