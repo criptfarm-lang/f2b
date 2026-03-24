@@ -3697,6 +3697,34 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
 
+                # Смотрим структуру конкретной отгрузки из UI
+                demand_id = "b9ef038f-2740-11f1-0a80-16cd000335c6"
+                async with session.get(
+                    f"{MS_BASE}/entity/demand/{demand_id}",
+                    headers=get_headers()
+                ) as r:
+                    d = await r.json()
+
+                agent = d.get("agent", {})
+                owner = d.get("owner", {})
+                agent_href = agent.get("meta", {}).get("href", "")
+                agent_id = agent.get("id", "")
+
+                # Загружаем полную карточку агента
+                async with session.get(agent_href, headers=get_headers()) as r2:
+                    cp_full = await r2.json()
+
+                await update.message.reply_text(
+                    f"📋 *Отгрузка {d.get('name')}*\n"
+                    f"Агент: {agent.get('name', '?')}\n"
+                    f"Agent ID: `{agent_id}`\n"
+                    f"Теги агента: {cp_full.get('tags', [])}\n"
+                    f"Moment: {d.get('moment', '')}\n"
+                    f"Owner: {owner.get('name', '?')}\n"
+                    f"Agent в cp_ids: {agent_id in cp_ids}",
+                    parse_mode="Markdown"
+                )
+
             # Считаем отгрузки — по каждому клиенту отдельно
             shipments = 0
             revenue = 0.0
