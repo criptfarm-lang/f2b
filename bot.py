@@ -3799,16 +3799,6 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text(f"Контрагентов с тегом {tag}: {len(cp_ids)}")
 
-            # Показываем первых 5 клиентов для проверки
-            async with session.get(
-                f"{MS_BASE}/entity/counterparty",
-                headers=get_headers(),
-                params={"filter": f"tags={tag}", "limit": 5}
-            ) as r:
-                sample_cps = await r.json()
-            names = [cp.get("name","") for cp in sample_cps.get("rows", [])]
-            await update.message.reply_text(f"Примеры клиентов: {names}")
-
             shipments = 0
             revenue = 0.0
             clients = set()
@@ -3877,7 +3867,6 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             revenue = 0.0
             clients = set()
             offset = 0
-            first_checked = False
             while True:
                 async with session.get(
                     f"{MS_BASE}/entity/demand",
@@ -3891,15 +3880,6 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ) as r:
                     data = await r.json()
                 rows = data.get("rows", [])
-                # Логируем первую строку один раз
-                if rows and not first_checked:
-                    first_checked = True
-                    agent0 = rows[0].get("agent", {})
-                    agent_id0 = agent0.get("id", "НЕТУ")
-                    agent_keys = list(agent0.keys())
-                    await update.message.reply_text(
-                        f"DEBUG первая отгрузка:\nagent keys: {agent_keys}\nagent.id: {agent_id0}\nЕсть в cp_ids: {agent_id0 in cp_ids}"
-                    )
                 for row in rows:
                     agent = row.get("agent", {})
                     agent_href = agent.get("meta", {}).get("href", "")
