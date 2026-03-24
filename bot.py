@@ -3721,8 +3721,8 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if plan_val > 0:
                     fv = f"{fact_val:.1f}" if divisor == 1_000_000 else f"{int(fact_val)}"
                     pv = f"{plan_val:.1f}" if divisor == 1_000_000 else f"{int(plan_val)}"
-                    ax.text(max(pct * 0.5, 0.05), by, f"{fv} / {pv}",
-                            va="center", ha="center", color="white",
+                    ax.text(0.02, by, f"{fv} / {pv}",
+                            va="center", ha="left", color="white",
                             fontsize=6.5, fontweight="bold", zorder=3)
 
                 ytick_pos.append(by)
