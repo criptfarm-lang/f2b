@@ -258,18 +258,6 @@ class Database:
                 chat_id BIGINT,
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
-            """CREATE TABLE IF NOT EXISTS sales_plans (
-                id SERIAL PRIMARY KEY,
-                manager TEXT NOT NULL,
-                period_start DATE NOT NULL,
-                period_end DATE NOT NULL,
-                revenue NUMERIC DEFAULT 0,
-                shipments INT DEFAULT 0,
-                clients INT DEFAULT 0,
-                created_by TEXT,
-                created_at TIMESTAMP DEFAULT NOW(),
-                UNIQUE(manager, period_start)
-            )""",
             # Таблица для хранения контекста алертов цены (ожидание ответа менеджера)
             """CREATE TABLE IF NOT EXISTS price_alerts (
                 id SERIAL PRIMARY KEY,
@@ -365,38 +353,6 @@ class Database:
         return last_date, results
 
     # ─── ПЛАНЫ ПРОДАЖ ────────────────────────────────────────────────────────
-
-    def save_sales_plan(self, manager: str, period_start, period_end,
-                        revenue: float, shipments: int, clients: int, created_by: str = ""):
-        self._execute(
-            """INSERT INTO sales_plans (manager, period_start, period_end, revenue, shipments, clients, created_by)
-               VALUES (%s,%s,%s,%s,%s,%s,%s)
-               ON CONFLICT (manager, period_start) DO UPDATE SET
-                 period_end=%s, revenue=%s, shipments=%s, clients=%s, created_by=%s, created_at=NOW()""",
-            (manager, period_start, period_end, revenue, shipments, clients, created_by,
-             period_end, revenue, shipments, clients, created_by)
-        )
-
-    def get_current_plans(self, date=None) -> list:
-        """Последний актуальный план каждого менеджера."""
-        from datetime import date as _date
-        d = date or _date.today()
-        return self._fetchall(
-            """SELECT DISTINCT ON (manager)
-                      manager, revenue, shipments, clients, period_start, period_end
-               FROM sales_plans
-               WHERE period_start <= %s
-               ORDER BY manager, period_start DESC""",
-            (d,)
-        )
-
-    def get_plans_for_period(self, period_start) -> list:
-        return self._fetchall(
-            "SELECT * FROM sales_plans WHERE period_start=%s ORDER BY manager",
-            (period_start,)
-        )
-
-    # ─── ЧАТЫ МЕНЕДЖЕРОВ ────────────────────────────────────────────────────────
 
     def save_manager_chat_id(self, user_id: int, full_name: str):
         self._execute(
