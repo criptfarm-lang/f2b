@@ -4146,20 +4146,42 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка: {e}")
 
 async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/set_promo — задать рекламный текст для отправки клиентам при согласовании заказа."""
+    """/set_promo [хорека|опт] [текст] — задать рекламный текст по сегменту."""
     user = update.effective_user
     if not user or user.id != 360092495:
         return
+
     if not context.args:
-        current = db.get_promo()
-        if current:
-            await update.message.reply_text(f"Текущий промо-текст:\n\n{current}\n\nЧтобы изменить: /set_promo [новый текст]")
-        else:
-            await update.message.reply_text("Промо-текст не задан.\nИспользование: /set_promo [текст]")
+        хорека = db.get_promo("хорека")
+        опт = db.get_promo("опт")
+        общий = db.get_promo()
+        msg = (
+            "📢 *Текущие промо-тексты:*\n\n"
+            f"*Хорека:*\n{хорека or '— не задан'}\n\n"
+            f"*Опт:*\n{опт or '— не задан'}\n\n"
+            f"*Общий:*\n{общий or '— не задан'}\n\n"
+            "Чтобы изменить:\n"
+            "`/set_promo хорека [текст]`\n"
+            "`/set_promo опт [текст]`\n"
+            "`/set_promo [текст]` — общий"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
         return
-    text = " ".join(context.args)
-    db.set_promo(text)
-    await update.message.reply_text(f"✅ Промо-текст сохранён:\n\n{text}")
+
+    # Проверяем первый аргумент — сегмент или начало текста
+    first = context.args[0].lower()
+    if first in ("хорека", "horeka", "опт", "opt"):
+        segment = "хорека" if first in ("хорека", "horeka") else "опт"
+        text = " ".join(context.args[1:])
+        if not text:
+            await update.message.reply_text(f"Укажи текст: /set_promo {first} [текст]")
+            return
+        db.set_promo(text, segment)
+        await update.message.reply_text(f"✅ Промо для *{segment}* сохранён:\n\n{text}", parse_mode="Markdown")
+    else:
+        text = " ".join(context.args)
+        db.set_promo(text)
+        await update.message.reply_text(f"✅ Общий промо сохранён:\n\n{text}")
 
 
 async def cmd_test_publink(update, context):
@@ -5179,6 +5201,74 @@ async def check_order_agreed(order_href: str, bot):
 
         logger.info(f"check_order_agreed: заказ {order_name} клиент={agent_name} статус=Согласовано")
 
+        # Загружаем позиции заказа
+        order_id = order_href.split("/")[-1].split("?")[0]
+        positions_text = ""
+        try:
+            async with aiohttp.ClientSession() as session2:
+                async with session2.get(
+                    f"https://api.moysklad.ru/api/remap/1.2/entity/customerorder/{order_id}/positions",
+                    headers=get_headers(),
+                    params={"expand": "assortment", "limit": 100}
+                ) as r2:
+                    if r2.status == 200:
+                        pos_data = await r2.json()
+                        lines = []
+                        for pos in pos_data.get("rows", []):
+                            name = pos.get("assortment", {}).get("name", "?")
+                            qty = int(pos.get("quantity", 0))
+                            price = (pos.get("price", 0) or 0) / 100
+                            total = qty * price
+                            lines.append(f"  • {name} × {qty} = {total:,.0f} руб.")
+                        if lines:
+                            positions_text = "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"check_order_agreed: не удалось загрузить позиции: {e}")
+
+        # Формируем сообщение
+        delivery = order.get("deliveryPlannedMoment", "")[:10] if order.get("deliveryPlannedMoment") else ""
+
+        # Определяем сегмент клиента по тегам
+        segment = None
+        tags = agent.get("tags", [])
+        for tag in tags:
+            if tag.lower() in ("хорека", "horeka"):
+                segment = "хорека"
+                break
+            elif tag.lower() == "опт":
+                segment = "опт"
+                break
+
+        # Если теги не пришли в expand — загружаем карточку
+        if not tags and agent_id:
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(
+                        f"https://api.moysklad.ru/api/remap/1.2/entity/counterparty/{agent_id}",
+                        headers=get_headers()
+                    ) as r:
+                        if r.status == 200:
+                            cp = await r.json()
+                            for tag in cp.get("tags", []):
+                                if tag.lower() in ("хорека", "horeka"):
+                                    segment = "хорека"
+                                    break
+                                elif tag.lower() == "опт":
+                                    segment = "опт"
+                                    break
+            except Exception:
+                pass
+
+        promo = db.get_promo(segment)
+        msg = f"📋 Пожалуйста, проверьте заказ *{order_name}*\n\n"
+        if positions_text:
+            msg += f"📦 Состав:\n{positions_text}\n\n"
+        msg += f"💰 Итого: *{order_sum:,.0f} руб.*\n"
+        if delivery:
+            msg += f"📅 Плановая дата отгрузки: {delivery}\n"
+        if promo:
+            msg += f"\n{promo}"
+
         # Ищем мессенджер клиента
         contact = db._fetchone(
             """SELECT chat_id, channel_id, chat_type, manager
@@ -5187,14 +5277,6 @@ async def check_order_agreed(order_href: str, bot):
                LIMIT 1""",
             (f"%{agent_name}%",)
         )
-
-        promo = db.get_promo()
-        msg = (
-            f"✅ Ваш заказ *{order_name}* согласован!\n"
-            f"💰 Сумма: *{order_sum:,.0f} руб.*\n\n"
-        )
-        if promo:
-            msg += f"{promo}"
 
         if not contact:
             # Нет мессенджера — уведомляем менеджера
@@ -5211,7 +5293,6 @@ async def check_order_agreed(order_href: str, bot):
                 )
             logger.info(f"check_order_agreed: мессенджер {agent_name} не найден, уведомлён {owner_name}")
             return
-
         # Отправляем через Wazzup
         import aiohttp as _aio
         api_key = os.getenv("WAZZUP_API_KEY", "")
