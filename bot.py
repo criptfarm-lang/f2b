@@ -3818,6 +3818,93 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"cmd_op_report: {e}", exc_info=True)
         await reply(f"Ошибка: {e}")
 
+async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/test_group — тест суммы по группе товаров за текущий месяц."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+
+    import aiohttp
+    from datetime import date
+    from moysklad import get_headers
+    MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
+
+    month_start = date.today().replace(day=1).isoformat()
+    month_end   = date.today().isoformat()
+
+    await update.message.reply_text("🔍 Ищу группу товаров ПРИВЛЕЧЕННЫЕ ТОВАРЫ...")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+
+            # 1. Ищем группу товаров по названию
+            async with session.get(
+                f"{MS_BASE}/entity/productfolder",
+                headers=get_headers(),
+                params={"filter": "name=ПРИВЛЕЧЕННЫЕ ТОВАРЫ", "limit": 10}
+            ) as r:
+                data = await r.json()
+
+            folders = data.get("rows", [])
+            if not folders:
+                # Попробуем без точного совпадения
+                async with session.get(
+                    f"{MS_BASE}/entity/productfolder",
+                    headers=get_headers(),
+                    params={"limit": 100}
+                ) as r:
+                    data = await r.json()
+                all_folders = [(f.get("name"), f.get("meta",{}).get("href","")) for f in data.get("rows",[])]
+                await update.message.reply_text(f"Все группы товаров:\n" + "\n".join(f[0] for f in all_folders[:20]))
+                return
+
+            folder = folders[0]
+            folder_href = folder.get("meta", {}).get("href", "")
+            folder_name = folder.get("name", "")
+            await update.message.reply_text(f"Группа найдена: {folder_name}")
+
+            # 2. Запрашиваем отчёт прибыльности по товарам в этой группе
+            # Фильтр: productFolder + теги менеджера (через контрагентов)
+            # Сначала просто общая сумма по группе за период
+            offset = 0
+            total_sum = 0.0
+            while True:
+                params = {
+                    "momentFrom": f"{month_start} 00:00:00",
+                    "momentTo":   f"{month_end} 23:59:59",
+                    "filter":     f"productFolder={folder_href}",
+                    "limit": 200,
+                    "offset": offset,
+                }
+                async with session.get(
+                    f"{MS_BASE}/report/profit/byproduct",
+                    headers=get_headers(), params=params
+                ) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        await update.message.reply_text(f"Ошибка {r.status}: {body[:200]}")
+                        return
+                    data = await r.json()
+
+                rows = data.get("rows", [])
+                for row in rows:
+                    total_sum += (row.get("sellSum", 0) or 0) / 100
+
+                total = data.get("meta", {}).get("size", 0)
+                offset += len(rows)
+                if offset >= total or len(rows) < 200:
+                    break
+
+            await update.message.reply_text(
+                f"Группа: {folder_name}\n"
+                f"Период: {month_start} — {month_end}\n"
+                f"Сумма продаж: {total_sum:,.0f} руб."
+            )
+
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+
 async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_fact [тег] — тест получения отгрузок по тегу за текущий месяц."""
     user = update.effective_user
@@ -4443,6 +4530,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_task_done_callback, pattern="^task_done\\|"))
     app.add_handler(CommandHandler("del_tasks", cmd_delete_executor_tasks))
     app.add_handler(CommandHandler("op_report", cmd_op_report))
+    app.add_handler(CommandHandler("test_group", cmd_test_group))
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
     app.add_handler(CommandHandler("block", cmd_block_user))
     app.add_handler(CommandHandler("unblock", cmd_unblock_user))
