@@ -407,7 +407,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await cmd_pdz_results(update, context)
 
     elif action == "menu_evening":
-        await query.message.reply_text("📊 Отчёт ОП — в разработке.")
+        await cmd_op_report(update, context)
 
     elif action == "menu_activity":
         await query.message.reply_text(
@@ -3634,13 +3634,204 @@ async def cmd_delete_executor_tasks(update: Update, context: ContextTypes.DEFAUL
     await update.message.reply_text(f"✅ Закрыто задач для *{name}*: {count}", parse_mode="Markdown")
 
 
+async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/op_report — Отчёт ОП: план vs факт по менеджерам."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+
+    await update.message.reply_text("⏳ Собираю данные...")
+
+    from datetime import date
+    from moysklad import get_manager_shipments
+
+    today = date.today()
+    month_start = today.replace(day=1).isoformat()
+    month_end = today.isoformat()
+
+    facts = await get_manager_shipments(month_start, month_end)
+
+    # Планы — заданные вручную (TODO: брать из БД)
+    PLANS = {
+        "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29},
+        "Карина Баласанян": {"shipments": 150, "revenue": 5_000_000,  "clients": 38},
+        "Елена Мерзлякова": {"shipments": 65,  "revenue": 6_000_000,  "clients": 30},
+        "Алексей Леонтьев": {"shipments": 12,  "revenue": 180_000,    "clients": 5},
+        "Сергей Черентаев": {"shipments": 4,   "revenue": 200_000,    "clients": 4},
+    }
+
+    try:
+        import io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        MANAGERS = [
+            ("Инесса Скляр",     "Инесса"),
+            ("Карина Баласанян", "Карина"),
+            ("Елена Мерзлякова", "Елена"),
+            ("Алексей Леонтьев", "Алексей"),
+            ("Сергей Черентаев", "Сергей"),
+        ]
+        METRICS = [
+            ("revenue",   "Выручка",  1_000_000, "#4FC3F7"),
+            ("shipments", "Отгрузки", 1,          "#66BB6A"),
+            ("clients",   "Клиенты",  1,          "#FFA726"),
+        ]
+
+        bar_h = 0.2
+        bar_gap = 0.05
+        mgr_gap = 0.4
+        group_h = len(METRICS) * bar_h + (len(METRICS) - 1) * bar_gap
+        step = group_h + mgr_gap
+
+        fig_h = len(MANAGERS) * step + 0.5
+        fig, ax = plt.subplots(figsize=(7, fig_h))
+        fig.patch.set_facecolor("#0d1117")
+        ax.set_facecolor("#0d1117")
+
+        BAR_END = 1.0
+        XLIM = 1.5
+        ytick_pos = []
+        ytick_labels = []
+        mgr_label_data = []
+
+        for mgr_i, (full_name, short) in enumerate(MANAGERS):
+            plan = PLANS.get(full_name, {})
+            fact = facts.get(full_name, {})
+            gy_bottom = mgr_i * step
+            bar_ys = []
+
+            for met_i, (metric, label, divisor, color) in enumerate(METRICS):
+                plan_val = float(plan.get(metric) or 0) / divisor
+                fact_val = float(fact.get(metric) or 0) / divisor
+                pct = min(fact_val / plan_val, 1.0) if plan_val > 0 else 0.0
+                by = gy_bottom + met_i * (bar_h + bar_gap)
+
+                # Полный бар = план
+                ax.barh(by, BAR_END, height=bar_h, color="#21262d", left=0, zorder=1)
+                # Заштрихованный = факт
+                ax.barh(by, max(pct * BAR_END, 0.005), height=bar_h,
+                        color=color, alpha=0.85, hatch="///", edgecolor=color, zorder=2)
+
+                # Данные факт/план на баре
+                if plan_val > 0:
+                    fv = f"{fact_val:.1f}" if divisor == 1_000_000 else f"{int(fact_val)}"
+                    pv = f"{plan_val:.1f}" if divisor == 1_000_000 else f"{int(plan_val)}"
+                    ax.text(pct * BAR_END / 2, by, f"{fv}/{pv}",
+                            va="center", ha="center", color="white",
+                            fontsize=6.5, fontweight="bold", zorder=3)
+
+                ytick_pos.append(by)
+                ytick_labels.append(label)
+                bar_ys.append(by)
+
+            cx = 0.5
+            top_y = gy_bottom + group_h + 0.15
+            mgr_label_data.append((cx, top_y, short))
+
+        for lx, ly, name in mgr_label_data:
+            ax.text(lx, ly, name, ha="center", va="bottom",
+                    color="#c9d1d9", fontsize=9, fontweight="bold")
+
+        ax.set_xlim(0, XLIM)
+        ax.set_ylim(-bar_h, len(MANAGERS) * step)
+        ax.set_yticks(ytick_pos)
+        ax.set_yticklabels(ytick_labels, color="#8b949e", fontsize=7)
+        ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
+        ax.set_xticklabels(["0%", "25%", "50%", "75%", "100%"], color="#555", fontsize=7)
+        ax.xaxis.grid(True, color="#21262d", linewidth=0.5, zorder=0)
+        ax.axvline(x=BAR_END, color="#444", linewidth=0.8, linestyle="--", zorder=3)
+        ax.set_axisbelow(True)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        ax.set_title(f"Отчёт ОП — {today.strftime('%d.%m.%Y')}",
+                     color="#c9d1d9", fontsize=10, pad=8)
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=130,
+                    facecolor=fig.get_facecolor(), bbox_inches="tight")
+        buf.seek(0)
+        plt.close()
+
+        await update.message.reply_photo(photo=buf, caption="📊 Отчёт ОП")
+
+    except Exception as e:
+        logger.error(f"cmd_op_report: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка графика: {e}")
+
+
 async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_fact [тег] — тест получения отгрузок по тегу за текущий месяц."""
     user = update.effective_user
     if not user or user.id != 360092495:
         return
     tag = " ".join(context.args).lower() if context.args else "скляр"
-    await update.message.reply_text(f"🔍 Считаю отгрузки за март по тегу *{tag}*...", parse_mode="Markdown")
+    await update.message.reply_text(f"🔍 Считаю отгрузки за март по тегу {tag}...")
+
+    import aiohttp
+    from datetime import date
+    from moysklad import get_headers
+    MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
+
+    month_start = date.today().replace(day=1).isoformat()
+    month_end = date.today().isoformat()
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            cp_ids = set()
+            offset = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/counterparty",
+                    headers=get_headers(),
+                    params={"filter": f"tags={tag}", "limit": 100, "offset": offset}
+                ) as r:
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for cp in rows:
+                    cp_ids.add(cp.get("id", ""))
+                if len(rows) < 100:
+                    break
+                offset += 100
+
+            await update.message.reply_text(f"Контрагентов с тегом {tag}: {len(cp_ids)}")
+
+            shipments = 0
+            revenue = 0.0
+            clients = set()
+            offset = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(),
+                    params={
+                        "filter": f"moment>={month_start} 00:00:00;moment<={month_end} 23:59:59",
+                        "expand": "agent",
+                        "limit": 200,
+                        "offset": offset,
+                    }
+                ) as r:
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
+                    agent_id = agent_href.split("/")[-1] if agent_href else ""
+                    if agent_id in cp_ids:
+                        shipments += 1
+                        revenue += (row.get("sum", 0) or 0) / 100
+                        clients.add(agent_id)
+                if len(rows) < 200:
+                    break
+                offset += 200
+
+            await update.message.reply_text(
+                f"Итог {tag} за март:\nОтгрузок: {shipments}\nВыручка: {revenue:,.0f} руб.\nКлиентов: {len(clients)}"
+            )
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
 
     import aiohttp
     from datetime import date
@@ -4194,6 +4385,7 @@ def main():
     # Команды
     app.add_handler(CallbackQueryHandler(handle_task_done_callback, pattern="^task_done\\|"))
     app.add_handler(CommandHandler("del_tasks", cmd_delete_executor_tasks))
+    app.add_handler(CommandHandler("op_report", cmd_op_report))
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
     app.add_handler(CommandHandler("block", cmd_block_user))
     app.add_handler(CommandHandler("unblock", cmd_unblock_user))
