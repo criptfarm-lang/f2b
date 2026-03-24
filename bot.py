@@ -4245,6 +4245,70 @@ async def cmd_test_publink(update, context):
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
+async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unlink [chat_id или имя контакта] — удаляет контакт из базы идентификации."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /unlink [chat_id]\nПример: /unlink 1293122998")
+        return
+
+    query_val = " ".join(context.args)
+
+    # Пробуем удалить по chat_id или по имени контакта
+    rows = db._fetchall(
+        "SELECT chat_id, contact_name, company_name FROM wazzup_contact_map WHERE chat_id=%s OR LOWER(contact_name) LIKE LOWER(%s)",
+        (query_val, f"%{query_val}%")
+    )
+    if not rows:
+        await update.message.reply_text(f"❌ Контакт не найден: {query_val}")
+        return
+
+    for r in rows:
+        db._execute("DELETE FROM wazzup_contact_map WHERE chat_id=%s", (r["chat_id"],))
+        await update.message.reply_text(
+            f"✅ Удалён: {r['contact_name']} / {r['company_name']} (chat_id: {r['chat_id']})"
+        )
+
+
+async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/relink [chat_id] [новое имя компании] — перепривязывает контакт к другой компании."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /relink [chat_id] [название компании]\n"
+            "Пример: /relink 1293122998 ИП Махнев"
+        )
+        return
+
+    chat_id = context.args[0]
+    company_name = " ".join(context.args[1:])
+
+    # Обновляем company_name в wazzup_contact_map
+    db._execute(
+        "UPDATE wazzup_contact_map SET company_name=%s WHERE chat_id=%s",
+        (company_name, chat_id)
+    )
+    rows = db._fetchall(
+        "SELECT chat_id, contact_name, company_name, manager FROM wazzup_contact_map WHERE chat_id=%s",
+        (chat_id,)
+    )
+    if rows:
+        r = rows[0]
+        await update.message.reply_text(
+            f"✅ Контакт перепривязан:\n"
+            f"chat_id: {r['chat_id']}\n"
+            f"Контакт: {r['contact_name']}\n"
+            f"Компания: {r['company_name']}\n"
+            f"Менеджер: {r['manager']}"
+        )
+    else:
+        await update.message.reply_text(f"❌ Контакт с chat_id={chat_id} не найден")
+
+
 async def cmd_sync_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sync_managers — обновляет менеджеров в базе по тегам МойСклад."""
     user = update.effective_user
@@ -4862,6 +4926,8 @@ def main():
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
     app.add_handler(CommandHandler("set_promo", cmd_set_promo))
     app.add_handler(CommandHandler("test_publink", cmd_test_publink))
+    app.add_handler(CommandHandler("unlink", cmd_unlink))
+    app.add_handler(CommandHandler("relink", cmd_relink))
     app.add_handler(CommandHandler("sync_managers", cmd_sync_managers))
     app.add_handler(CommandHandler("search_msg", cmd_search_msg))
     app.add_handler(CommandHandler("aging", cmd_aging))
