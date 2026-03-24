@@ -3707,7 +3707,7 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ("shipments",  "Отгрузки",     1,          "#a855f7"),
             ("clients",    "Клиенты",      1,          "#c084fc"),
             ("new_clients","Клиенты нов.", 1,          "#e879f9"),
-            ("attracted",  "Привл.тов.",   1_000_000,  "#f0abfc"),
+            ("attracted",  "Привл.тов, т.", 1_000,     "#f0abfc"),
         ]
 
         BG      = "#ffffff"
@@ -3753,8 +3753,15 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         edgecolor=color, zorder=2)
 
                 if plan_val > 0:
-                    fv = f"{fact_val:.1f}" if divisor == 1_000_000 else f"{int(fact_val)}"
-                    pv = f"{plan_val:.1f}" if divisor == 1_000_000 else f"{int(plan_val)}"
+                    if divisor == 1_000_000:
+                        fv = f"{fact_val:.1f}"
+                        pv = f"{plan_val:.1f}"
+                    elif divisor == 1_000:
+                        fv = f"{fact_val:.0f}"
+                        pv = f"{plan_val:.0f}"
+                    else:
+                        fv = f"{int(fact_val)}"
+                        pv = f"{int(plan_val)}"
                     ax.text(0.02, by, f"{fv} / {pv}",
                             va="center", ha="left", color="white",
                             fontsize=6.5, fontweight="bold", zorder=3)
@@ -3789,7 +3796,7 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{total_fact['new_clients']} / {total_plan['new_clients']}\n"
             f"{pct(total_fact['new_clients'], total_plan['new_clients'])}\n\n"
             f"Привл.тов.\n"
-            f"{total_fact['attracted']/1e6:.2f} / {total_plan['attracted']/1e6:.1f} млн\n"
+            f"{total_fact['attracted']/1e3:.0f} / {total_plan['attracted']/1e3:.0f} т.р.\n"
             f"{pct(total_fact['attracted'], total_plan['attracted'])}"
         )
 
