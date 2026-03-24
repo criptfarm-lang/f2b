@@ -3652,12 +3652,16 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     facts = await get_manager_shipments(month_start, month_end)
 
     PLANS = {
-        "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29},
-        "Карина Баласанян": {"shipments": 150, "revenue": 5_000_000,  "clients": 38},
-        "Елена Мерзлякова": {"shipments": 65,  "revenue": 6_000_000,  "clients": 30},
-        "Алексей Леонтьев": {"shipments": 12,  "revenue": 180_000,    "clients": 5},
-        "Сергей Черентаев": {"shipments": 4,   "revenue": 200_000,    "clients": 4},
+        "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29, "new_clients": 3},
+        "Карина Баласанян": {"shipments": 150, "revenue": 5_000_000,  "clients": 38, "new_clients": 3},
+        "Елена Мерзлякова": {"shipments": 65,  "revenue": 6_000_000,  "clients": 30, "new_clients": 3},
+        "Алексей Леонтьев": {"shipments": 12,  "revenue": 180_000,    "clients": 5,  "new_clients": 3},
+        "Сергей Черентаев": {"shipments": 4,   "revenue": 200_000,    "clients": 4,  "new_clients": 3},
     }
+
+    # new_clients пока 0 — будет добавлено позже
+    for name in facts:
+        facts[name]["new_clients"] = 0
 
     try:
         import io
@@ -3673,18 +3677,19 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ("Сергей Черентаев", "Сергей"),
         ]
         METRICS = [
-            ("revenue",   "Выручка, млн",  1_000_000, "#7c3aed"),
-            ("shipments", "Отгрузки",      1,          "#a855f7"),
-            ("clients",   "Клиенты",       1,          "#c084fc"),
+            ("revenue",    "Выручка, млн", 1_000_000, "#7c3aed"),
+            ("shipments",  "Отгрузки",     1,          "#a855f7"),
+            ("clients",    "Клиенты",      1,          "#c084fc"),
+            ("new_clients","Клиенты нов.", 1,          "#e879f9"),
         ]
 
-        BG     = "#ffffff"
-        BG_AX  = "#f8f7ff"
-        BAR_BG = "#e8e5f5"
-        TEXT   = "#1e1b4b"
-        SUBTEXT= "#6b7280"
-        GRID   = "#e5e7eb"
-        LINE100= "#7c3aed"
+        BG      = "#ffffff"
+        BG_AX   = "#f8f7ff"
+        BAR_BG  = "#e8e5f5"
+        TEXT    = "#1e1b4b"
+        SUBTEXT = "#6b7280"
+        GRID    = "#e5e7eb"
+        LINE100 = "#7c3aed"
 
         bar_h   = 0.18
         bar_gap = 0.04
@@ -3693,9 +3698,12 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         step    = group_h + mgr_gap
 
         fig_h = len(MANAGERS) * step + 1.2
-        fig, ax = plt.subplots(figsize=(8, fig_h))
+        fig, ax = plt.subplots(figsize=(10, fig_h))
         fig.patch.set_facecolor(BG)
         ax.set_facecolor(BG_AX)
+
+        BAR_END = 1.0
+        XLIM    = 1.8
 
         ytick_pos = []
         ytick_labels = []
@@ -3705,7 +3713,6 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             plan = PLANS.get(full_name, {})
             fact = facts.get(full_name, {})
             gy   = mgr_i * step
-            bar_ys = []
 
             for met_i, (metric, label, divisor, color) in enumerate(METRICS):
                 plan_val = float(plan.get(metric) or 0) / divisor
@@ -3713,7 +3720,7 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pct      = min(fact_val / plan_val, 1.0) if plan_val > 0 else 0.0
                 by       = gy + met_i * (bar_h + bar_gap)
 
-                ax.barh(by, 1.0, height=bar_h, color=BAR_BG, left=0, zorder=1)
+                ax.barh(by, BAR_END, height=bar_h, color=BAR_BG, left=0, zorder=1)
                 ax.barh(by, max(pct, 0.006), height=bar_h,
                         color=color, alpha=0.85, hatch="///",
                         edgecolor=color, zorder=2)
@@ -3727,7 +3734,6 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 ytick_pos.append(by)
                 ytick_labels.append(label)
-                bar_ys.append(by)
 
             mgr_labels.append((0.5, gy + group_h + 0.17, short))
 
@@ -3735,22 +3741,49 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ax.text(lx, ly, name, ha="center", va="bottom",
                     color=TEXT, fontsize=9, fontweight="bold")
 
-        ax.set_xlim(0, 1.5)
+        # Суммарные план/факт
+        total_plan = {m: sum(PLANS[n][m] for n in PLANS) for m in ["revenue","shipments","clients","new_clients"]}
+        total_fact = {m: sum(facts.get(n, {}).get(m, 0) for n in PLANS) for m in ["revenue","shipments","clients","new_clients"]}
+
+        def pct(f, p): return f"{f/p*100:.0f}%" if p else "—"
+
+        box_text = (
+            f"  ПЛАН МЕСЯЦ  \n\n"
+            f"Выручка\n"
+            f"{total_fact['revenue']/1e6:.1f} / {total_plan['revenue']/1e6:.0f} млн\n"
+            f"{pct(total_fact['revenue'], total_plan['revenue'])}\n\n"
+            f"Отгрузки\n"
+            f"{total_fact['shipments']} / {total_plan['shipments']}\n"
+            f"{pct(total_fact['shipments'], total_plan['shipments'])}\n\n"
+            f"Клиенты\n"
+            f"{total_fact['clients']} / {total_plan['clients']}\n"
+            f"{pct(total_fact['clients'], total_plan['clients'])}\n\n"
+            f"Клиенты нов.\n"
+            f"{total_fact['new_clients']} / {total_plan['new_clients']}\n"
+            f"{pct(total_fact['new_clients'], total_plan['new_clients'])}"
+        )
+
+        mid_y = (len(MANAGERS) * step) / 2 - 0.3
+        ax.text(1.43, mid_y, box_text,
+                va="center", ha="center", color=TEXT,
+                fontsize=12, family="monospace",
+                transform=ax.transData,
+                bbox=dict(boxstyle="round,pad=0.7", facecolor="#ede9fe",
+                          edgecolor="#c4b5fd", linewidth=1.5, alpha=0.95))
+
+        ax.set_xlim(0, XLIM)
         ax.set_ylim(-bar_h, len(MANAGERS) * step)
         ax.set_yticks(ytick_pos)
         ax.set_yticklabels(ytick_labels, color=SUBTEXT, fontsize=7)
         ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
         ax.set_xticklabels(["0%", "25%", "50%", "75%", "100%"], color=SUBTEXT, fontsize=7)
         ax.xaxis.grid(True, color=GRID, linewidth=0.6, zorder=0)
-        ax.axvline(x=1.0, color=LINE100, linewidth=1.0, linestyle="--", zorder=3)
+        ax.axvline(x=BAR_END, color=LINE100, linewidth=1.0, linestyle="--", zorder=3)
         ax.set_axisbelow(True)
         for spine in ax.spines.values():
             spine.set_color(GRID)
 
-        ax.set_title(
-            f"Отчёт ОП · {today.strftime('%d.%m.%Y')}  |  план: неделя = месяц (накопительно)",
-            color=TEXT, fontsize=9, pad=10
-        )
+        ax.set_title(f"Отчёт ОП · {today.strftime('%d.%m.%Y')}", color=TEXT, fontsize=10, pad=10)
 
         plt.tight_layout()
         buf = io.BytesIO()
@@ -3762,7 +3795,7 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"cmd_op_report: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        await update.message.reply_text(f"Ошибка: {e}")
 
 async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_fact [тег] — тест получения отгрузок по тегу за текущий месяц."""
