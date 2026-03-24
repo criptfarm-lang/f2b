@@ -4163,7 +4163,7 @@ async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_test_publink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/test_publink [order_id] — проверяет публичную ссылку на заказ в МойСклад."""
+    """/test_publink [order_id] — проверяет варианты ссылок на заказ в МойСклад."""
     user = update.effective_user
     if not user or user.id != 360092495:
         return
@@ -4171,35 +4171,58 @@ async def cmd_test_publink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import aiohttp
     from moysklad import get_headers, MS_BASE
 
-    # Берём ID из аргумента или используем тестовый
-    order_id = context.args[0] if context.args else None
-    if not order_id:
-        await update.message.reply_text("Использование: /test_publink [order_id]\nПример: /test_publink b9ef038f-2740-11f1-0a80-16cd000335c6")
-        return
-
-    await update.message.reply_text(f"🔍 Проверяю публичную ссылку для заказа {order_id}...")
+    order_id = context.args[0] if context.args else "ff0588e7-2766-11f1-0a80-01a1000aa0eb"
+    await update.message.reply_text(f"🔍 Проверяю варианты ссылок для заказа...")
 
     try:
         async with aiohttp.ClientSession() as session:
 
-            # 1. Пробуем получить публичную ссылку через API
+            # 1. Получаем данные заказа
             async with session.get(
-                f"{MS_BASE}/entity/customerorder/{order_id}/publications",
+                f"{MS_BASE}/entity/customerorder/{order_id}",
                 headers=get_headers()
             ) as r:
-                status = r.status
-                body = await r.json() if r.status == 200 else await r.text()
-                await update.message.reply_text(f"GET publications: {status}\n{str(body)[:300]}")
+                order = await r.json()
 
-            # 2. Пробуем создать публикацию
-            async with session.post(
-                f"{MS_BASE}/entity/customerorder/{order_id}/publications",
+            order_name = order.get("name", "")
+            agent_href = order.get("agent", {}).get("meta", {}).get("href", "")
+            agent_id = agent_href.split("/")[-1] if agent_href else ""
+
+            await update.message.reply_text(f"Заказ: {order_name}\nКонтрагент ID: {agent_id}")
+
+            # 2. Пробуем publications на demand (отгрузка)
+            # Ищем связанную отгрузку
+            async with session.get(
+                f"{MS_BASE}/entity/demand",
                 headers=get_headers(),
-                json={"template": {"meta": {"href": f"{MS_BASE}/entity/customerorder/metadata/customtemplate", "type": "customtemplate", "mediaType": "application/json"}}}
+                params={"filter": f"customerOrder={MS_BASE}/entity/customerorder/{order_id}", "limit": 1}
             ) as r:
-                status2 = r.status
-                body2 = await r.json() if r.status in (200, 201) else await r.text()
-                await update.message.reply_text(f"POST publications: {status2}\n{str(body2)[:300]}")
+                demands = await r.json()
+            demand_rows = demands.get("rows", [])
+            if demand_rows:
+                demand_id = demand_rows[0].get("id", "")
+                demand_name = demand_rows[0].get("name", "")
+                await update.message.reply_text(f"Связанная отгрузка: {demand_name} ({demand_id})")
+
+                # Пробуем публикацию отгрузки
+                async with session.get(
+                    f"{MS_BASE}/entity/demand/{demand_id}/publications",
+                    headers=get_headers()
+                ) as r2:
+                    pub_status = r2.status
+                    pub_body = await r2.json() if r2.status == 200 else await r2.text()
+                await update.message.reply_text(f"Publications отгрузки: {pub_status}\n{str(pub_body)[:300]}")
+            else:
+                await update.message.reply_text("Связанных отгрузок нет")
+
+            # 3. Проверяем личный кабинет покупателя
+            async with session.get(
+                f"{MS_BASE}/entity/counterparty/{agent_id}/accounts",
+                headers=get_headers()
+            ) as r:
+                acc_status = r.status
+                acc_body = await r.json() if r.status == 200 else await r.text()
+            await update.message.reply_text(f"Аккаунты контрагента: {acc_status}\n{str(acc_body)[:300]}")
 
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
