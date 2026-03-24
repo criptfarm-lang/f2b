@@ -250,6 +250,11 @@ class Database:
             "ALTER TABLE manager_chats ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT FALSE",
             "ALTER TABLE manager_chats ADD COLUMN IF NOT EXISTS request_count INT DEFAULT 0",
             "ALTER TABLE manager_chats ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT NOW()",
+            """CREATE TABLE IF NOT EXISTS aging_alerts (
+                counterparty_id TEXT PRIMARY KEY,
+                name TEXT,
+                alerted_at DATE DEFAULT CURRENT_DATE
+            )""",
             """CREATE TABLE IF NOT EXISTS bot_usage_log (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT,
@@ -353,6 +358,24 @@ class Database:
         return last_date, results
 
     # ─── ПЛАНЫ ПРОДАЖ ────────────────────────────────────────────────────────
+
+    def get_aging_alerted(self) -> set:
+        """Возвращает ID контрагентов которым уже отправлен алерт."""
+        rows = self._fetchall("SELECT counterparty_id FROM aging_alerts")
+        return {r["counterparty_id"] for r in rows}
+
+    def save_aging_alert(self, counterparty_id: str, name: str):
+        """Сохраняет факт отправки алерта."""
+        self._execute(
+            """INSERT INTO aging_alerts (counterparty_id, name, alerted_at)
+               VALUES (%s, %s, CURRENT_DATE)
+               ON CONFLICT (counterparty_id) DO UPDATE SET alerted_at=CURRENT_DATE""",
+            (counterparty_id, name)
+        )
+
+    def clear_aging_alerts(self):
+        """Очищает алерты (вызывать в начале нового цикла если нужно)."""
+        self._execute("DELETE FROM aging_alerts")
 
     def save_manager_chat_id(self, user_id: int, full_name: str):
         self._execute(
