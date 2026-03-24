@@ -3709,7 +3709,7 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ("shipments",  "Отгрузки",     1,          "#a855f7"),
             ("clients",    "Клиенты",      1,          "#c084fc"),
             ("new_clients","Клиенты нов.", 1,          "#e879f9"),
-            ("attracted",  "Привл.тов, т.", 1_000,     "#f0abfc"),
+            ("attracted",  "Привл.тов.млн", 1_000_000,  "#f0abfc"),
         ]
 
         BG      = "#ffffff"
@@ -3785,8 +3785,8 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         box_text = (
             f"  ПЛАН МЕСЯЦ  \n\n"
-            f"Выручка\n"
-            f"{total_fact['revenue']/1e6:.1f} / {total_plan['revenue']/1e6:.0f} млн\n"
+            f"Выручка, млн\n"
+            f"{total_fact['revenue']/1e6:.1f} / {total_plan['revenue']/1e6:.1f}\n"
             f"{pct(total_fact['revenue'], total_plan['revenue'])}\n\n"
             f"Отгрузки\n"
             f"{total_fact['shipments']} / {total_plan['shipments']}\n"
@@ -3797,8 +3797,8 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Клиенты нов.\n"
             f"{total_fact['new_clients']} / {total_plan['new_clients']}\n"
             f"{pct(total_fact['new_clients'], total_plan['new_clients'])}\n\n"
-            f"Привл.тов.\n"
-            f"{total_fact['attracted']/1e3:.0f} / {total_plan['attracted']/1e3:.0f} т.р.\n"
+            f"Привл.тов., млн\n"
+            f"{total_fact['attracted']/1e6:.1f} / {total_plan['attracted']/1e6:.1f}\n"
             f"{pct(total_fact['attracted'], total_plan['attracted'])}"
         )
 
@@ -4130,6 +4130,56 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
+
+async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/aging — показать список стареющих клиентов (50+ дней без отгрузок)."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+
+    await update.message.reply_text("🔍 Ищу стареющих клиентов...")
+
+    from moysklad import get_aging_clients
+    MANAGER_TAG_MAP = {
+        "баласанян": "Карина", "мерзлякова": "Елена",
+        "скляр": "Инесса", "леонтьев": "Алексей", "черентаев": "Сергей",
+    }
+
+    try:
+        clients = await get_aging_clients(days=50)
+        if not clients:
+            await update.message.reply_text("✅ Стареющих клиентов нет.")
+            return
+
+        # Группируем по менеджеру
+        by_mgr = {}
+        for c in clients:
+            mgr = "Без менеджера"
+            for tag in c.get("tags", []):
+                if tag.lower() in MANAGER_TAG_MAP:
+                    mgr = MANAGER_TAG_MAP[tag.lower()]
+                    break
+            by_mgr.setdefault(mgr, []).append(c)
+
+        lines = [f"⚠️ *Стареющие клиенты (50+ дней)* — {len(clients)} чел.\n"]
+        for mgr, cl_list in sorted(by_mgr.items()):
+            lines.append(f"*{mgr}* ({len(cl_list)}):")
+            for c in sorted(cl_list, key=lambda x: -x.get("days", 0)):
+                days = c.get("days", c.get("days_ago", "?"))
+                lines.append(f"  • {c['name']} — {days} дн.")
+            lines.append("")
+
+        text = "\n".join(lines)
+        # Разбиваем если длинный
+        if len(text) > 4000:
+            for i in range(0, len(text), 4000):
+                await update.message.reply_text(text[i:i+4000], parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, parse_mode="Markdown")
+
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
 
 async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/block [user_id] — заблокировать пользователя."""
@@ -4607,6 +4657,7 @@ def main():
     app.add_handler(CommandHandler("op_report", cmd_op_report))
     app.add_handler(CommandHandler("test_group", cmd_test_group))
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
+    app.add_handler(CommandHandler("aging", cmd_aging))
     app.add_handler(CommandHandler("block", cmd_block_user))
     app.add_handler(CommandHandler("unblock", cmd_unblock_user))
     app.add_handler(CommandHandler("stats", cmd_stats))
