@@ -2537,6 +2537,7 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
             # 2. Все отгрузки за период
             offset = 0
             total_demands = 0
+            batayeva_id = "45bdefd1-2697-11f1-0a80-1d34002ab2f4"
             while True:
                 params = {
                     "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
@@ -2554,6 +2555,8 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                 for row in rows:
                     agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
                     agent_id = agent_href.split("/")[-1] if agent_href else ""
+                    if agent_id == batayeva_id:
+                        logger.info(f"БАТАЕВА найдена в отгрузках! offset={offset} sum={row.get('sum')} moment={row.get('moment')}")
                     revenue = (row.get("sum", 0) or 0) / 100
                     for tag, mgr_name in MANAGERS.items():
                         if agent_id in tag_to_ids.get(tag, set()):
