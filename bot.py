@@ -4163,7 +4163,7 @@ async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_test_publink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/test_publink — проверяет публичные ссылки на заказ."""
+    """/test_publink — проверяет ссылку личного кабинета."""
     user = update.effective_user
     if not user or user.id != 360092495:
         return
@@ -4172,50 +4172,40 @@ async def cmd_test_publink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from moysklad import get_headers, MS_BASE
 
     order_id = context.args[0] if context.args else "ff0588e7-2766-11f1-0a80-01a1000aa0eb"
-    await update.message.reply_text("🔍 Проверяю шаблоны и публикации...")
+    await update.message.reply_text("🔍 Ищу ссылку личного кабинета...")
 
     try:
         async with aiohttp.ClientSession() as session:
 
-            # 1. Список шаблонов для заказа покупателя
+            # 1. Получаем данные аккаунта — там должен быть онлайн-магазин
             async with session.get(
-                f"{MS_BASE}/entity/customerorder/metadata/customtemplate",
+                f"{MS_BASE}/context/companysettings",
                 headers=get_headers()
             ) as r:
-                tmpl_data = await r.json() if r.status == 200 else {}
-            templates = tmpl_data.get("rows", [])
+                settings = await r.json() if r.status == 200 else {}
+            await update.message.reply_text(f"Настройки компании:\n{str(settings)[:400]}")
+
+            # 2. Ищем приложения/интеграции
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder/{order_id}",
+                headers=get_headers(),
+                params={"expand": "agent"}
+            ) as r:
+                order = await r.json()
+
+            order_name = order.get("name", "")
+            # Ищем externalCode — может быть ссылка
+            ext_code = order.get("externalCode", "")
+            shared = order.get("shared", False)
+            sync_id = order.get("syncId", "")
+
             await update.message.reply_text(
-                f"Шаблонов заказа: {len(templates)}\n" +
-                "\n".join(f"  - {t.get('name','?')} ({t.get('id','')})" for t in templates[:5])
+                f"Заказ: {order_name}\n"
+                f"externalCode: {ext_code}\n"
+                f"shared: {shared}\n"
+                f"syncId: {sync_id}\n"
+                f"Ключи: {list(order.keys())}"
             )
-
-            if not templates:
-                # Пробуем стандартные шаблоны
-                async with session.get(
-                    f"{MS_BASE}/entity/customerorder/metadata/embeddedtemplate",
-                    headers=get_headers()
-                ) as r:
-                    emb_data = await r.json() if r.status == 200 else {}
-                emb_templates = emb_data.get("rows", [])
-                await update.message.reply_text(
-                    f"Встроенных шаблонов: {len(emb_templates)}\n" +
-                    "\n".join(f"  - {t.get('name','?')} ({t.get('id','')})" for t in emb_templates[:5])
-                )
-                templates = emb_templates
-
-            if templates:
-                # Пробуем создать публикацию
-                tmpl = templates[0]
-                tmpl_href = tmpl.get("meta", {}).get("href", "")
-                tmpl_type = tmpl.get("meta", {}).get("type", "customtemplate")
-                async with session.post(
-                    f"{MS_BASE}/entity/customerorder/{order_id}/publications",
-                    headers=get_headers(),
-                    json={"template": {"meta": {"href": tmpl_href, "type": tmpl_type, "mediaType": "application/json"}}}
-                ) as r:
-                    pub_status = r.status
-                    pub_body = await r.json() if r.status in (200, 201) else await r.text()
-                await update.message.reply_text(f"Публикация: {pub_status}\n{str(pub_body)[:400]}")
 
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
