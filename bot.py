@@ -3672,62 +3672,59 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text(f"Контрагентов с тегом *{tag}*: {len(cp_ids)}", parse_mode="Markdown")
 
-            # Диагностика: смотрим первую отгрузку за март
-            async with session.get(
-                f"{MS_BASE}/entity/demand",
-                headers=get_headers(),
-                params={
-                    "filter": f"moment>={month_start} 00:00:00;moment<={month_end} 23:59:59",
-                    "expand": "agent",
-                    "limit": 1,
-                }
-            ) as r:
-                sample = await r.json()
-            if sample.get("rows"):
-                row = sample["rows"][0]
-                agent = row.get("agent", {})
-                agent_id = agent.get("id", "")
-                agent_name = agent.get("name", "")
-                agent_tags = agent.get("tags", [])
-                # Проверяем есть ли этот ID в нашем списке
-                in_list = agent_id in cp_ids
-                await update.message.reply_text(
-                    f"🔍 *Первая отгрузка:*\n"
-                    f"Клиент: {agent_name}\n"
-                    f"ID агента: `{agent_id}`\n"
-                    f"Теги агента: {agent_tags}\n"
-                    f"Есть в списке скляр: {in_list}\n\n"
-                    f"Пример ID из списка скляр: `{list(cp_ids)[:1]}`",
-                    parse_mode="Markdown"
-                )
-
-            # 2. Отгрузки за период
-            shipments = 0
-            revenue = 0.0
-            clients = set()
-            offset = 0
-            while True:
+            # Диагностика: проверяем отгрузки одного конкретного клиента Скляр
+            sample_id = list(cp_ids)[0] if cp_ids else None
+            if sample_id:
+                agent_href = f"{MS_BASE}/entity/counterparty/{sample_id}"
                 async with session.get(
                     f"{MS_BASE}/entity/demand",
                     headers=get_headers(),
                     params={
-                        "filter": f"moment>={month_start} 00:00:00;moment<={month_end} 23:59:59",
-                        "expand": "agent",
-                        "limit": 200,
-                        "offset": offset,
+                        "filter": f"agent={agent_href};moment>={month_start} 00:00:00;moment<={month_end} 23:59:59",
+                        "limit": 5,
                     }
                 ) as r:
-                    data = await r.json()
-                rows = data.get("rows", [])
-                for row in rows:
-                    agent_id = row.get("agent", {}).get("id", "")
-                    if agent_id in cp_ids:
-                        shipments += 1
-                        revenue += (row.get("sum", 0) or 0) / 100
-                        clients.add(agent_id)
-                if len(rows) < 200:
-                    break
-                offset += 200
+                    sample = await r.json()
+                sample_count = sample.get("meta", {}).get("size", 0)
+                # Имя контрагента
+                async with session.get(agent_href, headers=get_headers()) as r2:
+                    cp_data = await r2.json()
+                    cp_name = cp_data.get("name", sample_id)
+                await update.message.reply_text(
+                    f"🔍 *Проверка одного клиента:*\n"
+                    f"Клиент: {cp_name}\n"
+                    f"Отгрузок за март: {sample_count}",
+                    parse_mode="Markdown"
+                )
+
+            # Считаем отгрузки — по каждому клиенту отдельно
+            shipments = 0
+            revenue = 0.0
+            clients = set()
+            for cp_id in cp_ids:
+                agent_href = f"{MS_BASE}/entity/counterparty/{cp_id}"
+                off = 0
+                while True:
+                    async with session.get(
+                        f"{MS_BASE}/entity/demand",
+                        headers=get_headers(),
+                        params={
+                            "filter": f"agent={agent_href};moment>={month_start} 00:00:00;moment<={month_end} 23:59:59",
+                            "limit": 100,
+                            "offset": off,
+                        }
+                    ) as r:
+                        data = await r.json()
+                    rows = data.get("rows", [])
+                    cnt = data.get("meta", {}).get("size", 0)
+                    if cnt > 0:
+                        shipments += cnt
+                        clients.add(cp_id)
+                        for row in rows:
+                            revenue += (row.get("sum", 0) or 0) / 100
+                    if len(rows) < 100:
+                        break
+                    off += 100
 
             await update.message.reply_text(
                 f"📊 *Итог по тегу {tag} за март:*\n"
