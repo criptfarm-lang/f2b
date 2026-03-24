@@ -316,6 +316,10 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
         ],
         [
+            InlineKeyboardButton("📢 Промо хорека", callback_data="menu_promo_horeka"),
+            InlineKeyboardButton("📢 Промо опт", callback_data="menu_promo_opt"),
+        ],
+        [
             InlineKeyboardButton("💣 Очистить ВСЕ", callback_data="menu_clearall"),
         ],
     ])
@@ -416,6 +420,24 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif action == "menu_evening":
         await cmd_op_report(update, context)
+
+    elif action == "menu_promo_horeka":
+        await query.answer()
+        current = db.get_promo("хорека")
+        await query.message.reply_text(
+            f"📢 *Промо хорека:*\n\n{current or '— не задан'}\n\n"
+            f"Чтобы изменить: `/set_promo хорека [текст]`",
+            parse_mode="Markdown"
+        )
+
+    elif action == "menu_promo_opt":
+        await query.answer()
+        current = db.get_promo("опт")
+        await query.message.reply_text(
+            f"📢 *Промо опт:*\n\n{current or '— не задан'}\n\n"
+            f"Чтобы изменить: `/set_promo опт [текст]`",
+            parse_mode="Markdown"
+        )
 
     elif action == "menu_aging":
         await query.answer()
