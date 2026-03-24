@@ -4135,6 +4135,34 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
+async def cmd_search_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/search_msg [слово] — ищет сообщения в БД без ограничения по дате."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    query = " ".join(context.args).lower() if context.args else ""
+    if not query:
+        await update.message.reply_text("Использование: /search_msg [слово]")
+        return
+
+    rows = db._fetchall(
+        """SELECT manager_name, contact_name, text, sent_at, is_outbound
+           FROM wazzup_messages
+           WHERE LOWER(text) LIKE %s
+           ORDER BY sent_at DESC LIMIT 10""",
+        (f"%{query}%",)
+    )
+    if not rows:
+        await update.message.reply_text(f"В БД нет сообщений со словом '{query}'")
+        return
+
+    lines = [f"Найдено {len(rows)} сообщений со словом '{query}':\n"]
+    for r in rows:
+        direction = "→" if r["is_outbound"] else "←"
+        lines.append(f"{direction} {r['manager_name'] or '?'} / {r['contact_name']} [{r['sent_at']}]\n  {r['text'][:80]}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/aging — показать список стареющих клиентов (50+ дней без отгрузок)."""
     user = update.effective_user
@@ -4661,6 +4689,7 @@ def main():
     app.add_handler(CommandHandler("op_report", cmd_op_report))
     app.add_handler(CommandHandler("test_group", cmd_test_group))
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
+    app.add_handler(CommandHandler("search_msg", cmd_search_msg))
     app.add_handler(CommandHandler("aging", cmd_aging))
     app.add_handler(CommandHandler("block", cmd_block_user))
     app.add_handler(CommandHandler("unblock", cmd_unblock_user))
