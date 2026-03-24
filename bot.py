@@ -3863,43 +3863,102 @@ async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
             folder_name = folder.get("name", "")
             await update.message.reply_text(f"Группа найдена: {folder_name}")
 
-            # 2. Запрашиваем отчёт прибыльности по товарам в этой группе
-            # Фильтр: productFolder + теги менеджера (через контрагентов)
-            # Сначала просто общая сумма по группе за период
+            # 2. Все товары из этой группы
+            product_ids = set()
             offset = 0
-            total_sum = 0.0
             while True:
-                params = {
-                    "momentFrom": f"{month_start} 00:00:00",
-                    "momentTo":   f"{month_end} 23:59:59",
-                    "filter":     f"productFolder={folder_href}",
-                    "limit": 200,
-                    "offset": offset,
-                }
                 async with session.get(
-                    f"{MS_BASE}/report/profit/byproduct",
-                    headers=get_headers(), params=params
+                    f"{MS_BASE}/entity/product",
+                    headers=get_headers(),
+                    params={"filter": f"productFolder={folder_href}", "limit": 100, "offset": offset}
                 ) as r:
-                    if r.status != 200:
-                        body = await r.text()
-                        await update.message.reply_text(f"Ошибка {r.status}: {body[:200]}")
-                        return
                     data = await r.json()
+                rows = data.get("rows", [])
+                for p in rows:
+                    product_ids.add(p.get("id", ""))
+                if len(rows) < 100:
+                    break
+                offset += 100
 
+            await update.message.reply_text(f"Товаров в группе: {len(product_ids)}")
+
+            # 3. Контрагенты каждого менеджера
+            TAGS = {
+                "скляр":      "Инесса",
+                "мерзлякова": "Елена",
+                "баласанян":  "Карина",
+                "леонтьев":   "Алексей",
+                "черентаев":  "Сергей",
+            }
+            tag_to_ids = {}
+            for tag in TAGS:
+                ids = set()
+                off = 0
+                while True:
+                    async with session.get(
+                        f"{MS_BASE}/entity/counterparty",
+                        headers=get_headers(),
+                        params={"filter": f"tags={tag}", "limit": 100, "offset": off}
+                    ) as r:
+                        data = await r.json()
+                    rows = data.get("rows", [])
+                    for cp in rows:
+                        ids.add(cp.get("id", ""))
+                    if len(rows) < 100:
+                        break
+                    off += 100
+                tag_to_ids[tag] = ids
+
+            # 4. Отгрузки за период — ищем позиции из нужной группы
+            mgr_sums = {tag: 0.0 for tag in TAGS}
+            total_sum = 0.0
+            offset = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(),
+                    params={
+                        "filter": f"moment>={month_start} 00:00:00;moment<={month_end} 23:59:59",
+                        "expand": "agent,positions.assortment",
+                        "limit": 100,
+                        "offset": offset,
+                    }
+                ) as r:
+                    data = await r.json()
                 rows = data.get("rows", [])
                 for row in rows:
-                    total_sum += (row.get("sellSum", 0) or 0) / 100
+                    agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
+                    agent_id = agent_href.split("/")[-1] if agent_href else ""
 
-                total = data.get("meta", {}).get("size", 0)
-                offset += len(rows)
-                if offset >= total or len(rows) < 200:
+                    # Определяем менеджера
+                    mgr_tag = None
+                    for tag, ids in tag_to_ids.items():
+                        if agent_id in ids:
+                            mgr_tag = tag
+                            break
+
+                    # Считаем сумму позиций из нужной группы
+                    positions = row.get("positions", {}).get("rows", [])
+                    for pos in positions:
+                        assortment = pos.get("assortment", {})
+                        prod_id = assortment.get("id", "") or assortment.get("meta", {}).get("href", "").split("/")[-1]
+                        if prod_id in product_ids:
+                            pos_sum = (pos.get("price", 0) * pos.get("quantity", 0)) / 100
+                            total_sum += pos_sum
+                            if mgr_tag:
+                                mgr_sums[mgr_tag] += pos_sum
+
+                if len(rows) < 100:
                     break
+                offset += 100
 
-            await update.message.reply_text(
-                f"Группа: {folder_name}\n"
-                f"Период: {month_start} — {month_end}\n"
-                f"Сумма продаж: {total_sum:,.0f} руб."
-            )
+            lines = [f"📊 *ПРИВЛЕЧЕННЫЕ ТОВАРЫ* за март\n"]
+            lines.append(f"Итого: *{total_sum:,.0f} руб.*\n")
+            lines.append("По менеджерам:")
+            for tag, short in TAGS.items():
+                lines.append(f"  {short}: {mgr_sums[tag]:,.0f} руб.")
+
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
