@@ -2570,3 +2570,99 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
         logger.info(f"get_manager_shipments {name}: ship={result[name]['shipments']} rev={result[name]['revenue']:.0f} cl={result[name]['clients']}")
 
     return result
+
+
+async def get_attracted_goods_by_manager(date_from: str, date_to: str) -> dict:
+    """
+    Сумма продаж групп 'ПРИВЛЕЧЕННЫЕ ТОВАРЫ' + 'Акционный прайс-лист' по менеджерам.
+    """
+    import aiohttp
+
+    TAGS = {
+        "скляр":      "Инесса Скляр",
+        "мерзлякова": "Елена Мерзлякова",
+        "баласанян":  "Карина Баласанян",
+        "леонтьев":   "Алексей Леонтьев",
+        "черентаев":  "Сергей Черентаев",
+    }
+    GROUP_NAMES = ["ПРИВЛЕЧЕННЫЕ ТОВАРЫ", "Акционный прайс-лист"]
+
+    result = {name: 0.0 for name in TAGS.values()}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+
+            # 1. Находим href групп товаров
+            folder_hrefs = []
+            for gname in GROUP_NAMES:
+                async with session.get(
+                    f"{MS_BASE}/entity/productfolder",
+                    headers=get_headers(),
+                    params={"filter": f"name={gname}", "limit": 5}
+                ) as r:
+                    data = await r.json()
+                for f in data.get("rows", []):
+                    folder_hrefs.append(f.get("meta", {}).get("href", ""))
+                    logger.info(f"get_attracted_goods: группа '{gname}' найдена")
+
+            if not folder_hrefs:
+                logger.warning("get_attracted_goods: группы не найдены")
+                return result
+
+            # 2. Контрагенты каждого менеджера
+            tag_to_ids = {}
+            for tag in TAGS:
+                ids = set()
+                off = 0
+                while True:
+                    async with session.get(
+                        f"{MS_BASE}/entity/counterparty",
+                        headers=get_headers(),
+                        params={"filter": f"tags={tag}", "limit": 100, "offset": off}
+                    ) as r:
+                        data = await r.json()
+                    rows = data.get("rows", [])
+                    for cp in rows:
+                        ids.add(cp.get("id", ""))
+                    if len(rows) < 100:
+                        break
+                    off += 100
+                tag_to_ids[tag] = ids
+
+            # 3. Отчёт прибыльности по покупателям для каждой группы
+            for folder_href in folder_hrefs:
+                offset = 0
+                while True:
+                    async with session.get(
+                        f"{MS_BASE}/report/profit/bycounterparty",
+                        headers=get_headers(),
+                        params={
+                            "momentFrom": f"{date_from} 00:00:00",
+                            "momentTo":   f"{date_to} 23:59:59",
+                            "filter":     f"productFolder={folder_href}",
+                            "limit": 200,
+                            "offset": offset,
+                        }
+                    ) as r:
+                        data = await r.json()
+                    rows = data.get("rows", [])
+                    for row in rows:
+                        cp_href = row.get("counterparty", {}).get("meta", {}).get("href", "")
+                        cp_id = cp_href.split("/")[-1] if cp_href else ""
+                        sell_sum = (row.get("sellSum", 0) or 0) / 100
+                        for tag, mgr_name in TAGS.items():
+                            if cp_id in tag_to_ids.get(tag, set()):
+                                result[mgr_name] += sell_sum
+                                break
+                    total = data.get("meta", {}).get("size", 0)
+                    offset += len(rows)
+                    if offset >= total or len(rows) < 200:
+                        break
+
+    except Exception as e:
+        logger.error(f"get_attracted_goods_by_manager: {e}", exc_info=True)
+
+    for name, val in result.items():
+        logger.info(f"attracted_goods {name}: {val:.0f}")
+
+    return result
