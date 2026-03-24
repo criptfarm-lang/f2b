@@ -3832,7 +3832,8 @@ async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month_start = date.today().replace(day=1).isoformat()
     month_end   = date.today().isoformat()
 
-    await update.message.reply_text("🔍 Ищу группу товаров ПРИВЛЕЧЕННЫЕ ТОВАРЫ...")
+    group_name_query = " ".join(context.args) if context.args else "ПРИВЛЕЧЕННЫЕ ТОВАРЫ"
+    await update.message.reply_text(f"🔍 Ищу группу товаров {group_name_query}...")
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -3841,7 +3842,7 @@ async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with session.get(
                 f"{MS_BASE}/entity/productfolder",
                 headers=get_headers(),
-                params={"filter": "name=ПРИВЛЕЧЕННЫЕ ТОВАРЫ", "limit": 10}
+                params={"filter": f"name={group_name_query}", "limit": 10}
             ) as r:
                 data = await r.json()
 
