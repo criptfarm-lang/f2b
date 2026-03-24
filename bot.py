@@ -169,6 +169,9 @@ def _user_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
             InlineKeyboardButton("📋 Мои задачи", callback_data="user_my_tasks"),
         ],
+        [
+            InlineKeyboardButton("📊 Отчёт ОП", callback_data="user_op_report"),
+        ],
     ])
 
 
@@ -210,6 +213,9 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
             parse_mode="Markdown"
         )
         _user_awaiting[query.from_user.id] = "contract"
+
+    elif action == "user_op_report":
+        await cmd_op_report(update, context)
 
     elif action == "user_my_tasks":
         tasks = db.get_tasks_by_executor(user.full_name)
@@ -3067,6 +3073,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+    elif action == "op_report":
+        await cmd_op_report(update, context)
+        return
+
     elif action == "search_mentions":
         product = params.get("product", "")
         days = int(params.get("days", 7))
@@ -3637,10 +3647,21 @@ async def cmd_delete_executor_tasks(update: Update, context: ContextTypes.DEFAUL
 async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/op_report — Отчёт ОП: план vs факт по менеджерам."""
     user = update.effective_user
-    if not user or user.id != 360092495:
-        return
+    OWNER_ID = 360092495
 
-    await update.message.reply_text("⏳ Собираю данные...")
+    # Определяем чат куда отправлять
+    if update.callback_query:
+        chat_id = update.callback_query.message.chat_id
+        reply = update.callback_query.message.reply_text
+        reply_photo = update.callback_query.message.reply_photo
+    else:
+        if not user or user.id != OWNER_ID:
+            return
+        chat_id = update.effective_chat.id
+        reply = update.message.reply_text
+        reply_photo = update.message.reply_photo
+
+    await reply("⏳ Собираю данные...")
 
     from datetime import date
     from moysklad import get_manager_shipments
@@ -3791,11 +3812,11 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buf.seek(0)
         plt.close()
 
-        await update.message.reply_photo(photo=buf, caption="📊 Отчёт ОП")
+        await reply_photo(photo=buf, caption="📊 Отчёт ОП")
 
     except Exception as e:
         logger.error(f"cmd_op_report: {e}", exc_info=True)
-        await update.message.reply_text(f"Ошибка: {e}")
+        await reply(f"Ошибка: {e}")
 
 async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_fact [тег] — тест получения отгрузок по тегу за текущий месяц."""
