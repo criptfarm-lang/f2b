@@ -2436,8 +2436,10 @@ async def get_aging_clients(days: int = 50) -> list:
             active_ids = set()
             for doc in recent_data.get("rows", []):
                 agent = doc.get("agent", {})
-                if agent.get("id"):
-                    active_ids.add(agent["id"])
+                agent_href = agent.get("meta", {}).get("href", "")
+                agent_id = agent_href.split("/")[-1] if agent_href else agent.get("id", "")
+                if agent_id:
+                    active_ids.add(agent_id)
 
             logger.info(f"get_aging_clients: активных за {days} дней = {len(active_ids)}")
 
@@ -2460,7 +2462,8 @@ async def get_aging_clients(days: int = 50) -> list:
                     rows = hist_data.get("rows", [])
                     for doc in rows:
                         agent = doc.get("agent", {})
-                        agent_id = agent.get("id", "")
+                        agent_href = agent.get("meta", {}).get("href", "")
+                        agent_id = agent_href.split("/")[-1] if agent_href else agent.get("id", "")
                         if not agent_id or agent_id in active_ids:
                             continue
                         if "розничный покупатель" in agent.get("name", "").lower():
