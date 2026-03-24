@@ -3700,7 +3700,9 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"DEBUG первая отгрузка:\nagent keys: {agent_keys}\nagent.id: {agent_id0}\nЕсть в cp_ids: {agent_id0 in cp_ids}"
                     )
                 for row in rows:
-                    agent_id = row.get("agent", {}).get("id", "")
+                    agent = row.get("agent", {})
+                    agent_href = agent.get("meta", {}).get("href", "")
+                    agent_id = agent_href.split("/")[-1] if agent_href else ""
                     if agent_id in cp_ids:
                         shipments += 1
                         revenue += (row.get("sum", 0) or 0) / 100
