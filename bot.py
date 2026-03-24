@@ -5288,10 +5288,10 @@ async def check_order_agreed(order_href: str, bot):
                 pass
 
         promo = db.get_promo(segment)
-        msg = f"📋 Пожалуйста, проверьте заказ *{order_name}*\n\n"
+        msg = f"📋 Пожалуйста, проверьте заказ {order_name}\n\n"
         if positions_text:
             msg += f"📦 Состав:\n{positions_text}\n\n"
-        msg += f"💰 Итого: *{order_sum:,.0f} руб.*\n"
+        msg += f"💰 Итого: {order_sum:,.0f} руб.\n"
         if delivery:
             msg += f"📅 Плановая дата отгрузки: {delivery}\n"
         if promo:
