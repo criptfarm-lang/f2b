@@ -5191,6 +5191,12 @@ async def check_order_agreed(order_href: str, bot):
         if state_id != MS_STATE_AGREED:
             return
 
+        # Проверяем не отправляли ли уже
+        order_id_check = order_href.split("/")[-1].split("?")[0]
+        if db.is_agreed_notified(order_id_check):
+            logger.info(f"check_order_agreed: заказ {order_id_check} — уведомление уже отправлялось, пропускаем")
+            return
+
         order_name = order.get("name", "")
         order_sum = (order.get("sum", 0) or 0) / 100
         agent = order.get("agent", {})
@@ -5292,6 +5298,7 @@ async def check_order_agreed(order_href: str, bot):
                     parse_mode="Markdown"
                 )
             logger.info(f"check_order_agreed: мессенджер {agent_name} не найден, уведомлён {owner_name}")
+            db.save_agreed_notification(order_id_check)
             return
         # Отправляем через Wazzup
         import aiohttp as _aio
@@ -5310,6 +5317,7 @@ async def check_order_agreed(order_href: str, bot):
             ) as r:
                 if r.status in (200, 201):
                     logger.info(f"check_order_agreed: отправлено {agent_name} в {contact['chat_type']}")
+                    db.save_agreed_notification(order_id_check)
                 else:
                     body = await r.text()
                     logger.error(f"check_order_agreed: ошибка отправки {r.status} {body[:100]}")
