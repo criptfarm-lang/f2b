@@ -422,7 +422,6 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await cmd_op_report(update, context)
 
     elif action == "menu_promo_horeka":
-        await query.answer()
         current = db.get_promo("хорека")
         await query.message.reply_text(
             f"📢 *Промо хорека:*\n\n{current or '— не задан'}\n\n"
@@ -431,7 +430,6 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
     elif action == "menu_promo_opt":
-        await query.answer()
         current = db.get_promo("опт")
         await query.message.reply_text(
             f"📢 *Промо опт:*\n\n{current or '— не задан'}\n\n"
@@ -440,7 +438,6 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
     elif action == "menu_aging":
-        await query.answer()
         await cmd_aging(update, context)
 
     elif action == "menu_activity":
