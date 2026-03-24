@@ -5227,6 +5227,12 @@ async def check_order_agreed(order_href: str, bot):
         owner = order.get("owner", {})
         owner_name = owner.get("name", "")
 
+        # Пропускаем розничного покупателя
+        if agent_name.lower().strip() == "розничный покупатель":
+            logger.info(f"check_order_agreed: пропускаем розничного покупателя")
+            db.save_agreed_notification(order_id_check)
+            return
+
         logger.info(f"check_order_agreed: заказ {order_name} клиент={agent_name} статус=Согласовано")
 
         # Загружаем позиции заказа
