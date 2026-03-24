@@ -3799,6 +3799,16 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text(f"Контрагентов с тегом {tag}: {len(cp_ids)}")
 
+            # Показываем первых 5 клиентов для проверки
+            async with session.get(
+                f"{MS_BASE}/entity/counterparty",
+                headers=get_headers(),
+                params={"filter": f"tags={tag}", "limit": 5}
+            ) as r:
+                sample_cps = await r.json()
+            names = [cp.get("name","") for cp in sample_cps.get("rows", [])]
+            await update.message.reply_text(f"Примеры клиентов: {names}")
+
             shipments = 0
             revenue = 0.0
             clients = set()
