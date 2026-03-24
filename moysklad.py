@@ -2532,7 +2532,6 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                     offset += 100
                 tag_to_ids[tag] = ids
                 logger.info(f"get_manager_shipments: {tag} — {len(ids)} контрагентов")
-
             # 2. Все отгрузки за период
             offset = 0
             while True:
