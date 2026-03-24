@@ -2,7 +2,7 @@
 Планировщик задач бота F2B PRO
 - Утренняя сводка в 9:00
 - Напоминание о дедлайнах в 10:00
-- Вечерняя сводка ПДЗ в 17:00 (только если был запущен /pdz)
+- Сводка ПДЗ вызывается вручную кнопкой "Результат ПДЗ" или командой /pdz_results
 - ПДЗ по командам через /pdz — НЕ автоматически
 """
 
@@ -284,7 +284,7 @@ def cleanup_done_tasks():
 
 
 async def check_aging_clients(app: Application):
-    """Ежедневно в 12:00 — проверяет клиентов без отгрузок 50 дней."""
+    """Ежедневно в 12:00 — алерт по новым стареющим клиентам (40+ дней без отгрузок)."""
     from moysklad import get_aging_clients
     from database import Database
 
@@ -295,9 +295,19 @@ async def check_aging_clients(app: Application):
     db = Database()
 
     try:
-        clients = await get_aging_clients(days=50)
+        clients = await get_aging_clients(days=40)
         if not clients:
             logger.info("check_aging_clients: стареющих клиентов нет")
+            return
+
+        # Фильтруем — только новые (кому ещё не отправляли алерт)
+        already_alerted = db.get_aging_alerted()
+        new_clients = [c for c in clients if c["id"] not in already_alerted]
+
+        logger.info(f"check_aging_clients: всего={len(clients)} новых={len(new_clients)}")
+
+        if not new_clients:
+            logger.info("check_aging_clients: новых стареющих нет")
             return
 
         MANAGER_TAG_MAP = {
@@ -309,13 +319,12 @@ async def check_aging_clients(app: Application):
         }
 
         import asyncio
-        for i, client in enumerate(clients):
+        for i, client in enumerate(new_clients):
             name = client["name"]
             tags = client.get("tags", [])
             last_date = client["last_demand_date"]
-            days = client.get("days", client.get("days_ago", 50))
+            days = client.get("days", 40)
 
-            # Определяем менеджера
             manager_name = "Без менеджера"
             manager_tag = None
             for tag in tags:
@@ -324,31 +333,19 @@ async def check_aging_clients(app: Application):
                     manager_tag = tag.lower()
                     break
 
-            # 1. Алерт в группу PRO
+            # Алерт в группу
             await app.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"⚠️ *Стареющий клиент*\n\n"
                     f"👤 *{name}*\n"
-                    f"📅 Последняя отгрузка: {last_date} ({days} дней назад)\n"
-                    f"👔 Менеджер: {manager_name}\n\n"
-                    f"Необходимо связаться с клиентом и сделать специальное предложение."
+                    f"📅 Последняя отгрузка: {last_date} ({days} дн. назад)\n"
+                    f"👔 Менеджер: {manager_name}"
                 ),
                 parse_mode="Markdown"
             )
 
-            # 2. Задача в список задач
-            task_text = f"Связаться с {name} — нет отгрузок {days} дней. Сделать спецпредложение."
-            db.save_task(
-                text=task_text,
-                executor=manager_name,
-                deadline=None,
-                source_chat=chat_id,
-                source_message_id=0,
-                created_by="Эф (авто)"
-            )
-
-            # 3. Личное сообщение менеджеру
+            # Задача менеджеру в личку
             if manager_tag:
                 mgr_chat_id = db.get_manager_chat_id(manager_name.split()[0])
                 if mgr_chat_id:
@@ -356,22 +353,22 @@ async def check_aging_clients(app: Application):
                         await app.bot.send_message(
                             chat_id=mgr_chat_id,
                             text=(
-                                f"📋 *Задача: стареющий клиент*\n\n"
-                                f"👤 *{name}* не делал заказов уже {days} дней.\n"
-                                f"Последняя отгрузка: {last_date}\n\n"
-                                f"Свяжись с клиентом, узнай причину и сделай специальное предложение.\n"
-                                f"Результат напиши мне в личку."
+                                f"📋 *Стареющий клиент*\n\n"
+                                f"👤 *{name}* — нет отгрузок {days} дней.\n"
+                                f"Последняя: {last_date}\n\n"
+                                f"Свяжись и сделай спецпредложение."
                             ),
                             parse_mode="Markdown"
                         )
                     except Exception as e:
-                        logger.warning(f"check_aging_clients: не удалось написать {manager_name}: {e}")
+                        logger.warning(f"check_aging_clients: {manager_name}: {e}")
 
-            logger.info(f"check_aging_clients: обработан {name} → {manager_name}")
+            # Сохраняем что алерт отправлен
+            db.save_aging_alert(client["id"], name)
+            logger.info(f"check_aging_clients: {name} → {manager_name}")
 
-            # Пауза 2 минуты между алертами
-            if i < len(clients) - 1:
-                await asyncio.sleep(120)
+            if i < len(new_clients) - 1:
+                await asyncio.sleep(30)
 
     except Exception as e:
         logger.error(f"check_aging_clients: {e}", exc_info=True)
