@@ -4173,7 +4173,12 @@ async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or user.id != 360092495:
         return
 
-    if not context.args:
+    # Берём сырой текст сообщения чтобы не потерять URL и спецсимволы
+    raw = update.message.text or ""
+    # Убираем команду /set_promo
+    raw_args = raw.split(" ", 1)[1].strip() if " " in raw else ""
+
+    if not raw_args:
         хорека = db.get_promo("хорека")
         опт = db.get_promo("опт")
         общий = db.get_promo()
@@ -4190,20 +4195,18 @@ async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
-    # Проверяем первый аргумент — сегмент или начало текста
-    first = context.args[0].lower()
-    if first in ("хорека", "horeka", "опт", "opt"):
-        segment = "хорека" if first in ("хорека", "horeka") else "опт"
-        text = " ".join(context.args[1:])
+    first_word = raw_args.split(" ", 1)[0].lower()
+    if first_word in ("хорека", "horeka", "опт", "opt"):
+        segment = "хорека" if first_word in ("хорека", "horeka") else "опт"
+        text = raw_args.split(" ", 1)[1].strip() if " " in raw_args else ""
         if not text:
-            await update.message.reply_text(f"Укажи текст: /set_promo {first} [текст]")
+            await update.message.reply_text(f"Укажи текст: /set_promo {first_word} [текст]")
             return
         db.set_promo(text, segment)
         await update.message.reply_text(f"✅ Промо для *{segment}* сохранён:\n\n{text}", parse_mode="Markdown")
     else:
-        text = " ".join(context.args)
-        db.set_promo(text)
-        await update.message.reply_text(f"✅ Общий промо сохранён:\n\n{text}")
+        db.set_promo(raw_args)
+        await update.message.reply_text(f"✅ Общий промо сохранён:\n\n{raw_args}")
 
 
 async def cmd_test_publink(update, context):
