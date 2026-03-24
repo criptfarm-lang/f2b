@@ -3095,7 +3095,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_chat_action("typing")
 
         # Разбиваем на несколько товаров если через запятую
-        keywords = [p.strip().lower() for p in product.replace(" и ", ",").split(",") if p.strip()]
+        # Добавляем словоформы — обрезаем до основы (первые 5+ символов)
+        raw_keywords = [p.strip().lower() for p in product.replace(" и ", ",").split(",") if p.strip()]
+        keywords = []
+        for kw in raw_keywords:
+            keywords.append(kw)
+            # Добавляем основу слова если длиннее 5 символов
+            if len(kw) > 5:
+                keywords.append(kw[:5])
+        keywords = list(set(keywords))
 
         rows = db.search_wazzup_mentions(keywords, days=days, manager_name=manager_filter or None)
         call_rows = db.search_call_mentions(keywords, days=days, manager_name=manager_filter or None)
@@ -4941,6 +4949,8 @@ def main():
             allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post", "callback_query"]
         )
         logger.info("🤖 Бот запущен!")
+        # Загружаем менеджеров Wazzup
+        await load_wazzup_managers()
         # Восстанавливаем pending_links из БД после рестарта
         try:
             pending_rows = db.load_pending_links()
@@ -4984,6 +4994,30 @@ MANAGERS_CONTACTS = {
 
 # Маппинг crmUserId Wazzup → имя менеджера (заполним после первых вебхуков)
 WAZZUP_MANAGERS: dict = {}
+
+
+async def load_wazzup_managers():
+    """Загружает список менеджеров из Wazzup API."""
+    import aiohttp
+    api_key = os.getenv("WAZZUP_API_KEY", "")
+    if not api_key:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.wazzup24.com/v3/users",
+                headers={"Authorization": f"Bearer {api_key}"}
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    for u in data.get("users", []):
+                        uid = u.get("userId") or u.get("id", "")
+                        name = u.get("name", "") or f"{u.get('firstName','')} {u.get('lastName','')}".strip()
+                        if uid and name:
+                            WAZZUP_MANAGERS[str(uid)] = name
+                    logger.info(f"Wazzup managers loaded: {len(WAZZUP_MANAGERS)} — {list(WAZZUP_MANAGERS.values())}")
+    except Exception as e:
+        logger.warning(f"load_wazzup_managers: {e}")
 # Кэш для дедупликации webhook — order_id → timestamp последней проверки
 _price_check_cache: dict = {}
 # Хранилище данных алертов ПДЗ — order_id → {client, manager, debt_amount, debt_days, order_name}
