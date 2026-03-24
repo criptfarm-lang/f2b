@@ -2534,6 +2534,21 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                 logger.info(f"get_manager_shipments: {tag} — {len(ids)} контрагентов")
                 if tag == "леонтьев":
                     logger.info(f"леонтьев IDs: {ids}")
+            # Проверяем конкретную отгрузку Батаевой
+            demand_id = "7ab90e44-26be-11f1-0a80-106c0032c7b1"
+            async with session.get(
+                f"{MS_BASE}/entity/demand/{demand_id}",
+                headers=get_headers()
+            ) as r:
+                d = await r.json()
+            agent = d.get("agent", {})
+            agent_href = agent.get("meta", {}).get("href", "")
+            agent_id_from_demand = agent_href.split("/")[-1] if agent_href else ""
+            logger.info(f"Батаева отгрузка: agent_href={agent_href}")
+            logger.info(f"Батаева отгрузка: agent_id={agent_id_from_demand}")
+            logger.info(f"Батаева в tag_to_ids леонтьев: {agent_id_from_demand in tag_to_ids.get('леонтьев', set())}")
+            logger.info(f"Батаева в tag_to_ids все: {[(t, agent_id_from_demand in ids) for t, ids in tag_to_ids.items()]}")
+
             # 2. Все отгрузки за период
             offset = 0
             total_demands = 0
