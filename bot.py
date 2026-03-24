@@ -3863,24 +3863,56 @@ async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
             folder_name = folder.get("name", "")
             await update.message.reply_text(f"Группа найдена: {folder_name}")
 
-            # 2. Все товары из этой группы
+            # 2. Ищем товары в группе — через все типы
             product_ids = set()
-            offset = 0
-            while True:
+            for entity_type in ["product", "service", "bundle"]:
+                offset = 0
+                while True:
+                    async with session.get(
+                        f"{MS_BASE}/entity/{entity_type}",
+                        headers=get_headers(),
+                        params={"filter": f"productFolder={folder_href}", "limit": 100, "offset": offset}
+                    ) as r:
+                        if r.status != 200:
+                            break
+                        data = await r.json()
+                    rows = data.get("rows", [])
+                    for p in rows:
+                        product_ids.add(p.get("id", ""))
+                    if len(rows) < 100:
+                        break
+                    offset += 100
+
+            await update.message.reply_text(f"Товаров в группе: {len(product_ids)}")
+
+            # Если всё ещё 0 — посмотрим вложенные группы
+            if not product_ids:
                 async with session.get(
-                    f"{MS_BASE}/entity/product",
+                    f"{MS_BASE}/entity/productfolder",
                     headers=get_headers(),
-                    params={"filter": f"productFolder={folder_href}", "limit": 100, "offset": offset}
+                    params={"filter": f"productFolder={folder_href}", "limit": 100}
+                ) as r:
+                    data = await r.json()
+                subfolders = data.get("rows", [])
+                subfolder_names = [s.get("name") for s in subfolders]
+                await update.message.reply_text(f"Вложенные группы: {subfolder_names}")
+
+                # Пробуем найти товары через отчёт прибыльности
+                async with session.get(
+                    f"{MS_BASE}/report/profit/byproduct",
+                    headers=get_headers(),
+                    params={
+                        "momentFrom": f"{month_start} 00:00:00",
+                        "momentTo":   f"{month_end} 23:59:59",
+                        "filter": f"productFolder={folder_href}",
+                        "limit": 5,
+                    }
                 ) as r:
                     data = await r.json()
                 rows = data.get("rows", [])
-                for p in rows:
-                    product_ids.add(p.get("id", ""))
-                if len(rows) < 100:
-                    break
-                offset += 100
-
-            await update.message.reply_text(f"Товаров в группе: {len(product_ids)}")
+                sample = [(r.get("assortment", {}).get("name", "?"), (r.get("sellSum",0) or 0)/100) for r in rows[:5]]
+                await update.message.reply_text(f"Товары в отчёте прибыльности: {sample}")
+                return
 
             # 3. Контрагенты каждого менеджера
             TAGS = {
