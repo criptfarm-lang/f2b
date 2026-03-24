@@ -294,6 +294,9 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
             InlineKeyboardButton("📋 Мои задачи", callback_data="user_my_tasks"),
         ],
+        [
+            InlineKeyboardButton("📊 Отчёт ОП", callback_data="menu_evening"),
+        ],
         # ── Только руководитель ────────────────────────────────────
         [InlineKeyboardButton("── Только для меня ──", callback_data="menu_noop")],
         [
@@ -306,14 +309,13 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📈 Активность", callback_data="menu_activity"),
-            InlineKeyboardButton("📊 Отчёт ОП", callback_data="menu_evening"),
-        ],
-        [
             InlineKeyboardButton("📊 Статистика бота", callback_data="menu_stats"),
-            InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
         ],
         [
+            InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
             InlineKeyboardButton("🗑 Очистить открытые", callback_data="menu_clearopen"),
+        ],
+        [
             InlineKeyboardButton("💣 Очистить ВСЕ", callback_data="menu_clearall"),
         ],
     ])
