@@ -4143,6 +4143,67 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
+async def cmd_sync_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sync_managers — обновляет менеджеров в базе по тегам МойСклад."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+
+    await update.message.reply_text("🔄 Синхронизирую менеджеров...")
+    updated = await sync_contact_managers()
+    await update.message.reply_text(f"✅ Обновлено контактов: {updated}")
+
+
+async def sync_contact_managers() -> int:
+    """Обновляет поле manager в wazzup_contact_map по тегам из МойСклад."""
+    import aiohttp
+    from moysklad import get_headers, MS_BASE
+
+    TAG_TO_NAME = {
+        "скляр":      "Инесса Скляр",
+        "мерзлякова": "Елена Мерзлякова",
+        "баласанян":  "Карина Баласанян",
+        "леонтьев":   "Алексей Леонтьев",
+        "черентаев":  "Сергей Черентаев",
+    }
+
+    updated = 0
+    try:
+        # Берём все контакты из нашей БД
+        contacts = db.get_all_contacts_with_company()
+        if not contacts:
+            return 0
+
+        async with aiohttp.ClientSession() as session:
+            for contact in contacts:
+                company_name = contact.get("company_name", "")
+                if not company_name:
+                    continue
+                # Ищем в МойСклад
+                async with session.get(
+                    f"{MS_BASE}/entity/counterparty",
+                    headers=get_headers(),
+                    params={"search": company_name, "limit": 1}
+                ) as r:
+                    if r.status != 200:
+                        continue
+                    data = await r.json()
+                rows = data.get("rows", [])
+                if not rows:
+                    continue
+                tags = [t.lower() for t in rows[0].get("tags", [])]
+                mgr = next((TAG_TO_NAME[t] for t in tags if t in TAG_TO_NAME), None)
+                if mgr and mgr != contact.get("manager"):
+                    db.update_contact_manager(company_name, mgr)
+                    updated += 1
+                    logger.info(f"sync_managers: {company_name} → {mgr}")
+
+    except Exception as e:
+        logger.error(f"sync_contact_managers: {e}", exc_info=True)
+
+    return updated
+
+
 async def cmd_search_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/search_msg [слово] — ищет сообщения в БД без ограничения по дате."""
     user = update.effective_user
@@ -4697,6 +4758,7 @@ def main():
     app.add_handler(CommandHandler("op_report", cmd_op_report))
     app.add_handler(CommandHandler("test_group", cmd_test_group))
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
+    app.add_handler(CommandHandler("sync_managers", cmd_sync_managers))
     app.add_handler(CommandHandler("search_msg", cmd_search_msg))
     app.add_handler(CommandHandler("aging", cmd_aging))
     app.add_handler(CommandHandler("block", cmd_block_user))
