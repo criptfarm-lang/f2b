@@ -309,11 +309,11 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📈 Активность", callback_data="menu_activity"),
-            InlineKeyboardButton("📊 Статистика бота", callback_data="menu_stats"),
+            InlineKeyboardButton("⏳ Стареющие", callback_data="menu_aging"),
         ],
         [
+            InlineKeyboardButton("📊 Статистика бота", callback_data="menu_stats"),
             InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
-            InlineKeyboardButton("🗑 Очистить открытые", callback_data="menu_clearopen"),
         ],
         [
             InlineKeyboardButton("💣 Очистить ВСЕ", callback_data="menu_clearall"),
@@ -416,6 +416,10 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif action == "menu_evening":
         await cmd_op_report(update, context)
+
+    elif action == "menu_aging":
+        await query.answer()
+        await cmd_aging(update, context)
 
     elif action == "menu_activity":
         await query.message.reply_text(
