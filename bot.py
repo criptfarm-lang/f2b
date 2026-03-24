@@ -3664,20 +3664,25 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply("⏳ Собираю данные...")
 
     from datetime import date
-    from moysklad import get_manager_shipments
+    from moysklad import get_manager_shipments, get_attracted_goods_by_manager
 
     today = date.today()
     month_start = today.replace(day=1).isoformat()
     month_end = today.isoformat()
 
     facts = await get_manager_shipments(month_start, month_end)
+    attracted = await get_attracted_goods_by_manager(month_start, month_end)
+
+    # Добавляем attracted в facts
+    for mgr_name in facts:
+        facts[mgr_name]["attracted"] = attracted.get(mgr_name, 0.0)
 
     PLANS = {
-        "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29, "new_clients": 3},
-        "Карина Баласанян": {"shipments": 150, "revenue": 5_000_000,  "clients": 38, "new_clients": 3},
-        "Елена Мерзлякова": {"shipments": 65,  "revenue": 6_000_000,  "clients": 30, "new_clients": 3},
-        "Алексей Леонтьев": {"shipments": 12,  "revenue": 180_000,    "clients": 5,  "new_clients": 3},
-        "Сергей Черентаев": {"shipments": 4,   "revenue": 200_000,    "clients": 4,  "new_clients": 3},
+        "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29, "new_clients": 3, "attracted": 1_000_000},
+        "Карина Баласанян": {"shipments": 150, "revenue": 5_000_000,  "clients": 38, "new_clients": 3, "attracted": 1_100_000},
+        "Елена Мерзлякова": {"shipments": 65,  "revenue": 6_000_000,  "clients": 30, "new_clients": 3, "attracted": 300_000},
+        "Алексей Леонтьев": {"shipments": 12,  "revenue": 180_000,    "clients": 5,  "new_clients": 3, "attracted": 300_000},
+        "Сергей Черентаев": {"shipments": 4,   "revenue": 200_000,    "clients": 4,  "new_clients": 3, "attracted": 300_000},
     }
 
     # new_clients пока 0 — будет добавлено позже
@@ -3702,6 +3707,7 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ("shipments",  "Отгрузки",     1,          "#a855f7"),
             ("clients",    "Клиенты",      1,          "#c084fc"),
             ("new_clients","Клиенты нов.", 1,          "#e879f9"),
+            ("attracted",  "Привл.тов.",   1_000_000,  "#f0abfc"),
         ]
 
         BG      = "#ffffff"
@@ -3763,8 +3769,8 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     color=TEXT, fontsize=9, fontweight="bold")
 
         # Суммарные план/факт
-        total_plan = {m: sum(PLANS[n][m] for n in PLANS) for m in ["revenue","shipments","clients","new_clients"]}
-        total_fact = {m: sum(facts.get(n, {}).get(m, 0) for n in PLANS) for m in ["revenue","shipments","clients","new_clients"]}
+        total_plan = {m: sum(PLANS[n][m] for n in PLANS) for m in ["revenue","shipments","clients","new_clients","attracted"]}
+        total_fact = {m: sum(facts.get(n, {}).get(m, 0) for n in PLANS) for m in ["revenue","shipments","clients","new_clients","attracted"]}
 
         def pct(f, p): return f"{f/p*100:.0f}%" if p else "—"
 
@@ -3781,7 +3787,10 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{pct(total_fact['clients'], total_plan['clients'])}\n\n"
             f"Клиенты нов.\n"
             f"{total_fact['new_clients']} / {total_plan['new_clients']}\n"
-            f"{pct(total_fact['new_clients'], total_plan['new_clients'])}"
+            f"{pct(total_fact['new_clients'], total_plan['new_clients'])}\n\n"
+            f"Привл.тов.\n"
+            f"{total_fact['attracted']/1e6:.2f} / {total_plan['attracted']/1e6:.1f} млн\n"
+            f"{pct(total_fact['attracted'], total_plan['attracted'])}"
         )
 
         mid_y = (len(MANAGERS) * step) / 2 - 0.3
