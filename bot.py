@@ -3634,6 +3634,83 @@ async def cmd_delete_executor_tasks(update: Update, context: ContextTypes.DEFAUL
     await update.message.reply_text(f"✅ Закрыто задач для *{name}*: {count}", parse_mode="Markdown")
 
 
+async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/test_fact [тег] — тест получения отгрузок по тегу за текущий месяц."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    tag = " ".join(context.args).lower() if context.args else "скляр"
+    await update.message.reply_text(f"🔍 Считаю отгрузки за март по тегу *{tag}*...", parse_mode="Markdown")
+
+    import aiohttp
+    from datetime import date
+
+    MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
+    from moysklad import get_headers
+
+    month_start = date.today().replace(day=1).isoformat()
+    month_end = date.today().isoformat()
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 1. Все контрагенты с тегом
+            cp_ids = set()
+            offset = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/counterparty",
+                    headers=get_headers(),
+                    params={"filter": f"tags={tag}", "limit": 100, "offset": offset}
+                ) as r:
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for cp in rows:
+                    cp_ids.add(cp.get("id", ""))
+                if len(rows) < 100:
+                    break
+                offset += 100
+
+            await update.message.reply_text(f"Контрагентов с тегом *{tag}*: {len(cp_ids)}", parse_mode="Markdown")
+
+            # 2. Отгрузки за период
+            shipments = 0
+            revenue = 0.0
+            clients = set()
+            offset = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(),
+                    params={
+                        "filter": f"moment>={month_start} 00:00:00;moment<={month_end} 23:59:59",
+                        "expand": "agent",
+                        "limit": 200,
+                        "offset": offset,
+                    }
+                ) as r:
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent_id = row.get("agent", {}).get("id", "")
+                    if agent_id in cp_ids:
+                        shipments += 1
+                        revenue += (row.get("sum", 0) or 0) / 100
+                        clients.add(agent_id)
+                if len(rows) < 200:
+                    break
+                offset += 200
+
+            await update.message.reply_text(
+                f"📊 *Итог по тегу {tag} за март:*\n"
+                f"🚚 Отгрузок: *{shipments}*\n"
+                f"💰 Выручка: *{revenue:,.0f} руб.*\n"
+                f"👥 Клиентов: *{len(clients)}*",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/block [user_id] — заблокировать пользователя."""
     if not update.effective_user or update.effective_user.id != 360092495:
@@ -4107,6 +4184,7 @@ def main():
     # Команды
     app.add_handler(CallbackQueryHandler(handle_task_done_callback, pattern="^task_done\\|"))
     app.add_handler(CommandHandler("del_tasks", cmd_delete_executor_tasks))
+    app.add_handler(CommandHandler("test_fact", cmd_test_fact))
     app.add_handler(CommandHandler("block", cmd_block_user))
     app.add_handler(CommandHandler("unblock", cmd_unblock_user))
     app.add_handler(CommandHandler("stats", cmd_stats))
