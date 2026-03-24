@@ -4163,7 +4163,7 @@ async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_test_publink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/test_publink — проверяет ссылку личного кабинета."""
+    """/test_publink — пробуем сделать заказ публичным."""
     user = update.effective_user
     if not user or user.id != 360092495:
         return
@@ -4172,40 +4172,45 @@ async def cmd_test_publink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from moysklad import get_headers, MS_BASE
 
     order_id = context.args[0] if context.args else "ff0588e7-2766-11f1-0a80-01a1000aa0eb"
-    await update.message.reply_text("🔍 Ищу ссылку личного кабинета...")
+    await update.message.reply_text("🔍 Пробуем опубликовать заказ...")
 
     try:
         async with aiohttp.ClientSession() as session:
 
-            # 1. Получаем данные аккаунта — там должен быть онлайн-магазин
-            async with session.get(
-                f"{MS_BASE}/context/companysettings",
-                headers=get_headers()
-            ) as r:
-                settings = await r.json() if r.status == 200 else {}
-            await update.message.reply_text(f"Настройки компании:\n{str(settings)[:400]}")
-
-            # 2. Ищем приложения/интеграции
-            async with session.get(
+            # Пробуем поставить shared=True
+            async with session.put(
                 f"{MS_BASE}/entity/customerorder/{order_id}",
                 headers=get_headers(),
-                params={"expand": "agent"}
+                json={"shared": True}
             ) as r:
-                order = await r.json()
+                upd_status = r.status
+                upd_body = await r.json() if r.status == 200 else await r.text()
 
-            order_name = order.get("name", "")
-            # Ищем externalCode — может быть ссылка
-            ext_code = order.get("externalCode", "")
-            shared = order.get("shared", False)
-            sync_id = order.get("syncId", "")
+            if upd_status == 200:
+                shared = upd_body.get("shared", False)
+                ext_code = upd_body.get("externalCode", "")
+                order_name = upd_body.get("name", "")
+                # Формируем возможные ссылки
+                links = [
+                    f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}",
+                    f"https://online.moysklad.ru/app/#customerorder?externalCode={ext_code}",
+                ]
+                await update.message.reply_text(
+                    f"shared теперь: {shared}\n"
+                    f"externalCode: {ext_code}\n\n"
+                    f"Возможные ссылки:\n" + "\n".join(links)
+                )
+            else:
+                await update.message.reply_text(f"Ошибка {upd_status}: {str(upd_body)[:300]}")
 
-            await update.message.reply_text(
-                f"Заказ: {order_name}\n"
-                f"externalCode: {ext_code}\n"
-                f"shared: {shared}\n"
-                f"syncId: {sync_id}\n"
-                f"Ключи: {list(order.keys())}"
-            )
+            # Ищем решение "Онлайн-заказ" — его endpoint
+            async with session.get(
+                f"{MS_BASE}/app/",
+                headers=get_headers()
+            ) as r:
+                app_status = r.status
+                app_body = await r.text()
+            await update.message.reply_text(f"Apps endpoint: {app_status}\n{app_body[:200]}")
 
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
