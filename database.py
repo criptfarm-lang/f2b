@@ -255,6 +255,10 @@ class Database:
                 name TEXT,
                 alerted_at DATE DEFAULT CURRENT_DATE
             )""",
+            """CREATE TABLE IF NOT EXISTS agreed_notifications (
+                order_id TEXT PRIMARY KEY,
+                sent_at TIMESTAMP DEFAULT NOW()
+            )""",
             """CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -362,6 +366,18 @@ class Database:
         return last_date, results
 
     # ─── ПЛАНЫ ПРОДАЖ ────────────────────────────────────────────────────────
+
+    def is_agreed_notified(self, order_id: str) -> bool:
+        """Проверяет отправляли ли уже уведомление по этому заказу."""
+        row = self._fetchone("SELECT order_id FROM agreed_notifications WHERE order_id=%s", (order_id,))
+        return row is not None
+
+    def save_agreed_notification(self, order_id: str):
+        """Сохраняет факт отправки уведомления."""
+        self._execute(
+            "INSERT INTO agreed_notifications (order_id) VALUES (%s) ON CONFLICT DO NOTHING",
+            (order_id,)
+        )
 
     def get_aging_alerted(self) -> set:
         """Возвращает ID контрагентов которым уже отправлен алерт."""
