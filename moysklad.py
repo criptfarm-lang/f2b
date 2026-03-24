@@ -2532,27 +2532,9 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                     offset += 100
                 tag_to_ids[tag] = ids
                 logger.info(f"get_manager_shipments: {tag} — {len(ids)} контрагентов")
-                if tag == "леонтьев":
-                    logger.info(f"леонтьев IDs: {ids}")
-            # Проверяем конкретную отгрузку Батаевой
-            demand_id = "7ab90e44-26be-11f1-0a80-106c0032c7b1"
-            async with session.get(
-                f"{MS_BASE}/entity/demand/{demand_id}",
-                headers=get_headers()
-            ) as r:
-                d = await r.json()
-            agent = d.get("agent", {})
-            agent_href = agent.get("meta", {}).get("href", "")
-            agent_id_from_demand = agent_href.split("/")[-1] if agent_href else ""
-            logger.info(f"Батаева отгрузка: agent_href={agent_href}")
-            logger.info(f"Батаева отгрузка: agent_id={agent_id_from_demand}")
-            logger.info(f"Батаева в tag_to_ids леонтьев: {agent_id_from_demand in tag_to_ids.get('леонтьев', set())}")
-            logger.info(f"Батаева в tag_to_ids все: {[(t, agent_id_from_demand in ids) for t, ids in tag_to_ids.items()]}")
 
             # 2. Все отгрузки за период
             offset = 0
-            total_demands = 0
-            batayeva_id = "45bdefd1-2697-11f1-0a80-1d34002ab2f4"
             while True:
                 params = {
                     "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
@@ -2566,17 +2548,12 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                 ) as r:
                     data = await r.json()
                 rows = data.get("rows", [])
-                total_demands += len(rows)
                 for row in rows:
                     agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
                     agent_id = agent_href.split("/")[-1] if agent_href else ""
-                    if agent_id == batayeva_id:
-                        logger.info(f"БАТАЕВА найдена в отгрузках! offset={offset} sum={row.get('sum')} moment={row.get('moment')}")
                     revenue = (row.get("sum", 0) or 0) / 100
                     for tag, mgr_name in MANAGERS.items():
                         if agent_id in tag_to_ids.get(tag, set()):
-                            if tag == "леонтьев":
-                                logger.info(f"леонтьев совпадение: agent_id={agent_id} rev={revenue}")
                             result[mgr_name]["shipments"] += 1
                             result[mgr_name]["revenue"] += revenue
                             result[mgr_name]["clients"].add(agent_id)
@@ -2584,7 +2561,6 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                 if len(rows) < 200:
                     break
                 offset += 200
-            logger.info(f"get_manager_shipments: всего отгрузок за период={total_demands}")
 
     except Exception as e:
         logger.error(f"get_manager_shipments: {e}", exc_info=True)
