@@ -2484,6 +2484,22 @@ async def get_aging_clients(days: int = 50) -> list:
 
             result = list(all_agents.values())
             result.sort(key=lambda x: x["days"], reverse=True)
+
+            # Дозагружаем имена и теги через карточки контрагентов
+            async with aiohttp.ClientSession() as session2:
+                for client in result:
+                    try:
+                        async with session2.get(
+                            f"{MS_BASE}/entity/counterparty/{client['id']}",
+                            headers=get_headers()
+                        ) as r:
+                            if r.status == 200:
+                                cp = await r.json()
+                                client["name"] = cp.get("name", client["name"])
+                                client["tags"] = [t.lower() for t in cp.get("tags", [])]
+                    except Exception:
+                        pass
+
             logger.info(f"get_aging_clients: стареющих клиентов = {len(result)}")
             return result
 
