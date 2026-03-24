@@ -4146,7 +4146,7 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     try:
-        clients = await get_aging_clients(days=50)
+        clients = await get_aging_clients(days=40)
         if not clients:
             await update.message.reply_text("✅ Стареющих клиентов нет.")
             return
