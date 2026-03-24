@@ -3827,8 +3827,20 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
                 offset += 200
 
+            # Имена клиентов
+            client_names = []
+            for cid in clients:
+                async with session.get(
+                    f"{MS_BASE}/entity/counterparty/{cid}",
+                    headers=get_headers()
+                ) as r:
+                    cp = await r.json()
+                    client_names.append(cp.get("name", cid))
+            client_names.sort()
+
             await update.message.reply_text(
-                f"Итог {tag} за март:\nОтгрузок: {shipments}\nВыручка: {revenue:,.0f} руб.\nКлиентов: {len(clients)}"
+                f"Итог {tag} за март:\nОтгрузок: {shipments}\nВыручка: {revenue:,.0f} руб.\nКлиентов: {len(clients)}\n\n" +
+                "\n".join(f"{i+1}. {n}" for i, n in enumerate(client_names))
             )
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
