@@ -4162,59 +4162,44 @@ async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Промо-текст сохранён:\n\n{text}")
 
 
-async def cmd_test_publink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/test_publink — пробуем сделать заказ публичным."""
+async def cmd_test_publink(update, context):
+    """/test_publink — создаём публичную ссылку на PDF заказа."""
+    import aiohttp
+    from moysklad import get_headers, MS_BASE
+    from telegram.ext import ContextTypes
+    from telegram import Update
+
     user = update.effective_user
     if not user or user.id != 360092495:
         return
 
-    import aiohttp
-    from moysklad import get_headers, MS_BASE
-
     order_id = context.args[0] if context.args else "ff0588e7-2766-11f1-0a80-01a1000aa0eb"
-    await update.message.reply_text("🔍 Пробуем опубликовать заказ...")
+    await update.message.reply_text("🔍 Создаю публичную ссылку на PDF заказа...")
 
     try:
         async with aiohttp.ClientSession() as session:
+            tmpl_href = f"{MS_BASE}/entity/customerorder/metadata/embeddedtemplate/ff0ad2ff-1883-4bc2-ba2f-6fe91686fc1b"
 
-            # Пробуем поставить shared=True
-            async with session.put(
-                f"{MS_BASE}/entity/customerorder/{order_id}",
+            async with session.post(
+                f"{MS_BASE}/entity/customerorder/{order_id}/publications",
                 headers=get_headers(),
-                json={"shared": True}
+                json={"template": {"meta": {
+                    "href": tmpl_href,
+                    "type": "embeddedtemplate",
+                    "mediaType": "application/json"
+                }}}
             ) as r:
-                upd_status = r.status
-                upd_body = await r.json() if r.status == 200 else await r.text()
+                status = r.status
+                body = await r.json() if r.status in (200, 201) else await r.text()
 
-            if upd_status == 200:
-                shared = upd_body.get("shared", False)
-                ext_code = upd_body.get("externalCode", "")
-                order_name = upd_body.get("name", "")
-                # Формируем возможные ссылки
-                links = [
-                    f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}",
-                    f"https://online.moysklad.ru/app/#customerorder?externalCode={ext_code}",
-                ]
-                await update.message.reply_text(
-                    f"shared теперь: {shared}\n"
-                    f"externalCode: {ext_code}\n\n"
-                    f"Возможные ссылки:\n" + "\n".join(links)
-                )
-            else:
-                await update.message.reply_text(f"Ошибка {upd_status}: {str(upd_body)[:300]}")
+            await update.message.reply_text(f"Статус: {status}\n{str(body)[:500]}")
 
-            # Ищем решение "Онлайн-заказ" — его endpoint
-            async with session.get(
-                f"{MS_BASE}/app/",
-                headers=get_headers()
-            ) as r:
-                app_status = r.status
-                app_body = await r.text()
-            await update.message.reply_text(f"Apps endpoint: {app_status}\n{app_body[:200]}")
+            if status in (200, 201) and isinstance(body, dict):
+                pub_href = body.get("href", "")
+                await update.message.reply_text(f"Публичная ссылка:\n{pub_href}")
 
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
-
 
 async def cmd_sync_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sync_managers — обновляет менеджеров в базе по тегам МойСклад."""
