@@ -4154,15 +4154,20 @@ async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.set_promo(raw_args)
         await update.message.reply_text(f"✅ Общий промо сохранён:\n\n{raw_args}")
 
+# Временные токены для веб-отчёта: token → {expires, user_id, mgr_filter}
+_report_tokens: dict = {}
+
+
 async def cmd_web_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/web_report — ссылка на интерактивный веб-отчёт ОП."""
+    """/web_report — временная ссылка на интерактивный отчёт ОП (1 час)."""
     user = update.effective_user
     if not user or user.id != 360092495:
         return
-    token = os.getenv("REPORT_TOKEN", "f2bpro2026")
-    url = f"https://f2b-production.up.railway.app/report?token={token}"
-    await update.message.reply_text(
-        f"📊 Интерактивный отчёт ОП:\n{url}",
+    token = db.create_report_link(mgr_filter=None, ttl_minutes=60)
+    base = os.getenv("RAILWAY_PUBLIC_DOMAIN", "f2b-production.up.railway.app")
+    url = f"https://{base}/report?token={token}"
+    await update.effective_message.reply_text(
+        f"📊 Отчёт ОП (ссылка действует 1 час):\n{url}"
     )
 
 
@@ -5357,13 +5362,15 @@ def main():
     async def handle_health(request):
         return web.Response(text="ok")
 
-    REPORT_TOKEN = os.getenv("REPORT_TOKEN", "f2bpro2026")
-
     async def handle_web_report(request):
         """Интерактивный веб-отчёт ОП."""
         token = request.query.get("token", "")
-        if token != REPORT_TOKEN:
-            return web.Response(text="403 Forbidden", status=403)
+        link = db.get_report_link(token)
+        if not link:
+            return web.Response(
+                text="<html><body style='font-family:sans-serif;padding:40px;color:#6b7280'><h2>Ссылка истекла или недействительна</h2><p>Запроси новую через /web_report в боте.</p></body></html>",
+                content_type="text/html", status=403
+            )
 
         try:
             import json
