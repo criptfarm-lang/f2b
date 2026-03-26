@@ -3088,11 +3088,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Переписки
         if rows:
             by_manager = {}
+            unknown = []
             for row in rows:
                 mgr = row.get("manager_name") or "Неизвестно"
                 if mgr == "Неизвестно":
-                    continue  # пропускаем неидентифицированных
-                by_manager.setdefault(mgr, []).append(row)
+                    unknown.append(row)
+                else:
+                    by_manager.setdefault(mgr, []).append(row)
 
             lines.append("💬 *Переписки:*")
             for mgr, msgs in sorted(by_manager.items()):
@@ -3102,6 +3104,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lines.append(f"  • {c}")
                 if len(clients) > 10:
                     lines.append(f"  _...и ещё {len(clients)-10}_")
+                lines.append("")
+
+            if unknown:
+                clients_unk = list({r.get("client_name") or r.get("contact_name", "") for r in unknown if r.get("client_name") or r.get("contact_name")})
+                lines.append(f"❓ *Не идентифицированы* — {len(unknown)} сообщений, {len(clients_unk)} контактов:")
+                for c in clients_unk[:10]:
+                    lines.append(f"  • {c}")
+                if len(clients_unk) > 10:
+                    lines.append(f"  _...и ещё {len(clients_unk)-10}_")
                 lines.append("")
 
         # Звонки
