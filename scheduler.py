@@ -19,16 +19,13 @@ from moysklad import get_overdue_demands, format_overdue_summary
 
 logger = logging.getLogger(__name__)
 
-
 def get_group_ids():
     raw = os.getenv("GROUP_CHAT_IDS", "")
     return [int(x.strip()) for x in raw.split(",") if x.strip()]
 
-
 def get_group_chat_id():
     val = os.getenv("GROUP_CHAT_ID", "")
     return int(val) if val else None
-
 
 # Менеджеры ПДЗ — порядок определяет очерёдность отправки (2 мин между каждым)
 # chat_id подтягивается из БД (менеджер пишет /mychatid боту)
@@ -37,7 +34,6 @@ PDZ_MANAGERS = [
     {"name": "Елена",    "tag": "мерзлякова", "name_fragment": "Мерзлякова"},
     {"name": "Инесса",   "tag": "скляр",      "name_fragment": "Скляр"},
     {"name": "Алексей",  "tag": "леонтьев",   "name_fragment": "Леонтьев"},
-    {"name": "Сергей",   "tag": "черентаев",  "name_fragment": "Черентаев"},
 ]
 
 # Флаг — был ли запущен /pdz сегодня (для вечерней сводки)
@@ -45,7 +41,6 @@ pdz_launched_today: set = set()  # хранит даты когда был за�
 
 # Хранилище сообщений группы за текущий день ПДЗ
 pdz_day_messages: dict = {}
-
 
 def setup_scheduler(app: Application, db):
     """Настраивает и запускает все запланированные задачи."""
@@ -93,7 +88,6 @@ def setup_scheduler(app: Application, db):
     scheduler.start()
     logger.info("✅ Планировщик запущен")
 
-
 async def morning_summary(app: Application, db):
     """Отправляет утреннюю сводку в группы."""
     group_ids = get_group_ids()
@@ -115,7 +109,6 @@ async def morning_summary(app: Application, db):
         except Exception as e:
             logger.error(f"Не удалось отправить сводку в {chat_id}: {e}")
 
-
 async def remind_today_tasks(app: Application, db):
     """Напоминает о задачах на сегодня."""
     group_ids = get_group_ids()
@@ -135,7 +128,6 @@ async def remind_today_tasks(app: Application, db):
             await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Ошибка напоминания в {chat_id}: {e}")
-
 
 async def pdz_morning_task(app: Application, mgr: dict):
     """
@@ -205,7 +197,6 @@ async def pdz_morning_task(app: Application, mgr: dict):
     except Exception as e:
         logger.error(f"Ошибка pdz_morning_task для {mgr['name']}: {e}", exc_info=True)
 
-
 def record_group_message(sender_name: str, tag: str, text: str):
     """Записывает сообщение из группы в хранилище текущего дня ПДЗ."""
     today = date.today().isoformat()
@@ -214,7 +205,6 @@ def record_group_message(sender_name: str, tag: str, text: str):
     if tag not in pdz_day_messages[today]:
         pdz_day_messages[today][tag] = []
     pdz_day_messages[today][tag].append(f"{sender_name}: {text}")
-
 
 async def pdz_evening_summary(app: Application):
     """В 17:00 собирает результаты из БД и отправляет сводку по каждому менеджеру."""
@@ -279,7 +269,6 @@ async def pdz_evening_summary(app: Application):
     except Exception as e:
         logger.error(f"Ошибка pdz_evening_summary: {e}", exc_info=True)
 
-
 def cleanup_done_tasks():
     """Удаляет выполненные задачи старше 24 часов."""
     try:
@@ -290,7 +279,6 @@ def cleanup_done_tasks():
     except Exception as e:
         logger.error(f"cleanup_done_tasks: {e}")
 
-
 async def sync_managers_job(app: Application):
     """Ночная синхронизация менеджеров в wazzup_contact_map."""
     try:
@@ -299,7 +287,6 @@ async def sync_managers_job(app: Application):
         logger.info(f"sync_managers_job: обновлено {updated} контактов")
     except Exception as e:
         logger.error(f"sync_managers_job: {e}", exc_info=True)
-
 
 async def check_aging_clients(app: Application):
     """Ежедневно в 12:00 — алерт по новым стареющим клиентам (40+ дней без отгрузок)."""
@@ -333,7 +320,6 @@ async def check_aging_clients(app: Application):
             "мерзлякова": "Елена Мерзлякова",
             "скляр": "Инесса Скляр",
             "леонтьев": "Алексей Леонтьев",
-            "черентаев": "Сергей Черентаев",
         }
 
         import asyncio
