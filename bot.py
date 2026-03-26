@@ -4898,6 +4898,21 @@ async def _build_report_data() -> dict:
         facts[mgr_name]["lost_clients"] = lost.get(mgr_name, 0)
 
     TAGS = {"скляр":"Инесса Скляр","мерзлякова":"Елена Мерзлякова","баласанян":"Карина Баласанян","леонтьев":"Алексей Леонтьев"}
+
+    # История по месяцам (кэшируется раз в месяц)
+    from moysklad import get_manager_monthly_history
+    mgr_history = {}
+    for tag, mgr_name in TAGS.items():
+        cached_hist = db.get_mgr_history_cache(tag)
+        if cached_hist is not None:
+            mgr_history[mgr_name] = cached_hist
+            logger.info(f"_build_report_data: история {mgr_name} из кэша")
+        else:
+            logger.info(f"_build_report_data: считаю историю {mgr_name}...")
+            hist = await get_manager_monthly_history(tag, mgr_name)
+            db.set_mgr_history_cache(tag, hist)
+            mgr_history[mgr_name] = hist
+
     tag_to_ids = {}
     async with aiohttp.ClientSession() as session:
         for tag, mgr in TAGS.items():
@@ -4976,6 +4991,7 @@ async def _build_report_data() -> dict:
         "short_names": SHORT_NAMES,
         "new_client_names": new_client_names,
         "lost_client_names": lost_client_names,
+        "mgr_history": mgr_history,
     }
 
 
