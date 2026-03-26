@@ -4154,6 +4154,18 @@ async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.set_promo(raw_args)
         await update.message.reply_text(f"✅ Общий промо сохранён:\n\n{raw_args}")
 
+async def cmd_web_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/web_report — ссылка на интерактивный веб-отчёт ОП."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    token = os.getenv("REPORT_TOKEN", "f2bpro2026")
+    url = f"https://f2b-production.up.railway.app/report?token={token}"
+    await update.message.reply_text(
+        f"📊 Интерактивный отчёт ОП:\n{url}",
+    )
+
+
 async def cmd_lost_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/lost_clients — клиенты которые грузились в прошлом месяце но не грузились в этом."""
     user = update.effective_user
@@ -5109,6 +5121,7 @@ def main():
     app.add_handler(CommandHandler("test_group", cmd_test_group))
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
     app.add_handler(CommandHandler("set_promo", cmd_set_promo))
+    app.add_handler(CommandHandler("web_report", cmd_web_report))
     app.add_handler(CommandHandler("lost_clients", cmd_lost_clients))
     app.add_handler(CommandHandler("new_clients", cmd_new_clients))
     app.add_handler(CommandHandler("test_publink", cmd_test_publink))
@@ -5344,6 +5357,64 @@ def main():
     async def handle_health(request):
         return web.Response(text="ok")
 
+    REPORT_TOKEN = os.getenv("REPORT_TOKEN", "f2bpro2026")
+
+    async def handle_web_report(request):
+        """Интерактивный веб-отчёт ОП."""
+        token = request.query.get("token", "")
+        if token != REPORT_TOKEN:
+            return web.Response(text="403 Forbidden", status=403)
+
+        try:
+            import json
+            from datetime import date
+            from moysklad import get_manager_shipments, get_attracted_goods_by_manager, get_lost_clients_by_manager
+
+            today = date.today()
+            month_start = today.replace(day=1).isoformat()
+            month_end = today.isoformat()
+
+            facts = await get_manager_shipments(month_start, month_end)
+            attracted = await get_attracted_goods_by_manager(month_start, month_end)
+            lost = await get_lost_clients_by_manager(month_start, month_end)
+
+            for mgr_name in facts:
+                facts[mgr_name]["attracted"] = attracted.get(mgr_name, 0.0)
+                facts[mgr_name]["lost_clients"] = lost.get(mgr_name, 0)
+
+            PLANS = {
+                "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29, "new_clients": 3, "attracted": 1_000_000},
+                "Карина Баласанян": {"shipments": 150, "revenue": 5_000_000,  "clients": 38, "new_clients": 3, "attracted": 1_100_000},
+                "Елена Мерзлякова": {"shipments": 65,  "revenue": 6_000_000,  "clients": 30, "new_clients": 3, "attracted": 300_000},
+                "Алексей Леонтьев": {"shipments": 12,  "revenue": 180_000,    "clients": 5,  "new_clients": 3, "attracted": 300_000},
+            }
+            SHORT_NAMES = {
+                "Инесса Скляр": "Инесса",
+                "Карина Баласанян": "Карина",
+                "Елена Мерзлякова": "Елена",
+                "Алексей Леонтьев": "Алексей",
+            }
+
+            report_data = {
+                "date": today.strftime("%d.%m.%Y"),
+                "facts": facts,
+                "plans": PLANS,
+                "short_names": SHORT_NAMES,
+            }
+
+            # Читаем шаблон
+            import pathlib
+            tpl_path = pathlib.Path("/app/report_template.html")
+            if not tpl_path.exists():
+                tpl_path = pathlib.Path(__file__).parent / "report_template.html"
+            html = tpl_path.read_text(encoding="utf-8")
+            html = html.replace("__REPORT_DATA__", json.dumps(report_data, ensure_ascii=False))
+            return web.Response(text=html, content_type="text/html", charset="utf-8")
+
+        except Exception as e:
+            logger.error(f"handle_web_report: {e}", exc_info=True)
+            return web.Response(text=f"Ошибка: {e}", status=500)
+
     async def run_web():
         web_app = web.Application()
         web_app.router.add_post("/webhook/moysklad", handle_ms_webhook)
@@ -5351,6 +5422,7 @@ def main():
         web_app.router.add_get("/webhook/sipuni", handle_sipuni_webhook)
         web_app.router.add_post("/webhook/sipuni", handle_sipuni_webhook)
         web_app.router.add_get("/health", handle_health)
+        web_app.router.add_get("/report", handle_web_report)
         port = int(os.getenv("PORT", "8080"))
         runner = web.AppRunner(web_app)
         await runner.setup()
