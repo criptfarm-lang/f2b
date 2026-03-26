@@ -3687,7 +3687,6 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ("clients",      "Клиенты",        1,          "#c084fc"),
             ("new_clients",  "Клиенты нов.",   1,          "#e879f9"),
             ("attracted",    "Привл.тов.млн",  1_000_000,  "#f0abfc"),
-            ("lost_clients", "Выбывшие",       1,          "#f87171"),
         ]
 
         BG      = "#ffffff"
@@ -3749,11 +3748,16 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ytick_pos.append(by)
                 ytick_labels.append(label)
 
-            mgr_labels.append((0.5, gy + group_h + 0.17, short))
+            lost = fact.get("lost_clients", 0)
+            mgr_labels.append((0.5, gy + group_h + 0.17, short, lost))
 
-        for lx, ly, name in mgr_labels:
+        for lx, ly, name, lost in mgr_labels:
             ax.text(lx, ly, name, ha="center", va="bottom",
                     color=TEXT, fontsize=9, fontweight="bold")
+            if lost > 0:
+                ax.text(lx, ly - 0.13, f"▼ выбыли: -{lost}",
+                        ha="center", va="bottom",
+                        color="#ef4444", fontsize=7, fontweight="bold")
 
         # Суммарные план/факт
         total_plan = {m: sum(PLANS[n][m] for n in PLANS) for m in ["revenue","shipments","clients","new_clients","attracted","lost_clients"]}
