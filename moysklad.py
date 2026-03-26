@@ -2649,3 +2649,120 @@ async def get_attracted_goods_by_manager(date_from: str, date_to: str) -> dict:
         logger.info(f"attracted_goods {name}: {val:.0f}")
 
     return result
+
+
+async def get_lost_clients_by_manager(date_from: str, date_to: str) -> dict:
+    """
+    Клиенты которые грузились в прошлом месяце но не грузились в текущем.
+    date_from/date_to — текущий период.
+    """
+    import aiohttp
+    from datetime import datetime
+
+    MANAGERS = {
+        "скляр":      "Инесса Скляр",
+        "мерзлякова": "Елена Мерзлякова",
+        "баласанян":  "Карина Баласанян",
+        "леонтьев":   "Алексей Леонтьев",
+    }
+
+    result = {name: 0 for name in MANAGERS.values()}
+
+    try:
+        # Прошлый месяц
+        dt = datetime.strptime(date_from, "%Y-%m-%d")
+        if dt.month == 1:
+            prev_start = f"{dt.year-1}-12-01"
+            prev_end = date_from
+        else:
+            prev_start = f"{dt.year}-{dt.month-1:02d}-01"
+            prev_end = date_from
+
+        async with aiohttp.ClientSession() as session:
+            # Контрагенты каждого менеджера
+            tag_to_ids = {}
+            for tag in MANAGERS:
+                ids = set()
+                off = 0
+                while True:
+                    async with session.get(
+                        f"{MS_BASE}/entity/counterparty",
+                        headers=get_headers(),
+                        params={"filter": f"tags={tag}", "limit": 100, "offset": off}
+                    ) as r:
+                        data = await r.json()
+                    rows = data.get("rows", [])
+                    for cp in rows:
+                        ids.add(cp.get("id", ""))
+                    if len(rows) < 100:
+                        break
+                    off += 100
+                tag_to_ids[tag] = ids
+
+            all_mgr_ids = set().union(*tag_to_ids.values())
+
+            # Клиенты прошлого месяца (только менеджеров ОП)
+            prev_clients = set()
+            offset = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(),
+                    params={
+                        "filter": f"moment>={prev_start} 00:00:00;moment<{prev_end} 00:00:00",
+                        "expand": "agent",
+                        "limit": 200,
+                        "offset": offset,
+                    }
+                ) as r:
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
+                    agent_id = agent_href.split("/")[-1] if agent_href else ""
+                    if agent_id and agent_id in all_mgr_ids:
+                        prev_clients.add(agent_id)
+                if len(rows) < 200:
+                    break
+                offset += 200
+
+            # Клиенты текущего месяца
+            curr_clients = set()
+            offset = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(),
+                    params={
+                        "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
+                        "expand": "agent",
+                        "limit": 200,
+                        "offset": offset,
+                    }
+                ) as r:
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
+                    agent_id = agent_href.split("/")[-1] if agent_href else ""
+                    if agent_id:
+                        curr_clients.add(agent_id)
+                if len(rows) < 200:
+                    break
+                offset += 200
+
+            # Выбывшие по менеджерам
+            lost_ids = prev_clients - curr_clients
+            for agent_id in lost_ids:
+                for tag, mgr_name in MANAGERS.items():
+                    if agent_id in tag_to_ids.get(tag, set()):
+                        result[mgr_name] += 1
+                        break
+
+    except Exception as e:
+        logger.error(f"get_lost_clients_by_manager: {e}", exc_info=True)
+
+    for name, val in result.items():
+        logger.info(f"lost_clients {name}: {val}")
+
+    return result
