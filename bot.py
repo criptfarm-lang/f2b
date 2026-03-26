@@ -3643,7 +3643,7 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply("⏳ Собираю данные...")
 
     from datetime import date
-    from moysklad import get_manager_shipments, get_attracted_goods_by_manager
+    from moysklad import get_manager_shipments, get_attracted_goods_by_manager, get_lost_clients_by_manager
 
     today = date.today()
     month_start = today.replace(day=1).isoformat()
@@ -3651,16 +3651,17 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     facts = await get_manager_shipments(month_start, month_end)
     attracted = await get_attracted_goods_by_manager(month_start, month_end)
+    lost = await get_lost_clients_by_manager(month_start, month_end)
 
-    # Добавляем attracted в facts
     for mgr_name in facts:
         facts[mgr_name]["attracted"] = attracted.get(mgr_name, 0.0)
+        facts[mgr_name]["lost_clients"] = lost.get(mgr_name, 0)
 
     PLANS = {
-        "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29, "new_clients": 3, "attracted": 1_000_000},
-        "Карина Баласанян": {"shipments": 150, "revenue": 5_000_000,  "clients": 38, "new_clients": 3, "attracted": 1_100_000},
-        "Елена Мерзлякова": {"shipments": 65,  "revenue": 6_000_000,  "clients": 30, "new_clients": 3, "attracted": 300_000},
-        "Алексей Леонтьев": {"shipments": 12,  "revenue": 180_000,    "clients": 5,  "new_clients": 3, "attracted": 300_000},
+        "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29, "new_clients": 3, "attracted": 1_000_000, "lost_clients": 1},
+        "Карина Баласанян": {"shipments": 150, "revenue": 5_000_000,  "clients": 38, "new_clients": 3, "attracted": 1_100_000, "lost_clients": 1},
+        "Елена Мерзлякова": {"shipments": 65,  "revenue": 6_000_000,  "clients": 30, "new_clients": 3, "attracted": 300_000,   "lost_clients": 1},
+        "Алексей Леонтьев": {"shipments": 12,  "revenue": 180_000,    "clients": 5,  "new_clients": 3, "attracted": 300_000,   "lost_clients": 1},
     }
 
     # new_clients считается в get_manager_shipments
@@ -3681,11 +3682,12 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ("Алексей Леонтьев", "Алексей"),
         ]
         METRICS = [
-            ("revenue",    "Выручка, млн", 1_000_000, "#7c3aed"),
-            ("shipments",  "Отгрузки",     1,          "#a855f7"),
-            ("clients",    "Клиенты",      1,          "#c084fc"),
-            ("new_clients","Клиенты нов.", 1,          "#e879f9"),
-            ("attracted",  "Привл.тов.млн", 1_000_000,  "#f0abfc"),
+            ("revenue",      "Выручка, млн",  1_000_000, "#7c3aed"),
+            ("shipments",    "Отгрузки",       1,          "#a855f7"),
+            ("clients",      "Клиенты",        1,          "#c084fc"),
+            ("new_clients",  "Клиенты нов.",   1,          "#e879f9"),
+            ("attracted",    "Привл.тов.млн",  1_000_000,  "#f0abfc"),
+            ("lost_clients", "Выбывшие",       1,          "#f87171"),
         ]
 
         BG      = "#ffffff"
@@ -3754,8 +3756,8 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     color=TEXT, fontsize=9, fontweight="bold")
 
         # Суммарные план/факт
-        total_plan = {m: sum(PLANS[n][m] for n in PLANS) for m in ["revenue","shipments","clients","new_clients","attracted"]}
-        total_fact = {m: sum(facts.get(n, {}).get(m, 0) for n in PLANS) for m in ["revenue","shipments","clients","new_clients","attracted"]}
+        total_plan = {m: sum(PLANS[n][m] for n in PLANS) for m in ["revenue","shipments","clients","new_clients","attracted","lost_clients"]}
+        total_fact = {m: sum(facts.get(n, {}).get(m, 0) for n in PLANS) for m in ["revenue","shipments","clients","new_clients","attracted","lost_clients"]}
 
         def pct(f, p): return f"{f/p*100:.0f}%" if p else "—"
 
@@ -3775,7 +3777,10 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{pct(total_fact['new_clients'], total_plan['new_clients'])}\n\n"
             f"Привл.тов., млн\n"
             f"{total_fact['attracted']/1e6:.1f} / {total_plan['attracted']/1e6:.1f}\n"
-            f"{pct(total_fact['attracted'], total_plan['attracted'])}"
+            f"{pct(total_fact['attracted'], total_plan['attracted'])}\n\n"
+            f"Выбывшие\n"
+            f"{total_fact['lost_clients']} / {total_plan['lost_clients']}\n"
+            f"{pct(total_fact['lost_clients'], total_plan['lost_clients'])}"
         )
 
         mid_y = (len(MANAGERS) * step) / 2 - 0.3
