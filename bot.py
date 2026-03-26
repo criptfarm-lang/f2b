@@ -4982,7 +4982,18 @@ def main():
                         chat_type=chat_type,
                         channel_id=channel_id_val,
                     )
-                    # Для Telegram — уведомляем руководителя если контакт неизвестен
+
+                # Для исходящих — тоже проверяем идентификацию
+                if chat_id_val and contact_name and is_outbound:
+                    db.save_wazzup_contact(
+                        contact_name=contact_name,
+                        chat_id=chat_id_val,
+                        chat_type=chat_type,
+                        channel_id=channel_id_val,
+                    )
+
+                # Уведомляем если контакт неизвестен (для любых сообщений)
+                if chat_id_val and contact_name:
                     is_known = db.is_wazzup_contact_known(chat_id_val)
                     logger.info(f"Wazzup: chat_id={chat_id_val} is_known={is_known}")
                     if chat_type in ("telegram", "tgapi", "max") and not is_known and chat_id_val not in _wazzup_notified:
