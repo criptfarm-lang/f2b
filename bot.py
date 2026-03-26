@@ -3663,9 +3663,10 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Алексей Леонтьев": {"shipments": 12,  "revenue": 180_000,    "clients": 5,  "new_clients": 3, "attracted": 300_000},
     }
 
-    # new_clients пока 0 — будет добавлено позже
+    # new_clients считается в get_manager_shipments
     for name in facts:
-        facts[name]["new_clients"] = 0
+        if "new_clients" not in facts[name]:
+            facts[name]["new_clients"] = 0
 
     try:
         import io
