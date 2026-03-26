@@ -395,7 +395,7 @@ class Database:
         """Возвращает закэшированные данные отчёта если они не старше 1 часа."""
         import json
         row = self._fetchone(
-            "SELECT data FROM report_cache WHERE updated_at > NOW() - INTERVAL '60 minutes' ORDER BY updated_at DESC LIMIT 1"
+            "SELECT data FROM report_cache WHERE updated_at > NOW() - INTERVAL '300 minutes' ORDER BY updated_at DESC LIMIT 1"
         )
         return json.loads(row["data"]) if row else None
 
