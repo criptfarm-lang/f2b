@@ -2472,7 +2472,7 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
         "леонтьев":   "Алексей Леонтьев",
     }
 
-    result = {name: {"shipments": 0, "revenue": 0.0, "clients": set()}
+    result = {name: {"shipments": 0, "revenue": 0.0, "clients": set(), "new_clients": 0}
               for name in MANAGERS.values()}
 
     try:
@@ -2527,6 +2527,25 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                 if len(rows) < 200:
                     break
                 offset += 200
+
+            # 3. Новые клиенты — у кого не было отгрузок до date_from
+            for mgr_name, data_mgr in result.items():
+                new_clients = set()
+                for agent_id in data_mgr["clients"]:
+                    # Проверяем есть ли отгрузки до начала периода
+                    async with session.get(
+                        f"{MS_BASE}/entity/demand",
+                        headers=get_headers(),
+                        params={
+                            "filter": f"agent={MS_BASE}/entity/counterparty/{agent_id};moment<{date_from} 00:00:00",
+                            "limit": 1,
+                        }
+                    ) as r:
+                        prev = await r.json()
+                    if prev.get("meta", {}).get("size", 0) == 0:
+                        new_clients.add(agent_id)
+                result[mgr_name]["new_clients"] = len(new_clients)
+                logger.info(f"get_manager_shipments {mgr_name}: new_clients={len(new_clients)}")
 
     except Exception as e:
         logger.error(f"get_manager_shipments: {e}", exc_info=True)
