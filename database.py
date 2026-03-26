@@ -165,6 +165,12 @@ class Database:
                 created_at TIMESTAMP DEFAULT NOW()
             );
 
+            CREATE TABLE IF NOT EXISTS report_cache (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                data TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+
             CREATE TABLE IF NOT EXISTS aging_alerts (
                 counterparty_id TEXT PRIMARY KEY,
                 name TEXT,
@@ -384,6 +390,23 @@ class Database:
         return last_date, results
 
     # ─── ПЛАНЫ ПРОДАЖ ────────────────────────────────────────────────────────
+
+    def get_report_cache(self) -> dict:
+        """Возвращает закэшированные данные отчёта если они не старше 1 часа."""
+        import json
+        row = self._fetchone(
+            "SELECT data FROM report_cache WHERE updated_at > NOW() - INTERVAL '60 minutes' ORDER BY updated_at DESC LIMIT 1"
+        )
+        return json.loads(row["data"]) if row else None
+
+    def set_report_cache(self, data: dict):
+        """Сохраняет данные отчёта в кэш."""
+        import json
+        self._execute(
+            """INSERT INTO report_cache (data, updated_at) VALUES (%s, NOW())
+               ON CONFLICT (id) DO UPDATE SET data=%s, updated_at=NOW()""",
+            (json.dumps(data, ensure_ascii=False), json.dumps(data, ensure_ascii=False))
+        )
 
     def create_report_link(self, mgr_filter: str = None, ttl_minutes: int = 60) -> str:
         """Создаёт временную ссылку на отчёт. Возвращает токен."""
