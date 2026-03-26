@@ -3730,6 +3730,10 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg:
         await msg.reply_text(f"📊 Отчёт ОП (действует 1 час):\n{url}")
+    # Обновляем кэш в фоне если он устарел
+    if not db.get_report_cache():
+        import asyncio
+        asyncio.ensure_future(_refresh_report_cache())
 
 async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_fact [тег] — тест получения отгрузок по тегу за текущий месяц."""
@@ -4864,6 +4868,117 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
 
+async def _refresh_report_cache():
+    """Фоновое обновление кэша отчёта."""
+    try:
+        logger.info("_refresh_report_cache: начинаю сбор данных...")
+        data = await _build_report_data()
+        db.set_report_cache(data)
+        logger.info("_refresh_report_cache: кэш обновлён")
+    except Exception as e:
+        logger.error(f"_refresh_report_cache: {e}", exc_info=True)
+
+
+async def _build_report_data() -> dict:
+    """Собирает все данные для отчёта ОП из МойСклад."""
+    from datetime import date
+    from moysklad import get_manager_shipments, get_attracted_goods_by_manager, get_lost_clients_by_manager, get_headers, MS_BASE
+    import aiohttp
+
+    today = date.today()
+    month_start = today.replace(day=1).isoformat()
+    month_end = today.isoformat()
+
+    facts = await get_manager_shipments(month_start, month_end)
+    attracted = await get_attracted_goods_by_manager(month_start, month_end)
+    lost = await get_lost_clients_by_manager(month_start, month_end)
+
+    for mgr_name in facts:
+        facts[mgr_name]["attracted"] = attracted.get(mgr_name, 0.0)
+        facts[mgr_name]["lost_clients"] = lost.get(mgr_name, 0)
+
+    TAGS = {"скляр":"Инесса Скляр","мерзлякова":"Елена Мерзлякова","баласанян":"Карина Баласанян","леонтьев":"Алексей Леонтьев"}
+    tag_to_ids = {}
+    async with aiohttp.ClientSession() as session:
+        for tag, mgr in TAGS.items():
+            ids = set()
+            off = 0
+            while True:
+                async with session.get(f"{MS_BASE}/entity/counterparty", headers=get_headers(), params={"filter":f"tags={tag}","limit":100,"offset":off}) as r:
+                    d = await r.json()
+                rows = d.get("rows",[])
+                for cp in rows: ids.add(cp.get("id",""))
+                if len(rows)<100: break
+                off+=100
+            tag_to_ids[mgr] = ids
+
+        curr_ids = {}
+        off = 0
+        while True:
+            async with session.get(f"{MS_BASE}/entity/demand", headers=get_headers(), params={"filter":f"moment>={month_start} 00:00:00;moment<={month_end} 23:59:59","expand":"agent","limit":200,"offset":off}) as r:
+                d = await r.json()
+            rows = d.get("rows",[])
+            for row in rows:
+                href = row.get("agent",{}).get("meta",{}).get("href","")
+                aid = href.split("/")[-1] if href else ""
+                if aid: curr_ids[aid] = href
+            if len(rows)<200: break
+            off+=200
+
+        new_client_names = {}
+        for mgr, ids in tag_to_ids.items():
+            for aid in ids:
+                if aid not in curr_ids: continue
+                async with session.get(f"{MS_BASE}/entity/demand", headers=get_headers(), params={"filter":f"agent={MS_BASE}/entity/counterparty/{aid};moment<{month_start} 00:00:00","limit":1}) as r:
+                    prev = await r.json()
+                if prev.get("meta",{}).get("size",0)==0:
+                    async with session.get(f"{MS_BASE}/entity/counterparty/{aid}", headers=get_headers()) as r2:
+                        cp = await r2.json()
+                    new_client_names.setdefault(mgr,[]).append(cp.get("name",aid))
+
+        if today.month==1:
+            prev_start = f"{today.year-1}-12-01"
+        else:
+            prev_start = f"{today.year}-{today.month-1:02d}-01"
+        prev_ids = set()
+        all_mgr_ids = set().union(*tag_to_ids.values())
+        off = 0
+        while True:
+            async with session.get(f"{MS_BASE}/entity/demand", headers=get_headers(), params={"filter":f"moment>={prev_start} 00:00:00;moment<{month_start} 00:00:00","expand":"agent","limit":200,"offset":off}) as r:
+                d = await r.json()
+            rows = d.get("rows",[])
+            for row in rows:
+                href = row.get("agent",{}).get("meta",{}).get("href","")
+                aid = href.split("/")[-1] if href else ""
+                if aid and aid in all_mgr_ids: prev_ids.add(aid)
+            if len(rows)<200: break
+            off+=200
+
+        lost_client_names = {}
+        for mgr, ids in tag_to_ids.items():
+            for aid in (ids & prev_ids - set(curr_ids.keys())):
+                async with session.get(f"{MS_BASE}/entity/counterparty/{aid}", headers=get_headers()) as r:
+                    cp = await r.json()
+                lost_client_names.setdefault(mgr,[]).append(cp.get("name",aid))
+
+    PLANS = {
+        "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29, "new_clients": 3, "attracted": 1_000_000},
+        "Карина Баласанян": {"shipments": 150, "revenue": 5_000_000,  "clients": 38, "new_clients": 3, "attracted": 1_100_000},
+        "Елена Мерзлякова": {"shipments": 65,  "revenue": 6_000_000,  "clients": 30, "new_clients": 3, "attracted": 300_000},
+        "Алексей Леонтьев": {"shipments": 12,  "revenue": 180_000,    "clients": 5,  "new_clients": 3, "attracted": 300_000},
+    }
+    SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Алексей Леонтьев":"Алексей"}
+
+    return {
+        "date": today.strftime("%d.%m.%Y"),
+        "facts": facts,
+        "plans": PLANS,
+        "short_names": SHORT_NAMES,
+        "new_client_names": new_client_names,
+        "lost_client_names": lost_client_names,
+    }
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -5142,14 +5257,23 @@ def main():
             )
 
         try:
-            import json
+            import json, pathlib
             from datetime import date
-            from moysklad import get_manager_shipments, get_attracted_goods_by_manager, get_lost_clients_by_manager
-            import aiohttp
 
-            today = date.today()
-            month_start = today.replace(day=1).isoformat()
-            month_end = today.isoformat()
+            # Проверяем кэш
+            cached = db.get_report_cache()
+            if cached:
+                report_data = cached
+                logger.info("handle_web_report: отдаём из кэша")
+            else:
+                # Считаем данные и кэшируем
+                report_data = await _build_report_data()
+                db.set_report_cache(report_data)
+            return web.Response(text=html, content_type="text/html", charset="utf-8")
+
+        except Exception as e:
+            logger.error(f"handle_web_report: {e}", exc_info=True)
+            return web.Response(text=f"Ошибка: {e}", status=500)
 
             facts = await get_manager_shipments(month_start, month_end)
             attracted = await get_attracted_goods_by_manager(month_start, month_end)
