@@ -4145,6 +4145,145 @@ async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.set_promo(raw_args)
         await update.message.reply_text(f"✅ Общий промо сохранён:\n\n{raw_args}")
 
+async def cmd_lost_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/lost_clients — клиенты которые грузились в прошлом месяце но не грузились в этом."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+
+    await update.message.reply_text("🔍 Ищу выбывших клиентов...")
+
+    import aiohttp
+    from datetime import date
+    from moysklad import get_headers, MS_BASE
+
+    today = date.today()
+    # Текущий месяц
+    month_start = today.replace(day=1).isoformat()
+    # Прошлый месяц
+    if today.month == 1:
+        prev_month_start = date(today.year - 1, 12, 1).isoformat()
+        prev_month_end = date(today.year, 1, 1).isoformat()
+    else:
+        prev_month_start = date(today.year, today.month - 1, 1).isoformat()
+        prev_month_end = month_start
+
+    MANAGERS = {
+        "скляр":      "Инесса",
+        "мерзлякова": "Елена",
+        "баласанян":  "Карина",
+        "леонтьев":   "Алексей",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Контрагенты каждого менеджера
+            tag_to_ids = {}
+            for tag in MANAGERS:
+                ids = set()
+                off = 0
+                while True:
+                    async with session.get(
+                        f"{MS_BASE}/entity/counterparty",
+                        headers=get_headers(),
+                        params={"filter": f"tags={tag}", "limit": 100, "offset": off}
+                    ) as r:
+                        data = await r.json()
+                    rows = data.get("rows", [])
+                    for cp in rows:
+                        ids.add(cp.get("id", ""))
+                    if len(rows) < 100:
+                        break
+                    off += 100
+                tag_to_ids[tag] = ids
+
+            all_mgr_ids = set().union(*tag_to_ids.values())
+
+            # Клиенты у кого были отгрузки в ПРОШЛОМ месяце
+            prev_clients = {}  # agent_id → href
+            offset = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(),
+                    params={
+                        "filter": f"moment>={prev_month_start} 00:00:00;moment<{prev_month_end} 00:00:00",
+                        "expand": "agent",
+                        "limit": 200,
+                        "offset": offset,
+                    }
+                ) as r:
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
+                    agent_id = agent_href.split("/")[-1] if agent_href else ""
+                    if agent_id and agent_id in all_mgr_ids:
+                        prev_clients[agent_id] = agent_href
+                if len(rows) < 200:
+                    break
+                offset += 200
+
+            # Клиенты у кого были отгрузки в ТЕКУЩЕМ месяце
+            curr_clients = set()
+            offset = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(),
+                    params={
+                        "filter": f"moment>={month_start} 00:00:00;moment<={today.isoformat()} 23:59:59",
+                        "expand": "agent",
+                        "limit": 200,
+                        "offset": offset,
+                    }
+                ) as r:
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for row in rows:
+                    agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
+                    agent_id = agent_href.split("/")[-1] if agent_href else ""
+                    if agent_id:
+                        curr_clients.add(agent_id)
+                if len(rows) < 200:
+                    break
+                offset += 200
+
+            # Выбывшие = были в прошлом месяце но нет в текущем
+            lost_ids = {aid: href for aid, href in prev_clients.items() if aid not in curr_clients}
+
+            if not lost_ids:
+                await update.message.reply_text("✅ Выбывших клиентов нет.")
+                return
+
+            # Получаем имена и группируем по менеджеру
+            by_mgr = {}
+            for agent_id, agent_href in lost_ids.items():
+                mgr = "Без менеджера"
+                for tag, short in MANAGERS.items():
+                    if agent_id in tag_to_ids.get(tag, set()):
+                        mgr = short
+                        break
+                async with session.get(agent_href, headers=get_headers()) as r:
+                    cp = await r.json()
+                name = cp.get("name", agent_id)
+                by_mgr.setdefault(mgr, []).append(name)
+
+            total = sum(len(v) for v in by_mgr.values())
+            prev_label = date(today.year, today.month - 1 if today.month > 1 else 12, 1).strftime("%B")
+            lines = [f"📉 *Выбывшие клиенты* (грузились в {prev_label}, нет в марте) — {total} чел.\n"]
+            for mgr, names in sorted(by_mgr.items()):
+                lines.append(f"*{mgr}* ({len(names)}):")
+                for n in sorted(names):
+                    lines.append(f"  • {n}")
+                lines.append("")
+
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+
 async def cmd_new_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/new_clients — список новых клиентов текущего месяца."""
     user = update.effective_user
@@ -4961,6 +5100,7 @@ def main():
     app.add_handler(CommandHandler("test_group", cmd_test_group))
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
     app.add_handler(CommandHandler("set_promo", cmd_set_promo))
+    app.add_handler(CommandHandler("lost_clients", cmd_lost_clients))
     app.add_handler(CommandHandler("new_clients", cmd_new_clients))
     app.add_handler(CommandHandler("test_publink", cmd_test_publink))
     app.add_handler(CommandHandler("unlink", cmd_unlink))
