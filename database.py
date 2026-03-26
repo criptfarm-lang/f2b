@@ -171,6 +171,12 @@ class Database:
                 updated_at TIMESTAMP DEFAULT NOW()
             );
 
+            CREATE TABLE IF NOT EXISTS mgr_history_cache (
+                mgr_tag TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+
             CREATE TABLE IF NOT EXISTS aging_alerts (
                 counterparty_id TEXT PRIMARY KEY,
                 name TEXT,
@@ -390,6 +396,26 @@ class Database:
         return last_date, results
 
     # ─── ПЛАНЫ ПРОДАЖ ────────────────────────────────────────────────────────
+
+    def get_mgr_history_cache(self, mgr_tag: str) -> list:
+        """Возвращает кэш истории менеджера (обновляется раз в месяц)."""
+        import json
+        row = self._fetchone(
+            """SELECT data FROM mgr_history_cache
+               WHERE mgr_tag=%s
+               AND DATE_TRUNC('month', updated_at) = DATE_TRUNC('month', NOW())""",
+            (mgr_tag,)
+        )
+        return json.loads(row["data"]) if row else None
+
+    def set_mgr_history_cache(self, mgr_tag: str, data: list):
+        """Сохраняет историю менеджера в кэш."""
+        import json
+        self._execute(
+            """INSERT INTO mgr_history_cache (mgr_tag, data, updated_at) VALUES (%s, %s, NOW())
+               ON CONFLICT (mgr_tag) DO UPDATE SET data=%s, updated_at=NOW()""",
+            (mgr_tag, json.dumps(data, ensure_ascii=False), json.dumps(data, ensure_ascii=False))
+        )
 
     def get_report_cache(self) -> dict:
         """Возвращает закэшированные данные отчёта если они не старше 1 часа."""
