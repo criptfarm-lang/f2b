@@ -3625,6 +3625,103 @@ async def cmd_delete_executor_tasks(update: Update, context: ContextTypes.DEFAUL
     db.conn.commit()
     await update.message.reply_text(f"✅ Закрыто задач для *{name}*: {count}", parse_mode="Markdown")
 
+async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/test_group [название группы] — сумма продаж по группе товаров за текущий месяц по менеджерам."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+
+    import aiohttp
+    from datetime import date
+    from moysklad import get_headers
+    MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
+
+    group_name_query = " ".join(context.args) if context.args else "ПРИВЛЕЧЕННЫЕ ТОВАРЫ"
+    await update.message.reply_text(f"🔍 Ищу группу товаров {group_name_query}...")
+
+    month_start = date.today().replace(day=1).isoformat()
+    month_end   = date.today().isoformat()
+
+    TAGS = {
+        "скляр":      "Инесса",
+        "мерзлякова": "Елена",
+        "баласанян":  "Карина",
+        "леонтьев":   "Алексей",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/productfolder",
+                headers=get_headers(),
+                params={"filter": f"name={group_name_query}", "limit": 10}
+            ) as r:
+                data = await r.json()
+
+            folders = data.get("rows", [])
+            if not folders:
+                async with session.get(f"{MS_BASE}/entity/productfolder", headers=get_headers(), params={"limit": 100}) as r:
+                    data = await r.json()
+                all_folders = [f.get("name","") for f in data.get("rows",[])]
+                await update.message.reply_text(f"Группа не найдена. Все группы:\n" + "\n".join(all_folders[:20]))
+                return
+
+            folder = folders[0]
+            folder_href = folder.get("meta", {}).get("href", "")
+            folder_name = folder.get("name", "")
+            await update.message.reply_text(f"Группа найдена: {folder_name}\nСчитаю по менеджерам...")
+
+            tag_to_ids = {}
+            for tag in TAGS:
+                ids = set()
+                off = 0
+                while True:
+                    async with session.get(f"{MS_BASE}/entity/counterparty", headers=get_headers(),
+                                           params={"filter": f"tags={tag}", "limit": 100, "offset": off}) as r:
+                        d = await r.json()
+                    rows = d.get("rows", [])
+                    for cp in rows:
+                        ids.add(cp.get("id", ""))
+                    if len(rows) < 100:
+                        break
+                    off += 100
+                tag_to_ids[tag] = ids
+
+            mgr_sums = {tag: 0.0 for tag in TAGS}
+            total_sum = 0.0
+            offset = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/report/profit/bycounterparty",
+                    headers=get_headers(),
+                    params={"momentFrom": f"{month_start} 00:00:00", "momentTo": f"{month_end} 23:59:59",
+                            "filter": f"productFolder={folder_href}", "limit": 200, "offset": offset}
+                ) as r:
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for row in rows:
+                    cp_href = row.get("counterparty", {}).get("meta", {}).get("href", "")
+                    cp_id = cp_href.split("/")[-1] if cp_href else ""
+                    sell_sum = (row.get("sellSum", 0) or 0) / 100
+                    total_sum += sell_sum
+                    for tag, ids in tag_to_ids.items():
+                        if cp_id in ids:
+                            mgr_sums[tag] += sell_sum
+                            break
+                total = data.get("meta", {}).get("size", 0)
+                offset += len(rows)
+                if offset >= total or len(rows) < 200:
+                    break
+
+            lines = [f"📊 *{folder_name}* · март\n", f"Итого: *{total_sum:,.0f} руб.*\n"]
+            for tag, short in TAGS.items():
+                lines.append(f"  {short}: *{mgr_sums[tag]:,.0f}* руб.")
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+
 async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/op_report — временная ссылка на интерактивный отчёт ОП."""
     token = db.create_report_link(mgr_filter=None, ttl_minutes=60)
