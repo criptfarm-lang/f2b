@@ -70,10 +70,6 @@ EMPLOYEES = {
         "марзлякова", "марзляковой",
         "лена", "лены", "лене", "лену", "леной",
     ],
-    "Сергей Черентаев": [
-        "сергей", "сергея", "сергею", "сергеем",
-        "черентаев", "черентаева", "черентаеву",
-    ],
 }
 
 # Менеджеры отдела продаж — "всем менеджерам"
@@ -96,8 +92,6 @@ def find_employee(query: str) -> str | None:
                 return full_name
     return None
 
-
-
 # ─── Логирование ────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -110,7 +104,6 @@ db = Database()
 
 # ─── Определяем обращение к боту ─────────────────────────────────────────────
 BOT_TRIGGERS = ["эф,", "эф ", "бот,", "бот ", "@эф", "bot,", "bot ", "@f2b_assistant_bot", "@f2b_assistant"]
-
 
 def is_bot_addressed(text: str) -> bool:
     """Проверяет, обращаются ли к боту."""
@@ -125,7 +118,6 @@ def is_bot_addressed(text: str) -> bool:
         return True
     return False
 
-
 def clean_query(text: str) -> str:
     """Убирает обращение к боту из текста."""
     text_lower = text.lower()
@@ -133,7 +125,6 @@ def clean_query(text: str) -> str:
         if text_lower.startswith(trigger):
             return text[len(trigger):].strip()
     return text.strip()
-
 
 # ─── Команды ─────────────────────────────────────────────────────────────────
 
@@ -149,7 +140,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=_user_menu_keyboard()
     )
-
 
 def _user_menu_keyboard() -> InlineKeyboardMarkup:
     """Общее меню для всех пользователей."""
@@ -167,14 +157,12 @@ def _user_menu_keyboard() -> InlineKeyboardMarkup:
         ],
     ])
 
-
 async def cmd_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/usermenu — общее меню."""
     await update.message.reply_text(
         "Выбери действие:",
         reply_markup=_user_menu_keyboard()
     )
-
 
 async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик общего меню пользователей."""
@@ -231,7 +219,6 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
                 lines.append(f"• {t.get('text','')}{dl}")
             await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-
 async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает chat_id пользователя."""
     user = update.effective_user
@@ -243,7 +230,6 @@ async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Твой chat_id: `{chat_id}`",
         parse_mode="Markdown"
     )
-
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -263,7 +249,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/cleartasksall — очистить все задачи",
         parse_mode="Markdown"
     )
-
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Панель управления — только для руководителя."""
@@ -322,7 +307,6 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=keyboard
     )
-
 
 async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопок панели управления."""
@@ -546,7 +530,6 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     elif action == "menu_cancel":
         await query.message.delete()
 
-
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *Все команды:*\n\n"
@@ -566,17 +549,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-
 # Кэш уже отправленных уведомлений об идентификации — chat_id → True
 _wazzup_notified: set = set()
-
-
 
 _pending_links: dict = {}
 _pending_task_results: dict = {}  # user_id → {task_id, task_text, executor}
 _user_awaiting: dict = {}  # user_id → "photo" | "pdz_client"
 _pending_price_comments: dict = {}  # manager_user_id → {alert_id, order_id, mgr_name}
-
 
 async def handle_wazzup_ignore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Помечает контакт как 'не наш клиент' — больше не присылать уведомления."""
@@ -594,7 +573,6 @@ async def handle_wazzup_ignore_callback(update: Update, context: ContextTypes.DE
             role="игнор",
         )
     await query.message.edit_text("🚫 Контакт помечен как 'не наш клиент'. Уведомления больше не придут.")
-
 
 async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает нажатие кнопки привязки Telegram контакта к компании."""
@@ -805,7 +783,6 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
         parse_mode="Markdown"
     )
 
-
 async def cmd_clear_wazzup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаляет запись из wazzup_contact_map по chat_id. Только для руководителя."""
     user = update.effective_user
@@ -825,10 +802,8 @@ async def cmd_clear_wazzup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
-
 # Ожидающие данные для создания договора — user_id → {data, missing, missing_idx}
 _pending_contracts: dict = {}
-
 
 async def _create_and_send_contract(contract_data: dict, created_by: str,
                                     message, context, force_number: str = None):
@@ -881,7 +856,6 @@ async def _create_and_send_contract(contract_data: dict, created_by: str,
         logger.error(f"_create_and_send_contract: {e}", exc_info=True)
         await message.reply_text(f"❌ Ошибка генерации договора: {e}")
 
-
 async def cmd_wazzup_enrich(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обогащает базу контактов тегами из МойСклад. /wazzup_enrich"""
     user = update.effective_user
@@ -913,7 +887,6 @@ async def cmd_wazzup_enrich(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"wazzup_enrich {r['company_name']}: {e}")
 
     await update.message.reply_text(f"✅ Обновлено: {updated}/{len(rows)} контактов.")
-
 
 async def cmd_wazzup_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выгружает базу идентифицированных контактов в Excel. /wazzup_export"""
@@ -950,7 +923,6 @@ async def cmd_wazzup_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"📋 База контактов — {len(rows)} записей"
     )
 
-
 async def cmd_wazzup_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сбрасывает привязку Wazzup контакта. /wazzup_reset <chat_id>"""
     user = update.effective_user
@@ -969,7 +941,6 @@ async def cmd_wazzup_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Привязка для `{chat_id_val}` сброшена.", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
-
 
 async def cmd_wazzup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список каналов Wazzup с их ID."""
@@ -1006,7 +977,6 @@ async def cmd_wazzup_channels(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-
 async def cmd_wazzup_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Настраивает вебхук Wazzup. /wazzup_setup"""
     user = update.effective_user
@@ -1040,7 +1010,6 @@ async def cmd_wazzup_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = await resp.text()
                 await update.message.reply_text(f"❌ Ошибка: {resp.status} {text[:200]}")
 
-
 async def cmd_clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаляет ВСЕ открытые задачи. Только для руководителя."""
     user = update.effective_user
@@ -1055,7 +1024,6 @@ async def cmd_clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"cmd_clear_all error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {e}")
-
 
 async def cmd_clear_tasks_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаляет ВСЕ задачи включая выполненные. Только для руководителя."""
@@ -1075,7 +1043,6 @@ async def cmd_clear_tasks_all(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"cmd_clear_tasks_all error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {e}")
-
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Проверяет все основные функции Эфа. Только для руководителя."""
@@ -1180,7 +1147,6 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header = f"📊 Диагностика Эфа\n✅ {ok} ок  ⚠️ {warn} предупреждений  ❌ {err} ошибок\n\n"
     await update.message.reply_text(header + "\n".join(results))
 
-
 async def cmd_del_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаляет задачу по ID. /deltask 5"""
     user = update.effective_user
@@ -1205,7 +1171,6 @@ async def cmd_del_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Задача #{task_id} не найдена или уже закрыта.")
     except ValueError:
         await update.message.reply_text("❌ Укажи числовой ID задачи.")
-
 
 async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопок подтверждения создания договора."""
@@ -1280,7 +1245,6 @@ async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT
                 contract_data, user.full_name, query.message, context
             )
 
-
 async def handle_task_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки 'Выполнено' — запрашивает результат."""
     query = update.callback_query
@@ -1313,7 +1277,6 @@ async def handle_task_done_callback(update: Update, context: ContextTypes.DEFAUL
         parse_mode="Markdown"
     )
 
-
 async def cmd_deltask_by_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удалить задачу ответом 'удали' на сообщение бота с задачей."""
     msg = update.message
@@ -1343,7 +1306,6 @@ async def cmd_deltask_by_reply(update: Update, context: ContextTypes.DEFAULT_TYP
             pass
     else:
         await msg.reply_text("Задачи не найдены или уже закрыты.")
-
 
 async def cmd_clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаляет все открытые задачи кроме указанных ID. Только для руководителя."""
@@ -1379,7 +1341,6 @@ async def cmd_clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"cmd_clear_tasks error: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
-
 async def cmd_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает задачи текущего пользователя."""
     user = update.effective_user
@@ -1397,7 +1358,6 @@ async def cmd_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{status_icon} {t['text']}{deadline_str}")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
 
 async def cmd_all_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Все открытые и недавно выполненные задачи команды."""
@@ -1446,7 +1406,6 @@ async def cmd_all_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-
 async def cmd_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Просроченные задачи."""
     tasks = db.get_overdue_tasks()
@@ -1459,7 +1418,6 @@ async def cmd_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• *{t.get('executor', '?')}*: {t['text']} [срок: {t.get('deadline', '?')}]")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Недельный отчёт по команде."""
@@ -1477,7 +1435,6 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-
 async def cmd_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Срез по дебиторке."""
     debtors = db.get_debtors()
@@ -1491,7 +1448,6 @@ async def cmd_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-
 async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск фото по команде /фото [товар]."""
     query = " ".join(context.args) if context.args else ""
@@ -1499,7 +1455,6 @@ async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Укажи товар: /photo тунец")
         return
     await search_and_send_photo(update, context, query)
-
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Последний актуальный прайс."""
@@ -1511,7 +1466,6 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text("Прайс пока не загружен в базу. Скинь прайс в чат и я его сохраню!")
-
 
 async def cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск контакта."""
@@ -1530,7 +1484,6 @@ async def cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• *{c['name']}* — {c['phone']} ({c.get('company', '')})")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
 
 # ─── Обработка обычных сообщений ──────────────────────────────────────────────
 
@@ -1616,7 +1569,6 @@ async def process_sipuni_call(call_id: str, src_num: str, dst_num: str,
 
     except Exception as e:
         logger.error(f"process_sipuni_call: {e}", exc_info=True)
-
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главный обработчик всех сообщений."""
@@ -1800,7 +1752,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             MANAGER_TAG_MAP = {
                 "баласанян": "Карина Баласанян", "мерзлякова": "Елена Мерзлякова",
-                "скляр": "Инесса Скляр", "леонтьев": "Алексей Леонтьев", "черентаев": "Сергей Черентаев",
+                "скляр": "Инесса Скляр", "леонтьев": "Алексей Леонтьев",
             }
             manager = "Не назначен"
             for tag in tags:
@@ -2075,7 +2027,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=text[:1000],  # обрезаем очень длинные
         )
 
-
     # Записываем сообщения группы для анализа ПДЗ (пн/ср)
     group_chat_id = get_group_chat_id()
     if text and user and group_chat_id and chat_id == group_chat_id:
@@ -2210,7 +2161,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_lower_ac.startswith("задачи ") or
         "задач" in text_lower_ac and any(
             name in text_lower_ac for name in
-            ["карин", "инесс", "скляр", "алексей", "леонтьев", "мерзляков", "черентаев", "баласанян"]
+            ["карин", "инесс", "скляр", "алексей", "леонтьев", "мерзляков", "баласанян"]
         )
     )
     if not is_bot_addressed(text) and len(text) > 5 and not is_task_assignment:
@@ -2624,7 +2575,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         MANAGER_TAG_MAP = {
             "баласанян": "Карина Баласанян", "мерзлякова": "Елена Мерзлякова",
-            "скляр": "Инесса Скляр", "леонтьев": "Алексей Леонтьев", "черентаев": "Сергей Черентаев",
+            "скляр": "Инесса Скляр", "леонтьев": "Алексей Леонтьев",
         }
         SPEC_TAGS = {"опт", "хорека", "розница"}
 
@@ -3269,7 +3220,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await smart_answer(query, user.full_name, context_data)
         await message.reply_text(response)
 
-
 async def save_media(message: Message, media_type: str):
     """Сохраняет фото/документ в базу с тегами из подписи."""
     caption = message.caption or ""
@@ -3296,7 +3246,6 @@ async def save_media(message: Message, media_type: str):
         uploader=user,
         date=datetime.now().isoformat()
     )
-
 
 async def search_photo_in_content_channel(context: ContextTypes.DEFAULT_TYPE, query: str) -> list:
     """Ищет фото в канале Контент F2B по ключевым словам."""
@@ -3330,7 +3279,6 @@ async def search_photo_in_content_channel(context: ContextTypes.DEFAULT_TYPE, qu
     logger.info(f"search_photo: returning {len(results)} for '{query}'")
     return results
 
-
 async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
     """Ищет фото товара в канале Контент F2B."""
     await update.message.reply_chat_action("upload_photo")
@@ -3351,7 +3299,6 @@ async def search_and_send_photo(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
     await update.message.reply_text(f"😕 Фото *{query}* не найдено в канале Контент.", parse_mode="Markdown")
-
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает посты из канала Контент F2B — сохраняет фото в БД."""
@@ -3393,7 +3340,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         logger.info(f"Сохранено фото-документ из канала Контент: '{caption}'")
 
-
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3407,7 +3353,6 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• *{m['key']}*: {m['value']}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-
 async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Явно запомнить факт: /remember ключ: значение"""
     args = " ".join(context.args) if context.args else ""
@@ -3420,7 +3365,6 @@ async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key, value = args.split(":", 1)
     db.remember(key.strip(), value.strip())
     await update.message.reply_text(f"✅ Запомнил: *{key.strip()}* → {value.strip()}", parse_mode="Markdown")
-
 
 async def cmd_add_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Создаёт вебхуки в МойСклад. /add_webhook"""
@@ -3481,10 +3425,8 @@ async def cmd_add_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка для {mgr['name']}: {e}")
 
-
 # Хранилище ожидающих отправки сообщений — message_key → {phone, name, text, chat_type}
 _pending_sends: dict = {}
-
 
 async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает нажатие кнопки Отправить / Отменить для сообщений клиентам."""
@@ -3612,7 +3554,6 @@ async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         await query.message.edit_text(f"❌ Ошибка: {e}")
 
-
 async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/pdz — ПДЗ в группу + задача менеджерам в личку."""
     user = update.message.from_user
@@ -3654,7 +3595,6 @@ async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ Готово. Сводка результатов придёт в 17:00.")
 
-
 async def cmd_delete_executor_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/del_tasks [имя] — удалить все открытые задачи конкретного исполнителя."""
     user = update.effective_user
@@ -3673,7 +3613,6 @@ async def cmd_delete_executor_tasks(update: Update, context: ContextTypes.DEFAUL
         count = cur.rowcount
     db.conn.commit()
     await update.message.reply_text(f"✅ Закрыто задач для *{name}*: {count}", parse_mode="Markdown")
-
 
 async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/op_report — Отчёт ОП: план vs факт по менеджерам."""
@@ -3730,7 +3669,6 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ("Карина Баласанян", "Карина"),
             ("Елена Мерзлякова", "Елена"),
             ("Алексей Леонтьев", "Алексей"),
-            ("Сергей Черентаев", "Сергей"),
         ]
         METRICS = [
             ("revenue",    "Выручка, млн", 1_000_000, "#7c3aed"),
@@ -3916,7 +3854,6 @@ async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "мерзлякова": "Елена",
                 "баласанян":  "Карина",
                 "леонтьев":   "Алексей",
-                "черентаев":  "Сергей",
             }
             tag_to_ids = {}
             for tag in TAGS:
@@ -3983,7 +3920,6 @@ async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "мерзлякова": "Елена",
                 "баласанян":  "Карина",
                 "леонтьев":   "Алексей",
-                "черентаев":  "Сергей",
             }
             tag_to_ids = {}
             for tag in TAGS:
@@ -4006,7 +3942,6 @@ async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
-
 
 async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_fact [тег] — тест получения отгрузок по тегу за текущий месяц."""
@@ -4200,7 +4135,6 @@ async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.set_promo(raw_args)
         await update.message.reply_text(f"✅ Общий промо сохранён:\n\n{raw_args}")
 
-
 async def cmd_test_publink(update, context):
     """/test_publink — создаём публичную ссылку на PDF заказа."""
     import aiohttp
@@ -4266,7 +4200,6 @@ async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Удалён: {r['contact_name']} / {r['company_name']} (chat_id: {r['chat_id']})"
         )
 
-
 async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/relink [chat_id] [новое имя компании] — перепривязывает контакт к другой компании."""
     user = update.effective_user
@@ -4303,7 +4236,6 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"❌ Контакт с chat_id={chat_id} не найден")
 
-
 async def cmd_sync_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sync_managers — обновляет менеджеров в базе по тегам МойСклад."""
     user = update.effective_user
@@ -4313,7 +4245,6 @@ async def cmd_sync_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Синхронизирую менеджеров...")
     updated = await sync_contact_managers()
     await update.message.reply_text(f"✅ Обновлено контактов: {updated}")
-
 
 async def sync_contact_managers() -> int:
     """Обновляет поле manager в wazzup_contact_map по тегам из МойСклад."""
@@ -4325,7 +4256,6 @@ async def sync_contact_managers() -> int:
         "мерзлякова": "Елена Мерзлякова",
         "баласанян":  "Карина Баласанян",
         "леонтьев":   "Алексей Леонтьев",
-        "черентаев":  "Сергей Черентаев",
     }
 
     updated = 0
@@ -4364,7 +4294,6 @@ async def sync_contact_managers() -> int:
 
     return updated
 
-
 async def cmd_search_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/search_msg [слово] — ищет сообщения в БД без ограничения по дате."""
     user = update.effective_user
@@ -4392,7 +4321,6 @@ async def cmd_search_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{direction} {r['manager_name'] or '?'} / {r['contact_name']} [{r['sent_at']}]\n  {r['text'][:80]}")
     await update.message.reply_text("\n".join(lines))
 
-
 async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/aging — показать список стареющих клиентов (50+ дней без отгрузок)."""
     user = update.effective_user
@@ -4404,7 +4332,7 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from moysklad import get_aging_clients
     MANAGER_TAG_MAP = {
         "баласанян": "Карина", "мерзлякова": "Елена",
-        "скляр": "Инесса", "леонтьев": "Алексей", "черентаев": "Сергей",
+        "скляр": "Инесса", "леонтьев": "Алексей",
     }
 
     try:
@@ -4442,7 +4370,6 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
-
 async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/block [user_id] — заблокировать пользователя."""
     if not update.effective_user or update.effective_user.id != 360092495:
@@ -4457,7 +4384,6 @@ async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ {e}")
 
-
 async def cmd_unblock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/unblock [user_id] — разблокировать пользователя."""
     if not update.effective_user or update.effective_user.id != 360092495:
@@ -4471,7 +4397,6 @@ async def cmd_unblock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🔓 Пользователь {uid} разблокирован.")
     except Exception as e:
         await update.message.reply_text(f"❌ {e}")
-
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/stats — статистика использования бота."""
@@ -4580,7 +4505,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not sent_any:
         await context.bot.send_message(chat_id=OWNER_ID, text="📭 Просроченных долгов нет.")
 
-
 async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/pdz_results — результаты ПДЗ в личку по каждому менеджеру."""
     user = update.effective_user
@@ -4665,7 +4589,6 @@ async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not sent_any:
         await context.bot.send_message(chat_id=OWNER_ID, text="📭 Просроченных долгов нет.")
 
-
 async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тестовый запуск утренних задач ПДЗ. /pdz_test [имя|all]"""
     user = update.message.from_user
@@ -4699,7 +4622,6 @@ async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка для {mgr['name']}: {e}")
 
-
 async def cmd_pdz_evening_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тестовый запуск вечерней сводки ПДЗ. /pdz_evening"""
     user = update.message.from_user
@@ -4715,7 +4637,6 @@ async def cmd_pdz_evening_test(update: Update, context: ContextTypes.DEFAULT_TYP
         await pdz_evening_summary(context.application)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
-
 
 async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает нажатия кнопок на алерте о цене."""
@@ -4887,7 +4808,6 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 text=f"{mgr_mention}, дай комментарий по заказу *{order_name_pdz}* — у клиента просрочка {debt_days} дней.",
                 parse_mode="Markdown"
             )
-
 
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -5210,7 +5130,6 @@ def main():
 
     asyncio.run(run_all())
 
-
 # Маппинг менеджеров МойСклад → Telegram (username или телефон)
 MANAGERS_CONTACTS = {
     "Леонтьев Алексей Вадимович":      "@EL_Aliexbox",
@@ -5221,7 +5140,6 @@ MANAGERS_CONTACTS = {
 
 # Маппинг crmUserId Wazzup → имя менеджера (заполним после первых вебхуков)
 WAZZUP_MANAGERS: dict = {}
-
 
 async def load_wazzup_managers():
     """Загружает список менеджеров из Wazzup API."""
@@ -5249,7 +5167,6 @@ async def load_wazzup_managers():
 _price_check_cache: dict = {}
 # Хранилище данных алертов ПДЗ — order_id → {client, manager, debt_amount, debt_days, order_name}
 _pdz_alert_data: dict = {}
-
 
 async def check_order_agreed(order_href: str, bot):
     """При смене статуса заказа на Согласовано — отправляем клиенту в мессенджер."""
@@ -5402,7 +5319,6 @@ async def check_order_agreed(order_href: str, bot):
     except Exception as e:
         logger.error(f"check_order_agreed: {e}", exc_info=True)
 
-
 async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
     """Проверяет есть ли у клиента просрочка > 5 дней при новом заказе."""
     try:
@@ -5485,7 +5401,6 @@ async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
         logger.error(f"check_debtor_alert: {e}")
 # Кэш позиций заказа — order_id → frozenset(позиций) для отслеживания изменений цен/номенклатуры
 _order_positions_cache: dict = {}
-
 
 async def process_ms_webhook(data: dict, bot):
     """Обрабатывает webhook от МойСклад — проверяет цены в заказе."""
@@ -5581,7 +5496,6 @@ async def process_ms_webhook(data: dict, bot):
 
     except Exception as e:
         logger.error(f"process_ms_webhook: {e}")
-
 
 async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
     """Проверяет адрес доставки заказа на соответствие расписанию логистики."""
@@ -5680,7 +5594,6 @@ async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
 
     except Exception as e:
         logger.error(f"check_logistics_alert: {e}", exc_info=True)
-
 
 if __name__ == "__main__":
     main()
