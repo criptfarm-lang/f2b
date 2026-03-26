@@ -4322,12 +4322,12 @@ async def cmd_search_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/aging — показать список стареющих клиентов (50+ дней без отгрузок)."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
+    """/aging — показать список стареющих клиентов (40+ дней без отгрузок)."""
+    msg = update.effective_message
+    if not msg:
         return
 
-    await update.message.reply_text("🔍 Ищу стареющих клиентов...")
+    await msg.reply_text("🔍 Ищу стареющих клиентов...")
 
     from moysklad import get_aging_clients
     MANAGER_TAG_MAP = {
@@ -4338,7 +4338,7 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         clients = await get_aging_clients(days=40)
         if not clients:
-            await update.message.reply_text("✅ Стареющих клиентов нет.")
+            await msg.reply_text("✅ Стареющих клиентов нет.")
             return
 
         # Группируем по менеджеру
@@ -4351,7 +4351,7 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
             by_mgr.setdefault(mgr, []).append(c)
 
-        lines = [f"⚠️ *Стареющие клиенты (50+ дней)* — {len(clients)} чел.\n"]
+        lines = [f"⚠️ *Стареющие клиенты (40+ дней)* — {len(clients)} чел.\n"]
         for mgr, cl_list in sorted(by_mgr.items()):
             lines.append(f"*{mgr}* ({len(cl_list)}):")
             for c in sorted(cl_list, key=lambda x: -x.get("days", 0)):
@@ -4360,15 +4360,14 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("")
 
         text = "\n".join(lines)
-        # Разбиваем если длинный
         if len(text) > 4000:
             for i in range(0, len(text), 4000):
-                await update.message.reply_text(text[i:i+4000], parse_mode="Markdown")
+                await msg.reply_text(text[i:i+4000], parse_mode="Markdown")
         else:
-            await update.message.reply_text(text, parse_mode="Markdown")
+            await msg.reply_text(text, parse_mode="Markdown")
 
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        await msg.reply_text(f"Ошибка: {e}")
 
 async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/block [user_id] — заблокировать пользователя."""
