@@ -2766,3 +2766,136 @@ async def get_lost_clients_by_manager(date_from: str, date_to: str) -> dict:
         logger.info(f"lost_clients {name}: {val}")
 
     return result
+
+
+async def get_manager_monthly_history(tag: str, mgr_name: str) -> list:
+    """
+    История отгрузок менеджера по месяцам с первого месяца до текущего.
+    Возвращает список: [{"month": "2024-01", "revenue": ..., "shipments": ..., "clients": ...}]
+    """
+    import aiohttp
+    from datetime import date, datetime
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 1. Контрагенты менеджера
+            cp_ids = set()
+            off = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/counterparty",
+                    headers=get_headers(),
+                    params={"filter": f"tags={tag}", "limit": 100, "offset": off}
+                ) as r:
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for cp in rows:
+                    cp_ids.add(cp.get("id", ""))
+                if len(rows) < 100:
+                    break
+                off += 100
+
+            if not cp_ids:
+                return []
+
+            # 2. Первая отгрузка любого клиента менеджера
+            first_month = None
+            all_mgr_hrefs = [f"{MS_BASE}/entity/counterparty/{cid}" for cid in list(cp_ids)[:5]]
+            for href in all_mgr_hrefs:
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(),
+                    params={"filter": f"agent={href}", "limit": 1, "order": "moment,asc"}
+                ) as r:
+                    d = await r.json()
+                rows = d.get("rows", [])
+                if rows:
+                    moment = rows[0].get("moment", "")[:7]  # YYYY-MM
+                    if moment and (first_month is None or moment < first_month):
+                        first_month = moment
+
+            if not first_month:
+                # Пробуем через все отгрузки с фильтром
+                for cid in list(cp_ids):
+                    async with session.get(
+                        f"{MS_BASE}/entity/demand",
+                        headers=get_headers(),
+                        params={"filter": f"agent={MS_BASE}/entity/counterparty/{cid}", "limit": 1, "order": "moment,asc"}
+                    ) as r:
+                        d = await r.json()
+                    rows = d.get("rows", [])
+                    if rows:
+                        moment = rows[0].get("moment", "")[:7]
+                        if moment and (first_month is None or moment < first_month):
+                            first_month = moment
+                    if first_month:
+                        break
+
+            if not first_month:
+                return []
+
+            # 3. Собираем данные по каждому месяцу
+            today = date.today()
+            result = []
+            year, month = int(first_month[:4]), int(first_month[5:7])
+
+            while True:
+                month_start = f"{year}-{month:02d}-01"
+                if month == 12:
+                    month_end = f"{year+1}-01-01"
+                else:
+                    month_end = f"{year}-{month+1:02d}-01"
+
+                # Все отгрузки за месяц
+                revenue = 0.0
+                shipments = 0
+                clients = set()
+                offset = 0
+                while True:
+                    async with session.get(
+                        f"{MS_BASE}/entity/demand",
+                        headers=get_headers(),
+                        params={
+                            "filter": f"moment>={month_start} 00:00:00;moment<{month_end} 00:00:00",
+                            "expand": "agent",
+                            "limit": 200,
+                            "offset": offset,
+                        }
+                    ) as r:
+                        d = await r.json()
+                    rows = d.get("rows", [])
+                    for row in rows:
+                        agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
+                        agent_id = agent_href.split("/")[-1] if agent_href else ""
+                        if agent_id in cp_ids:
+                            shipments += 1
+                            revenue += (row.get("sum", 0) or 0) / 100
+                            clients.add(agent_id)
+                    if len(rows) < 200:
+                        break
+                    offset += 200
+
+                result.append({
+                    "month": f"{year}-{month:02d}",
+                    "revenue": revenue,
+                    "shipments": shipments,
+                    "clients": len(clients),
+                })
+
+                # Переходим к следующему месяцу
+                if month == 12:
+                    year += 1
+                    month = 1
+                else:
+                    month += 1
+
+                # Останавливаемся на текущем месяце
+                if year > today.year or (year == today.year and month > today.month):
+                    break
+
+            logger.info(f"get_manager_monthly_history {mgr_name}: {len(result)} месяцев с {first_month}")
+            return result
+
+    except Exception as e:
+        logger.error(f"get_manager_monthly_history {mgr_name}: {e}", exc_info=True)
+        return []
