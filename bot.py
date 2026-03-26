@@ -3095,6 +3095,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_op_report(update, context)
         return
 
+    elif action == "aging":
+        await cmd_aging(update, context)
+        return
+
     elif action == "search_mentions":
         product = params.get("product", "")
         days = int(params.get("days", 7))
