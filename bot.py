@@ -3931,6 +3931,41 @@ async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _report_tokens: dict = {}
 
 
+async def cmd_refresh_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/refresh_history — принудительно обновить историю менеджеров."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    await update.message.reply_text("🔄 Собираю историю по месяцам, это займёт несколько минут...")
+    try:
+        from moysklad import get_manager_monthly_history
+        TAGS = {
+            "скляр": "Инесса Скляр",
+            "мерзлякова": "Елена Мерзлякова",
+            "баласанян": "Карина Баласанян",
+            "леонтьев": "Алексей Леонтьев",
+        }
+        for tag, mgr_name in TAGS.items():
+            hist = await get_manager_monthly_history(tag, mgr_name)
+            db.set_mgr_history_cache(tag, hist)
+            await update.message.reply_text(f"✅ {mgr_name}: {len(hist)} месяцев")
+        # Сбрасываем кэш отчёта чтобы следующий запрос подхватил историю
+        db._execute("DELETE FROM report_cache")
+        await update.message.reply_text("✅ История обновлена. Запроси /web_report для нового отчёта.")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+
+async def cmd_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/refresh_cache — принудительно обновить кэш отчёта ОП."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    await update.message.reply_text("🔄 Запускаю обновление кэша... (займёт несколько минут)")
+    import asyncio
+    asyncio.ensure_future(_refresh_report_cache())
+
+
 async def cmd_web_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/web_report — временная ссылка на интерактивный отчёт ОП (1 час)."""
     user = update.effective_user
@@ -5026,6 +5061,8 @@ def main():
     app.add_handler(CommandHandler("test_group", cmd_test_group))
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
     app.add_handler(CommandHandler("set_promo", cmd_set_promo))
+    app.add_handler(CommandHandler("refresh_history", cmd_refresh_history))
+    app.add_handler(CommandHandler("refresh_cache", cmd_refresh_cache))
     app.add_handler(CommandHandler("web_report", cmd_web_report))
     app.add_handler(CommandHandler("lost_clients", cmd_lost_clients))
     app.add_handler(CommandHandler("new_clients", cmd_new_clients))
