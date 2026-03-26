@@ -5376,6 +5376,7 @@ def main():
             import json
             from datetime import date
             from moysklad import get_manager_shipments, get_attracted_goods_by_manager, get_lost_clients_by_manager
+            import aiohttp
 
             today = date.today()
             month_start = today.replace(day=1).isoformat()
@@ -5388,6 +5389,75 @@ def main():
             for mgr_name in facts:
                 facts[mgr_name]["attracted"] = attracted.get(mgr_name, 0.0)
                 facts[mgr_name]["lost_clients"] = lost.get(mgr_name, 0)
+
+            # Списки новых и выбывших клиентов
+            from moysklad import get_headers, MS_BASE
+
+            TAGS = {"скляр":"Инесса Скляр","мерзлякова":"Елена Мерзлякова","баласанян":"Карина Баласанян","леонтьев":"Алексей Леонтьев"}
+            tag_to_ids = {}
+            async with aiohttp.ClientSession() as session:
+                for tag, mgr in TAGS.items():
+                    ids = set()
+                    off = 0
+                    while True:
+                        async with session.get(f"{MS_BASE}/entity/counterparty", headers=get_headers(), params={"filter":f"tags={tag}","limit":100,"offset":off}) as r:
+                            d = await r.json()
+                        rows = d.get("rows",[])
+                        for cp in rows: ids.add(cp.get("id",""))
+                        if len(rows)<100: break
+                        off+=100
+                    tag_to_ids[mgr] = ids
+
+                # Новые клиенты — были в текущем месяце, не было до него
+                curr_ids = {}
+                off=0
+                while True:
+                    async with session.get(f"{MS_BASE}/entity/demand",headers=get_headers(),params={"filter":f"moment>={month_start} 00:00:00;moment<={month_end} 23:59:59","expand":"agent","limit":200,"offset":off}) as r:
+                        d=await r.json()
+                    rows=d.get("rows",[])
+                    for row in rows:
+                        href=row.get("agent",{}).get("meta",{}).get("href","")
+                        aid=href.split("/")[-1] if href else ""
+                        if aid: curr_ids[aid]=href
+                    if len(rows)<200: break
+                    off+=200
+
+                new_client_names = {}
+                lost_client_names = {}
+                for mgr, ids in tag_to_ids.items():
+                    for aid in ids:
+                        if aid not in curr_ids: continue
+                        async with session.get(f"{MS_BASE}/entity/demand",headers=get_headers(),params={"filter":f"agent={MS_BASE}/entity/counterparty/{aid};moment<{month_start} 00:00:00","limit":1}) as r:
+                            prev=await r.json()
+                        if prev.get("meta",{}).get("size",0)==0:
+                            async with session.get(f"{MS_BASE}/entity/counterparty/{aid}",headers=get_headers()) as r2:
+                                cp=await r2.json()
+                            new_client_names.setdefault(mgr,[]).append(cp.get("name",aid))
+
+                # Выбывшие
+                if today.month==1:
+                    prev_start=f"{today.year-1}-12-01"
+                else:
+                    prev_start=f"{today.year}-{today.month-1:02d}-01"
+                prev_ids=set()
+                off=0
+                all_mgr_ids=set().union(*tag_to_ids.values())
+                while True:
+                    async with session.get(f"{MS_BASE}/entity/demand",headers=get_headers(),params={"filter":f"moment>={prev_start} 00:00:00;moment<{month_start} 00:00:00","expand":"agent","limit":200,"offset":off}) as r:
+                        d=await r.json()
+                    rows=d.get("rows",[])
+                    for row in rows:
+                        href=row.get("agent",{}).get("meta",{}).get("href","")
+                        aid=href.split("/")[-1] if href else ""
+                        if aid and aid in all_mgr_ids: prev_ids.add(aid)
+                    if len(rows)<200: break
+                    off+=200
+
+                for mgr, ids in tag_to_ids.items():
+                    for aid in (ids & prev_ids - set(curr_ids.keys())):
+                        async with session.get(f"{MS_BASE}/entity/counterparty/{aid}",headers=get_headers()) as r:
+                            cp=await r.json()
+                        lost_client_names.setdefault(mgr,[]).append(cp.get("name",aid))
 
             PLANS = {
                 "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29, "new_clients": 3, "attracted": 1_000_000},
@@ -5402,11 +5472,17 @@ def main():
                 "Алексей Леонтьев": "Алексей",
             }
 
+            TAG_TO_FULL = {
+                "скляр": "Инесса Скляр", "мерзлякова": "Елена Мерзлякова",
+                "баласанян": "Карина Баласанян", "леонтьев": "Алексей Леонтьев",
+            }
             report_data = {
                 "date": today.strftime("%d.%m.%Y"),
                 "facts": facts,
                 "plans": PLANS,
                 "short_names": SHORT_NAMES,
+                "new_client_names": {TAG_TO_FULL.get(k,k): v for k,v in new_client_names.items()},
+                "lost_client_names": {TAG_TO_FULL.get(k,k): v for k,v in lost_client_names.items()},
             }
 
             # Встроенный шаблон
