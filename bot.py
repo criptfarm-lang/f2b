@@ -3636,11 +3636,9 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = update.callback_query.message.reply_text
         reply_photo = update.callback_query.message.reply_photo
     else:
-        if not user or user.id != OWNER_ID:
-            return
         chat_id = update.effective_chat.id
-        reply = update.message.reply_text
-        reply_photo = update.message.reply_photo
+        reply = update.effective_message.reply_text
+        reply_photo = update.effective_message.reply_photo
 
     await reply("⏳ Собираю данные...")
 
