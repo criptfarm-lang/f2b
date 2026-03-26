@@ -45,7 +45,6 @@ DELIVERY_CITIES_COORDS = {
 # Радиус (км) в котором адрес считается относящимся к направлению
 DELIVERY_RADIUS_KM = 25
 
-
 def _haversine(lat1, lon1, lat2, lon2) -> float:
     """Расстояние между двумя точками в км."""
     import math
@@ -54,7 +53,6 @@ def _haversine(lat1, lon1, lat2, lon2) -> float:
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
-
 
 async def geocode_address(address: str) -> tuple:
     """Геокодирует адрес через Яндекс. Возвращает (lat, lon) или None."""
@@ -86,9 +84,7 @@ def fmt_money(amount: float) -> str:
     """Форматирует сумму в рублях: 192 850,45 руб."""
     return f"{amount:,.2f}".replace(",", " ").replace(".", ",").rstrip("0").rstrip(",") + " руб."
 
-
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
-
 
 def get_headers():
     token = os.getenv("MOYSKLAD_TOKEN")
@@ -99,7 +95,6 @@ def get_headers():
         "Accept-Encoding": "gzip",
         "Content-Type": "application/json",
     }
-
 
 async def search_products(query: str, limit: int = 20) -> list:
     """Ищет товары по названию с поддержкой сокращений и синонимов."""
@@ -285,7 +280,6 @@ async def search_products(query: str, limit: int = 20) -> list:
         logger.error(f"МойСклад search_products error: {e}")
         return []
 
-
 async def get_stocks(session: aiohttp.ClientSession, product_ids: list) -> dict:
     """Получает остатки для списка товаров."""
     try:
@@ -312,7 +306,6 @@ async def get_stocks(session: aiohttp.ClientSession, product_ids: list) -> dict:
         logger.error(f"get_stocks error: {e}")
         return {}
 
-
 async def get_product_image(product_id: str) -> Optional[str]:
     """Получает URL первого фото товара."""
     try:
@@ -333,7 +326,6 @@ async def get_product_image(product_id: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"get_product_image error: {e}")
         return None
-
 
 async def get_image_download_url(url: str) -> Optional[str]:
     """Возвращает прямую ссылку на скачивание фото из МойСклад."""
@@ -356,7 +348,6 @@ async def get_image_download_url(url: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"get_image_download_url error: {e}")
         return None
-
 
 async def download_image(url: str) -> Optional[bytes]:
     """Скачивает фото товара из МойСклад."""
@@ -400,7 +391,6 @@ async def download_image(url: str) -> Optional[bytes]:
     except Exception as e:
         logger.error(f"download_image error: {e}", exc_info=True)
         return None
-
 
 async def search_products_filtered(parsed: dict, limit: int = 20) -> list:
     """Поиск товаров используя разобранные Claude фильтры."""
@@ -541,8 +531,6 @@ async def search_products_filtered(parsed: dict, limit: int = 20) -> list:
         logger.error(f"search_products_filtered error: {e}")
         return []
 
-
-
 async def get_counterparty_balance(query: str) -> list:
     """Ищет контрагента по имени и возвращает баланс через /report/counterparty."""
     import re as _re
@@ -611,7 +599,6 @@ async def get_counterparty_balance(query: str) -> list:
         logger.error(f"get_counterparty_balance error: {e}", exc_info=True)
         return []
 
-
 async def get_all_debtors() -> list:
     """Получает всех контрагентов с долгами через /report/counterparty."""
     try:
@@ -645,7 +632,6 @@ async def get_all_debtors() -> list:
         logger.error(f"get_all_debtors error: {e}")
         return []
 
-
 def format_debtors_ms(debtors: list) -> str:
     """Форматирует список должников из МойСклад."""
     if not debtors:
@@ -660,7 +646,6 @@ def format_debtors_ms(debtors: list) -> str:
         lines.append(f"\u2022 {d['name']} \u2014 *{fmt_money(d['debt'])}*")
 
     return "\n".join(lines)
-
 
 def format_counterparty_balance(counterparties: list, query: str) -> str:
     """Форматирует баланс конкретного контрагента."""
@@ -684,7 +669,6 @@ def format_counterparty_balance(counterparties: list, query: str) -> str:
 MANAGER_TAGS = {
     "баласанян": "Карина Баласанян",
     "леонтьев":  "Алексей Леонтьев",
-    "черентаев": "Сергей Черентаев",
     "мерзлякова": "Елена Мерзлякова",
     "скляр":     "Инесса Скляр",
 }
@@ -695,7 +679,6 @@ BUYER_TYPE_TAGS = {
     "опт":    "ОПТ (оптовые покупатели)",
     "покупатели": "Покупатель",
 }
-
 
 async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
     """
@@ -775,7 +758,6 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
     except Exception as e:
         logger.error(f"get_manager_stats_ms: {e}")
         return {"total": 0, "active": 0}
-
 
 async def get_counterparty_requisites(counterparty_id: str) -> dict:
     """
@@ -861,7 +843,6 @@ async def get_counterparty_requisites(counterparty_id: str) -> dict:
         logger.error(f"get_counterparty_requisites: {e}", exc_info=True)
         return {}
 
-
 async def find_counterparty_info(query: str) -> list:
     """Находит контрагента и возвращает его теги, менеджера, тип покупателя и баланс."""
     import re as _re
@@ -934,7 +915,6 @@ async def find_counterparty_info(query: str) -> list:
         logger.error(f"find_counterparty_info error: {e}", exc_info=True)
         return []
 
-
 def format_counterparty_info(counterparties: list, query: str) -> str:
     """Форматирует информацию о контрагенте."""
     if not counterparties:
@@ -967,7 +947,6 @@ def format_counterparty_info(counterparties: list, query: str) -> str:
         lines.append("\n".join(parts))
 
     return "\n\n".join(lines)
-
 
 async def get_debtors_by_tag(tag: str, limit: int = 100) -> list:
     """Возвращает должников с определённым тегом (менеджер, хорека, опт и т.д.)"""
@@ -1022,7 +1001,6 @@ async def get_debtors_by_tag(tag: str, limit: int = 100) -> list:
         logger.error(f"get_debtors_by_tag error: {e}", exc_info=True)
         return []
 
-
 async def get_clients_by_tag(tag: str, limit: int = 1000) -> list:
     """Возвращает всех контрагентов с тегом (список клиентов менеджера).
     МойСклад не поддерживает filter=tag, поэтому грузим всех и фильтруем локально.
@@ -1064,7 +1042,6 @@ async def get_clients_by_tag(tag: str, limit: int = 1000) -> list:
         logger.error(f"get_clients_by_tag error: {e}")
         return []
 
-
 def resolve_tag(query: str) -> str:
     """Определяет тег МойСклад по запросу пользователя."""
     q = query.lower().strip()
@@ -1074,8 +1051,6 @@ def resolve_tag(query: str) -> str:
         "карина": "баласанян",
         "леонтьев": "леонтьев",
         "алексей": "леонтьев",
-        "черентаев": "черентаев",
-        "сергей": "черентаев",
         "мерзлякова": "мерзлякова",
         "елена": "мерзлякова",
         "лена": "мерзлякова",
@@ -1096,7 +1071,6 @@ def resolve_tag(query: str) -> str:
             return tag
     return q  # вернуть как есть
 
-
 def format_debtors_by_tag(items: list, tag: str) -> str:
     """Форматирует долги по группе/менеджеру."""
     debtors = [i for i in items if i["debt"] > 0]
@@ -1114,7 +1088,6 @@ def format_debtors_by_tag(items: list, tag: str) -> str:
         lines.append(f"• {d['name']} — *{fmt_money(d['debt'])}*")
     return "\n".join(lines)
 
-
 def format_clients_by_tag(items: list, tag: str) -> str:
     """Форматирует список клиентов группы."""
     tag_label = tag.capitalize()
@@ -1125,8 +1098,6 @@ def format_clients_by_tag(items: list, tag: str) -> str:
     for c in items:
         lines.append(f"• {c['name']}")
     return "\n".join(lines)
-
-
 
 async def get_overdue_demands(tag: str = None, query: str = None) -> list:
     """Просроченная дебиторка через Заказы покупателей.
@@ -1360,7 +1331,6 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
         logger.error(f"get_overdue_demands error: {e}", exc_info=True)
         return []
 
-
 def format_overdue_summary(items: list) -> str:
     """Краткий формат ПДЗ: итог + по менеджерам со списком клиентов."""
     if not items:
@@ -1387,7 +1357,6 @@ def format_overdue_summary(items: list) -> str:
 
     return "\n".join(lines).rstrip()
 
-
 def format_overdue_demands(items: list, tag: str = None) -> str:
     """Форматирует просроченную дебиторку."""
     if not items:
@@ -1413,7 +1382,6 @@ def format_overdue_demands(items: list, tag: str = None) -> str:
 
     return "\n".join(lines).rstrip()
 
-
 def format_debt_reminder(client: dict) -> str:
     """Готовит текст напоминания клиенту об оплате."""
     demands = client.get("demands", [])
@@ -1434,7 +1402,6 @@ def format_debt_reminder(client: dict) -> str:
     ]
     return "\n".join(lines)
 
-
 def format_reminders_for_manager(items: list, manager_display: str) -> str:
     """Форматирует пакет напоминаний для менеджера — по одному на клиента."""
     if not items:
@@ -1451,7 +1418,6 @@ def format_reminders_for_manager(items: list, manager_display: str) -> str:
         lines.append(format_debt_reminder(c))
         lines.append("```")
     return "\n".join(lines)
-
 
 async def get_price_list(limit: int = 100) -> list:
     """Получает прайс-лист — все товары с ценами и остатками."""
@@ -1493,7 +1459,6 @@ async def get_price_list(limit: int = 100) -> list:
         logger.error(f"get_price_list error: {e}")
         return []
 
-
 def format_products(products: list, query: str = "") -> str:
     """Форматирует список товаров для отправки в Telegram."""
     if not products:
@@ -1529,7 +1494,6 @@ def format_products(products: list, query: str = "") -> str:
 
     return "\n".join(lines)
 
-
 def format_price_list(products: list) -> str:
     """Форматирует прайс-лист."""
     if not products:
@@ -1544,7 +1508,6 @@ def format_price_list(products: list) -> str:
         lines.append(f"{icon} {p['name']} — {price_str}")
 
     return "\n".join(lines)
-
 
 async def get_counterparties_by_product(product_query: str, period_days: int = 180) -> list:
     """
@@ -1638,7 +1601,6 @@ async def get_counterparties_by_product(product_query: str, period_days: int = 1
         logger.error(f"get_counterparties_by_product: {e}")
 
     return list(found.values())
-
 
 async def get_buyers_by_product(product_query: str, period_days: int = 180) -> list:
     """
@@ -1736,7 +1698,6 @@ async def get_buyers_by_product(product_query: str, period_days: int = 180) -> l
 
     return {"buyers": buyers, "product_name": product_name}
 
-
 async def get_counterparty_phones(buyers: list) -> list:
     """
     Получает телефоны контрагентов из МойСклад.
@@ -1786,7 +1747,6 @@ async def get_counterparty_phones(buyers: list) -> list:
     except Exception as e:
         logger.error(f"get_counterparty_phones: {e}")
     return result
-
 
 async def check_order_prices(order_href: str) -> list:
     """
@@ -1901,7 +1861,6 @@ async def check_order_prices(order_href: str) -> list:
 
     return alerts
 
-
 async def get_order_manager(order_href: str) -> dict:
     """
     Возвращает имя и Telegram ID менеджера-владельца заказа.
@@ -1948,7 +1907,6 @@ async def get_order_manager(order_href: str) -> dict:
 
     return manager_info
 
-
 async def get_order_positions_snapshot(order_href: str) -> frozenset:
     """
     Возвращает frozenset позиций заказа в виде (product_id, price).
@@ -1982,7 +1940,6 @@ async def get_order_positions_snapshot(order_href: str) -> frozenset:
     except Exception as e:
         logger.error(f"get_order_positions_snapshot: {e}")
         return frozenset()
-
 
 async def get_counterparty_debt(counterparty_id: str) -> dict:
     """
@@ -2101,7 +2058,6 @@ async def get_counterparty_debt(counterparty_id: str) -> dict:
         logger.error(f"get_counterparty_debt: {e}", exc_info=True)
         return {}
 
-
 async def set_order_state(order_id: str, state_id: str) -> bool:
     """Меняет статус заказа покупателя."""
     import aiohttp
@@ -2128,7 +2084,6 @@ async def set_order_state(order_id: str, state_id: str) -> bool:
     except Exception as e:
         logger.error(f"set_order_state: {e}")
         return False
-
 
 # Расписание доставки по МО
 # Каждый город — список вариантов написания (все в нижнем регистре)
@@ -2192,7 +2147,6 @@ def _build_city_index():
 _CITY_INDEX = _build_city_index()
 # Все города МО из расписания (все варианты написания)
 ALL_MO_CITIES = list(_CITY_INDEX.keys())
-
 
 async def check_delivery_schedule(address: str, delivery_date_str: str) -> dict:
     """
@@ -2287,7 +2241,6 @@ async def check_delivery_schedule(address: str, delivery_date_str: str) -> dict:
         "allowed_days": allowed_days,
         "distance_km": round(nearest_dist, 1),
     }
-
 
 async def get_reconciliation_data(counterparty_id: str, date_from: str, date_to: str) -> dict:
     """
@@ -2400,7 +2353,6 @@ async def get_reconciliation_data(counterparty_id: str, date_from: str, date_to:
         logger.error(f"get_reconciliation_data: {e}", exc_info=True)
         return {}
 
-
 async def get_aging_clients(days: int = 50) -> list:
     """
     Возвращает клиентов у которых последняя отгрузка была 50+ дней назад.
@@ -2506,9 +2458,6 @@ async def get_aging_clients(days: int = 50) -> list:
         logger.error(f"get_aging_clients: {e}", exc_info=True)
         return []
 
-
-
-
 async def get_manager_shipments(date_from: str, date_to: str) -> dict:
     """
     Берёт отгрузки за период для всех менеджеров ОП.
@@ -2587,7 +2536,6 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
         logger.info(f"get_manager_shipments {name}: ship={result[name]['shipments']} rev={result[name]['revenue']:.0f} cl={result[name]['clients']}")
 
     return result
-
 
 async def get_attracted_goods_by_manager(date_from: str, date_to: str) -> dict:
     """
