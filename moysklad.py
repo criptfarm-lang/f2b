@@ -1264,8 +1264,7 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                     "скляр": "Инесса Скляр",
                     "мерзлякова": "Елена Мерзлякова",
                             "леонтьев": "Алексей Леонтьев",
-                    "черентаев": "Сергей Черентаев",
-                }
+                            }
                 manager_name = "Без менеджера"
                 for t in agent_tags:
                     if t.lower() in MANAGER_TAG_MAP:
@@ -2522,7 +2521,6 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
         "мерзлякова": "Елена Мерзлякова",
         "баласанян":  "Карина Баласанян",
         "леонтьев":   "Алексей Леонтьев",
-        "черентаев":  "Сергей Черентаев",
     }
 
     result = {name: {"shipments": 0, "revenue": 0.0, "clients": set()}
@@ -2602,7 +2600,6 @@ async def get_attracted_goods_by_manager(date_from: str, date_to: str) -> dict:
         "мерзлякова": "Елена Мерзлякова",
         "баласанян":  "Карина Баласанян",
         "леонтьев":   "Алексей Леонтьев",
-        "черентаев":  "Сергей Черентаев",
     }
     GROUP_NAMES = ["ПРИВЛЕЧЕННЫЕ ТОВАРЫ", "Акционный прайс-лист"]
 
