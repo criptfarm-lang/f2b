@@ -152,6 +152,24 @@ class Database:
                 sent_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT NOW()
             );
+
+            CREATE TABLE IF NOT EXISTS agreed_notifications (
+                order_id TEXT PRIMARY KEY,
+                sent_at TIMESTAMP DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS report_links (
+                token TEXT PRIMARY KEY,
+                mgr_filter TEXT,
+                expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS aging_alerts (
+                counterparty_id TEXT PRIMARY KEY,
+                name TEXT,
+                alerted_at DATE DEFAULT CURRENT_DATE
+            );
         """
         with self.conn.cursor() as cur:
             cur.execute(sql)
@@ -366,6 +384,25 @@ class Database:
         return last_date, results
 
     # ─── ПЛАНЫ ПРОДАЖ ────────────────────────────────────────────────────────
+
+    def create_report_link(self, mgr_filter: str = None, ttl_minutes: int = 60) -> str:
+        """Создаёт временную ссылку на отчёт. Возвращает токен."""
+        import uuid
+        token = str(uuid.uuid4()).replace('-', '')[:24]
+        self._execute(
+            """INSERT INTO report_links (token, mgr_filter, expires_at)
+               VALUES (%s, %s, NOW() + INTERVAL '%s minutes')""",
+            (token, mgr_filter, ttl_minutes)
+        )
+        return token
+
+    def get_report_link(self, token: str) -> dict:
+        """Возвращает данные ссылки если она действительна."""
+        row = self._fetchone(
+            "SELECT token, mgr_filter FROM report_links WHERE token=%s AND expires_at > NOW()",
+            (token,)
+        )
+        return dict(row) if row else None
 
     def is_agreed_notified(self, order_id: str) -> bool:
         """Проверяет отправляли ли уже уведомление по этому заказу."""
