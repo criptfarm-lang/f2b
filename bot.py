@@ -70,11 +70,6 @@ EMPLOYEES = {
         "марзлякова", "марзляковой",
         "лена", "лены", "лене", "лену", "леной",
     ],
-    "Татьяна Голубева": [
-        "татьяна", "татьяны", "татьяне", "татьяну", "татьяной",
-        "голубева", "голубевой", "голубеву",
-        "таня", "тани", "тане", "таню", "таней",
-    ],
     "Сергей Черентаев": [
         "сергей", "сергея", "сергею", "сергеем",
         "черентаев", "черентаева", "черентаеву",
@@ -86,9 +81,7 @@ MOP_MANAGERS = [
     "Карина Баласанян",
     "Елена Мерзлякова",
     "Инесса Скляр",
-    "Татьяна Голубева",
     "Алексей Леонтьев",
-    "Сергей Черентаев",
 ]
 
 def find_employee(query: str) -> str | None:
@@ -3664,7 +3657,6 @@ async def cmd_delete_executor_tasks(update: Update, context: ContextTypes.DEFAUL
     if not user or user.id != 360092495:
         return
     if not context.args:
-        await update.message.reply_text("Использование: /del_tasks Голубева")
         return
     name = " ".join(context.args)
     db._ensure_connection()
@@ -3717,7 +3709,6 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Карина Баласанян": {"shipments": 150, "revenue": 5_000_000,  "clients": 38, "new_clients": 3, "attracted": 1_100_000},
         "Елена Мерзлякова": {"shipments": 65,  "revenue": 6_000_000,  "clients": 30, "new_clients": 3, "attracted": 300_000},
         "Алексей Леонтьев": {"shipments": 12,  "revenue": 180_000,    "clients": 5,  "new_clients": 3, "attracted": 300_000},
-        "Сергей Черентаев": {"shipments": 4,   "revenue": 200_000,    "clients": 4,  "new_clients": 3, "attracted": 300_000},
     }
 
     # new_clients пока 0 — будет добавлено позже
