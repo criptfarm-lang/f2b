@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Отчёт ОП — F2B PRO</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f8f7ff; color: #1e1b4b; min-height: 100vh; }
+.header { background: #fff; border-bottom: 1px solid #e8e5f5; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; }
+.header h1 { font-size: 17px; font-weight: 600; }
+.header .date { font-size: 13px; color: #6b7280; }
+.container { max-width: 1100px; margin: 0 auto; padding: 20px 16px; }
+.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 20px; }
+.card { background: #fff; border-radius: 10px; border: 1px solid #e8e5f5; padding: 12px 14px; }
+.card .label { font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 5px; }
+.card .value { font-size: 20px; font-weight: 600; }
+.card .pct { font-size: 12px; margin-top: 3px; }
+.good { color: #059669; } .warn { color: #d97706; } .bad { color: #dc2626; }
+.charts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-bottom: 20px; }
+.chart-wrap { background: #fff; border-radius: 10px; border: 1px solid #e8e5f5; padding: 16px; }
+.chart-label { font-size: 12px; font-weight: 500; color: #6b7280; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 12px; }
+.mgr-tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.tab { padding: 7px 14px; border-radius: 18px; border: 1.5px solid #e8e5f5; background: #fff; cursor: pointer; font-size: 13px; font-weight: 500; color: #6b7280; transition: all 0.15s; }
+.tab.active { background: #7c3aed; border-color: #7c3aed; color: #fff; }
+.tab:hover:not(.active) { border-color: #a78bfa; color: #7c3aed; }
+.detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.detail-card { background: #fff; border-radius: 10px; border: 1px solid #e8e5f5; padding: 16px; }
+.detail-card .dc-name { font-size: 14px; font-weight: 600; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #e8e5f5; }
+.dc-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; font-size: 12px; }
+.dc-row .dl { color: #6b7280; }
+.dc-row .dv { font-weight: 500; }
+.bar-mini { height: 3px; background: #e8e5f5; border-radius: 2px; margin-bottom: 4px; }
+.bar-fill { height: 100%; border-radius: 2px; }
+.lost-badge { display: inline-block; background: #fef2f2; color: #dc2626; border-radius: 4px; padding: 2px 7px; font-size: 11px; font-weight: 600; margin-top: 6px; }
+.loading { text-align: center; padding: 60px 20px; color: #6b7280; }
+.spinner { width: 28px; height: 28px; border: 3px solid #e8e5f5; border-top-color: #7c3aed; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Отчёт ОП — F2B PRO</h1>
+  <span class="date" id="report-date"></span>
+</div>
+<div class="container">
+  <div id="loading" class="loading"><div class="spinner"></div>Загружаю данные...</div>
+  <div id="content" style="display:none">
+    <div class="summary" id="summary"></div>
+    <div class="mgr-tabs" id="tabs"></div>
+    <div class="charts-grid" id="charts"></div>
+    <div class="detail-grid" id="detail"></div>
+  </div>
+</div>
+<script>
+const DATA = __REPORT_DATA__;
+const MGR_COLORS = ['#7c3aed','#a855f7','#c084fc','#e879f9'];
+const METRICS = [
+  { key:'revenue',     label:'Выручка',      divisor:1e6, fmt: v => v.toFixed(1)+' млн' },
+  { key:'shipments',   label:'Отгрузки',      divisor:1,   fmt: v => Math.round(v)+' шт' },
+  { key:'clients',     label:'АКБ',           divisor:1,   fmt: v => Math.round(v)+' кл' },
+  { key:'new_clients', label:'Новые клиенты', divisor:1,   fmt: v => Math.round(v)+' кл' },
+  { key:'attracted',   label:'Привл. товары', divisor:1e6, fmt: v => v.toFixed(2)+' млн' },
+];
+let charts = {};
+let selectedMgr = 'all';
+const mgrs = Object.keys(DATA.facts);
+function pct(f,p){ return p ? Math.min(Math.round(f/p*100),999) : 0; }
+function pClass(p){ return p>=80?'good':p>=50?'warn':'bad'; }
+function getActiveMgrs(){ return selectedMgr==='all'?mgrs:[selectedMgr]; }
+
+function renderSummary(){
+  document.getElementById('summary').innerHTML = METRICS.map(m => {
+    const tf = mgrs.reduce((s,mg)=>s+(DATA.facts[mg]?.[m.key]||0),0);
+    const tp = mgrs.reduce((s,mg)=>s+(DATA.plans[mg]?.[m.key]||0),0);
+    const p = pct(tf,tp);
+    return '<div class="card"><div class="label">'+m.label+'</div><div class="value">'+m.fmt(tf/m.divisor)+'</div><div class="pct '+pClass(p)+'">'+p+'% из '+m.fmt(tp/m.divisor)+'</div></div>';
+  }).join('');
+}
+
+function renderTabs(){
+  const tabs = [['all','Все'],...mgrs.map(m=>[m,DATA.short_names[m]||m])];
+  document.getElementById('tabs').innerHTML = tabs.map(([id,label])=>
+    '<div class="tab '+(id===selectedMgr?'active':'')+'" onclick="selectMgr(\''+id+'\')">'+label+'</div>'
+  ).join('');
+}
+
+function renderCharts(){
+  const am = getActiveMgrs();
+  const labels = am.map(m=>DATA.short_names[m]||m);
+  const colors = am.map((_,i)=>MGR_COLORS[i%MGR_COLORS.length]);
+  document.getElementById('charts').innerHTML = METRICS.map((m,mi)=>
+    '<div class="chart-wrap"><div class="chart-label">'+m.label+'</div><div style="position:relative;height:200px"><canvas id="chart_'+mi+'"></canvas></div></div>'
+  ).join('');
+  Object.values(charts).forEach(c=>c.destroy()); charts={};
+  METRICS.forEach((m,mi)=>{
+    const fData = am.map(mg=>{ const v=(DATA.facts[mg]?.[m.key]||0)/m.divisor; return m.divisor===1e6?Math.round(v*100)/100:Math.round(v); });
+    const pData = am.map(mg=>{ const v=(DATA.plans[mg]?.[m.key]||0)/m.divisor; return m.divisor===1e6?Math.round(v*100)/100:Math.round(v); });
+    charts[mi]=new Chart(document.getElementById('chart_'+mi),{
+      type:'bar',
+      data:{ labels, datasets:[
+        { label:'Факт', data:fData, backgroundColor:colors.map(c=>c+'bb'), borderColor:colors, borderWidth:1, borderRadius:4 },
+        { label:'План', data:pData, type:'line', borderColor:colors.map(c=>c+'66'), borderWidth:1.5, borderDash:[4,3], pointRadius:4, pointBackgroundColor:colors, fill:false, tension:0 }
+      ]},
+      options:{ responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label:ctx=>(' '+(ctx.dataset.label===undefined?'':ctx.dataset.label)+': '+m.fmt(ctx.raw)) }}},
+        scales:{ x:{grid:{display:false},ticks:{font:{size:11}}}, y:{grid:{color:'#f0effe'},ticks:{font:{size:10},callback:v=>m.fmt(v)}} }
+      }
+    });
+  });
+}
+
+function renderDetail(){
+  const am = getActiveMgrs();
+  document.getElementById('detail').innerHTML = am.map((mg,i)=>{
+    const f=DATA.facts[mg]||{}, p=DATA.plans[mg]||{};
+    const short=DATA.short_names[mg]||mg, color=MGR_COLORS[i%MGR_COLORS.length];
+    const lost=f.lost_clients||0;
+    const rows=METRICS.map(m=>{
+      const pc=pct(f[m.key]||0,p[m.key]||0);
+      return '<div class="dc-row"><span class="dl">'+m.label+'</span><span class="dv '+pClass(pc)+'">'+m.fmt((f[m.key]||0)/m.divisor)+' / '+m.fmt((p[m.key]||0)/m.divisor)+'</span></div><div class="bar-mini"><div class="bar-fill" style="width:'+Math.min(pc,100)+'%;background:'+color+'"></div></div>';
+    }).join('');
+    return '<div class="detail-card"><div class="dc-name" style="color:'+color+'">'+short+'</div>'+rows+(lost>0?'<span class="lost-badge">▼ выбыли: '+lost+'</span>':'')+'</div>';
+  }).join('');
+}
+
+function selectMgr(id){ selectedMgr=id; renderTabs(); renderCharts(); renderDetail(); }
+
+document.getElementById('report-date').textContent=DATA.date;
+document.getElementById('loading').style.display='none';
+document.getElementById('content').style.display='block';
+renderSummary(); renderTabs(); renderCharts(); renderDetail();
+</script>
+</body>
+</html>
