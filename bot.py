@@ -5402,12 +5402,14 @@ def main():
                 "short_names": SHORT_NAMES,
             }
 
-            # Читаем шаблон
+            # Встроенный шаблон
             import pathlib
-            tpl_path = pathlib.Path("/app/report_template.html")
-            if not tpl_path.exists():
-                tpl_path = pathlib.Path(__file__).parent / "report_template.html"
-            html = tpl_path.read_text(encoding="utf-8")
+            tpl_path = pathlib.Path(__file__).parent / "report_template.html"
+            if tpl_path.exists():
+                html = tpl_path.read_text(encoding="utf-8")
+            else:
+                from report_html import REPORT_HTML_TEMPLATE
+                html = REPORT_HTML_TEMPLATE
             html = html.replace("__REPORT_DATA__", json.dumps(report_data, ensure_ascii=False))
             return web.Response(text=html, content_type="text/html", charset="utf-8")
 
