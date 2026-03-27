@@ -2380,8 +2380,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             _pending_contracts.pop(user.id, None)
             db._execute("DELETE FROM pending_contracts WHERE user_id=%s", (user.id,))
-            await message.reply_text("✅ Все данные получены. Генерирую договор...")
-            await _create_and_send_contract(data, user.full_name, message, context)
+
+            # Режим refresh — генерируем с сохранением номера и даты
+            if pending_c.get("mode") == "refresh":
+                await message.reply_text("✅ Данные получены. Генерирую договор...")
+                try:
+                    from contract_generator import generate_contract_pdf
+                    import io as _io_refresh
+                    pdf_bytes = generate_contract_pdf(data)
+                    db.save_contract(data["contract_number"], data["buyer_name"], user.full_name, buyer_data=data)
+                    group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
+                    target = group_chat_id or message.chat_id
+                    await context.bot.send_document(
+                        chat_id=target,
+                        document=_io_refresh.BytesIO(pdf_bytes),
+                        filename=f"Договор_{data['contract_number']}_{data['buyer_name'][:30]}.pdf",
+                        caption=(
+                            f"📄 *Договор поставки № {data['contract_number']}* (переиздан, данные обновлены)\n"
+                            f"📅 {data['contract_date']}\n"
+                            f"🏢 {data['buyer_name']}\n"
+                            f"👤 {user.full_name}"
+                        ),
+                        parse_mode="Markdown"
+                    )
+                    if target != message.chat_id:
+                        await message.reply_text(f"✅ Договор № {data['contract_number']} переиздан и отправлен в группу.")
+                except Exception as _e:
+                    logger.error(f"refresh pending generate: {_e}", exc_info=True)
+                    await message.reply_text(f"❌ Ошибка генерации: {_e}")
+            else:
+                await message.reply_text("✅ Все данные получены. Генерирую договор...")
+                await _create_and_send_contract(data, user.full_name, message, context)
         return
 
     if not is_bot_addressed(text):
@@ -4155,7 +4184,25 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
             _full_fio = " ".join(filter(None, [_ip_last, _ip_first, _ip_mid]))
             contract_data["buyer_name"] = (contract_data["buyer_name"] + " " + _full_fio).strip() if contract_data["buyer_name"] else _full_fio
 
-        from contract_generator import generate_contract_pdf
+        # Если ФИО директора не нашли — спрашиваем вручную, не генерируем без фамилии
+        if not contract_data.get("buyer_director_name") or not contract_data.get("buyer_representative"):
+            _pending_contracts[user.id] = {
+                "data": contract_data,
+                "missing_keys": ["buyer_representative"],
+                "missing_labels": ["должность и полное ФИО директора (напр. 'генерального директора Иванову Марию Алексеевну' — обязательно с фамилией!)"],
+                "missing_idx": 0,
+                "mode": "refresh",  # чтобы после ответа сразу генерировать
+            }
+            await update.message.reply_text(
+                f"📄 *{contract_data['buyer_name']}*\n\n"
+                f"В МойСклад не заполнено ФИО директора.\n\n"
+                f"*Напиши должность и полное ФИО директора*\n"
+                f"_(напр. 'генерального директора Иванову Марию Алексеевну')_",
+                parse_mode="Markdown"
+            )
+            return
+
+
         import io as _io_rc
 
         pdf_bytes = generate_contract_pdf(contract_data)
