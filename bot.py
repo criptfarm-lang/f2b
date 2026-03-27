@@ -4167,9 +4167,10 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
             "buyer_ks": reqs.get("buyer_ks", "") or old_data.get("buyer_ks", ""),
             "buyer_phone": reqs.get("buyer_phone", "") or old_data.get("buyer_phone", ""),
             "buyer_email": reqs.get("buyer_email", "") or old_data.get("buyer_email", ""),
-            # ФИО директора — берём из МойСклад, fallback из старых данных
-            "buyer_representative": reqs.get("buyer_representative", "") or old_data.get("buyer_representative", ""),
-            "buyer_director_name": reqs.get("buyer_director_name", "") or old_data.get("buyer_director_name", ""),
+            # ФИО директора — ТОЛЬКО из МойСклад, не из старых данных
+            # (старые данные могут содержать неполное ФИО без фамилии)
+            "buyer_representative": reqs.get("buyer_representative", ""),
+            "buyer_director_name": reqs.get("buyer_director_name", ""),
             "buyer_basis": reqs.get("buyer_basis", "") or old_data.get("buyer_basis", "Устава"),
             # Сохраняем ОРИГИНАЛЬНЫЕ номер и дату
             "contract_number": contract_number,
@@ -4184,8 +4185,13 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
             _full_fio = " ".join(filter(None, [_ip_last, _ip_first, _ip_mid]))
             contract_data["buyer_name"] = (contract_data["buyer_name"] + " " + _full_fio).strip() if contract_data["buyer_name"] else _full_fio
 
-        # Если ФИО директора не нашли — спрашиваем вручную, не генерируем без фамилии
-        if not contract_data.get("buyer_director_name") or not contract_data.get("buyer_representative"):
+        # Если ФИО директора не нашли или нет фамилии — спрашиваем вручную
+        _director_ok = (
+            contract_data.get("buyer_director_name") and
+            len(contract_data["buyer_director_name"].split()) >= 2 and
+            contract_data.get("buyer_representative")
+        )
+        if not _director_ok:
             _pending_contracts[user.id] = {
                 "data": contract_data,
                 "missing_keys": ["buyer_representative"],
