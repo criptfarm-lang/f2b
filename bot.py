@@ -2338,8 +2338,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if field_key == "buyer_representative":
             parts = answer_text.split()
-            if len(parts) >= 2:
-                data["buyer_director_name"] = " ".join(parts[-2:])
+            if len(parts) >= 3:
+                data["buyer_director_name"] = " ".join(parts[-3:])
+            elif len(parts) == 2:
+                data["buyer_director_name"] = " ".join(parts[-3:]) if len(parts) >= 3 else " ".join(parts[-2:])
 
         idx += 1
         pending_c["missing_idx"] = idx
