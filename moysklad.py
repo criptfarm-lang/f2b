@@ -759,6 +759,45 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
         logger.error(f"get_manager_stats_ms: {e}")
         return {"total": 0, "active": 0}
 
+async def search_counterparty_by_name(query: str) -> dict | None:
+    """
+    Ищет контрагента по имени в МойСклад.
+    Возвращает {"id": ..., "name": ...} первого совпадения или None.
+    """
+    import re as _re
+    import aiohttp
+
+    def _strip_legal(q: str) -> str:
+        return _re.sub(r'^\s*(ооо|ип|зао|ао|пао|оао|нко|снт)\s+', '', q.strip(), flags=_re.IGNORECASE).strip()
+
+    try:
+        stripped = _strip_legal(query)
+        # Перебираем варианты написания
+        variants = [query, query.upper(), query.lower(), query.capitalize()]
+        if stripped and stripped.lower() != query.lower():
+            variants += [stripped, stripped.upper(), stripped.lower(), stripped.capitalize()]
+        # Также пробуем по первому значимому слову
+        words = [w for w in query.split() if len(w) >= 4]
+        variants += words
+
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/counterparty"
+            for v in variants:
+                params = {"filter": f"name~{v}", "limit": 5}
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        rows = data.get("rows", [])
+                        if rows:
+                            logger.info(f"search_counterparty_by_name: found '{rows[0].get('name')}' for query='{query}'")
+                            return {"id": rows[0]["id"], "name": rows[0].get("name", "")}
+        logger.info(f"search_counterparty_by_name: not found for query='{query}'")
+        return None
+    except Exception as e:
+        logger.error(f"search_counterparty_by_name: {e}", exc_info=True)
+        return None
+
+
 async def get_counterparty_requisites(counterparty_id: str) -> dict:
     """
     Читает полные реквизиты контрагента из МойСклад:
