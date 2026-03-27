@@ -244,13 +244,20 @@ def generate_contract_pdf(data: dict) -> bytes:
             buyer_rep = right + buyer_rep[len(wrong):]
             break
 
-    # Извлекаем ФИО директора — последние 2-3 слова
+    # Извлекаем ФИО директора — всё что после должности
+    _POSITION_WORDS = {
+        "генерального", "генеральный", "директора", "директор",
+        "индивидуального", "индивидуальный", "предпринимателя", "предприниматель",
+        "исполнительного", "исполнительный", "коммерческого", "коммерческий",
+        "финансового", "финансовый", "управляющего", "управляющий",
+        "президента", "президент", "председателя", "председатель",
+    }
     buyer_director = data.get("buyer_director_name", "")
     if not buyer_director and buyer_rep:
         words = buyer_rep.strip().split()
-        # Ищем слово с заглавной буквы — начало ФИО
         for i, w in enumerate(words):
-            if w and w[0].isupper() and i > 0:
+            cleaned = w.strip(".,").lower()
+            if w.strip(".,") and w.strip(".,")[0].isupper() and i > 0 and cleaned not in _POSITION_WORDS:
                 buyer_director = " ".join(words[i:])
                 break
         if not buyer_director:
