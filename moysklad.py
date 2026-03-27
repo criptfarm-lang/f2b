@@ -852,6 +852,32 @@ async def get_counterparty_requisites(counterparty_id: str) -> dict:
                 initials += lm[0] + "."
             director = f"{ll} {initials}".strip()
 
+        # Для ООО legalLastName пустой — ищем директора в contactPersons
+        if not director:
+            try:
+                cp_url = f"{MS_BASE}/entity/counterparty/{counterparty_id}/contactpersons"
+                async with aiohttp.ClientSession() as _cs:
+                    async with _cs.get(cp_url, headers=get_headers()) as _r:
+                        if _r.status == 200:
+                            cp_data = await _r.json()
+                            for person in cp_data.get("rows", []):
+                                position = (person.get("position") or "").lower()
+                                # Берём первого с должностью директора, или просто первого
+                                p_last = person.get("lastName", "") or ""
+                                p_first = person.get("firstName", "") or ""
+                                p_mid = person.get("middleName", "") or ""
+                                if p_last:
+                                    initials = ""
+                                    if p_first: initials += p_first[0] + "."
+                                    if p_mid: initials += p_mid[0] + "."
+                                    candidate = f"{p_last} {initials}".strip()
+                                    if "директор" in position or not director:
+                                        director = candidate
+                                    if "директор" in position:
+                                        break
+            except Exception as _e:
+                logger.warning(f"contactPersons fetch: {_e}")
+
         cp_type = cp.get("companyType", "")
 
         # Для ИП: полное ФИО = legalLastName + legalFirstName + legalMiddleName
