@@ -419,22 +419,39 @@ def generate_contract_pdf(data: dict) -> bytes:
             canvas_obj.setFont(fn, 8)
             # Полное юридическое название с фамилией для ИП
             bname = data.get("buyer_legal_title") or data.get("buyer_name", "")
-            # Должность из buyer_representative (берём первые слова до ФИО)
+            # Должность из buyer_representative
             _rep = data.get("buyer_representative", "")
             if "предприниматель" in _rep.lower():
                 buyer_position = "Индивидуальный предприниматель"
             else:
                 buyer_position = "Генеральный директор"
-            if len(bname) > 38:
-                canvas_obj.drawString(rx, base_y - 5*mm, bname[:38])
-                canvas_obj.drawString(rx, base_y - 10*mm, bname[38:])
-                canvas_obj.drawString(rx, base_y - 15*mm, buyer_position)
-            else:
-                canvas_obj.drawString(rx, base_y - 5*mm, bname)
-                canvas_obj.drawString(rx, base_y - 10*mm, buyer_position)
-            canvas_obj.line(rx, base_y - 16*mm, rx + 60*mm, base_y - 16*mm)
+
+            # Перенос по словам, не по символам
+            def _wrap_words(text, max_chars=40):
+                words = text.split()
+                lines, cur = [], ""
+                for w in words:
+                    if cur and len(cur) + 1 + len(w) > max_chars:
+                        lines.append(cur)
+                        cur = w
+                    else:
+                        cur = (cur + " " + w).strip()
+                if cur:
+                    lines.append(cur)
+                return lines
+
+            bname_lines = _wrap_words(bname, 40)
+            y_offset = 5 * mm
+            for bl in bname_lines[:3]:  # максимум 3 строки названия
+                canvas_obj.drawString(rx, base_y - y_offset, bl)
+                y_offset += 5 * mm
+            canvas_obj.drawString(rx, base_y - y_offset, buyer_position)
+            y_offset += 6 * mm
+            canvas_obj.line(rx, base_y - y_offset, rx + 60*mm, base_y - y_offset)
+            y_offset += 6 * mm
             canvas_obj.setFont(fb, 8)
-            canvas_obj.drawString(rx, base_y - 22*mm, f"/{buyer_director or data.get('buyer_director_name', '')}/")
+            _director = buyer_director or data.get('buyer_director_name', '')
+            canvas_obj.drawString(rx, base_y - y_offset, f"/{_director}/")
 
         canvas_obj.restoreState()
 
