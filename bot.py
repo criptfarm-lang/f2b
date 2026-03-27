@@ -1202,6 +1202,16 @@ async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT
             "buyer_director_name": reqs.get("buyer_director_name", ""),
             "buyer_basis": "Устава",
         }
+        # Для ИП: собираем полное ФИО если в buyer_name нет фамилии
+        _ip_last = reqs.get("buyer_last_name", "")
+        _ip_first = reqs.get("buyer_first_name", "")
+        _ip_mid = reqs.get("buyer_middle_name", "")
+        if _ip_last and _ip_first and _ip_last not in contract_data["buyer_name"]:
+            _full_fio = " ".join(filter(None, [_ip_last, _ip_first, _ip_mid]))
+            if contract_data["buyer_name"]:
+                contract_data["buyer_name"] = contract_data["buyer_name"] + " " + _full_fio
+            else:
+                contract_data["buyer_name"] = _full_fio
         # Проверяем недостающие поля
         ASK_REQUIRED = {
             "buyer_representative": "должность и ФИО директора в родительном падеже (напр. 'генерального директора Иванова И.И.')",
@@ -1702,6 +1712,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "buyer_director_name": reqs.get("buyer_director_name", ""),
                 "buyer_basis": "Устава",
             }
+            # Для ИП: собираем полное ФИО если в buyer_name нет фамилии
+            _ip_last = reqs.get("buyer_last_name", "")
+            _ip_first = reqs.get("buyer_first_name", "")
+            _ip_mid = reqs.get("buyer_middle_name", "")
+            if _ip_last and _ip_first and _ip_last not in contract_data["buyer_name"]:
+                _full_fio = " ".join(filter(None, [_ip_last, _ip_first, _ip_mid]))
+                if contract_data["buyer_name"]:
+                    contract_data["buyer_name"] = contract_data["buyer_name"] + " " + _full_fio
+                else:
+                    contract_data["buyer_name"] = _full_fio
             INFO_REQUIRED = {
                 "buyer_inn": "ИНН", "buyer_ogrn": "ОГРН",
                 "buyer_address": "юридический адрес",
@@ -2936,6 +2956,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "buyer_director_name": reqs.get("buyer_director_name", ""),
             "buyer_basis": "Устава",  # по умолчанию
         }
+        # Для ИП: собираем полное ФИО если в buyer_name нет фамилии
+        _ip_last = reqs.get("buyer_last_name", "")
+        _ip_first = reqs.get("buyer_first_name", "")
+        _ip_mid = reqs.get("buyer_middle_name", "")
+        if _ip_last and _ip_first and _ip_last not in contract_data["buyer_name"]:
+            _full_fio = " ".join(filter(None, [_ip_last, _ip_first, _ip_mid]))
+            if contract_data["buyer_name"]:
+                contract_data["buyer_name"] = contract_data["buyer_name"] + " " + _full_fio
+            else:
+                contract_data["buyer_name"] = _full_fio
 
         # Проверяем чего не хватает
         # Разделяем: что спрашиваем у менеджера, что просто сообщаем как отсутствующее
@@ -3977,7 +4007,11 @@ async def cmd_refresh_history(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def cmd_reissue_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/reissue_contract [название компании] — перегенерировать договор с теми же номером и датой."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    OWNER_ID = 360092495
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    allowed_ids = manager_ids + [OWNER_ID]
+    if not user or user.id not in allowed_ids:
+        await update.message.reply_text("❌ У вас нет доступа к этой команде.")
         return
     if not context.args:
         await update.message.reply_text("Использование: /reissue_contract [название компании]")
@@ -4031,6 +4065,114 @@ async def cmd_reissue_contract(update: Update, context: ContextTypes.DEFAULT_TYP
         if target != update.message.chat_id:
             await update.message.reply_text(f"✅ Договор № {contract_number} переиздан и отправлен в группу.")
     except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/refresh_contract [название компании] — обновить реквизиты из МойСклад и переиздать договор с тем же номером и датой."""
+    user = update.effective_user
+    OWNER_ID = 360092495
+    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
+    allowed_ids = manager_ids + [OWNER_ID]
+    if not user or user.id not in allowed_ids:
+        await update.message.reply_text("❌ У вас нет доступа к этой команде.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /refresh_contract [название компании]\n"
+            "Команда заново запросит реквизиты из МойСклад и переиздаст договор с сохранением номера и даты."
+        )
+        return
+
+    buyer_query = " ".join(context.args)
+    existing = db.find_contract_by_buyer(buyer_query)
+    if not existing:
+        await update.message.reply_text(f"❌ Договор с '{buyer_query}' не найден в базе.")
+        return
+
+    contract_number = existing["contract_number"]
+    created_at = existing["created_at"]
+
+    await update.message.reply_text(
+        f"🔍 Найден договор №{contract_number} от {created_at.strftime('%d.%m.%Y')}\n"
+        f"🏢 {existing['buyer_name']}\n\n"
+        f"Запрашиваю актуальные реквизиты из МойСклад..."
+    )
+
+    try:
+        from moysklad import get_counterparty_requisites, search_counterparty_by_name
+        cp = await search_counterparty_by_name(buyer_query)
+        if not cp:
+            await update.message.reply_text(f"❌ Компания '{buyer_query}' не найдена в МойСклад.")
+            return
+
+        cp_id = cp["id"]
+        reqs = await get_counterparty_requisites(cp_id)
+
+        MONTHS_RU_RC = ["января","февраля","марта","апреля","мая","июня",
+                        "июля","августа","сентября","октября","ноября","декабря"]
+
+        # Старые данные из БД — используем как fallback для полей которых нет в МойСклад
+        old_data = existing.get("buyer_data") or {}
+        if isinstance(old_data, str):
+            import json as _j2
+            old_data = _j2.loads(old_data)
+
+        contract_data = {
+            "buyer_name": reqs.get("buyer_legal_title") or reqs.get("buyer_name", buyer_query),
+            "buyer_inn": reqs.get("buyer_inn", "") or old_data.get("buyer_inn", ""),
+            "buyer_ogrn": reqs.get("buyer_ogrn", "") or old_data.get("buyer_ogrn", ""),
+            "buyer_address": reqs.get("buyer_address", "") or old_data.get("buyer_address", ""),
+            "buyer_bank": reqs.get("buyer_bank", "") or old_data.get("buyer_bank", ""),
+            "buyer_rs": reqs.get("buyer_rs", "") or old_data.get("buyer_rs", ""),
+            "buyer_bik": reqs.get("buyer_bik", "") or old_data.get("buyer_bik", ""),
+            "buyer_ks": reqs.get("buyer_ks", "") or old_data.get("buyer_ks", ""),
+            "buyer_phone": reqs.get("buyer_phone", "") or old_data.get("buyer_phone", ""),
+            "buyer_email": reqs.get("buyer_email", "") or old_data.get("buyer_email", ""),
+            # ФИО директора — берём из МойСклад, fallback из старых данных
+            "buyer_representative": reqs.get("buyer_representative", "") or old_data.get("buyer_representative", ""),
+            "buyer_director_name": reqs.get("buyer_director_name", "") or old_data.get("buyer_director_name", ""),
+            "buyer_basis": reqs.get("buyer_basis", "") or old_data.get("buyer_basis", "Устава"),
+            # Сохраняем ОРИГИНАЛЬНЫЕ номер и дату
+            "contract_number": contract_number,
+            "contract_date": f"{created_at.day} {MONTHS_RU_RC[created_at.month-1]} {created_at.year} г.",
+        }
+
+        # Для ИП: собираем полное ФИО если в buyer_name нет фамилии
+        _ip_last = reqs.get("buyer_last_name", "")
+        _ip_first = reqs.get("buyer_first_name", "")
+        _ip_mid = reqs.get("buyer_middle_name", "")
+        if _ip_last and _ip_first and _ip_last not in contract_data["buyer_name"]:
+            _full_fio = " ".join(filter(None, [_ip_last, _ip_first, _ip_mid]))
+            contract_data["buyer_name"] = (contract_data["buyer_name"] + " " + _full_fio).strip() if contract_data["buyer_name"] else _full_fio
+
+        from contract_generator import generate_contract_pdf
+        import io as _io_rc
+
+        pdf_bytes = generate_contract_pdf(contract_data)
+
+        # Обновляем данные в БД
+        import json as _j3
+        db.save_contract(contract_number, contract_data["buyer_name"], user.full_name, buyer_data=contract_data)
+
+        group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
+        target = group_chat_id or update.message.chat_id
+        await context.bot.send_document(
+            chat_id=target,
+            document=_io_rc.BytesIO(pdf_bytes),
+            filename=f"Договор_{contract_number}_{contract_data['buyer_name'][:30]}.pdf",
+            caption=(
+                f"📄 *Договор поставки № {contract_number}* (переиздан, данные обновлены)\n"
+                f"📅 {contract_data['contract_date']}\n"
+                f"🏢 {contract_data['buyer_name']}\n"
+                f"👤 {user.full_name}"
+            ),
+            parse_mode="Markdown"
+        )
+        if target != update.message.chat_id:
+            await update.message.reply_text(f"✅ Договор № {contract_number} переиздан с актуальными данными и отправлен в группу.")
+    except Exception as e:
+        logger.error(f"cmd_refresh_contract: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
@@ -5141,6 +5283,7 @@ def main():
     app.add_handler(CommandHandler("set_promo", cmd_set_promo))
     app.add_handler(CommandHandler("refresh_history", cmd_refresh_history))
     app.add_handler(CommandHandler("reissue_contract", cmd_reissue_contract))
+    app.add_handler(CommandHandler("refresh_contract", cmd_refresh_contract))
     app.add_handler(CommandHandler("refresh_cache", cmd_refresh_cache))
     app.add_handler(CommandHandler("web_report", cmd_web_report))
     app.add_handler(CommandHandler("lost_clients", cmd_lost_clients))
