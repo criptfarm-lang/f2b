@@ -216,8 +216,32 @@ def generate_contract_pdf(data: dict) -> bytes:
 
     # ── Вводный абзац ────────────────────────────────────────────────────────
     buyer_short = data["buyer_name"]
-    buyer_rep = data.get("buyer_representative", "")
+    buyer_rep_raw = data.get("buyer_representative", "")
     buyer_basis = data.get("buyer_basis", "Устава")
+
+    # Нормализуем — убираем лишние слова вначале если менеджер написал не по формату
+    # Ожидаемый формат: "генерального директора Иванова И.И."
+    # Если написали "генеральный директор Иванов И.И." — приводим к нужному падежу
+    import re as _re
+    rep_lower = buyer_rep_raw.lower().strip()
+    # Если начинается с именительного падежа — оставляем как есть, договор подставит правильно
+    # Формируем строку для "в лице X"
+    buyer_rep = buyer_rep_raw.strip()
+
+    # Извлекаем ФИО директора — последние 2-3 слова
+    buyer_director = data.get("buyer_director_name", "")
+    if not buyer_director and buyer_rep:
+        words = buyer_rep.strip().split()
+        # Ищем слово с заглавной буквы — начало ФИО
+        for i, w in enumerate(words):
+            if w and w[0].isupper() and i > 0:
+                buyer_director = " ".join(words[i:])
+                break
+        if not buyer_director:
+            buyer_director = " ".join(words[-3:]) if len(words) >= 3 else buyer_rep
+
+    # Сохраняем обратно в data для подписи
+    data["buyer_director_name"] = buyer_director
     intro = (
         f"Акционерное Общество «ФИШ ТУ БИЗНЕС», именуемое в дальнейшем «Поставщик», "
         f"в лице Генерального Директора Маланчука Александра Владимировича, "
@@ -384,7 +408,7 @@ def generate_contract_pdf(data: dict) -> bytes:
                 canvas_obj.drawString(rx, base_y - 10*mm, "Генеральный директор")
             canvas_obj.line(rx, base_y - 16*mm, rx + 60*mm, base_y - 16*mm)
             canvas_obj.setFont(fb, 8)
-            canvas_obj.drawString(rx, base_y - 22*mm, f"/{data.get('buyer_director_name', '')}/")
+            canvas_obj.drawString(rx, base_y - 22*mm, f"/{buyer_director or data.get('buyer_director_name', '')}/")
 
         canvas_obj.restoreState()
 
