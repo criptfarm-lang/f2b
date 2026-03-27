@@ -327,9 +327,12 @@ def generate_contract_pdf(data: dict) -> bytes:
     story.append(Spacer(1, 4*mm))
 
     # ── Реквизиты сторон ─────────────────────────────────────────────────────
+    # Для реквизитов используем полное юридическое название (buyer_legal_title),
+    # для ИП оно содержит "ИП Иванов Иван Иванович" с фамилией
+    buyer_legal_name = data.get("buyer_legal_title") or data.get("buyer_name", "")
     supplier_lines = [
         [Paragraph("<b>ПОСТАВЩИК:</b>", small_bold), Paragraph("<b>ПОКУПАТЕЛЬ:</b>", small_bold)],
-        [Paragraph("<b>АО «ФИШ ТУ БИЗНЕС»</b>", small_bold), Paragraph(f"<b>{data['buyer_name']}</b>", small_bold)],
+        [Paragraph("<b>АО «ФИШ ТУ БИЗНЕС»</b>", small_bold), Paragraph(f"<b>{buyer_legal_name}</b>", small_bold)],
         [Paragraph("ИНН: 9713025854", small), Paragraph(f"ИНН: {data.get('buyer_inn','')}", small)],
         [Paragraph("КПП: 771301001", small), Paragraph(f"ОГРН: {data.get('buyer_ogrn','')}", small)],
         [Paragraph("ОГРН: 1257700150553", small), Paragraph(f"Юр. адрес: {data.get('buyer_address','')}", small)],
@@ -414,14 +417,21 @@ def generate_contract_pdf(data: dict) -> bytes:
             canvas_obj.setFont(fb, 8)
             canvas_obj.drawString(rx, base_y, "ПОКУПАТЕЛЬ:")
             canvas_obj.setFont(fn, 8)
-            bname = data.get("buyer_name", "")
+            # Полное юридическое название с фамилией для ИП
+            bname = data.get("buyer_legal_title") or data.get("buyer_name", "")
+            # Должность из buyer_representative (берём первые слова до ФИО)
+            _rep = data.get("buyer_representative", "")
+            if "предприниматель" in _rep.lower():
+                buyer_position = "Индивидуальный предприниматель"
+            else:
+                buyer_position = "Генеральный директор"
             if len(bname) > 38:
                 canvas_obj.drawString(rx, base_y - 5*mm, bname[:38])
                 canvas_obj.drawString(rx, base_y - 10*mm, bname[38:])
-                canvas_obj.drawString(rx, base_y - 15*mm, "Генеральный директор")
+                canvas_obj.drawString(rx, base_y - 15*mm, buyer_position)
             else:
                 canvas_obj.drawString(rx, base_y - 5*mm, bname)
-                canvas_obj.drawString(rx, base_y - 10*mm, "Генеральный директор")
+                canvas_obj.drawString(rx, base_y - 10*mm, buyer_position)
             canvas_obj.line(rx, base_y - 16*mm, rx + 60*mm, base_y - 16*mm)
             canvas_obj.setFont(fb, 8)
             canvas_obj.drawString(rx, base_y - 22*mm, f"/{buyer_director or data.get('buyer_director_name', '')}/")
