@@ -813,6 +813,20 @@ async def get_counterparty_requisites(counterparty_id: str) -> dict:
                 initials += lm[0] + "."
             director = f"{ll} {initials}".strip()
 
+        cp_type = cp.get("companyType", "")
+
+        # Для ИП: полное ФИО = legalLastName + legalFirstName + legalMiddleName
+        full_fio_ip = ""
+        if cp_type == "entrepreneur" and ll:
+            full_fio_ip = " ".join(filter(None, [ll, lf, lm]))
+
+        # buyer_legal_title: для ИП берём полное ФИО если legalTitle пустой
+        legal_title = cp.get("legalTitle", "") or ""
+        if not legal_title and cp_type == "entrepreneur" and full_fio_ip:
+            legal_title = f"ИП {full_fio_ip}"
+        if not legal_title:
+            legal_title = cp.get("name", "")
+
         result = {
             "buyer_inn": cp.get("inn", "") or "",
             "buyer_ogrn": cp.get("ogrn", "") or cp.get("ogrnip", "") or "",
@@ -821,7 +835,11 @@ async def get_counterparty_requisites(counterparty_id: str) -> dict:
             "buyer_email": cp.get("email", "") or "",
             "buyer_director_name": director,
             "buyer_name": cp.get("name", ""),
-            "buyer_legal_title": cp.get("legalTitle", "") or cp.get("name", ""),
+            "buyer_legal_title": legal_title,
+            # Передаём отдельные поля ФИО — используются в bot.py для сборки реквизитов ИП
+            "buyer_last_name": ll,
+            "buyer_first_name": lf,
+            "buyer_middle_name": lm,
             "href": f"{MS_BASE}/entity/counterparty/{counterparty_id}",
             "id": counterparty_id,
         }
@@ -830,7 +848,6 @@ async def get_counterparty_requisites(counterparty_id: str) -> dict:
         # Представитель для договора
         if director:
             # Определяем должность по типу контрагента
-            cp_type = cp.get("companyType", "")
             if cp_type == "entrepreneur":
                 result["buyer_representative"] = f"индивидуального предпринимателя {director}"
             else:
