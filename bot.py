@@ -4202,7 +4202,7 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
-
+        from contract_generator import generate_contract_pdf
         import io as _io_rc
 
         pdf_bytes = generate_contract_pdf(contract_data)
