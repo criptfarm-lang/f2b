@@ -177,6 +177,12 @@ class Database:
                 updated_at TIMESTAMP DEFAULT NOW()
             );
 
+            CREATE TABLE IF NOT EXISTS pending_contracts (
+                user_id BIGINT PRIMARY KEY,
+                data TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+
             CREATE TABLE IF NOT EXISTS aging_alerts (
                 counterparty_id TEXT PRIMARY KEY,
                 name TEXT,
