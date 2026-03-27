@@ -1238,6 +1238,10 @@ async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT
                 "missing_labels": [m[1] for m in missing_ask],
                 "missing_idx": 0,
             }
+            try:
+                import json as _j
+                db._execute("INSERT INTO pending_contracts (user_id, data) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET data=%s,created_at=NOW()", (user.id, _j.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str), _j.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str)))
+            except Exception: pass
             msg += f"*{missing_ask[0][1]}*?"
             await query.message.edit_text(msg, parse_mode="Markdown")
         else:
@@ -2315,18 +2319,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # Проверяем ожидание данных для договора (ПОСЛЕ идентификации)
-    if user and user.id in _pending_contracts and not is_bot_addressed(text):
+    if user and user.id in _pending_contracts:
         pending_c = _pending_contracts[user.id]
         keys = pending_c["missing_keys"]
         labels = pending_c["missing_labels"]
         idx = pending_c["missing_idx"]
         data = pending_c["data"]
 
+        # Чистим текст от обращения "Эф," если есть
+        answer_text = text.strip()
+        for prefix in ["эф,", "эф ", "ef,", "ef "]:
+            if answer_text.lower().startswith(prefix):
+                answer_text = answer_text[len(prefix):].strip()
+                break
+
         field_key = keys[idx]
-        data[field_key] = text.strip()
+        data[field_key] = answer_text
 
         if field_key == "buyer_representative":
-            parts = text.strip().split()
+            parts = answer_text.split()
             if len(parts) >= 2:
                 data["buyer_director_name"] = " ".join(parts[-2:])
 
@@ -2337,6 +2348,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text(f"✅ Принято.\n\n*{labels[idx]}*?", parse_mode="Markdown")
         else:
             _pending_contracts.pop(user.id, None)
+            db._execute("DELETE FROM pending_contracts WHERE user_id=%s", (user.id,))
             await message.reply_text("✅ Все данные получены. Генерирую договор...")
             await _create_and_send_contract(data, user.full_name, message, context)
         return
@@ -2949,6 +2961,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "missing_labels": [m[1] for m in missing_ask],
                 "missing_idx": 0,
             }
+            try:
+                import json as _j
+                db._execute("INSERT INTO pending_contracts (user_id, data) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET data=%s,created_at=NOW()", (user.id, _j.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str), _j.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str)))
+            except Exception: pass
             found_info = []
             if contract_data["buyer_inn"]: found_info.append(f"ИНН: {contract_data['buyer_inn']}")
             if contract_data["buyer_ogrn"]: found_info.append(f"ОГРН: {contract_data['buyer_ogrn']}")
@@ -5371,6 +5387,16 @@ def main():
         logger.info("🤖 Бот запущен!")
         # Загружаем менеджеров Wazzup
         await load_wazzup_managers()
+        # Восстанавливаем pending_contracts из БД
+        try:
+            import json as _json
+            rows = db._fetchall("SELECT user_id, data FROM pending_contracts WHERE created_at > NOW() - INTERVAL '24 hours'")
+            for row in rows:
+                _pending_contracts[row["user_id"]] = _json.loads(row["data"])
+            if rows:
+                logger.info(f"Восстановлено {len(rows)} pending_contracts из БД")
+        except Exception as e:
+            logger.warning(f"Не удалось восстановить pending_contracts: {e}")
         # Восстанавливаем pending_links из БД после рестарта
         try:
             pending_rows = db.load_pending_links()
