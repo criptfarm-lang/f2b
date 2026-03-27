@@ -3974,6 +3974,66 @@ async def cmd_refresh_history(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Ошибка: {e}")
 
 
+async def cmd_reissue_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/reissue_contract [название компании] — перегенерировать договор с теми же номером и датой."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /reissue_contract [название компании]")
+        return
+
+    buyer_query = " ".join(context.args)
+    existing = db.find_contract_by_buyer(buyer_query)
+    if not existing:
+        await update.message.reply_text(f"❌ Договор с '{buyer_query}' не найден в базе.")
+        return
+
+    contract_number = existing["contract_number"]
+    created_at = existing["created_at"]
+    buyer_data = existing.get("buyer_data") or {}
+
+    await update.message.reply_text(
+        f"📄 Найден договор №{contract_number} от {created_at.strftime('%d.%m.%Y')}\n"
+        f"🏢 {existing['buyer_name']}\n\n"
+        f"Перегенерирую PDF с теми же номером и датой..."
+    )
+
+    try:
+        from contract_generator import generate_contract_pdf
+        import io
+
+        # Восстанавливаем данные из БД
+        if isinstance(buyer_data, str):
+            import json
+            buyer_data = json.loads(buyer_data)
+
+        MONTHS_RU = ["января","февраля","марта","апреля","мая","июня",
+                     "июля","августа","сентября","октября","ноября","декабря"]
+        buyer_data["contract_number"] = contract_number
+        buyer_data["contract_date"] = f"{created_at.day} {MONTHS_RU[created_at.month-1]} {created_at.year} г."
+
+        pdf_bytes = generate_contract_pdf(buyer_data)
+
+        group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
+        target = group_chat_id or update.message.chat_id
+        await context.bot.send_document(
+            chat_id=target,
+            document=io.BytesIO(pdf_bytes),
+            filename=f"Договор_{contract_number}_{existing['buyer_name'][:30]}.pdf",
+            caption=(
+                f"📄 *Договор поставки № {contract_number}* (переизданный)\n"
+                f"📅 {buyer_data['contract_date']}\n"
+                f"🏢 {existing['buyer_name']}"
+            ),
+            parse_mode="Markdown"
+        )
+        if target != update.message.chat_id:
+            await update.message.reply_text(f"✅ Договор № {contract_number} переиздан и отправлен в группу.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 async def cmd_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/refresh_cache — принудительно обновить кэш отчёта ОП."""
     user = update.effective_user
@@ -5080,6 +5140,7 @@ def main():
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
     app.add_handler(CommandHandler("set_promo", cmd_set_promo))
     app.add_handler(CommandHandler("refresh_history", cmd_refresh_history))
+    app.add_handler(CommandHandler("reissue_contract", cmd_reissue_contract))
     app.add_handler(CommandHandler("refresh_cache", cmd_refresh_cache))
     app.add_handler(CommandHandler("web_report", cmd_web_report))
     app.add_handler(CommandHandler("lost_clients", cmd_lost_clients))
