@@ -2358,10 +2358,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if field_key == "buyer_representative":
             parts = answer_text.split()
-            if len(parts) >= 3:
-                data["buyer_director_name"] = " ".join(parts[-3:])
-            elif len(parts) == 2:
-                data["buyer_director_name"] = " ".join(parts[-3:]) if len(parts) >= 3 else " ".join(parts[-2:])
+            # Ищем начало ФИО — первое слово с заглавной буквы после должности
+            # Пример: "генерального директора Иванова Марии Алексеевны"
+            fio_start = 0
+            for i, w in enumerate(parts):
+                # Должность обычно в родительном падеже, строчными — ищем первое слово с заглавной
+                cleaned = w.strip(".,")
+                if cleaned and cleaned[0].isupper() and i > 0:
+                    fio_start = i
+                    break
+            if fio_start > 0:
+                data["buyer_director_name"] = " ".join(parts[fio_start:])
+            elif len(parts) >= 2:
+                data["buyer_director_name"] = " ".join(parts[-3:]) if len(parts) >= 3 else " ".join(parts)
 
         idx += 1
         pending_c["missing_idx"] = idx
