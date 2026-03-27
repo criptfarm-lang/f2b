@@ -4192,13 +4192,23 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
             contract_data.get("buyer_representative")
         )
         if not _director_ok:
+            # Сначала очищаем любую старую запись
+            _pending_contracts.pop(user.id, None)
+            db._execute("DELETE FROM pending_contracts WHERE user_id=%s", (user.id,))
+
             _pending_contracts[user.id] = {
                 "data": contract_data,
                 "missing_keys": ["buyer_representative"],
                 "missing_labels": ["должность и полное ФИО директора (напр. 'генерального директора Иванову Марию Алексеевну' — обязательно с фамилией!)"],
                 "missing_idx": 0,
-                "mode": "refresh",  # чтобы после ответа сразу генерировать
+                "mode": "refresh",
             }
+            import json as _j_rc
+            db._execute(
+                "INSERT INTO pending_contracts (user_id, data) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET data=%s,created_at=NOW()",
+                (user.id, _j_rc.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str),
+                 _j_rc.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str))
+            )
             await update.message.reply_text(
                 f"📄 *{contract_data['buyer_name']}*\n\n"
                 f"В МойСклад не заполнено ФИО директора.\n\n"
