@@ -1214,7 +1214,7 @@ async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT
                 contract_data["buyer_name"] = _full_fio
         # Проверяем недостающие поля
         ASK_REQUIRED = {
-            "buyer_representative": "должность и ФИО директора в родительном падеже (напр. 'генерального директора Иванова И.И.')",
+            "buyer_representative": "должность и полное ФИО директора (напр. 'генерального директора Иванову Марию Алексеевну' — обязательно с фамилией!)",
             "buyer_basis": "основание полномочий",
         }
         INFO_REQUIRED = {
@@ -1729,7 +1729,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "buyer_bank": "название банка", "buyer_ks": "корреспондентский счёт (к/с)",
             }
             ASK_REQUIRED = {
-                "buyer_representative": "должность и ФИО директора в родительном падеже (напр. 'генерального директора Иванова И.И.')",
+                "buyer_representative": "должность и полное ФИО директора (напр. 'генерального директора Иванову Марию Алексеевну' — обязательно с фамилией!)",
                 "buyer_basis": "основание полномочий",
             }
             missing_info = [(k, v) for k, v in INFO_REQUIRED.items() if not contract_data.get(k)]
@@ -2979,7 +2979,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Проверяем чего не хватает
         # Разделяем: что спрашиваем у менеджера, что просто сообщаем как отсутствующее
         ASK_REQUIRED = {
-            "buyer_representative": "должность и ФИО директора в родительном падеже (напр. 'генерального директора Иванова Ивана Ивановича')",
+            "buyer_representative": "должность и полное ФИО директора (напр. 'генерального директора Иванову Марию Алексеевну' — обязательно с фамилией!)",
             "buyer_basis": "основание полномочий (напр. 'Устава' или 'доверенности № 1 от 01.01.2026')",
         }
         INFO_REQUIRED = {
