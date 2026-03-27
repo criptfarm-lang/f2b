@@ -4158,6 +4158,7 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
 
         contract_data = {
             "buyer_name": reqs.get("buyer_legal_title") or reqs.get("buyer_name", buyer_query),
+            "buyer_legal_title": reqs.get("buyer_legal_title") or reqs.get("buyer_name", buyer_query),
             "buyer_inn": reqs.get("buyer_inn", "") or old_data.get("buyer_inn", ""),
             "buyer_ogrn": reqs.get("buyer_ogrn", "") or old_data.get("buyer_ogrn", ""),
             "buyer_address": reqs.get("buyer_address", "") or old_data.get("buyer_address", ""),
