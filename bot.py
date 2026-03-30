@@ -10,12 +10,7 @@ import re
 from datetime import datetime
 
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    TypeHandler,
+from telegram.ext import ( 
     ContextTypes,
     filters,
 )
@@ -1762,6 +1757,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif awaiting == "pdz_client":
             await message.reply_chat_action("typing")
+            from moysklad import get_overdue_demands
             counterparties = await get_counterparty_balance(text)
             if not counterparties:
                 await message.reply_text(f"❌ Клиент *{text}* не найден.", parse_mode="Markdown")
@@ -4143,13 +4139,13 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     try:
-        from moysklad import get_counterparty_requisites, search_counterparty_by_name
-        cp = await search_counterparty_by_name(buyer_query)
-        if not cp:
+        from moysklad import get_counterparty_requisites, get_counterparty_balance
+        # Используем get_counterparty_balance для поиска контрагента по имени
+        _found_list = await get_counterparty_balance(buyer_query)
+        if not _found_list:
             await update.message.reply_text(f"❌ Компания '{buyer_query}' не найдена в МойСклад.")
             return
-
-        cp_id = cp["id"]
+        cp_id = _found_list[0]["id"]
         reqs = await get_counterparty_requisites(cp_id)
 
         MONTHS_RU_RC = ["января","февраля","марта","апреля","мая","июня",
@@ -6097,7 +6093,10 @@ async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
         delivery_date = order.get("deliveryPlannedMoment", "")
         order_name = order.get("name", "")
 
+        logger.info(f"check_logistics_alert: заказ={order_name} address='{address}' delivery_date='{delivery_date}'")
+
         if not address or not delivery_date:
+            logger.info(f"check_logistics_alert: заказ {order_name} — нет адреса или даты, пропускаем (address={bool(address)}, date={bool(delivery_date)})")
             return
 
         # Не алертим старые заказы (старше 3 дней)
