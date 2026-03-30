@@ -759,45 +759,6 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
         logger.error(f"get_manager_stats_ms: {e}")
         return {"total": 0, "active": 0}
 
-async def search_counterparty_by_name(query: str) -> dict | None:
-    """
-    Ищет контрагента по имени в МойСклад.
-    Возвращает {"id": ..., "name": ...} первого совпадения или None.
-    """
-    import re as _re
-    import aiohttp
-
-    def _strip_legal(q: str) -> str:
-        return _re.sub(r'^\s*(ооо|ип|зао|ао|пао|оао|нко|снт)\s+', '', q.strip(), flags=_re.IGNORECASE).strip()
-
-    try:
-        stripped = _strip_legal(query)
-        # Перебираем варианты написания
-        variants = [query, query.upper(), query.lower(), query.capitalize()]
-        if stripped and stripped.lower() != query.lower():
-            variants += [stripped, stripped.upper(), stripped.lower(), stripped.capitalize()]
-        # Также пробуем по первому значимому слову
-        words = [w for w in query.split() if len(w) >= 4]
-        variants += words
-
-        async with aiohttp.ClientSession() as session:
-            url = f"{MS_BASE}/entity/counterparty"
-            for v in variants:
-                params = {"filter": f"name~{v}", "limit": 5}
-                async with session.get(url, headers=get_headers(), params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        rows = data.get("rows", [])
-                        if rows:
-                            logger.info(f"search_counterparty_by_name: found '{rows[0].get('name')}' for query='{query}'")
-                            return {"id": rows[0]["id"], "name": rows[0].get("name", "")}
-        logger.info(f"search_counterparty_by_name: not found for query='{query}'")
-        return None
-    except Exception as e:
-        logger.error(f"search_counterparty_by_name: {e}", exc_info=True)
-        return None
-
-
 async def get_counterparty_requisites(counterparty_id: str) -> dict:
     """
     Читает полные реквизиты контрагента из МойСклад:
@@ -852,40 +813,14 @@ async def get_counterparty_requisites(counterparty_id: str) -> dict:
                 initials += lm[0] + "."
             director = f"{ll} {initials}".strip()
 
-        # Для ООО legalLastName пустой — ищем директора в contactPersons
-        if not director:
-            try:
-                cp_url = f"{MS_BASE}/entity/counterparty/{counterparty_id}/contactpersons"
-                async with aiohttp.ClientSession() as _cs:
-                    async with _cs.get(cp_url, headers=get_headers()) as _r:
-                        if _r.status == 200:
-                            cp_data = await _r.json()
-                            for person in cp_data.get("rows", []):
-                                position = (person.get("position") or "").lower()
-                                # Берём первого с должностью директора, или просто первого
-                                p_last = person.get("lastName", "") or ""
-                                p_first = person.get("firstName", "") or ""
-                                p_mid = person.get("middleName", "") or ""
-                                if p_last:
-                                    initials = ""
-                                    if p_first: initials += p_first[0] + "."
-                                    if p_mid: initials += p_mid[0] + "."
-                                    candidate = f"{p_last} {initials}".strip()
-                                    if "директор" in position or not director:
-                                        director = candidate
-                                    if "директор" in position:
-                                        break
-            except Exception as _e:
-                logger.warning(f"contactPersons fetch: {_e}")
-
         cp_type = cp.get("companyType", "")
 
-        # Для ИП: полное ФИО = legalLastName + legalFirstName + legalMiddleName
+        # Для ИП: полное ФИО из legalLastName + legalFirstName + legalMiddleName
         full_fio_ip = ""
         if cp_type == "entrepreneur" and ll:
             full_fio_ip = " ".join(filter(None, [ll, lf, lm]))
 
-        # buyer_legal_title: для ИП берём полное ФИО если legalTitle пустой
+        # buyer_legal_title: для ИП берём "ИП Фамилия Имя Отчество" если legalTitle пустой
         legal_title = cp.get("legalTitle", "") or ""
         if not legal_title and cp_type == "entrepreneur" and full_fio_ip:
             legal_title = f"ИП {full_fio_ip}"
@@ -901,7 +836,7 @@ async def get_counterparty_requisites(counterparty_id: str) -> dict:
             "buyer_director_name": director,
             "buyer_name": cp.get("name", ""),
             "buyer_legal_title": legal_title,
-            # Передаём отдельные поля ФИО — используются в bot.py для сборки реквизитов ИП
+            # Поля ФИО для ИП — используются в bot.py
             "buyer_last_name": ll,
             "buyer_first_name": lf,
             "buyer_middle_name": lm,
@@ -912,7 +847,6 @@ async def get_counterparty_requisites(counterparty_id: str) -> dict:
 
         # Представитель для договора
         if director:
-            # Определяем должность по типу контрагента
             if cp_type == "entrepreneur":
                 result["buyer_representative"] = f"индивидуального предпринимателя {director}"
             else:
