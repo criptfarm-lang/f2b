@@ -4581,20 +4581,19 @@ async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Ищем по chat_id, contact_name, wazzup_name, company_name
     rows = db._fetchall(
-        """SELECT chat_id, contact_name, wazzup_name, company_name 
+        """SELECT chat_id, contact_name, company_name 
            FROM wazzup_contact_map 
            WHERE chat_id::text = %s 
               OR LOWER(contact_name) LIKE LOWER(%s)
-              OR LOWER(wazzup_name) LIKE LOWER(%s)
               OR LOWER(company_name) LIKE LOWER(%s)""",
-        (query_val, f"%{query_val}%", f"%{query_val}%", f"%{query_val}%")
+        (query_val, f"%{query_val}%", f"%{query_val}%")
     )
     if not rows:
         # Показываем последние 5 записей для диагностики
         recent = db._fetchall(
-            "SELECT chat_id, contact_name, wazzup_name, company_name FROM wazzup_contact_map ORDER BY created_at DESC LIMIT 5"
+            "SELECT chat_id, contact_name, company_name FROM wazzup_contact_map ORDER BY created_at DESC LIMIT 5"
         )
-        hint = "\n".join([f"• {r['wazzup_name']} / {r['company_name']} ({r['chat_id']})" for r in recent]) if recent else "—"
+        hint = "\n".join([f"• {r['contact_name']} / {r['company_name']} ({r['chat_id']})" for r in recent]) if recent else "—"
         await update.message.reply_text(
             f"❌ Контакт не найден: {query_val}\n\n"
             f"Последние 5 записей в базе:\n{hint}"
@@ -4604,7 +4603,7 @@ async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         db._execute("DELETE FROM wazzup_contact_map WHERE chat_id=%s", (r["chat_id"],))
         await update.message.reply_text(
-            f"✅ Удалён: {r['wazzup_name']} / {r['company_name']} (chat_id: {r['chat_id']})"
+            f"✅ Удалён: {r['contact_name']} / {r['company_name']} (chat_id: {r['chat_id']})"
         )
 
 async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
