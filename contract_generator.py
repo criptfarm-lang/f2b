@@ -428,8 +428,8 @@ def generate_contract_pdf(data: dict) -> bytes:
             bname = data.get("buyer_legal_title") or data.get("buyer_name", "")
             # Должность из buyer_representative
             _rep = data.get("buyer_representative", "")
-            if "предприниматель" in _rep.lower():
-                buyer_position = "Индивидуальный предприниматель"
+            if "предпринимател" in _rep.lower():
+                buyer_position = ""  # для ИП должность не нужна — она уже в названии "ИП ..."
             else:
                 buyer_position = "Генеральный директор"
 
@@ -449,11 +449,12 @@ def generate_contract_pdf(data: dict) -> bytes:
 
             bname_lines = _wrap_words(bname, 40)
             y_offset = 5 * mm
-            for bl in bname_lines[:3]:  # максимум 3 строки названия
+            for bl in bname_lines[:3]:
                 canvas_obj.drawString(rx, base_y - y_offset, bl)
                 y_offset += 5 * mm
-            canvas_obj.drawString(rx, base_y - y_offset, buyer_position)
-            y_offset += 6 * mm
+            if buyer_position:
+                canvas_obj.drawString(rx, base_y - y_offset, buyer_position)
+                y_offset += 6 * mm
             canvas_obj.line(rx, base_y - y_offset, rx + 60*mm, base_y - y_offset)
             y_offset += 6 * mm
             canvas_obj.setFont(fb, 8)
