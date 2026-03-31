@@ -5330,10 +5330,16 @@ async def _build_report_data() -> dict:
                 lost_client_names.setdefault(mgr, []).append(cp.get("name", aid))
 
     PLANS = {
-        "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29, "new_clients": 3, "attracted": 1_000_000},
-        "Карина Баласанян": {"shipments": 150, "revenue": 5_000_000,  "clients": 38, "new_clients": 3, "attracted": 1_100_000},
-        "Елена Мерзлякова": {"shipments": 65,  "revenue": 6_000_000,  "clients": 30, "new_clients": 3, "attracted": 300_000},
-        "Алексей Леонтьев": {"shipments": 12,  "revenue": 180_000,    "clients": 5,  "new_clients": 3, "attracted": 300_000},
+        "Инесса Скляр":     {"shipments": 250, "revenue": 26_500_000, "clients": 30, "new_clients": 5, "attracted": 1_000_000},
+        "Карина Баласанян": {"shipments": 170, "revenue": 6_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
+        "Елена Мерзлякова": {"shipments": 80,  "revenue": 6_700_000,  "clients": 30, "new_clients": 5, "attracted": 300_000},
+        "Алексей Леонтьев": {"shipments": 17,  "revenue": 500_000,    "clients": 8,  "new_clients": 7, "attracted": 300_000},
+    }
+    WEEKLY_PLANS = {
+        "Инесса Скляр":     {"shipments": 25,  "revenue": 2_000_000,  "clients": 10, "new_clients": 1, "attracted": 250_000},
+        "Карина Баласанян": {"shipments": 40,  "revenue": 1_200_000,  "clients": 16, "new_clients": 1, "attracted": 275_000},
+        "Елена Мерзлякова": {"shipments": 10,  "revenue": 1_000_000,  "clients": 5,  "new_clients": 1, "attracted": 75_000},
+        "Алексей Леонтьев": {"shipments": 3,   "revenue": 100_000,    "clients": 3,  "new_clients": 1, "attracted": 75_000},
     }
     SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Алексей Леонтьев":"Алексей"}
 
@@ -5346,6 +5352,7 @@ async def _build_report_data() -> dict:
         "date": today.strftime("%d.%m.%Y"),
         "facts": facts,
         "plans": PLANS,
+        "weekly_plans": WEEKLY_PLANS,
         "short_names": SHORT_NAMES,
         "new_client_names": new_client_names,
         "lost_client_names": lost_client_names,
