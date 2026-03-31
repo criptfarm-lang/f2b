@@ -2453,6 +2453,9 @@ async def get_aging_clients(days: int = 50) -> list:
             result.sort(key=lambda x: x["days"], reverse=True)
 
             # Дозагружаем имена и теги через карточки контрагентов
+            # Фильтруем закрытых и переименованных
+            EXCLUDED_STATUSES = {"закрылся", "переименован"}
+            filtered_result = []
             async with aiohttp.ClientSession() as session2:
                 for client in result:
                     try:
@@ -2462,10 +2465,18 @@ async def get_aging_clients(days: int = 50) -> list:
                         ) as r:
                             if r.status == 200:
                                 cp = await r.json()
+                                # Проверяем статус — исключаем закрытых и переименованных
+                                cp_status = (cp.get("state") or {}).get("name", "").lower().strip()
+                                if cp_status in EXCLUDED_STATUSES:
+                                    logger.info(f"get_aging_clients: исключён {cp.get('name')} — статус '{cp_status}'")
+                                    continue
                                 client["name"] = cp.get("name", client["name"])
                                 client["tags"] = [t.lower() for t in cp.get("tags", [])]
+                                filtered_result.append(client)
                     except Exception:
-                        pass
+                        filtered_result.append(client)
+
+            result = filtered_result
 
             logger.info(f"get_aging_clients: стареющих клиентов = {len(result)}")
             return result
