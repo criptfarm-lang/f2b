@@ -33,6 +33,9 @@ from moysklad import (search_products, search_products_filtered, get_price_list,
     get_overdue_demands, format_overdue_demands, format_overdue_summary,
     format_reminders_for_manager, format_debt_reminder, fmt_money)
 
+# ─── Квиз — URL сервиса викторины ────────────────────────────────────────────
+QUIZ_BASE_URL = os.getenv("QUIZ_BASE_URL", "")  # https://викторина-xxxx.up.railway.app
+
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
 EMPLOYEES = {
     "Белякова Александра": [
@@ -5804,8 +5807,28 @@ _price_check_cache: dict = {}
 # Хранилище данных алертов ПДЗ — order_id → {client, manager, debt_amount, debt_days, order_name}
 _pdz_alert_data: dict = {}
 
+async def _is_company_excluded(company_name: str) -> bool:
+    """Проверяет — находится ли компания в списке исключений квиза."""
+    import aiohttp as _aio_excl
+    if not QUIZ_BASE_URL:
+        return False
+    try:
+        async with _aio_excl.ClientSession() as session:
+            async with session.get(
+                f"{QUIZ_BASE_URL}/api/check-exclusion",
+                params={"company_name": company_name},
+                timeout=_aio_excl.ClientTimeout(total=5)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return data.get("excluded", False)
+    except Exception as e:
+        logger.warning(f"_is_company_excluded: не удалось проверить ({e}), считаем не исключённой")
+    return False
+
+
 async def check_order_agreed(order_href: str, bot):
-    """При смене статуса заказа на Согласовано — отправляем клиенту в мессенджер."""
+    """При смене статуса заказа на Согласовано — отправляем клиенту состав + ссылку на квиз."""
     MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
     try:
         import aiohttp
@@ -5827,19 +5850,19 @@ async def check_order_agreed(order_href: str, bot):
         if state_id != MS_STATE_AGREED:
             return
 
-        # Проверяем не отправляли ли уже
+        # Проверяем — не отправляли ли уже (один раз на заказ)
         order_id_check = order_href.split("/")[-1].split("?")[0]
         if db.is_agreed_notified(order_id_check):
             logger.info(f"check_order_agreed: заказ {order_id_check} — уведомление уже отправлялось, пропускаем")
             return
 
-        order_name = order.get("name", "")
-        order_sum = (order.get("sum", 0) or 0) / 100
-        agent = order.get("agent", {})
-        agent_name = agent.get("name", "")
-        agent_id = agent.get("meta", {}).get("href", "").split("/")[-1]
-        owner = order.get("owner", {})
-        owner_name = owner.get("name", "")
+        order_name  = order.get("name", "")
+        order_sum   = (order.get("sum", 0) or 0) / 100
+        agent       = order.get("agent", {})
+        agent_name  = agent.get("name", "")
+        agent_id    = agent.get("meta", {}).get("href", "").split("/")[-1]
+        owner       = order.get("owner", {})
+        owner_name  = owner.get("name", "")
 
         # Пропускаем розничного покупателя
         if agent_name.lower().strip() == "розничный покупатель":
@@ -5850,7 +5873,7 @@ async def check_order_agreed(order_href: str, bot):
         logger.info(f"check_order_agreed: заказ {order_name} клиент={agent_name} статус=Согласовано")
 
         # Загружаем позиции заказа
-        order_id = order_href.split("/")[-1].split("?")[0]
+        order_id = order_id_check
         positions_text = ""
         try:
             async with aiohttp.ClientSession() as session2:
@@ -5863,8 +5886,8 @@ async def check_order_agreed(order_href: str, bot):
                         pos_data = await r2.json()
                         lines = []
                         for pos in pos_data.get("rows", []):
-                            name = pos.get("assortment", {}).get("name", "?")
-                            qty = int(pos.get("quantity", 0))
+                            name  = pos.get("assortment", {}).get("name", "?")
+                            qty   = int(pos.get("quantity", 0))
                             price = (pos.get("price", 0) or 0) / 100
                             total = qty * price
                             lines.append(f"  • {name} × {qty} = {total:,.0f} руб.")
@@ -5873,49 +5896,36 @@ async def check_order_agreed(order_href: str, bot):
         except Exception as e:
             logger.warning(f"check_order_agreed: не удалось загрузить позиции: {e}")
 
-        # Формируем сообщение
+        # Дата отгрузки
         delivery = order.get("deliveryPlannedMoment", "")[:10] if order.get("deliveryPlannedMoment") else ""
 
-        # Определяем сегмент клиента по тегам
-        segment = None
-        tags = agent.get("tags", [])
-        for tag in tags:
-            if tag.lower() in ("хорека", "horeka"):
-                segment = "хорека"
-                break
-            elif tag.lower() == "опт":
-                segment = "опт"
-                break
-
-        # Если теги не пришли в expand — загружаем карточку
-        if not tags and agent_id:
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(
-                        f"https://api.moysklad.ru/api/remap/1.2/entity/counterparty/{agent_id}",
-                        headers=get_headers()
-                    ) as r:
-                        if r.status == 200:
-                            cp = await r.json()
-                            for tag in cp.get("tags", []):
-                                if tag.lower() in ("хорека", "horeka"):
-                                    segment = "хорека"
-                                    break
-                                elif tag.lower() == "опт":
-                                    segment = "опт"
-                                    break
-            except Exception:
-                pass
-
-        promo = db.get_promo(segment)
+        # Формируем сообщение — состав заказа
         msg = f"📋 Пожалуйста, проверьте заказ {order_name}\n\n"
         if positions_text:
             msg += f"📦 Состав:\n{positions_text}\n\n"
         msg += f"💰 Итого: {order_sum:,.0f} руб.\n"
         if delivery:
             msg += f"📅 Плановая дата отгрузки: {delivery}\n"
-        if promo:
-            msg += f"\n{promo}"
+
+        # ── Квиз вместо рекламного объявления ────────────────────────────────
+        if QUIZ_BASE_URL:
+            excluded = await _is_company_excluded(agent_name)
+            if not excluded:
+                quiz_url = (
+                    f"{QUIZ_BASE_URL}"
+                    f"/?order={order_id}"
+                    f"&client_id={agent_id}"
+                    f"&amount={int(order_sum)}"
+                )
+                msg += (
+                    f"\n\n🐟 *Сыграйте в нашу викторину FISHки!*\n"
+                    f"Правильные ответы = FISHки. 50 FISHек = бесплатный пласт форели 🎣\n"
+                    f"{quiz_url}"
+                )
+                logger.info(f"check_order_agreed: квиз добавлен для {agent_name}")
+            else:
+                logger.info(f"check_order_agreed: {agent_name} в исключениях, квиз не добавляем")
+        # ─────────────────────────────────────────────────────────────────────
 
         # Ищем мессенджер клиента
         contact = db._fetchone(
@@ -5930,15 +5940,16 @@ async def check_order_agreed(order_href: str, bot):
             logger.info(f"check_order_agreed: мессенджер {agent_name} не найден, пропускаем")
             db.save_agreed_notification(order_id_check)
             return
+
         # Отправляем через Wazzup
         import aiohttp as _aio
         api_key = os.getenv("WAZZUP_API_KEY", "")
         async with _aio.ClientSession() as session:
             payload = {
                 "channelId": contact["channel_id"],
-                "chatType": contact["chat_type"],
-                "chatId": contact["chat_id"],
-                "text": msg,
+                "chatType":  contact["chat_type"],
+                "chatId":    contact["chat_id"],
+                "text":      msg,
             }
             async with session.post(
                 "https://api.wazzup24.com/v3/message",
