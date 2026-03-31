@@ -5320,7 +5320,14 @@ async def _build_report_data() -> dict:
             for aid in (ids & prev_ids - set(curr_ids.keys())):
                 async with session.get(f"{MS_BASE}/entity/counterparty/{aid}", headers=get_headers()) as r:
                     cp = await r.json()
-                lost_client_names.setdefault(mgr,[]).append(cp.get("name",aid))
+                # Проверяем что клиент всё ещё принадлежит этому менеджеру по тегу
+                # Если тег сменился — клиент не выбывший, просто перешёл к другому менеджеру
+                cp_tags = [t.lower() for t in cp.get("tags", [])]
+                mgr_tag = next((t for t, m in TAGS.items() if m == mgr), None)
+                if mgr_tag and mgr_tag not in cp_tags:
+                    logger.info(f"Skipping lost client {cp.get('name')} for {mgr} — tag changed to {cp_tags}")
+                    continue
+                lost_client_names.setdefault(mgr, []).append(cp.get("name", aid))
 
     PLANS = {
         "Инесса Скляр":     {"shipments": 220, "revenue": 25_000_000, "clients": 29, "new_clients": 3, "attracted": 1_000_000},
