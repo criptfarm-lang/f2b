@@ -1771,7 +1771,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif awaiting == "pdz_client":
             await message.reply_chat_action("typing")
-            from moysklad import get_overdue_demands
             counterparties = await get_counterparty_balance(text)
             if not counterparties:
                 await message.reply_text(f"❌ Клиент *{text}* не найден.", parse_mode="Markdown")
