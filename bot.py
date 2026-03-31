@@ -1632,6 +1632,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
             return
 
+        elif awaiting and awaiting.startswith("promo_"):
+            segment = awaiting.replace("promo_", "")
+            db.set_promo(text, segment)
+            await message.reply_text(
+                f"✅ Промо для *{segment}* сохранён:\n\n{text}",
+                parse_mode="Markdown"
+            )
+            return
+
         elif awaiting == "contract":
             await message.reply_chat_action("typing")
             buyer_query = text
@@ -4011,7 +4020,13 @@ async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         segment = "хорека" if first_word in ("хорека", "horeka") else "опт"
         text = raw_args.split(" ", 1)[1].strip() if " " in raw_args else ""
         if not text:
-            await update.message.reply_text(f"Укажи текст: /set_promo {first_word} [текст]")
+            # Текст не указан — просим прислать следующим сообщением
+            _user_awaiting[user.id] = f"promo_{segment}"
+            await update.message.reply_text(
+                f"📢 Отправь текст промо для *{segment}* следующим сообщением.\n"
+                f"Можно использовать переносы строк, эмодзи и ссылки.",
+                parse_mode="Markdown"
+            )
             return
         db.set_promo(text, segment)
         await update.message.reply_text(f"✅ Промо для *{segment}* сохранён:\n\n{text}", parse_mode="Markdown")
