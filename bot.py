@@ -5918,8 +5918,7 @@ async def check_order_agreed(order_href: str, bot):
                     f"&amount={int(order_sum)}"
                 )
                 msg += (
-                    f"\n\n🐟 *Сыграйте в нашу викторину FISHки!*\n"
-                    f"Правильные ответы = FISHки. 50 FISHек = бесплатный пласт форели 🎣\n"
+                    f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
                     f"{quiz_url}"
                 )
                 logger.info(f"check_order_agreed: квиз добавлен для {agent_name}")
