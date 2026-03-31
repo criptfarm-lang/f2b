@@ -5337,6 +5337,11 @@ async def _build_report_data() -> dict:
     }
     SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Алексей Леонтьев":"Алексей"}
 
+    # Синхронизируем счётчики с реальными списками имён
+    for mgr_name in facts:
+        facts[mgr_name]["new_clients"] = len(new_client_names.get(mgr_name, []))
+        facts[mgr_name]["lost_clients"] = len(lost_client_names.get(mgr_name, []))
+
     return {
         "date": today.strftime("%d.%m.%Y"),
         "facts": facts,
