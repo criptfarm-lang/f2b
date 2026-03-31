@@ -5874,6 +5874,8 @@ async def check_order_agreed(order_href: str, bot):
 
         # Загружаем позиции заказа
         order_id = order_href.split("/")[-1].split("?")[0]
+        logger.info(f"check_order_agreed: загружаю позиции order_id={order_id}")
+        logger.info(f"check_order_agreed: загружаю позиции order_id={order_id}")
         positions_text = ""
         try:
             async with aiohttp.ClientSession() as session2:
@@ -5893,6 +5895,7 @@ async def check_order_agreed(order_href: str, bot):
                             lines.append(f"  • {name} × {qty} = {total:,.0f} руб.")
                         if lines:
                             positions_text = "\n".join(lines)
+                    logger.info(f"check_order_agreed: позиции загружены, строк={len(positions_text.splitlines())}")
         except Exception as e:
             logger.warning(f"check_order_agreed: не удалось загрузить позиции: {e}")
 
@@ -5902,6 +5905,7 @@ async def check_order_agreed(order_href: str, bot):
         # Определяем сегмент клиента по тегам (хорека / опт)
         segment = None
         tags = agent.get("tags", [])
+        logger.info(f"check_order_agreed: теги агента={tags}")
         for tag in tags:
             if tag.lower() in ("хорека", "horeka"):
                 segment = "хорека"
@@ -5963,6 +5967,7 @@ async def check_order_agreed(order_href: str, bot):
         # ─────────────────────────────────────────────────────────────────────
 
         # Ищем мессенджер клиента
+        logger.info(f"check_order_agreed: сегмент={segment}, ищу контакт для {agent_name}")
         contact = db._fetchone(
             """SELECT chat_id, channel_id, chat_type, manager
                FROM wazzup_contact_map
