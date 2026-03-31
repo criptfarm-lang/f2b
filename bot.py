@@ -5315,11 +5315,17 @@ async def _build_report_data() -> dict:
             if len(rows)<200: break
             off+=200
 
+        EXCLUDED_STATUSES = {"закрылся", "переименован"}
         lost_client_names = {}
         for mgr, ids in tag_to_ids.items():
             for aid in (ids & prev_ids - set(curr_ids.keys())):
                 async with session.get(f"{MS_BASE}/entity/counterparty/{aid}", headers=get_headers()) as r:
                     cp = await r.json()
+                # Исключаем закрытых и переименованных
+                cp_status = (cp.get("state") or {}).get("name", "").lower().strip()
+                if cp_status in EXCLUDED_STATUSES:
+                    logger.info(f"lost_clients: исключён {cp.get('name')} — статус '{cp_status}'")
+                    continue
                 # Проверяем что клиент всё ещё принадлежит этому менеджеру по тегу
                 # Если тег сменился — клиент не выбывший, просто перешёл к другому менеджеру
                 cp_tags = [t.lower() for t in cp.get("tags", [])]
