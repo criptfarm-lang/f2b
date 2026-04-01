@@ -4273,6 +4273,30 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+async def cmd_fix_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/fix_channels — найти и исправить записи с пустым channel_id."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    TELEGRAM_CHANNEL_ID = "ddd24a95-9304-4098-a320-3e47fcd1020a"
+    # Находим все записи с пустым channel_id
+    rows = db._fetchall(
+        "SELECT chat_id, company_name, chat_type FROM wazzup_contact_map WHERE channel_id='' OR channel_id IS NULL"
+    )
+    if not rows:
+        await update.message.reply_text("✅ Все записи имеют channel_id — всё в порядке.")
+        return
+    # Исправляем
+    db._execute(
+        "UPDATE wazzup_contact_map SET channel_id=%s WHERE channel_id='' OR channel_id IS NULL",
+        (TELEGRAM_CHANNEL_ID,)
+    )
+    lines = [f"✅ Исправлено {len(rows)} записей с пустым channel_id:\n"]
+    for r in rows:
+        lines.append(f"• {r['company_name']} ({r['chat_type']}, {r['chat_id']})")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/reset_agreed [order_id или номер заказа] — сбросить флаг отправки уведомления."""
     user = update.effective_user
@@ -5529,6 +5553,7 @@ def main():
     app.add_handler(CommandHandler("check_webhooks", cmd_check_webhooks))
     app.add_handler(CommandHandler("managers", cmd_managers))
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
+    app.add_handler(CommandHandler("fix_channels", cmd_fix_channels))
     app.add_handler(CommandHandler("web_report", cmd_web_report))
     app.add_handler(CommandHandler("lost_clients", cmd_lost_clients))
     app.add_handler(CommandHandler("new_clients", cmd_new_clients))
