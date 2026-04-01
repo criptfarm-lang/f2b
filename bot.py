@@ -4611,7 +4611,7 @@ async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
         recent = db._fetchall(
             "SELECT chat_id, wazzup_name, company_name FROM wazzup_contact_map ORDER BY created_at DESC LIMIT 5"
         )
-        hint = "\n".join([f"• {r['wazzup_name']} / {r['company_name']} ({r['chat_id']})" for r in recent]) if recent else "—"
+        hint = "\n".join([f"• {r['company_name']} ({r['chat_id']})" for r in recent]) if recent else "—"
         await update.message.reply_text(
             f"❌ Контакт не найден: {query_val}\n\n"
             f"Последние 5 записей в базе:\n{hint}"
@@ -4621,7 +4621,7 @@ async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         db._execute("DELETE FROM wazzup_contact_map WHERE chat_id=%s", (r["chat_id"],))
         await update.message.reply_text(
-            f"✅ Удалён: {r['wazzup_name']} / {r['company_name']} (chat_id: {r['chat_id']})"
+            f"✅ Удалён: {r['company_name']} (chat_id: {r['chat_id']})"
         )
 
 async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4639,26 +4639,35 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.args[0]
     company_name = " ".join(context.args[1:])
 
-    # Обновляем company_name в wazzup_contact_map
-    db._execute(
-        "UPDATE wazzup_contact_map SET company_name=%s WHERE chat_id=%s",
-        (company_name, chat_id)
-    )
-    rows = db._fetchall(
-        "SELECT chat_id, contact_name, company_name, manager FROM wazzup_contact_map WHERE chat_id=%s",
+    # Проверяем есть ли контакт
+    existing = db._fetchone(
+        "SELECT chat_id, company_name FROM wazzup_contact_map WHERE chat_id=%s",
         (chat_id,)
     )
-    if rows:
-        r = rows[0]
+
+    if existing:
+        db._execute(
+            "UPDATE wazzup_contact_map SET company_name=%s WHERE chat_id=%s",
+            (company_name, chat_id)
+        )
         await update.message.reply_text(
             f"✅ Контакт перепривязан:\n"
-            f"chat_id: {r['chat_id']}\n"
-            f"Контакт: {r['wazzup_name']}\n"
-            f"Компания: {r['company_name']}\n"
-            f"Менеджер: {r['manager']}"
+            f"chat_id: {chat_id}\n"
+            f"Компания: {company_name}"
         )
     else:
-        await update.message.reply_text(f"❌ Контакт с chat_id={chat_id} не найден")
+        # Контакта нет — создаём новую запись
+        db._execute(
+            """INSERT INTO wazzup_contact_map (chat_id, company_name, chat_type, channel_id, wazzup_name)
+               VALUES (%s, %s, 'telegram', '', %s)
+               ON CONFLICT (chat_id) DO UPDATE SET company_name=%s""",
+            (chat_id, company_name, company_name, company_name)
+        )
+        await update.message.reply_text(
+            f"✅ Контакт создан:\n"
+            f"chat_id: {chat_id}\n"
+            f"Компания: {company_name}"
+        )
 
 async def cmd_sync_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sync_managers — обновляет менеджеров в базе по тегам МойСклад."""
@@ -5894,6 +5903,7 @@ async def check_order_agreed(order_href: str, bot):
 
         # Загружаем позиции заказа
         order_id = order_href.split("/")[-1].split("?")[0]
+        logger.info(f"check_order_agreed: загружаю позиции order_id={order_id}")
         positions_text = ""
         try:
             async with aiohttp.ClientSession() as session2:
@@ -5913,6 +5923,7 @@ async def check_order_agreed(order_href: str, bot):
                             lines.append(f"  • {name} × {qty} = {total:,.0f} руб.")
                         if lines:
                             positions_text = "\n".join(lines)
+                    logger.info(f"check_order_agreed: позиции загружены, строк={len(positions_text.splitlines())}")
         except Exception as e:
             logger.warning(f"check_order_agreed: не удалось загрузить позиции: {e}")
 
@@ -5922,6 +5933,7 @@ async def check_order_agreed(order_href: str, bot):
         # Определяем сегмент клиента по тегам (хорека / опт)
         segment = None
         tags = agent.get("tags", [])
+        logger.info(f"check_order_agreed: теги агента={tags}")
         for tag in tags:
             if tag.lower() in ("хорека", "horeka"):
                 segment = "хорека"
@@ -5995,6 +6007,7 @@ async def check_order_agreed(order_href: str, bot):
         # ─────────────────────────────────────────────────────────────────────
 
         # Ищем мессенджер клиента
+        logger.info(f"check_order_agreed: сегмент={segment}, ищу контакт для {agent_name}")
         contact = db._fetchone(
             """SELECT chat_id, channel_id, chat_type, manager
                FROM wazzup_contact_map
