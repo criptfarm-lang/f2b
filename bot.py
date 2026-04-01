@@ -6250,7 +6250,7 @@ async def process_ms_webhook(data: dict, bot):
             order_id = order_href.split("/")[-1]
             now = time.time()
             last_check = _price_check_cache.get(order_id, 0)
-            already_checked = now - last_check < 10
+            already_checked = now - last_check < 3
             _price_check_cache[order_id] = now
 
             action = event.get("action", "")
