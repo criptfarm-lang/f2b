@@ -4274,16 +4274,51 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/reset_agreed [order_id] — сбросить флаг отправки уведомления для заказа."""
+    """/reset_agreed [order_id или номер заказа] — сбросить флаг отправки уведомления."""
     user = update.effective_user
     if not user or user.id != 360092495:
         return
     if not context.args:
-        await update.message.reply_text("Использование: /reset_agreed [order_id]")
+        await update.message.reply_text("Использование: /reset_agreed [order_id или номер, например 01559]")
         return
-    order_id = context.args[0]
-    db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
-    await update.message.reply_text(f"✅ Флаг уведомления для заказа {order_id} сброшен.")
+    query = " ".join(context.args)
+
+    # Если похоже на UUID — сбрасываем напрямую
+    if len(query) > 20 and "-" in query:
+        db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (query,))
+        await update.message.reply_text(f"✅ Флаг сброшен для {query}")
+        return
+
+    # Иначе ищем заказ по номеру через МойСклад
+    try:
+        import aiohttp
+        from moysklad import get_headers, MS_BASE
+        await update.message.reply_text(f"🔍 Ищу заказ №{query}...")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder",
+                headers=get_headers(),
+                params={"filter": f"name={query}", "limit": 5}
+            ) as resp:
+                data = await resp.json()
+        rows = data.get("rows", [])
+        if not rows:
+            await update.message.reply_text(f"❌ Заказ №{query} не найден в МойСклад.")
+            return
+        results = []
+        for row in rows:
+            order_id = row["id"]
+            order_name = row.get("name", "")
+            agent_name = row.get("agent", {}).get("name", "")
+            db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
+            results.append(f"✅ №{order_name} — {agent_name}\n   ID: `{order_id}`")
+        await update.message.reply_text(
+            f"Флаги сброшены:\n\n" + "\n".join(results) +
+            "\n\nТеперь смени статус заказа на «Согласовано» — уведомление отправится.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
