@@ -5827,6 +5827,26 @@ async def _is_company_excluded(company_name: str) -> bool:
     return False
 
 
+async def _is_company_whitelisted(company_name: str) -> bool:
+    """Проверяет — в белом списке ли компания (опт, которому разрешён квиз)."""
+    import aiohttp as _aio_wl
+    if not QUIZ_BASE_URL:
+        return False
+    try:
+        async with _aio_wl.ClientSession() as session:
+            async with session.get(
+                f"{QUIZ_BASE_URL}/api/check-whitelist",
+                params={"company_name": company_name},
+                timeout=_aio_wl.ClientTimeout(total=5)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return data.get("whitelisted", False)
+    except Exception as e:
+        logger.warning(f"_is_company_whitelisted: ошибка ({e}), считаем не в белом списке")
+    return False
+
+
 async def check_order_agreed(order_href: str, bot):
     """При смене статуса заказа на Согласовано — отправляем клиенту в мессенджер."""
     MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
@@ -5874,8 +5894,6 @@ async def check_order_agreed(order_href: str, bot):
 
         # Загружаем позиции заказа
         order_id = order_href.split("/")[-1].split("?")[0]
-        logger.info(f"check_order_agreed: загружаю позиции order_id={order_id}")
-        logger.info(f"check_order_agreed: загружаю позиции order_id={order_id}")
         positions_text = ""
         try:
             async with aiohttp.ClientSession() as session2:
@@ -5895,7 +5913,6 @@ async def check_order_agreed(order_href: str, bot):
                             lines.append(f"  • {name} × {qty} = {total:,.0f} руб.")
                         if lines:
                             positions_text = "\n".join(lines)
-                    logger.info(f"check_order_agreed: позиции загружены, строк={len(positions_text.splitlines())}")
         except Exception as e:
             logger.warning(f"check_order_agreed: не удалось загрузить позиции: {e}")
 
@@ -5905,7 +5922,6 @@ async def check_order_agreed(order_href: str, bot):
         # Определяем сегмент клиента по тегам (хорека / опт)
         segment = None
         tags = agent.get("tags", [])
-        logger.info(f"check_order_agreed: теги агента={tags}")
         for tag in tags:
             if tag.lower() in ("хорека", "horeka"):
                 segment = "хорека"
@@ -5940,34 +5956,45 @@ async def check_order_agreed(order_href: str, bot):
         if delivery:
             msg += f"📅 Плановая дата отгрузки: {delivery}\n"
 
-        if segment == "хорека":
-            # ── Хорека: квиз FISHки ───────────────────────────────────────────
-            if QUIZ_BASE_URL:
-                excluded = await _is_company_excluded(agent_name)
-                if not excluded:
-                    quiz_url = (
-                        f"{QUIZ_BASE_URL}"
-                        f"/?order={order_id}"
-                        f"&client_id={agent_id}"
-                        f"&amount={int(order_sum)}"
-                    )
-                    msg += (
-                        f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
-                        f"{quiz_url}"
-                    )
-                    logger.info(f"check_order_agreed: квиз добавлен для {agent_name}")
+        # ── Определяем отправлять ли квиз ───────────────────────────────────
+        send_quiz = False
+        if QUIZ_BASE_URL:
+            excluded = await _is_company_excluded(agent_name)
+            if not excluded:
+                if segment == "хорека":
+                    send_quiz = True
+                    logger.info(f"check_order_agreed: хорека → квиз для {agent_name}")
                 else:
-                    logger.info(f"check_order_agreed: {agent_name} в исключениях, квиз не добавляем")
-        else:
-            # ── Опт и остальные: старое промо ────────────────────────────────
+                    # Опт и остальные — только если в белом списке
+                    whitelisted = await _is_company_whitelisted(agent_name)
+                    if whitelisted:
+                        send_quiz = True
+                        logger.info(f"check_order_agreed: опт в белом списке → квиз для {agent_name}")
+                    else:
+                        logger.info(f"check_order_agreed: {agent_name} (опт) не в белом списке, квиз не отправляем")
+            else:
+                logger.info(f"check_order_agreed: {agent_name} в исключениях, квиз не отправляем")
+
+        if send_quiz:
+            quiz_url = (
+                f"{QUIZ_BASE_URL}"
+                f"/?order={order_id}"
+                f"&client_id={agent_id}"
+                f"&amount={int(order_sum)}"
+            )
+            msg += (
+                f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
+                f"{quiz_url}"
+            )
+        elif segment != "хорека":
+            # Старое промо для тех кто не получил квиз
             promo = db.get_promo(segment)
             if promo:
                 msg += f"\n{promo}"
-                logger.info(f"check_order_agreed: промо добавлено для {agent_name} (сегмент: {segment})")
+                logger.info(f"check_order_agreed: промо для {agent_name} (сегмент: {segment})")
         # ─────────────────────────────────────────────────────────────────────
 
         # Ищем мессенджер клиента
-        logger.info(f"check_order_agreed: сегмент={segment}, ищу контакт для {agent_name}")
         contact = db._fetchone(
             """SELECT chat_id, channel_id, chat_type, manager
                FROM wazzup_contact_map
