@@ -4273,6 +4273,54 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/managers — показать всех зарегистрированных менеджеров и их chat_id."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    rows = db._fetchall(
+        "SELECT user_id, full_name, is_blocked FROM manager_chats ORDER BY full_name"
+    )
+    if not rows:
+        await update.message.reply_text("❌ Менеджеры не найдены.")
+        return
+    lines = ["👥 *Зарегистрированные менеджеры:*\n"]
+    for r in rows:
+        blocked = " 🚫" if r.get("is_blocked") else ""
+        lines.append(f"• {r['full_name']}{blocked}\n  ID: `{r['user_id']}`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_check_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/check_webhooks — проверить вебхуки МойСклад."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    try:
+        import aiohttp
+        from moysklad import get_headers, MS_BASE
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{MS_BASE}/entity/webhook", headers=get_headers()) as resp:
+                if resp.status != 200:
+                    await update.message.reply_text(f"❌ Ошибка запроса: {resp.status}")
+                    return
+                data = await resp.json()
+        rows = data.get("rows", [])
+        if not rows:
+            await update.message.reply_text("❌ Вебхуки не найдены в МойСклад!")
+            return
+        lines = [f"📋 Вебхуки МойСклад ({len(rows)} шт):\n"]
+        for w in rows:
+            enabled = "✅" if w.get("enabled") else "❌"
+            url = w.get("url", "")
+            action = w.get("action", "")
+            entity = w.get("entityType", "")
+            lines.append(f"{enabled} {entity} / {action}\n   {url}")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 async def cmd_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/refresh_cache — принудительно обновить кэш отчёта ОП."""
     user = update.effective_user
@@ -5428,6 +5476,8 @@ def main():
     app.add_handler(CommandHandler("reissue_contract", cmd_reissue_contract))
     app.add_handler(CommandHandler("refresh_contract", cmd_refresh_contract))
     app.add_handler(CommandHandler("refresh_cache", cmd_refresh_cache))
+    app.add_handler(CommandHandler("check_webhooks", cmd_check_webhooks))
+    app.add_handler(CommandHandler("managers", cmd_managers))
     app.add_handler(CommandHandler("web_report", cmd_web_report))
     app.add_handler(CommandHandler("lost_clients", cmd_lost_clients))
     app.add_handler(CommandHandler("new_clients", cmd_new_clients))
