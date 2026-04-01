@@ -4273,6 +4273,19 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/reset_agreed [order_id] — сбросить флаг отправки уведомления для заказа."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /reset_agreed [order_id]")
+        return
+    order_id = context.args[0]
+    db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
+    await update.message.reply_text(f"✅ Флаг уведомления для заказа {order_id} сброшен.")
+
+
 async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/managers — показать всех зарегистрированных менеджеров и их chat_id."""
     user = update.effective_user
@@ -5478,6 +5491,7 @@ def main():
     app.add_handler(CommandHandler("refresh_cache", cmd_refresh_cache))
     app.add_handler(CommandHandler("check_webhooks", cmd_check_webhooks))
     app.add_handler(CommandHandler("managers", cmd_managers))
+    app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
     app.add_handler(CommandHandler("web_report", cmd_web_report))
     app.add_handler(CommandHandler("lost_clients", cmd_lost_clients))
     app.add_handler(CommandHandler("new_clients", cmd_new_clients))
@@ -6067,8 +6081,7 @@ async def check_order_agreed(order_href: str, bot):
         )
 
         if not contact:
-            logger.info(f"check_order_agreed: мессенджер {agent_name} не найден, пропускаем")
-            db.save_agreed_notification(order_id_check)
+            logger.info(f"check_order_agreed: мессенджер {agent_name} не найден, пропускаем (не сохраняем — попробуем при следующем UPDATE)")
             return
         # Отправляем через Wazzup
         import aiohttp as _aio
