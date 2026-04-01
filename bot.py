@@ -4273,126 +4273,6 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
-async def cmd_fix_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/fix_channels — найти и исправить записи с пустым channel_id."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    TELEGRAM_CHANNEL_ID = "ddd24a95-9304-4098-a320-3e47fcd1020a"
-    # Находим все записи с пустым channel_id
-    rows = db._fetchall(
-        "SELECT chat_id, company_name, chat_type FROM wazzup_contact_map WHERE channel_id='' OR channel_id IS NULL"
-    )
-    if not rows:
-        await update.message.reply_text("✅ Все записи имеют channel_id — всё в порядке.")
-        return
-    # Исправляем
-    db._execute(
-        "UPDATE wazzup_contact_map SET channel_id=%s WHERE channel_id='' OR channel_id IS NULL",
-        (TELEGRAM_CHANNEL_ID,)
-    )
-    lines = [f"✅ Исправлено {len(rows)} записей с пустым channel_id:\n"]
-    for r in rows:
-        lines.append(f"• {r['company_name']} ({r['chat_type']}, {r['chat_id']})")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/reset_agreed [order_id или номер заказа] — сбросить флаг отправки уведомления."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /reset_agreed [order_id или номер, например 01559]")
-        return
-    query = " ".join(context.args)
-
-    # Если похоже на UUID — сбрасываем напрямую
-    if len(query) > 20 and "-" in query:
-        db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (query,))
-        await update.message.reply_text(f"✅ Флаг сброшен для {query}")
-        return
-
-    # Иначе ищем заказ по номеру через МойСклад
-    try:
-        import aiohttp
-        from moysklad import get_headers, MS_BASE
-        await update.message.reply_text(f"🔍 Ищу заказ №{query}...")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{MS_BASE}/entity/customerorder",
-                headers=get_headers(),
-                params={"filter": f"name~{query}", "limit": 5}
-            ) as resp:
-                data = await resp.json()
-        rows = data.get("rows", [])
-        if not rows:
-            await update.message.reply_text(f"❌ Заказ №{query} не найден в МойСклад.")
-            return
-        results = []
-        for row in rows:
-            order_id = row["id"]
-            order_name = row.get("name", "")
-            agent_name = row.get("agent", {}).get("name", "")
-            db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
-            results.append(f"✅ №{order_name} — {agent_name}\n   ID: `{order_id}`")
-        await update.message.reply_text(
-            f"Флаги сброшены:\n\n" + "\n".join(results) +
-            "\n\nТеперь смени статус заказа на «Согласовано» — уведомление отправится.",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/managers — показать всех зарегистрированных менеджеров и их chat_id."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    rows = db._fetchall(
-        "SELECT user_id, full_name, is_blocked FROM manager_chats ORDER BY full_name"
-    )
-    if not rows:
-        await update.message.reply_text("❌ Менеджеры не найдены.")
-        return
-    lines = ["👥 *Зарегистрированные менеджеры:*\n"]
-    for r in rows:
-        blocked = " 🚫" if r.get("is_blocked") else ""
-        lines.append(f"• {r['full_name']}{blocked}\n  ID: `{r['user_id']}`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_check_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/check_webhooks — проверить вебхуки МойСклад."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    try:
-        import aiohttp
-        from moysklad import get_headers, MS_BASE
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{MS_BASE}/entity/webhook", headers=get_headers()) as resp:
-                if resp.status != 200:
-                    await update.message.reply_text(f"❌ Ошибка запроса: {resp.status}")
-                    return
-                data = await resp.json()
-        rows = data.get("rows", [])
-        if not rows:
-            await update.message.reply_text("❌ Вебхуки не найдены в МойСклад!")
-            return
-        lines = [f"📋 Вебхуки МойСклад ({len(rows)} шт):\n"]
-        for w in rows:
-            enabled = "✅" if w.get("enabled") else "❌"
-            url = w.get("url", "")
-            action = w.get("action", "")
-            entity = w.get("entityType", "")
-            lines.append(f"{enabled} {entity} / {action}\n   {url}")
-        await update.message.reply_text("\n".join(lines))
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
 async def cmd_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/refresh_cache — принудительно обновить кэш отчёта ОП."""
     user = update.effective_user
@@ -4759,14 +4639,12 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.args[0]
     company_name = " ".join(context.args[1:])
 
-    # Проверяем есть ли контакт
+    TELEGRAM_CHANNEL_ID = "ddd24a95-9304-4098-a320-3e47fcd1020a"
     existing = db._fetchone(
         "SELECT chat_id, company_name FROM wazzup_contact_map WHERE chat_id=%s",
         (chat_id,)
     )
-
     if existing:
-        TELEGRAM_CHANNEL_ID = "ddd24a95-9304-4098-a320-3e47fcd1020a"
         db._execute(
             "UPDATE wazzup_contact_map SET company_name=%s, channel_id=COALESCE(NULLIF(channel_id,''), %s) WHERE chat_id=%s",
             (company_name, TELEGRAM_CHANNEL_ID, chat_id)
@@ -4777,8 +4655,6 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Компания: {company_name}"
         )
     else:
-        # Контакта нет — создаём новую запись
-        TELEGRAM_CHANNEL_ID = "ddd24a95-9304-4098-a320-3e47fcd1020a"
         db._execute(
             """INSERT INTO wazzup_contact_map (chat_id, company_name, chat_type, channel_id, wazzup_name)
                VALUES (%s, %s, 'telegram', %s, %s)
@@ -4790,6 +4666,120 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"chat_id: {chat_id}\n"
             f"Компания: {company_name}"
         )
+
+async def cmd_fix_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/fix_channels — найти и исправить записи с пустым channel_id."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    TELEGRAM_CHANNEL_ID = "ddd24a95-9304-4098-a320-3e47fcd1020a"
+    rows = db._fetchall(
+        "SELECT chat_id, company_name, chat_type FROM wazzup_contact_map WHERE channel_id='' OR channel_id IS NULL"
+    )
+    if not rows:
+        await update.message.reply_text("✅ Все записи имеют channel_id — всё в порядке.")
+        return
+    db._execute(
+        "UPDATE wazzup_contact_map SET channel_id=%s WHERE channel_id='' OR channel_id IS NULL",
+        (TELEGRAM_CHANNEL_ID,)
+    )
+    lines = [f"✅ Исправлено {len(rows)} записей с пустым channel_id:\n"]
+    for r in rows:
+        lines.append(f"• {r['company_name']} ({r['chat_type']}, {r['chat_id']})")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/reset_agreed [order_id или номер заказа] — сбросить флаг отправки уведомления."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /reset_agreed [order_id или номер, например 01559]")
+        return
+    query = " ".join(context.args)
+    if len(query) > 20 and "-" in query:
+        db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (query,))
+        await update.message.reply_text(f"✅ Флаг сброшен для {query}")
+        return
+    try:
+        import aiohttp
+        from moysklad import get_headers, MS_BASE
+        await update.message.reply_text(f"🔍 Ищу заказ №{query}...")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder",
+                headers=get_headers(),
+                params={"filter": f"name~{query}", "limit": 5}
+            ) as resp:
+                data = await resp.json()
+        rows = data.get("rows", [])
+        if not rows:
+            await update.message.reply_text(f"❌ Заказ №{query} не найден в МойСклад.")
+            return
+        results = []
+        for row in rows:
+            order_id = row["id"]
+            order_name = row.get("name", "")
+            agent_name = row.get("agent", {}).get("name", "")
+            db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
+            results.append(f"✅ №{order_name} — {agent_name}\n   ID: `{order_id}`")
+        await update.message.reply_text(
+            f"Флаги сброшены:\n\n" + "\n".join(results) +
+            "\n\nТеперь смени статус заказа на «Согласовано» — уведомление отправится.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/managers — показать всех зарегистрированных менеджеров и их chat_id."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    rows = db._fetchall(
+        "SELECT user_id, full_name, is_blocked FROM manager_chats ORDER BY full_name"
+    )
+    if not rows:
+        await update.message.reply_text("❌ Менеджеры не найдены.")
+        return
+    lines = ["👥 *Зарегистрированные менеджеры:*\n"]
+    for r in rows:
+        blocked = " 🚫" if r.get("is_blocked") else ""
+        lines.append(f"• {r['full_name']}{blocked}\n  ID: `{r['user_id']}`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_check_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/check_webhooks — проверить вебхуки МойСклад."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    try:
+        import aiohttp
+        from moysklad import get_headers, MS_BASE
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{MS_BASE}/entity/webhook", headers=get_headers()) as resp:
+                if resp.status != 200:
+                    await update.message.reply_text(f"❌ Ошибка запроса: {resp.status}")
+                    return
+                data = await resp.json()
+        rows = data.get("rows", [])
+        if not rows:
+            await update.message.reply_text("❌ Вебхуки не найдены в МойСклад!")
+            return
+        lines = [f"📋 Вебхуки МойСклад ({len(rows)} шт):\n"]
+        for w in rows:
+            enabled = "✅" if w.get("enabled") else "❌"
+            url = w.get("url", "")
+            action = w.get("action", "")
+            entity = w.get("entityType", "")
+            lines.append(f"{enabled} {entity} / {action}\n   {url}")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
 
 async def cmd_sync_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sync_managers — обновляет менеджеров в базе по тегам МойСклад."""
@@ -5962,26 +5952,6 @@ async def _is_company_excluded(company_name: str) -> bool:
     return False
 
 
-async def _is_company_whitelisted(company_name: str) -> bool:
-    """Проверяет — в белом списке ли компания (опт, которому разрешён квиз)."""
-    import aiohttp as _aio_wl
-    if not QUIZ_BASE_URL:
-        return False
-    try:
-        async with _aio_wl.ClientSession() as session:
-            async with session.get(
-                f"{QUIZ_BASE_URL}/api/check-whitelist",
-                params={"company_name": company_name},
-                timeout=_aio_wl.ClientTimeout(total=5)
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    return data.get("whitelisted", False)
-    except Exception as e:
-        logger.warning(f"_is_company_whitelisted: ошибка ({e}), считаем не в белом списке")
-    return False
-
-
 async def check_order_agreed(order_href: str, bot):
     """При смене статуса заказа на Согласовано — отправляем клиенту в мессенджер."""
     MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
@@ -6094,46 +6064,26 @@ async def check_order_agreed(order_href: str, bot):
         if delivery:
             msg += f"📅 Плановая дата отгрузки: {delivery}\n"
 
-        # ── Определяем отправлять ли квиз ───────────────────────────────────
-        send_quiz = False
+        # ── Квиз всем кроме исключений ───────────────────────────────────
         if QUIZ_BASE_URL:
             excluded = await _is_company_excluded(agent_name)
             if not excluded:
-                if segment == "хорека":
-                    send_quiz = True
-                    logger.info(f"check_order_agreed: хорека → квиз для {agent_name}")
-                else:
-                    # Опт и остальные — только если в белом списке
-                    whitelisted = await _is_company_whitelisted(agent_name)
-                    if whitelisted:
-                        send_quiz = True
-                        logger.info(f"check_order_agreed: опт в белом списке → квиз для {agent_name}")
-                    else:
-                        logger.info(f"check_order_agreed: {agent_name} (опт) не в белом списке, квиз не отправляем")
+                quiz_url = (
+                    f"{QUIZ_BASE_URL}"
+                    f"/?order={order_id}"
+                    f"&client_id={agent_id}"
+                    f"&amount={int(order_sum)}"
+                )
+                msg += (
+                    f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
+                    f"{quiz_url}"
+                )
+                logger.info(f"check_order_agreed: квиз добавлен для {agent_name} (сегмент: {segment})")
             else:
                 logger.info(f"check_order_agreed: {agent_name} в исключениях, квиз не отправляем")
-
-        if send_quiz:
-            quiz_url = (
-                f"{QUIZ_BASE_URL}"
-                f"/?order={order_id}"
-                f"&client_id={agent_id}"
-                f"&amount={int(order_sum)}"
-            )
-            msg += (
-                f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
-                f"{quiz_url}"
-            )
-        elif segment != "хорека":
-            # Старое промо для тех кто не получил квиз
-            promo = db.get_promo(segment)
-            if promo:
-                msg += f"\n{promo}"
-                logger.info(f"check_order_agreed: промо для {agent_name} (сегмент: {segment})")
         # ─────────────────────────────────────────────────────────────────────
 
         # Ищем мессенджер клиента
-        logger.info(f"check_order_agreed: сегмент={segment}, ищу контакт для {agent_name}")
         contact = db._fetchone(
             """SELECT chat_id, channel_id, chat_type, manager
                FROM wazzup_contact_map
@@ -6142,6 +6092,7 @@ async def check_order_agreed(order_href: str, bot):
             (f"%{agent_name}%",)
         )
 
+        logger.info(f"check_order_agreed: сегмент={segment}, ищу контакт для {agent_name}")
         if not contact:
             logger.info(f"check_order_agreed: мессенджер {agent_name} не найден, пропускаем (не сохраняем — попробуем при следующем UPDATE)")
             return
