@@ -4298,7 +4298,7 @@ async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with session.get(
                 f"{MS_BASE}/entity/customerorder",
                 headers=get_headers(),
-                params={"filter": f"name={query}", "limit": 5}
+                params={"filter": f"name~{query}", "limit": 5}
             ) as resp:
                 data = await resp.json()
         rows = data.get("rows", [])
