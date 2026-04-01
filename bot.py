@@ -4742,9 +4742,10 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if existing:
+        TELEGRAM_CHANNEL_ID = "ddd24a95-9304-4098-a320-3e47fcd1020a"
         db._execute(
-            "UPDATE wazzup_contact_map SET company_name=%s WHERE chat_id=%s",
-            (company_name, chat_id)
+            "UPDATE wazzup_contact_map SET company_name=%s, channel_id=COALESCE(NULLIF(channel_id,''), %s) WHERE chat_id=%s",
+            (company_name, TELEGRAM_CHANNEL_ID, chat_id)
         )
         await update.message.reply_text(
             f"✅ Контакт перепривязан:\n"
@@ -4753,11 +4754,12 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         # Контакта нет — создаём новую запись
+        TELEGRAM_CHANNEL_ID = "ddd24a95-9304-4098-a320-3e47fcd1020a"
         db._execute(
             """INSERT INTO wazzup_contact_map (chat_id, company_name, chat_type, channel_id, wazzup_name)
-               VALUES (%s, %s, 'telegram', '', %s)
-               ON CONFLICT (chat_id) DO UPDATE SET company_name=%s""",
-            (chat_id, company_name, company_name, company_name)
+               VALUES (%s, %s, 'telegram', %s, %s)
+               ON CONFLICT (chat_id) DO UPDATE SET company_name=%s, channel_id=%s""",
+            (chat_id, company_name, TELEGRAM_CHANNEL_ID, company_name, company_name, TELEGRAM_CHANNEL_ID)
         )
         await update.message.reply_text(
             f"✅ Контакт создан:\n"
