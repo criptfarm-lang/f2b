@@ -6138,7 +6138,8 @@ async def check_order_agreed(order_href: str, bot):
                     db.save_agreed_notification(order_id_check)
                 else:
                     body = await r.text()
-                    logger.error(f"check_order_agreed: ошибка отправки {r.status} {body[:100]}")
+                    logger.error(f"check_order_agreed: ошибка отправки {r.status} {body}")
+                    logger.error(f"check_order_agreed: payload был: channelId={contact['channel_id']} chatType={contact['chat_type']} chatId={contact['chat_id']}")
 
     except Exception as e:
         logger.error(f"check_order_agreed: {e}", exc_info=True)
