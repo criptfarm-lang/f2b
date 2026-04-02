@@ -6094,11 +6094,13 @@ async def check_order_agreed(order_href: str, bot):
         if QUIZ_BASE_URL:
             excluded = await _is_company_excluded(agent_name)
             if not excluded:
+                import urllib.parse as _up
                 quiz_url = (
                     f"{QUIZ_BASE_URL}"
                     f"/?order={order_id}"
                     f"&client_id={agent_id}"
                     f"&amount={int(order_sum)}"
+                    f"&company={_up.quote(agent_name)}"
                 )
                 msg += (
                     f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
