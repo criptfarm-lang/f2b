@@ -4692,6 +4692,35 @@ async def cmd_relink_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_relink_wa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/relink_wa [phone] [компания] — привязать WhatsApp контакт к компании.
+    Пример: /relink_wa 79161234567 ИП Павлова Елена Владиславовна
+    """
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /relink_wa [телефон] [название компании]\n"
+            "Пример: /relink_wa 79161234567 ИП Павлова Елена Владиславовна"
+        )
+        return
+    chat_id = context.args[0]
+    company_name = " ".join(context.args[1:])
+    WA_CHANNEL_ID = "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03"
+    db._execute(
+        """INSERT INTO wazzup_contact_map (chat_id, company_name, chat_type, channel_id, wazzup_name)
+           VALUES (%s, %s, 'whatsapp', %s, %s)
+           ON CONFLICT (chat_id) DO UPDATE SET company_name=%s, channel_id=%s, chat_type='whatsapp'""",
+        (chat_id, company_name, WA_CHANNEL_ID, company_name, company_name, WA_CHANNEL_ID)
+    )
+    await update.message.reply_text(
+        f"✅ WhatsApp контакт привязан:\n"
+        f"Телефон: {chat_id}\n"
+        f"Компания: {company_name}"
+    )
+
+
 async def cmd_fix_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/fix_channels — найти и исправить записи с пустым channel_id."""
     user = update.effective_user
@@ -5576,6 +5605,7 @@ def main():
     app.add_handler(CommandHandler("test_publink", cmd_test_publink))
     app.add_handler(CommandHandler("unlink", cmd_unlink))
     app.add_handler(CommandHandler("relink", cmd_relink))
+    app.add_handler(CommandHandler("relink_wa", cmd_relink_wa))
     app.add_handler(CommandHandler("sync_managers", cmd_sync_managers))
     app.add_handler(CommandHandler("search_msg", cmd_search_msg))
     app.add_handler(CommandHandler("aging", cmd_aging))
