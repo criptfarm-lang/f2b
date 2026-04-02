@@ -4667,6 +4667,31 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Компания: {company_name}"
         )
 
+async def cmd_relink_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/relink_max [chat_id] [компания] — привязать MAX контакт."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /relink_max [phone] [название компании]")
+        return
+    chat_id = context.args[0]
+    company_name = " ".join(context.args[1:])
+    MAX_CHANNEL_ID = "1d5bc70a-7ca6-4895-8d1f-9690cf448214"
+    db._execute(
+        """INSERT INTO wazzup_contact_map (chat_id, company_name, chat_type, channel_id, wazzup_name)
+           VALUES (%s, %s, 'max', %s, %s)
+           ON CONFLICT (chat_id) DO UPDATE SET company_name=%s, channel_id=%s, chat_type='max'""",
+        (chat_id, company_name, MAX_CHANNEL_ID, company_name, company_name, MAX_CHANNEL_ID)
+    )
+    await update.message.reply_text(
+        f"✅ MAX контакт привязан:\n"
+        f"chat_id: {chat_id}\n"
+        f"Компания: {company_name}\n"
+        f"Канал: MAX"
+    )
+
+
 async def cmd_fix_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/fix_channels — найти и исправить записи с пустым channel_id."""
     user = update.effective_user
@@ -5544,6 +5569,7 @@ def main():
     app.add_handler(CommandHandler("managers", cmd_managers))
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
     app.add_handler(CommandHandler("fix_channels", cmd_fix_channels))
+    app.add_handler(CommandHandler("relink_max", cmd_relink_max))
     app.add_handler(CommandHandler("web_report", cmd_web_report))
     app.add_handler(CommandHandler("lost_clients", cmd_lost_clients))
     app.add_handler(CommandHandler("new_clients", cmd_new_clients))
