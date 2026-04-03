@@ -4279,6 +4279,7 @@ async def cmd_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or user.id != 360092495:
         return
     await update.message.reply_text("🔄 Запускаю обновление кэша... (займёт несколько минут)")
+    db._execute("DELETE FROM report_cache")
     import asyncio
     asyncio.ensure_future(_refresh_report_cache())
 
