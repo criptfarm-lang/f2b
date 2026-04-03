@@ -5615,7 +5615,9 @@ async def _build_report_data() -> dict:
     # Загружаем аттестацию из БД
     attestation = {}
     for mgr_name in PLANS:
-        attestation[mgr_name] = get_attestation(mgr_name)
+        att = get_attestation(mgr_name)
+        attestation[mgr_name] = att
+        logger.info(f"_build_report_data: аттестация {mgr_name} = {att}")
 
     return {
         "date": today.strftime("%d.%m.%Y"),
