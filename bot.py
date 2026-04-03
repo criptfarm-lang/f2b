@@ -4692,6 +4692,68 @@ async def cmd_relink_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_set_attestation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/set_attestation [имя] [общая|акб] [процент] — задать аттестацию менеджера."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Использование: /set_attestation [имя] [общая|акб] [процент]\n"
+            "Пример: /set_attestation Карина общая 35"
+        )
+        return
+
+    name_part = context.args[0].lower()
+    atype = context.args[1].lower()
+    try:
+        value = int(context.args[2].replace('%', ''))
+    except ValueError:
+        await update.message.reply_text("❌ Процент должен быть числом от 0 до 100")
+        return
+
+    NAME_MAP = {
+        "инесса": "Инесса Скляр", "скляр": "Инесса Скляр",
+        "карина": "Карина Баласанян", "баласанян": "Карина Баласанян",
+        "елена": "Елена Мерзлякова", "лена": "Елена Мерзлякова", "мерзлякова": "Елена Мерзлякова",
+        "алексей": "Алексей Леонтьев", "леонтьев": "Алексей Леонтьев",
+        "денис": "Денис Коликов", "коликов": "Денис Коликов",
+    }
+    mgr_name = NAME_MAP.get(name_part)
+    if not mgr_name:
+        await update.message.reply_text(f"❌ Менеджер '{context.args[0]}' не найден.")
+        return
+
+    if atype in ("общая", "obshaya", "общ"):
+        key = f"attestation_general_{mgr_name}"
+        label = "общая"
+    elif atype in ("акб", "akb"):
+        key = f"attestation_akb_{mgr_name}"
+        label = "АКБ"
+    else:
+        await update.message.reply_text("❌ Тип аттестации: общая или акб")
+        return
+
+    db._execute(
+        "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
+        (key, str(value), str(value))
+    )
+    await update.message.reply_text(f"✅ Аттестация {label} для *{mgr_name}*: {value}%", parse_mode="Markdown")
+
+
+def get_attestation(mgr_name: str) -> dict:
+    """Возвращает значения аттестации менеджера из БД."""
+    try:
+        gen_row = db._fetchone("SELECT value FROM bot_settings WHERE key=%s", (f"attestation_general_{mgr_name}",))
+        akb_row = db._fetchone("SELECT value FROM bot_settings WHERE key=%s", (f"attestation_akb_{mgr_name}",))
+        return {
+            "general": int(gen_row["value"]) if gen_row else None,
+            "akb": int(akb_row["value"]) if akb_row else None,
+        }
+    except Exception:
+        return {"general": None, "akb": None}
+
+
 async def cmd_relink_wa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/relink_wa [phone] [компания] — привязать WhatsApp контакт к компании.
     Пример: /relink_wa 79161234567 ИП Павлова Елена Владиславовна
@@ -5436,7 +5498,7 @@ async def _build_report_data() -> dict:
         facts[mgr_name]["attracted"] = attracted.get(mgr_name, 0.0)
         facts[mgr_name]["lost_clients"] = lost.get(mgr_name, 0)
 
-    TAGS = {"скляр":"Инесса Скляр","мерзлякова":"Елена Мерзлякова","баласанян":"Карина Баласанян","леонтьев":"Алексей Леонтьев"}
+    TAGS = {"скляр":"Инесса Скляр","мерзлякова":"Елена Мерзлякова","баласанян":"Карина Баласанян","леонтьев":"Алексей Леонтьев","коликов":"Денис Коликов"}
 
     # История по месяцам (кэшируется раз в месяц)
     from moysklad import get_manager_monthly_history
@@ -5533,19 +5595,26 @@ async def _build_report_data() -> dict:
         "Карина Баласанян": {"shipments": 170, "revenue": 6_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
         "Елена Мерзлякова": {"shipments": 80,  "revenue": 6_700_000,  "clients": 30, "new_clients": 5, "attracted": 300_000},
         "Алексей Леонтьев": {"shipments": 17,  "revenue": 500_000,    "clients": 8,  "new_clients": 7, "attracted": 300_000},
+        "Денис Коликов":    {"shipments": 3,   "revenue": 900_000,    "clients": 3,  "new_clients": 3, "attracted": 100_000},
     }
     WEEKLY_PLANS = {
         "Инесса Скляр":     {"shipments": 25,  "revenue": 2_000_000,  "clients": 10, "new_clients": 1, "attracted": 250_000},
         "Карина Баласанян": {"shipments": 40,  "revenue": 1_200_000,  "clients": 16, "new_clients": 1, "attracted": 275_000},
         "Елена Мерзлякова": {"shipments": 10,  "revenue": 1_000_000,  "clients": 5,  "new_clients": 1, "attracted": 75_000},
         "Алексей Леонтьев": {"shipments": 3,   "revenue": 100_000,    "clients": 3,  "new_clients": 1, "attracted": 75_000},
+        "Денис Коликов":    {"shipments": 1,   "revenue": 225_000,    "clients": 1,  "new_clients": 1, "attracted": 25_000},
     }
-    SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Алексей Леонтьев":"Алексей"}
+    SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Алексей Леонтьев":"Алексей","Денис Коликов":"Денис"}
 
     # Синхронизируем счётчики с реальными списками имён
     for mgr_name in facts:
         facts[mgr_name]["new_clients"] = len(new_client_names.get(mgr_name, []))
         facts[mgr_name]["lost_clients"] = len(lost_client_names.get(mgr_name, []))
+
+    # Загружаем аттестацию из БД
+    attestation = {}
+    for mgr_name in PLANS:
+        attestation[mgr_name] = get_attestation(mgr_name)
 
     return {
         "date": today.strftime("%d.%m.%Y"),
@@ -5556,6 +5625,7 @@ async def _build_report_data() -> dict:
         "new_client_names": new_client_names,
         "lost_client_names": lost_client_names,
         "mgr_history": mgr_history,
+        "attestation": attestation,
     }
 
 
@@ -5598,14 +5668,15 @@ def main():
     app.add_handler(CommandHandler("managers", cmd_managers))
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
     app.add_handler(CommandHandler("fix_channels", cmd_fix_channels))
+    app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
     app.add_handler(CommandHandler("relink_max", cmd_relink_max))
+    app.add_handler(CommandHandler("relink_wa", cmd_relink_wa))
     app.add_handler(CommandHandler("web_report", cmd_web_report))
     app.add_handler(CommandHandler("lost_clients", cmd_lost_clients))
     app.add_handler(CommandHandler("new_clients", cmd_new_clients))
     app.add_handler(CommandHandler("test_publink", cmd_test_publink))
     app.add_handler(CommandHandler("unlink", cmd_unlink))
     app.add_handler(CommandHandler("relink", cmd_relink))
-    app.add_handler(CommandHandler("relink_wa", cmd_relink_wa))
     app.add_handler(CommandHandler("sync_managers", cmd_sync_managers))
     app.add_handler(CommandHandler("search_msg", cmd_search_msg))
     app.add_handler(CommandHandler("aging", cmd_aging))
@@ -6124,13 +6195,11 @@ async def check_order_agreed(order_href: str, bot):
         if QUIZ_BASE_URL:
             excluded = await _is_company_excluded(agent_name)
             if not excluded:
-                import urllib.parse as _up
                 quiz_url = (
                     f"{QUIZ_BASE_URL}"
                     f"/?order={order_id}"
                     f"&client_id={agent_id}"
                     f"&amount={int(order_sum)}"
-                    f"&company={_up.quote(agent_name)}"
                 )
                 msg += (
                     f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
