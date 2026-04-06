@@ -6274,23 +6274,25 @@ async def check_order_agreed(order_href: str, bot):
             msg += f"📅 Плановая дата отгрузки: {delivery_fmt}\n"
 
         # ── Определяем отправлять ли квиз ───────────────────────────────────
-        # ── Квиз всем кроме исключений ───────────────────────────────────────
+        # ── Квиз + проверка исключений ───────────────────────────────────────
+        excluded = await _is_company_excluded(agent_name) if QUIZ_BASE_URL else False
+        if excluded:
+            logger.info(f"check_order_agreed: {agent_name} в исключениях, рассылка не отправляется")
+            db.save_agreed_notification(order_id_check)
+            return
+
         if QUIZ_BASE_URL:
-            excluded = await _is_company_excluded(agent_name)
-            if not excluded:
-                quiz_url = (
-                    f"{QUIZ_BASE_URL}"
-                    f"/?order={order_id}"
-                    f"&client_id={agent_id}"
-                    f"&amount={int(order_sum)}"
-                )
-                msg += (
-                    f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
-                    f"{quiz_url}"
-                )
-                logger.info(f"check_order_agreed: квиз добавлен для {agent_name}")
-            else:
-                logger.info(f"check_order_agreed: {agent_name} в исключениях, квиз не отправляем")
+            quiz_url = (
+                f"{QUIZ_BASE_URL}"
+                f"/?order={order_id}"
+                f"&client_id={agent_id}"
+                f"&amount={int(order_sum)}"
+            )
+            msg += (
+                f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
+                f"{quiz_url}"
+            )
+            logger.info(f"check_order_agreed: квиз добавлен для {agent_name}")
         # ─────────────────────────────────────────────────────────────────────
 
         # Ищем мессенджер клиента
