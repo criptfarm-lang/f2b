@@ -6133,8 +6133,8 @@ async def _is_company_excluded(company_name: str) -> bool:
                     data = await r.json()
                     return data.get("excluded", False)
     except Exception as e:
-        logger.warning(f"_is_company_excluded: не удалось проверить ({e}), считаем ИСКЛЮЧЁННОЙ (fail-safe)")
-    return True
+        logger.warning(f"_is_company_excluded: не удалось проверить ({e}), квиз отправляем (API недоступен)")
+    return False
 
 
 async def _is_company_whitelisted(company_name: str) -> bool:
@@ -6264,7 +6264,14 @@ async def check_order_agreed(order_href: str, bot):
             msg += f"📦 Состав:\n{positions_text}\n\n"
         msg += f"💰 Итого: {order_sum:,.0f} руб.\n"
         if delivery:
-            msg += f"📅 Плановая дата отгрузки: {delivery}\n"
+            try:
+                from datetime import date as _ddate
+                MONTHS_RU = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
+                d = _ddate.fromisoformat(delivery[:10])
+                delivery_fmt = f"{d.day} {MONTHS_RU[d.month-1]}"
+            except Exception:
+                delivery_fmt = delivery
+            msg += f"📅 Плановая дата отгрузки: {delivery_fmt}\n"
 
         # ── Определяем отправлять ли квиз ───────────────────────────────────
         # ── Квиз всем кроме исключений ───────────────────────────────────────
