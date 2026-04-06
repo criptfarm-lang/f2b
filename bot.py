@@ -4279,7 +4279,6 @@ async def cmd_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or user.id != 360092495:
         return
     await update.message.reply_text("🔄 Запускаю обновление кэша... (займёт несколько минут)")
-    db._execute("DELETE FROM report_cache")
     import asyncio
     asyncio.ensure_future(_refresh_report_cache())
 
@@ -4612,7 +4611,7 @@ async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
         recent = db._fetchall(
             "SELECT chat_id, wazzup_name, company_name FROM wazzup_contact_map ORDER BY created_at DESC LIMIT 5"
         )
-        hint = "\n".join([f"• {r['company_name']} ({r['chat_id']})" for r in recent]) if recent else "—"
+        hint = "\n".join([f"• {r['wazzup_name']} / {r['company_name']} ({r['chat_id']})" for r in recent]) if recent else "—"
         await update.message.reply_text(
             f"❌ Контакт не найден: {query_val}\n\n"
             f"Последние 5 записей в базе:\n{hint}"
@@ -4622,7 +4621,7 @@ async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         db._execute("DELETE FROM wazzup_contact_map WHERE chat_id=%s", (r["chat_id"],))
         await update.message.reply_text(
-            f"✅ Удалён: {r['company_name']} (chat_id: {r['chat_id']})"
+            f"✅ Удалён: {r['wazzup_name']} / {r['company_name']} (chat_id: {r['chat_id']})"
         )
 
 async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4640,263 +4639,26 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.args[0]
     company_name = " ".join(context.args[1:])
 
-    TELEGRAM_CHANNEL_ID = "ddd24a95-9304-4098-a320-3e47fcd1020a"
-    existing = db._fetchone(
-        "SELECT chat_id, company_name FROM wazzup_contact_map WHERE chat_id=%s",
+    # Обновляем company_name в wazzup_contact_map
+    db._execute(
+        "UPDATE wazzup_contact_map SET company_name=%s WHERE chat_id=%s",
+        (company_name, chat_id)
+    )
+    rows = db._fetchall(
+        "SELECT chat_id, contact_name, company_name, manager FROM wazzup_contact_map WHERE chat_id=%s",
         (chat_id,)
     )
-    if existing:
-        db._execute(
-            "UPDATE wazzup_contact_map SET company_name=%s, channel_id=COALESCE(NULLIF(channel_id,''), %s) WHERE chat_id=%s",
-            (company_name, TELEGRAM_CHANNEL_ID, chat_id)
-        )
+    if rows:
+        r = rows[0]
         await update.message.reply_text(
             f"✅ Контакт перепривязан:\n"
-            f"chat_id: {chat_id}\n"
-            f"Компания: {company_name}"
+            f"chat_id: {r['chat_id']}\n"
+            f"Контакт: {r['wazzup_name']}\n"
+            f"Компания: {r['company_name']}\n"
+            f"Менеджер: {r['manager']}"
         )
     else:
-        db._execute(
-            """INSERT INTO wazzup_contact_map (chat_id, company_name, chat_type, channel_id, wazzup_name)
-               VALUES (%s, %s, 'telegram', %s, %s)
-               ON CONFLICT (chat_id) DO UPDATE SET company_name=%s, channel_id=%s""",
-            (chat_id, company_name, TELEGRAM_CHANNEL_ID, company_name, company_name, TELEGRAM_CHANNEL_ID)
-        )
-        await update.message.reply_text(
-            f"✅ Контакт создан:\n"
-            f"chat_id: {chat_id}\n"
-            f"Компания: {company_name}"
-        )
-
-async def cmd_relink_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/relink_max [chat_id] [компания] — привязать MAX контакт."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    if len(context.args) < 2:
-        await update.message.reply_text("Использование: /relink_max [phone] [название компании]")
-        return
-    chat_id = context.args[0]
-    company_name = " ".join(context.args[1:])
-    MAX_CHANNEL_ID = "1d5bc70a-7ca6-4895-8d1f-9690cf448214"
-    db._execute(
-        """INSERT INTO wazzup_contact_map (chat_id, company_name, chat_type, channel_id, wazzup_name)
-           VALUES (%s, %s, 'max', %s, %s)
-           ON CONFLICT (chat_id) DO UPDATE SET company_name=%s, channel_id=%s, chat_type='max'""",
-        (chat_id, company_name, MAX_CHANNEL_ID, company_name, company_name, MAX_CHANNEL_ID)
-    )
-    await update.message.reply_text(
-        f"✅ MAX контакт привязан:\n"
-        f"chat_id: {chat_id}\n"
-        f"Компания: {company_name}\n"
-        f"Канал: MAX"
-    )
-
-
-async def cmd_set_attestation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/set_attestation [имя] [общая|акб] [процент] — задать аттестацию менеджера."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    if len(context.args) < 3:
-        await update.message.reply_text(
-            "Использование: /set_attestation [имя] [общая|акб] [процент]\n"
-            "Пример: /set_attestation Карина общая 35"
-        )
-        return
-
-    name_part = context.args[0].lower()
-    atype = context.args[1].lower()
-    try:
-        value = int(context.args[2].replace('%', ''))
-    except ValueError:
-        await update.message.reply_text("❌ Процент должен быть числом от 0 до 100")
-        return
-
-    NAME_MAP = {
-        "инесса": "Инесса Скляр", "скляр": "Инесса Скляр",
-        "карина": "Карина Баласанян", "баласанян": "Карина Баласанян",
-        "елена": "Елена Мерзлякова", "лена": "Елена Мерзлякова", "мерзлякова": "Елена Мерзлякова",
-        "алексей": "Алексей Леонтьев", "леонтьев": "Алексей Леонтьев",
-        "денис": "Денис Коликов", "коликов": "Денис Коликов",
-    }
-    mgr_name = NAME_MAP.get(name_part)
-    if not mgr_name:
-        await update.message.reply_text(f"❌ Менеджер '{context.args[0]}' не найден.")
-        return
-
-    if atype in ("общая", "obshaya", "общ"):
-        key = f"attestation_general_{mgr_name}"
-        label = "общая"
-    elif atype in ("акб", "akb"):
-        key = f"attestation_akb_{mgr_name}"
-        label = "АКБ"
-    else:
-        await update.message.reply_text("❌ Тип аттестации: общая или акб")
-        return
-
-    db._execute(
-        "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
-        (key, str(value), str(value))
-    )
-    await update.message.reply_text(f"✅ Аттестация {label} для *{mgr_name}*: {value}%", parse_mode="Markdown")
-
-
-def get_attestation(mgr_name: str) -> dict:
-    """Возвращает значения аттестации менеджера из БД."""
-    try:
-        gen_row = db._fetchone("SELECT value FROM bot_settings WHERE key=%s", (f"attestation_general_{mgr_name}",))
-        akb_row = db._fetchone("SELECT value FROM bot_settings WHERE key=%s", (f"attestation_akb_{mgr_name}",))
-        return {
-            "general": int(gen_row["value"]) if gen_row else None,
-            "akb": int(akb_row["value"]) if akb_row else None,
-        }
-    except Exception:
-        return {"general": None, "akb": None}
-
-
-async def cmd_relink_wa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/relink_wa [phone] [компания] — привязать WhatsApp контакт к компании.
-    Пример: /relink_wa 79161234567 ИП Павлова Елена Владиславовна
-    """
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Использование: /relink_wa [телефон] [название компании]\n"
-            "Пример: /relink_wa 79161234567 ИП Павлова Елена Владиславовна"
-        )
-        return
-    chat_id = context.args[0]
-    company_name = " ".join(context.args[1:])
-    WA_CHANNEL_ID = "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03"
-    db._execute(
-        """INSERT INTO wazzup_contact_map (chat_id, company_name, chat_type, channel_id, wazzup_name)
-           VALUES (%s, %s, 'whatsapp', %s, %s)
-           ON CONFLICT (chat_id) DO UPDATE SET company_name=%s, channel_id=%s, chat_type='whatsapp'""",
-        (chat_id, company_name, WA_CHANNEL_ID, company_name, company_name, WA_CHANNEL_ID)
-    )
-    await update.message.reply_text(
-        f"✅ WhatsApp контакт привязан:\n"
-        f"Телефон: {chat_id}\n"
-        f"Компания: {company_name}"
-    )
-
-
-async def cmd_fix_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/fix_channels — найти и исправить записи с пустым channel_id."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    TELEGRAM_CHANNEL_ID = "ddd24a95-9304-4098-a320-3e47fcd1020a"
-    rows = db._fetchall(
-        "SELECT chat_id, company_name, chat_type FROM wazzup_contact_map WHERE channel_id='' OR channel_id IS NULL"
-    )
-    if not rows:
-        await update.message.reply_text("✅ Все записи имеют channel_id — всё в порядке.")
-        return
-    db._execute(
-        "UPDATE wazzup_contact_map SET channel_id=%s WHERE channel_id='' OR channel_id IS NULL",
-        (TELEGRAM_CHANNEL_ID,)
-    )
-    lines = [f"✅ Исправлено {len(rows)} записей с пустым channel_id:\n"]
-    for r in rows:
-        lines.append(f"• {r['company_name']} ({r['chat_type']}, {r['chat_id']})")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/reset_agreed [order_id или номер заказа] — сбросить флаг отправки уведомления."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /reset_agreed [order_id или номер, например 01559]")
-        return
-    query = " ".join(context.args)
-    if len(query) > 20 and "-" in query:
-        db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (query,))
-        await update.message.reply_text(f"✅ Флаг сброшен для {query}")
-        return
-    try:
-        import aiohttp
-        from moysklad import get_headers, MS_BASE
-        await update.message.reply_text(f"🔍 Ищу заказ №{query}...")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{MS_BASE}/entity/customerorder",
-                headers=get_headers(),
-                params={"filter": f"name~{query}", "limit": 5}
-            ) as resp:
-                data = await resp.json()
-        rows = data.get("rows", [])
-        if not rows:
-            await update.message.reply_text(f"❌ Заказ №{query} не найден в МойСклад.")
-            return
-        results = []
-        for row in rows:
-            order_id = row["id"]
-            order_name = row.get("name", "")
-            agent_name = row.get("agent", {}).get("name", "")
-            db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
-            results.append(f"✅ №{order_name} — {agent_name}\n   ID: `{order_id}`")
-        await update.message.reply_text(
-            f"Флаги сброшены:\n\n" + "\n".join(results) +
-            "\n\nТеперь смени статус заказа на «Согласовано» — уведомление отправится.",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/managers — показать всех зарегистрированных менеджеров и их chat_id."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    rows = db._fetchall(
-        "SELECT user_id, full_name, is_blocked FROM manager_chats ORDER BY full_name"
-    )
-    if not rows:
-        await update.message.reply_text("❌ Менеджеры не найдены.")
-        return
-    lines = ["👥 *Зарегистрированные менеджеры:*\n"]
-    for r in rows:
-        blocked = " 🚫" if r.get("is_blocked") else ""
-        lines.append(f"• {r['full_name']}{blocked}\n  ID: `{r['user_id']}`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_check_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/check_webhooks — проверить вебхуки МойСклад."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    try:
-        import aiohttp
-        from moysklad import get_headers, MS_BASE
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{MS_BASE}/entity/webhook", headers=get_headers()) as resp:
-                if resp.status != 200:
-                    await update.message.reply_text(f"❌ Ошибка запроса: {resp.status}")
-                    return
-                data = await resp.json()
-        rows = data.get("rows", [])
-        if not rows:
-            await update.message.reply_text("❌ Вебхуки не найдены в МойСклад!")
-            return
-        lines = [f"📋 Вебхуки МойСклад ({len(rows)} шт):\n"]
-        for w in rows:
-            enabled = "✅" if w.get("enabled") else "❌"
-            url = w.get("url", "")
-            action = w.get("action", "")
-            entity = w.get("entityType", "")
-            lines.append(f"{enabled} {entity} / {action}\n   {url}")
-        await update.message.reply_text("\n".join(lines))
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
+        await update.message.reply_text(f"❌ Контакт с chat_id={chat_id} не найден")
 
 async def cmd_sync_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sync_managers — обновляет менеджеров в базе по тегам МойСклад."""
@@ -5030,6 +4792,123 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await msg.reply_text(f"Ошибка: {e}")
+
+async def cmd_set_attestation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/set_attestation [имя] [общая|акб] [процент] — задать аттестацию менеджера."""
+    if not update.effective_user or update.effective_user.id != 360092495:
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Использование: /set_attestation [имя] [общая|акб] [процент]\n"
+            "Пример: /set_attestation Карина общая 35"
+        )
+        return
+
+    name_part = context.args[0].lower()
+    kind = context.args[1].lower()
+    try:
+        value = int(context.args[2])
+    except ValueError:
+        await update.message.reply_text("❌ Процент должен быть целым числом")
+        return
+
+    NAME_MAP = {
+        "инесса": "Инесса Скляр", "скляр": "Инесса Скляр",
+        "карина": "Карина Баласанян", "баласанян": "Карина Баласанян",
+        "елена": "Елена Мерзлякова", "лена": "Елена Мерзлякова", "мерзлякова": "Елена Мерзлякова",
+        "алексей": "Алексей Леонтьев", "леонтьев": "Алексей Леонтьев",
+        "денис": "Денис Коликов", "коликов": "Денис Коликов",
+    }
+    mgr_name = NAME_MAP.get(name_part)
+    if not mgr_name:
+        await update.message.reply_text(f"❌ Менеджер '{context.args[0]}' не найден.")
+        return
+
+    if kind in ("общая", "general"):
+        key = f"attestation_general_{mgr_name}"
+        label = "общая"
+    elif kind in ("акб", "akb"):
+        key = f"attestation_akb_{mgr_name}"
+        label = "АКБ"
+    else:
+        await update.message.reply_text("❌ Тип должен быть 'общая' или 'акб'")
+        return
+
+    db._execute(
+        "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
+        (key, str(value), str(value))
+    )
+    await update.message.reply_text(f"✅ Аттестация {label} для {mgr_name}: {value}%")
+
+
+def get_weekly_targets(mgr_name: str) -> dict:
+    """Возвращает накопительные недельные цели менеджера из БД."""
+    result = {}
+    for metric in ["revenue", "shipments", "clients", "new_clients", "attracted"]:
+        try:
+            row = db._fetchone("SELECT value FROM bot_settings WHERE key=%s", (f"weekly_target_{mgr_name}_{metric}",))
+            if row:
+                result[metric] = float(row["value"])
+        except Exception:
+            pass
+    return result
+
+
+async def cmd_set_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/set_weekly [имя] [показатель] [значение] — задать накопительный недельный план."""
+    if not update.effective_user or update.effective_user.id != 360092495:
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Использование: /set_weekly [имя] [показатель] [значение]\n"
+            "Показатели: выручка, отгрузки, акб, новые, привл\n"
+            "Пример: /set_weekly Инесса выручка 4000000"
+        )
+        return
+
+    name_part = context.args[0].lower()
+    metric_part = context.args[1].lower()
+    try:
+        value = float(context.args[2].replace(',', '.'))
+    except ValueError:
+        await update.message.reply_text("❌ Значение должно быть числом")
+        return
+
+    NAME_MAP = {
+        "инесса": "Инесса Скляр", "скляр": "Инесса Скляр",
+        "карина": "Карина Баласанян", "баласанян": "Карина Баласанян",
+        "елена": "Елена Мерзлякова", "лена": "Елена Мерзлякова", "мерзлякова": "Елена Мерзлякова",
+        "алексей": "Алексей Леонтьев", "леонтьев": "Алексей Леонтьев",
+        "денис": "Денис Коликов", "коликов": "Денис Коликов",
+    }
+    METRIC_MAP = {
+        "выручка": "revenue", "revenue": "revenue",
+        "отгрузки": "shipments", "отгрузка": "shipments", "shipments": "shipments",
+        "акб": "clients", "клиенты": "clients", "clients": "clients",
+        "новые": "new_clients", "новых": "new_clients", "new_clients": "new_clients",
+        "привл": "attracted", "привлеченные": "attracted", "attracted": "attracted",
+    }
+
+    mgr_name = NAME_MAP.get(name_part)
+    if not mgr_name:
+        await update.message.reply_text(f"❌ Менеджер '{context.args[0]}' не найден.")
+        return
+
+    metric_key = METRIC_MAP.get(metric_part)
+    if not metric_key:
+        await update.message.reply_text(f"❌ Показатель '{context.args[1]}' не найден.\nДоступные: выручка, отгрузки, акб, новые, привл")
+        return
+
+    key = f"weekly_target_{mgr_name}_{metric_key}"
+    db._execute(
+        "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
+        (key, str(value), str(value))
+    )
+
+    METRIC_LABELS = {"revenue": "Выручка", "shipments": "Отгрузки", "clients": "АКБ", "new_clients": "Новые", "attracted": "Привл. товары"}
+    label = METRIC_LABELS.get(metric_key, metric_key)
+    await update.message.reply_text(f"✅ Недельный план *{label}* для *{mgr_name}*: {value:,.0f}", parse_mode="Markdown")
+
 
 async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/block [user_id] — заблокировать пользователя."""
@@ -5499,7 +5378,7 @@ async def _build_report_data() -> dict:
         facts[mgr_name]["attracted"] = attracted.get(mgr_name, 0.0)
         facts[mgr_name]["lost_clients"] = lost.get(mgr_name, 0)
 
-    TAGS = {"скляр":"Инесса Скляр","мерзлякова":"Елена Мерзлякова","баласанян":"Карина Баласанян","леонтьев":"Алексей Леонтьев","коликов":"Денис Коликов"}
+    TAGS = {"скляр":"Инесса Скляр","мерзлякова":"Елена Мерзлякова","баласанян":"Карина Баласанян","леонтьев":"Алексей Леонтьев"}
 
     # История по месяцам (кэшируется раз в месяц)
     from moysklad import get_manager_monthly_history
@@ -5596,16 +5475,14 @@ async def _build_report_data() -> dict:
         "Карина Баласанян": {"shipments": 170, "revenue": 6_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
         "Елена Мерзлякова": {"shipments": 80,  "revenue": 6_700_000,  "clients": 30, "new_clients": 5, "attracted": 300_000},
         "Алексей Леонтьев": {"shipments": 17,  "revenue": 500_000,    "clients": 8,  "new_clients": 7, "attracted": 300_000},
-        "Денис Коликов":    {"shipments": 3,   "revenue": 900_000,    "clients": 3,  "new_clients": 3, "attracted": 100_000},
     }
     WEEKLY_PLANS = {
         "Инесса Скляр":     {"shipments": 25,  "revenue": 2_000_000,  "clients": 10, "new_clients": 1, "attracted": 250_000},
         "Карина Баласанян": {"shipments": 40,  "revenue": 1_200_000,  "clients": 16, "new_clients": 1, "attracted": 275_000},
         "Елена Мерзлякова": {"shipments": 10,  "revenue": 1_000_000,  "clients": 5,  "new_clients": 1, "attracted": 75_000},
         "Алексей Леонтьев": {"shipments": 3,   "revenue": 100_000,    "clients": 3,  "new_clients": 1, "attracted": 75_000},
-        "Денис Коликов":    {"shipments": 1,   "revenue": 225_000,    "clients": 1,  "new_clients": 1, "attracted": 25_000},
     }
-    SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Алексей Леонтьев":"Алексей","Денис Коликов":"Денис"}
+    SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Алексей Леонтьев":"Алексей"}
 
     # Синхронизируем счётчики с реальными списками имён
     for mgr_name in facts:
@@ -5615,15 +5492,35 @@ async def _build_report_data() -> dict:
     # Загружаем аттестацию из БД
     attestation = {}
     for mgr_name in PLANS:
-        att = get_attestation(mgr_name)
-        attestation[mgr_name] = att
-        logger.info(f"_build_report_data: аттестация {mgr_name} = {att}")
+        att = {}
+        for kind, suffix in [("general", "general"), ("akb", "akb")]:
+            try:
+                row = db._fetchone("SELECT value FROM bot_settings WHERE key=%s", (f"attestation_{suffix}_{mgr_name}",))
+                if row:
+                    att[kind] = int(row["value"])
+            except Exception:
+                pass
+        if att:
+            attestation[mgr_name] = att
+            logger.info(f"_build_report_data: аттестация {mgr_name} = {att}")
+
+    # Загружаем накопительные недельные цели из БД
+    weekly_targets = {}
+    for mgr_name in PLANS:
+        wt = get_weekly_targets(mgr_name)
+        wp = WEEKLY_PLANS.get(mgr_name, {})
+        for metric in ["revenue", "shipments", "clients", "new_clients", "attracted"]:
+            if metric not in wt and metric in wp:
+                wt[metric] = wp[metric]
+        weekly_targets[mgr_name] = wt
+        logger.info(f"_build_report_data: weekly_targets {mgr_name} = {wt}")
 
     return {
         "date": today.strftime("%d.%m.%Y"),
         "facts": facts,
         "plans": PLANS,
         "weekly_plans": WEEKLY_PLANS,
+        "weekly_targets": weekly_targets,
         "short_names": SHORT_NAMES,
         "new_client_names": new_client_names,
         "lost_client_names": lost_client_names,
@@ -5667,13 +5564,6 @@ def main():
     app.add_handler(CommandHandler("reissue_contract", cmd_reissue_contract))
     app.add_handler(CommandHandler("refresh_contract", cmd_refresh_contract))
     app.add_handler(CommandHandler("refresh_cache", cmd_refresh_cache))
-    app.add_handler(CommandHandler("check_webhooks", cmd_check_webhooks))
-    app.add_handler(CommandHandler("managers", cmd_managers))
-    app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
-    app.add_handler(CommandHandler("fix_channels", cmd_fix_channels))
-    app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
-    app.add_handler(CommandHandler("relink_max", cmd_relink_max))
-    app.add_handler(CommandHandler("relink_wa", cmd_relink_wa))
     app.add_handler(CommandHandler("web_report", cmd_web_report))
     app.add_handler(CommandHandler("lost_clients", cmd_lost_clients))
     app.add_handler(CommandHandler("new_clients", cmd_new_clients))
@@ -5683,6 +5573,8 @@ def main():
     app.add_handler(CommandHandler("sync_managers", cmd_sync_managers))
     app.add_handler(CommandHandler("search_msg", cmd_search_msg))
     app.add_handler(CommandHandler("aging", cmd_aging))
+    app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
+    app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
     app.add_handler(CommandHandler("block", cmd_block_user))
     app.add_handler(CommandHandler("unblock", cmd_unblock_user))
     app.add_handler(CommandHandler("stats", cmd_stats))
@@ -6082,6 +5974,26 @@ async def _is_company_excluded(company_name: str) -> bool:
     return False
 
 
+async def _is_company_whitelisted(company_name: str) -> bool:
+    """Проверяет — в белом списке ли компания (опт, которому разрешён квиз)."""
+    import aiohttp as _aio_wl
+    if not QUIZ_BASE_URL:
+        return False
+    try:
+        async with _aio_wl.ClientSession() as session:
+            async with session.get(
+                f"{QUIZ_BASE_URL}/api/check-whitelist",
+                params={"company_name": company_name},
+                timeout=_aio_wl.ClientTimeout(total=5)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return data.get("whitelisted", False)
+    except Exception as e:
+        logger.warning(f"_is_company_whitelisted: ошибка ({e}), считаем не в белом списке")
+    return False
+
+
 async def check_order_agreed(order_href: str, bot):
     """При смене статуса заказа на Согласовано — отправляем клиенту в мессенджер."""
     MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
@@ -6129,7 +6041,6 @@ async def check_order_agreed(order_href: str, bot):
 
         # Загружаем позиции заказа
         order_id = order_href.split("/")[-1].split("?")[0]
-        logger.info(f"check_order_agreed: загружаю позиции order_id={order_id}")
         positions_text = ""
         try:
             async with aiohttp.ClientSession() as session2:
@@ -6149,7 +6060,6 @@ async def check_order_agreed(order_href: str, bot):
                             lines.append(f"  • {name} × {qty} = {total:,.0f} руб.")
                         if lines:
                             positions_text = "\n".join(lines)
-                    logger.info(f"check_order_agreed: позиции загружены, строк={len(positions_text.splitlines())}")
         except Exception as e:
             logger.warning(f"check_order_agreed: не удалось загрузить позиции: {e}")
 
@@ -6159,7 +6069,6 @@ async def check_order_agreed(order_href: str, bot):
         # Определяем сегмент клиента по тегам (хорека / опт)
         segment = None
         tags = agent.get("tags", [])
-        logger.info(f"check_order_agreed: теги агента={tags}")
         for tag in tags:
             if tag.lower() in ("хорека", "horeka"):
                 segment = "хорека"
@@ -6194,23 +6103,42 @@ async def check_order_agreed(order_href: str, bot):
         if delivery:
             msg += f"📅 Плановая дата отгрузки: {delivery}\n"
 
-        # ── Квиз всем кроме исключений ───────────────────────────────────
+        # ── Определяем отправлять ли квиз ───────────────────────────────────
+        send_quiz = False
         if QUIZ_BASE_URL:
             excluded = await _is_company_excluded(agent_name)
             if not excluded:
-                quiz_url = (
-                    f"{QUIZ_BASE_URL}"
-                    f"/?order={order_id}"
-                    f"&client_id={agent_id}"
-                    f"&amount={int(order_sum)}"
-                )
-                msg += (
-                    f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
-                    f"{quiz_url}"
-                )
-                logger.info(f"check_order_agreed: квиз добавлен для {agent_name} (сегмент: {segment})")
+                if segment == "хорека":
+                    send_quiz = True
+                    logger.info(f"check_order_agreed: хорека → квиз для {agent_name}")
+                else:
+                    # Опт и остальные — только если в белом списке
+                    whitelisted = await _is_company_whitelisted(agent_name)
+                    if whitelisted:
+                        send_quiz = True
+                        logger.info(f"check_order_agreed: опт в белом списке → квиз для {agent_name}")
+                    else:
+                        logger.info(f"check_order_agreed: {agent_name} (опт) не в белом списке, квиз не отправляем")
             else:
                 logger.info(f"check_order_agreed: {agent_name} в исключениях, квиз не отправляем")
+
+        if send_quiz:
+            quiz_url = (
+                f"{QUIZ_BASE_URL}"
+                f"/?order={order_id}"
+                f"&client_id={agent_id}"
+                f"&amount={int(order_sum)}"
+            )
+            msg += (
+                f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
+                f"{quiz_url}"
+            )
+        elif segment != "хорека":
+            # Старое промо для тех кто не получил квиз
+            promo = db.get_promo(segment)
+            if promo:
+                msg += f"\n{promo}"
+                logger.info(f"check_order_agreed: промо для {agent_name} (сегмент: {segment})")
         # ─────────────────────────────────────────────────────────────────────
 
         # Ищем мессенджер клиента
@@ -6222,9 +6150,9 @@ async def check_order_agreed(order_href: str, bot):
             (f"%{agent_name}%",)
         )
 
-        logger.info(f"check_order_agreed: сегмент={segment}, ищу контакт для {agent_name}")
         if not contact:
-            logger.info(f"check_order_agreed: мессенджер {agent_name} не найден, пропускаем (не сохраняем — попробуем при следующем UPDATE)")
+            logger.info(f"check_order_agreed: мессенджер {agent_name} не найден, пропускаем")
+            db.save_agreed_notification(order_id_check)
             return
         # Отправляем через Wazzup
         import aiohttp as _aio
@@ -6246,8 +6174,7 @@ async def check_order_agreed(order_href: str, bot):
                     db.save_agreed_notification(order_id_check)
                 else:
                     body = await r.text()
-                    logger.error(f"check_order_agreed: ошибка отправки {r.status} {body}")
-                    logger.error(f"check_order_agreed: payload был: channelId={contact['channel_id']} chatType={contact['chat_type']} chatId={contact['chat_id']}")
+                    logger.error(f"check_order_agreed: ошибка отправки {r.status} {body[:100]}")
 
     except Exception as e:
         logger.error(f"check_order_agreed: {e}", exc_info=True)
@@ -6359,7 +6286,7 @@ async def process_ms_webhook(data: dict, bot):
             order_id = order_href.split("/")[-1]
             now = time.time()
             last_check = _price_check_cache.get(order_id, 0)
-            already_checked = now - last_check < 3
+            already_checked = now - last_check < 10
             _price_check_cache[order_id] = now
 
             action = event.get("action", "")
