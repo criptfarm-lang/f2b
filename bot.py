@@ -4793,6 +4793,7 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.reply_text(f"Ошибка: {e}")
 
+
 async def cmd_set_attestation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/set_attestation [имя] [общая|акб] [процент] — задать аттестацию менеджера."""
     if not update.effective_user or update.effective_user.id != 360092495:
@@ -4803,7 +4804,6 @@ async def cmd_set_attestation(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Пример: /set_attestation Карина общая 35"
         )
         return
-
     name_part = context.args[0].lower()
     kind = context.args[1].lower()
     try:
@@ -4811,7 +4811,6 @@ async def cmd_set_attestation(update: Update, context: ContextTypes.DEFAULT_TYPE
     except ValueError:
         await update.message.reply_text("❌ Процент должен быть целым числом")
         return
-
     NAME_MAP = {
         "инесса": "Инесса Скляр", "скляр": "Инесса Скляр",
         "карина": "Карина Баласанян", "баласанян": "Карина Баласанян",
@@ -4823,7 +4822,6 @@ async def cmd_set_attestation(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not mgr_name:
         await update.message.reply_text(f"❌ Менеджер '{context.args[0]}' не найден.")
         return
-
     if kind in ("общая", "general"):
         key = f"attestation_general_{mgr_name}"
         label = "общая"
@@ -4833,7 +4831,6 @@ async def cmd_set_attestation(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await update.message.reply_text("❌ Тип должен быть 'общая' или 'акб'")
         return
-
     db._execute(
         "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
         (key, str(value), str(value))
@@ -4865,7 +4862,6 @@ async def cmd_set_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пример: /set_weekly Инесса выручка 4000000"
         )
         return
-
     name_part = context.args[0].lower()
     metric_part = context.args[1].lower()
     try:
@@ -4873,7 +4869,6 @@ async def cmd_set_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Значение должно быть числом")
         return
-
     NAME_MAP = {
         "инесса": "Инесса Скляр", "скляр": "Инесса Скляр",
         "карина": "Карина Баласанян", "баласанян": "Карина Баласанян",
@@ -4888,26 +4883,186 @@ async def cmd_set_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "новые": "new_clients", "новых": "new_clients", "new_clients": "new_clients",
         "привл": "attracted", "привлеченные": "attracted", "attracted": "attracted",
     }
-
     mgr_name = NAME_MAP.get(name_part)
     if not mgr_name:
         await update.message.reply_text(f"❌ Менеджер '{context.args[0]}' не найден.")
         return
-
     metric_key = METRIC_MAP.get(metric_part)
     if not metric_key:
         await update.message.reply_text(f"❌ Показатель '{context.args[1]}' не найден.\nДоступные: выручка, отгрузки, акб, новые, привл")
         return
-
     key = f"weekly_target_{mgr_name}_{metric_key}"
     db._execute(
         "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
         (key, str(value), str(value))
     )
-
     METRIC_LABELS = {"revenue": "Выручка", "shipments": "Отгрузки", "clients": "АКБ", "new_clients": "Новые", "attracted": "Привл. товары"}
     label = METRIC_LABELS.get(metric_key, metric_key)
     await update.message.reply_text(f"✅ Недельный план *{label}* для *{mgr_name}*: {value:,.0f}", parse_mode="Markdown")
+
+
+
+async def cmd_check_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/check_webhooks — проверить вебхуки МойСклад."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    try:
+        import aiohttp
+        from moysklad import get_headers, MS_BASE
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{MS_BASE}/entity/webhook", headers=get_headers()) as resp:
+                if resp.status != 200:
+                    await update.message.reply_text(f"❌ Ошибка запроса: {resp.status}")
+                    return
+                data = await resp.json()
+        rows = data.get("rows", [])
+        if not rows:
+            await update.message.reply_text("❌ Вебхуки не найдены в МойСклад!")
+            return
+        lines = [f"📋 Вебхуки МойСклад ({len(rows)} шт):\n"]
+        for w in rows:
+            enabled = "✅" if w.get("enabled") else "❌"
+            url = w.get("url", "")
+            action = w.get("action", "")
+            entity = w.get("entityType", "")
+            lines.append(f"{enabled} {entity} / {action}\n   {url}")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/managers — показать всех зарегистрированных менеджеров и их chat_id."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    rows = db._fetchall(
+        "SELECT user_id, full_name, is_blocked FROM manager_chats ORDER BY full_name"
+    )
+    if not rows:
+        await update.message.reply_text("❌ Менеджеры не найдены.")
+        return
+    lines = ["👥 *Зарегистрированные менеджеры:*\n"]
+    for r in rows:
+        blocked = " 🚫" if r.get("is_blocked") else ""
+        lines.append(f"• {r['full_name']}{blocked}\n  ID: `{r['user_id']}`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/reset_agreed [order_id или номер заказа] — сбросить флаг отправки уведомления."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /reset_agreed [order_id или номер, например 01559]")
+        return
+    query = " ".join(context.args)
+    if len(query) > 20 and "-" in query:
+        db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (query,))
+        await update.message.reply_text(f"✅ Флаг сброшен для {query}")
+        return
+    try:
+        import aiohttp
+        from moysklad import get_headers, MS_BASE
+        await update.message.reply_text(f"🔍 Ищу заказ №{query}...")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder",
+                headers=get_headers(),
+                params={"filter": f"name~{query}", "limit": 5}
+            ) as resp:
+                data = await resp.json()
+        rows = data.get("rows", [])
+        if not rows:
+            await update.message.reply_text(f"❌ Заказ №{query} не найден в МойСклад.")
+            return
+        results = []
+        for row in rows:
+            order_id = row["id"]
+            order_name = row.get("name", "")
+            agent_name = row.get("agent", {}).get("name", "")
+            db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
+            results.append(f"✅ №{order_name} — {agent_name}\n   ID: `{order_id}`")
+        await update.message.reply_text(
+            f"Флаги сброшены:\n\n" + "\n".join(results) +
+            "\n\nТеперь смени статус заказа на «Согласовано» — уведомление отправится.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+async def cmd_fix_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/fix_channels — найти и исправить записи с пустым channel_id."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    TELEGRAM_CHANNEL_ID = "ddd24a95-9304-4098-a320-3e47fcd1020a"
+    rows = db._fetchall(
+        "SELECT chat_id, company_name, chat_type FROM wazzup_contact_map WHERE channel_id='' OR channel_id IS NULL"
+    )
+    if not rows:
+        await update.message.reply_text("✅ Все записи имеют channel_id — всё в порядке.")
+        return
+    db._execute(
+        "UPDATE wazzup_contact_map SET channel_id=%s WHERE channel_id='' OR channel_id IS NULL",
+        (TELEGRAM_CHANNEL_ID,)
+    )
+    lines = [f"✅ Исправлено {len(rows)} записей с пустым channel_id:\n"]
+    for r in rows:
+        lines.append(f"• {r['company_name']} ({r['chat_type']}, {r['chat_id']})")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_relink_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/relink_max [chat_id] [компания] — привязать MAX контакт."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /relink_max [phone] [название компании]")
+        return
+    chat_id = context.args[0]
+    company_name = " ".join(context.args[1:])
+    MAX_CHANNEL_ID = "1d5bc70a-7ca6-4895-8d1f-9690cf448214"
+    db._execute(
+        """INSERT INTO wazzup_contact_map (chat_id, company_name, chat_type, channel_id, wazzup_name)
+           VALUES (%s, %s, 'max', %s, %s)
+           ON CONFLICT (chat_id) DO UPDATE SET company_name=%s, channel_id=%s, chat_type='max'""",
+        (chat_id, company_name, MAX_CHANNEL_ID, company_name, company_name, MAX_CHANNEL_ID)
+    )
+    await update.message.reply_text(
+        f"✅ MAX контакт привязан:\n"
+        f"chat_id: {chat_id}\n"
+        f"Компания: {company_name}\n"
+        f"Канал: MAX"
+    )
+
+
+async def cmd_relink_wa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/relink_wa [phone] [компания] — привязать WhatsApp контакт."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /relink_wa [телефон] [название компании]")
+        return
+    chat_id = context.args[0]
+    company_name = " ".join(context.args[1:])
+    WA_CHANNEL_ID = "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03"
+    db._execute(
+        """INSERT INTO wazzup_contact_map (chat_id, company_name, chat_type, channel_id, wazzup_name)
+           VALUES (%s, %s, 'whatsapp', %s, %s)
+           ON CONFLICT (chat_id) DO UPDATE SET company_name=%s, channel_id=%s, chat_type='whatsapp'""",
+        (chat_id, company_name, WA_CHANNEL_ID, company_name, company_name, WA_CHANNEL_ID)
+    )
+    await update.message.reply_text(
+        f"✅ WhatsApp контакт привязан:\n"
+        f"Телефон: {chat_id}\n"
+        f"Компания: {company_name}"
+    )
 
 
 async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5378,7 +5533,7 @@ async def _build_report_data() -> dict:
         facts[mgr_name]["attracted"] = attracted.get(mgr_name, 0.0)
         facts[mgr_name]["lost_clients"] = lost.get(mgr_name, 0)
 
-    TAGS = {"скляр":"Инесса Скляр","мерзлякова":"Елена Мерзлякова","баласанян":"Карина Баласанян","леонтьев":"Алексей Леонтьев"}
+    TAGS = {"скляр":"Инесса Скляр","мерзлякова":"Елена Мерзлякова","баласанян":"Карина Баласанян","леонтьев":"Алексей Леонтьев","коликов":"Денис Коликов"}
 
     # История по месяцам (кэшируется раз в месяц)
     from moysklad import get_manager_monthly_history
@@ -5475,14 +5630,16 @@ async def _build_report_data() -> dict:
         "Карина Баласанян": {"shipments": 170, "revenue": 6_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
         "Елена Мерзлякова": {"shipments": 80,  "revenue": 6_700_000,  "clients": 30, "new_clients": 5, "attracted": 300_000},
         "Алексей Леонтьев": {"shipments": 17,  "revenue": 500_000,    "clients": 8,  "new_clients": 7, "attracted": 300_000},
+        "Денис Коликов":    {"shipments": 3,   "revenue": 900_000,    "clients": 3,  "new_clients": 3, "attracted": 100_000},
     }
     WEEKLY_PLANS = {
         "Инесса Скляр":     {"shipments": 25,  "revenue": 2_000_000,  "clients": 10, "new_clients": 1, "attracted": 250_000},
         "Карина Баласанян": {"shipments": 40,  "revenue": 1_200_000,  "clients": 16, "new_clients": 1, "attracted": 275_000},
         "Елена Мерзлякова": {"shipments": 10,  "revenue": 1_000_000,  "clients": 5,  "new_clients": 1, "attracted": 75_000},
         "Алексей Леонтьев": {"shipments": 3,   "revenue": 100_000,    "clients": 3,  "new_clients": 1, "attracted": 75_000},
+        "Денис Коликов":    {"shipments": 1,   "revenue": 225_000,    "clients": 1,  "new_clients": 1, "attracted": 25_000},
     }
-    SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Алексей Леонтьев":"Алексей"}
+    SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Алексей Леонтьев":"Алексей","Денис Коликов":"Денис"}
 
     # Синхронизируем счётчики с реальными списками имён
     for mgr_name in facts:
@@ -5573,6 +5730,12 @@ def main():
     app.add_handler(CommandHandler("sync_managers", cmd_sync_managers))
     app.add_handler(CommandHandler("search_msg", cmd_search_msg))
     app.add_handler(CommandHandler("aging", cmd_aging))
+    app.add_handler(CommandHandler("check_webhooks", cmd_check_webhooks))
+    app.add_handler(CommandHandler("managers", cmd_managers))
+    app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
+    app.add_handler(CommandHandler("fix_channels", cmd_fix_channels))
+    app.add_handler(CommandHandler("relink_max", cmd_relink_max))
+    app.add_handler(CommandHandler("relink_wa", cmd_relink_wa))
     app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
     app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
     app.add_handler(CommandHandler("block", cmd_block_user))
@@ -5970,8 +6133,8 @@ async def _is_company_excluded(company_name: str) -> bool:
                     data = await r.json()
                     return data.get("excluded", False)
     except Exception as e:
-        logger.warning(f"_is_company_excluded: не удалось проверить ({e}), считаем не исключённой")
-    return False
+        logger.warning(f"_is_company_excluded: не удалось проверить ({e}), считаем ИСКЛЮЧЁННОЙ (fail-safe)")
+    return True
 
 
 async def _is_company_whitelisted(company_name: str) -> bool:
@@ -6104,41 +6267,23 @@ async def check_order_agreed(order_href: str, bot):
             msg += f"📅 Плановая дата отгрузки: {delivery}\n"
 
         # ── Определяем отправлять ли квиз ───────────────────────────────────
-        send_quiz = False
+        # ── Квиз всем кроме исключений ───────────────────────────────────────
         if QUIZ_BASE_URL:
             excluded = await _is_company_excluded(agent_name)
             if not excluded:
-                if segment == "хорека":
-                    send_quiz = True
-                    logger.info(f"check_order_agreed: хорека → квиз для {agent_name}")
-                else:
-                    # Опт и остальные — только если в белом списке
-                    whitelisted = await _is_company_whitelisted(agent_name)
-                    if whitelisted:
-                        send_quiz = True
-                        logger.info(f"check_order_agreed: опт в белом списке → квиз для {agent_name}")
-                    else:
-                        logger.info(f"check_order_agreed: {agent_name} (опт) не в белом списке, квиз не отправляем")
+                quiz_url = (
+                    f"{QUIZ_BASE_URL}"
+                    f"/?order={order_id}"
+                    f"&client_id={agent_id}"
+                    f"&amount={int(order_sum)}"
+                )
+                msg += (
+                    f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
+                    f"{quiz_url}"
+                )
+                logger.info(f"check_order_agreed: квиз добавлен для {agent_name}")
             else:
                 logger.info(f"check_order_agreed: {agent_name} в исключениях, квиз не отправляем")
-
-        if send_quiz:
-            quiz_url = (
-                f"{QUIZ_BASE_URL}"
-                f"/?order={order_id}"
-                f"&client_id={agent_id}"
-                f"&amount={int(order_sum)}"
-            )
-            msg += (
-                f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
-                f"{quiz_url}"
-            )
-        elif segment != "хорека":
-            # Старое промо для тех кто не получил квиз
-            promo = db.get_promo(segment)
-            if promo:
-                msg += f"\n{promo}"
-                logger.info(f"check_order_agreed: промо для {agent_name} (сегмент: {segment})")
         # ─────────────────────────────────────────────────────────────────────
 
         # Ищем мессенджер клиента
