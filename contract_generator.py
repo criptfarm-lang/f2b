@@ -228,36 +228,13 @@ def generate_contract_pdf(data: dict) -> bytes:
     # Формируем строку для "в лице X"
     buyer_rep = buyer_rep_raw.strip()
 
-    # Автокоррекция именительного падежа → родительный для "в лице ..."
-    _case_corrections = [
-        ("Генеральный Директор", "генерального директора"),
-        ("Генеральный директор", "генерального директора"),
-        ("генеральный директор", "генерального директора"),
-        ("Индивидуальный предприниматель", "индивидуального предпринимателя"),
-        ("индивидуальный предприниматель", "индивидуального предпринимателя"),
-        ("Директор", "директора"),
-        ("директор", "директора"),
-        ("Генеральный директора", "генерального директора"),  # опечатка
-    ]
-    for wrong, right in _case_corrections:
-        if buyer_rep.lower().startswith(wrong.lower()):
-            buyer_rep = right + buyer_rep[len(wrong):]
-            break
-
-    # Извлекаем ФИО директора — всё что после должности
-    _POSITION_WORDS = {
-        "генерального", "генеральный", "директора", "директор",
-        "индивидуального", "индивидуальный", "предпринимателя", "предприниматель",
-        "исполнительного", "исполнительный", "коммерческого", "коммерческий",
-        "финансового", "финансовый", "управляющего", "управляющий",
-        "президента", "президент", "председателя", "председатель",
-    }
+    # Извлекаем ФИО директора — последние 2-3 слова
     buyer_director = data.get("buyer_director_name", "")
     if not buyer_director and buyer_rep:
         words = buyer_rep.strip().split()
+        # Ищем слово с заглавной буквы — начало ФИО
         for i, w in enumerate(words):
-            cleaned = w.strip(".,").lower()
-            if w.strip(".,") and w.strip(".,")[0].isupper() and i > 0 and cleaned not in _POSITION_WORDS:
+            if w and w[0].isupper() and i > 0:
                 buyer_director = " ".join(words[i:])
                 break
         if not buyer_director:
@@ -334,12 +311,9 @@ def generate_contract_pdf(data: dict) -> bytes:
     story.append(Spacer(1, 4*mm))
 
     # ── Реквизиты сторон ─────────────────────────────────────────────────────
-    # Для реквизитов используем полное юридическое название (buyer_legal_title),
-    # для ИП оно содержит "ИП Иванов Иван Иванович" с фамилией
-    buyer_legal_name = data.get("buyer_legal_title") or data.get("buyer_name", "")
     supplier_lines = [
         [Paragraph("<b>ПОСТАВЩИК:</b>", small_bold), Paragraph("<b>ПОКУПАТЕЛЬ:</b>", small_bold)],
-        [Paragraph("<b>АО «ФИШ ТУ БИЗНЕС»</b>", small_bold), Paragraph(f"<b>{buyer_legal_name}</b>", small_bold)],
+        [Paragraph("<b>АО «ФИШ ТУ БИЗНЕС»</b>", small_bold), Paragraph(f"<b>{data['buyer_name']}</b>", small_bold)],
         [Paragraph("ИНН: 9713025854", small), Paragraph(f"ИНН: {data.get('buyer_inn','')}", small)],
         [Paragraph("КПП: 771301001", small), Paragraph(f"ОГРН: {data.get('buyer_ogrn','')}", small)],
         [Paragraph("ОГРН: 1257700150553", small), Paragraph(f"Юр. адрес: {data.get('buyer_address','')}", small)],
@@ -424,42 +398,42 @@ def generate_contract_pdf(data: dict) -> bytes:
             canvas_obj.setFont(fb, 8)
             canvas_obj.drawString(rx, base_y, "ПОКУПАТЕЛЬ:")
             canvas_obj.setFont(fn, 8)
-            # Полное юридическое название с фамилией для ИП
-            bname = data.get("buyer_legal_title") or data.get("buyer_name", "")
-            # Должность из buyer_representative
-            _rep = data.get("buyer_representative", "")
-            if "предпринимател" in _rep.lower():
-                buyer_position = ""  # для ИП должность не нужна — она уже в названии "ИП ..."
-            else:
-                buyer_position = "Генеральный директор"
-
-            # Перенос по словам, не по символам
-            def _wrap_words(text, max_chars=40):
-                words = text.split()
-                lines, cur = [], ""
+            bname = data.get("buyer_name", "")
+            # Извлекаем должность из buyer_representative (первые слова до ФИО)
+            buyer_position = "Генеральный директор"  # fallback
+            rep_raw = data.get("buyer_representative", "")
+            if rep_raw:
+                words = rep_raw.strip().split()
+                pos_words = []
                 for w in words:
-                    if cur and len(cur) + 1 + len(w) > max_chars:
-                        lines.append(cur)
-                        cur = w
-                    else:
-                        cur = (cur + " " + w).strip()
-                if cur:
-                    lines.append(cur)
-                return lines
-
-            bname_lines = _wrap_words(bname, 40)
-            y_offset = 5 * mm
-            for bl in bname_lines[:3]:
-                canvas_obj.drawString(rx, base_y - y_offset, bl)
-                y_offset += 5 * mm
-            if buyer_position:
-                canvas_obj.drawString(rx, base_y - y_offset, buyer_position)
-                y_offset += 6 * mm
-            canvas_obj.line(rx, base_y - y_offset, rx + 60*mm, base_y - y_offset)
-            y_offset += 6 * mm
+                    if w and w[0].isupper() and pos_words:
+                        break  # началось ФИО
+                    pos_words.append(w)
+                if pos_words:
+                    pos_str = " ".join(pos_words).strip().rstrip(",")
+                    # Приводим к именительному падежу для подписи
+                    POS_MAP = {
+                        "генерального директора": "Генеральный директор",
+                        "генеральный директор": "Генеральный директор",
+                        "директора": "Директор",
+                        "директор": "Директор",
+                        "управляющего": "Управляющий",
+                        "управляющий": "Управляющий",
+                        "исполнительного директора": "Исполнительный директор",
+                        "коммерческого директора": "Коммерческий директор",
+                        "индивидуального предпринимателя": "Индивидуальный предприниматель",
+                    }
+                    buyer_position = POS_MAP.get(pos_str.lower(), pos_str.capitalize())
+            if len(bname) > 38:
+                canvas_obj.drawString(rx, base_y - 5*mm, bname[:38])
+                canvas_obj.drawString(rx, base_y - 10*mm, bname[38:])
+                canvas_obj.drawString(rx, base_y - 15*mm, buyer_position)
+            else:
+                canvas_obj.drawString(rx, base_y - 5*mm, bname)
+                canvas_obj.drawString(rx, base_y - 10*mm, buyer_position)
+            canvas_obj.line(rx, base_y - 16*mm, rx + 60*mm, base_y - 16*mm)
             canvas_obj.setFont(fb, 8)
-            _director = buyer_director or data.get('buyer_director_name', '')
-            canvas_obj.drawString(rx, base_y - y_offset, f"/{_director}/")
+            canvas_obj.drawString(rx, base_y - 22*mm, f"/{buyer_director or data.get('buyer_director_name', '')}/")
 
         canvas_obj.restoreState()
 
