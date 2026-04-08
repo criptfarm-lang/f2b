@@ -5076,16 +5076,10 @@ async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order_name = row.get("name", "")
             agent_name = row.get("agent", {}).get("name", "")
             db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
-            results.append(f"✅ №{order_name} — {agent_name}
-   ID: `{order_id}`")
+            results.append(f"\u2705 \u2116{order_name} \u2014 {agent_name}\n   ID: `{order_id}`")
         await update.message.reply_text(
-            "Флаги сброшены:
-
-" + "
-".join(results) +
-            "
-
-Теперь смени статус заказа на «Согласовано» — уведомление отправится.",
+            "Флаги сброшены:\n\n" + "\n".join(results) +
+            "\n\nТеперь смени статус заказа на «Согласовано» — уведомление отправится.",
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -5134,21 +5128,17 @@ async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
                 reason = "нет контакта в базе" if not contact else "неизвестно"
                 not_sent.append(f"  ❌ №{order_name} — {agent_name} ({reason})")
-        lines = [f"📊 Рассылка за {today} — всего {len(rows)} заказов
-"]
+        lines = [f"📊 Рассылка за {today} — всего {len(rows)} заказов\n"]
         if not_sent:
             lines.append(f"Не получили ({len(not_sent)}):")
             lines.extend(not_sent)
-            lines.append("
-Чтобы дослать: /reset\_agreed [номер заказа]")
+            lines.append("\nЧтобы дослать: /reset\_agreed [номер заказа]")
         else:
             lines.append("✅ Все получили рассылку!")
         if sent:
-            lines.append(f"
-Получили ({len(sent)}):")
+            lines.append(f"\nПолучили ({len(sent)}):")
             lines.extend(sent)
-        await update.message.reply_text("
-".join(lines), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         logger.error(f"cmd_notifier_status: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {e}")
