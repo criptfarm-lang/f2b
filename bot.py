@@ -4625,7 +4625,7 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (company_name, chat_id)
     )
     rows = db._fetchall(
-        "SELECT chat_id, contact_name, company_name, manager FROM wazzup_contact_map WHERE chat_id=%s",
+        "SELECT chat_id, wazzup_name, company_name, manager FROM wazzup_contact_map WHERE chat_id=%s",
         (chat_id,)
     )
     if rows:
@@ -5041,6 +5041,119 @@ async def cmd_pdz_evening_test(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
+async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/reset_agreed [номер заказа] — сбросить флаг отправки уведомления."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /reset_agreed [номер заказа, например 01645]")
+        return
+    query = " ".join(context.args)
+    # Полный UUID — удаляем напрямую
+    if len(query) > 20 and "-" in query:
+        db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (query,))
+        await update.message.reply_text(f"✅ Флаг сброшен для `{query}`", parse_mode="Markdown")
+        return
+    try:
+        import aiohttp
+        from moysklad import get_headers, MS_BASE
+        await update.message.reply_text(f"🔍 Ищу заказ №{query}...")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder",
+                headers=get_headers(),
+                params={"filter": f"name~{query}", "limit": 5}
+            ) as resp:
+                data = await resp.json()
+        rows = data.get("rows", [])
+        if not rows:
+            await update.message.reply_text(f"❌ Заказ №{query} не найден в МойСклад.")
+            return
+        results = []
+        for row in rows:
+            order_id = row["id"]
+            order_name = row.get("name", "")
+            agent_name = row.get("agent", {}).get("name", "")
+            db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
+            results.append(f"✅ №{order_name} — {agent_name}
+   ID: `{order_id}`")
+        await update.message.reply_text(
+            "Флаги сброшены:
+
+" + "
+".join(results) +
+            "
+
+Теперь смени статус заказа на «Согласовано» — уведомление отправится.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/notifier_status — заказы за сегодня которым не ушла рассылка."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    await update.message.reply_text("🔍 Проверяю заказы за сегодня...")
+    try:
+        import aiohttp
+        from moysklad import get_headers, MS_BASE
+        from datetime import date
+        today = date.today().isoformat()
+        MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder",
+                headers=get_headers(),
+                params={
+                    "filter": f"state={MS_BASE}/entity/customerorderstatus/{MS_STATE_AGREED};moment>={today} 00:00:00",
+                    "expand": "agent,state",
+                    "limit": 100,
+                }
+            ) as resp:
+                data = await resp.json()
+        rows = data.get("rows", [])
+        if not rows:
+            await update.message.reply_text("✅ Сегодня согласованных заказов нет.")
+            return
+        sent, not_sent = [], []
+        for row in rows:
+            order_id = row["id"]
+            order_name = row.get("name", "")
+            agent_name = row.get("agent", {}).get("name", "")
+            notified = db._fetchone("SELECT order_id FROM agreed_notifications WHERE order_id=%s", (order_id,))
+            if notified:
+                sent.append(f"  ✅ №{order_name} — {agent_name}")
+            else:
+                contact = db._fetchone(
+                    "SELECT chat_id FROM wazzup_contact_map WHERE LOWER(company_name) LIKE LOWER(%s) LIMIT 1",
+                    (f"%{agent_name}%",)
+                )
+                reason = "нет контакта в базе" if not contact else "неизвестно"
+                not_sent.append(f"  ❌ №{order_name} — {agent_name} ({reason})")
+        lines = [f"📊 Рассылка за {today} — всего {len(rows)} заказов
+"]
+        if not_sent:
+            lines.append(f"Не получили ({len(not_sent)}):")
+            lines.extend(not_sent)
+            lines.append("
+Чтобы дослать: /reset\_agreed [номер заказа]")
+        else:
+            lines.append("✅ Все получили рассылку!")
+        if sent:
+            lines.append(f"
+Получили ({len(sent)}):")
+            lines.extend(sent)
+        await update.message.reply_text("
+".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"cmd_notifier_status: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает нажатия кнопок на алерте о цене."""
     query = update.callback_query
@@ -5448,6 +5561,8 @@ def main():
     app.add_handler(CommandHandler("pdz", cmd_pdz))
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
+    app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
+    app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
