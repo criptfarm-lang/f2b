@@ -24,6 +24,7 @@ from database import Database
 from scheduler import setup_scheduler, record_group_message, PDZ_MANAGERS, get_group_chat_id
 from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion, parse_product_query
 from amocrm import check_connection as amo_check  # оставляем для совместимости
+from notifier import check_order_agreed  # рассылка при согласовании — не трогать!
 from moysklad import (search_products, search_products_filtered, get_price_list, format_products,
     format_price_list, get_product_image, download_image, get_image_download_url,
     get_counterparty_balance, get_all_debtors, format_debtors_ms, format_counterparty_balance,
@@ -5553,6 +5554,8 @@ def main():
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
+    app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
+    app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
@@ -5932,181 +5935,6 @@ async def _is_company_whitelisted(company_name: str) -> bool:
     return False
 
 
-async def check_order_agreed(order_href: str, bot):
-    """При смене статуса заказа на Согласовано — отправляем клиенту в мессенджер."""
-    MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
-    try:
-        import aiohttp
-        from moysklad import get_headers
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                order_href,
-                headers=get_headers(),
-                params={"expand": "agent,state,owner"}
-            ) as r:
-                if r.status != 200:
-                    return
-                order = await r.json()
-
-        state = order.get("state", {})
-        state_id = state.get("meta", {}).get("href", "").split("/")[-1]
-
-        if state_id != MS_STATE_AGREED:
-            return
-
-        # Проверяем не отправляли ли уже
-        order_id_check = order_href.split("/")[-1].split("?")[0]
-        if db.is_agreed_notified(order_id_check):
-            logger.info(f"check_order_agreed: заказ {order_id_check} — уведомление уже отправлялось, пропускаем")
-            return
-
-        order_name = order.get("name", "")
-        order_sum = (order.get("sum", 0) or 0) / 100
-        agent = order.get("agent", {})
-        agent_name = agent.get("name", "")
-        agent_id = agent.get("meta", {}).get("href", "").split("/")[-1]
-        owner = order.get("owner", {})
-        owner_name = owner.get("name", "")
-
-        # Пропускаем розничного покупателя
-        if agent_name.lower().strip() == "розничный покупатель":
-            logger.info(f"check_order_agreed: пропускаем розничного покупателя")
-            db.save_agreed_notification(order_id_check)
-            return
-
-        logger.info(f"check_order_agreed: заказ {order_name} клиент={agent_name} статус=Согласовано")
-
-        # Загружаем позиции заказа
-        order_id = order_href.split("/")[-1].split("?")[0]
-        positions_text = ""
-        try:
-            async with aiohttp.ClientSession() as session2:
-                async with session2.get(
-                    f"https://api.moysklad.ru/api/remap/1.2/entity/customerorder/{order_id}/positions",
-                    headers=get_headers(),
-                    params={"expand": "assortment", "limit": 100}
-                ) as r2:
-                    if r2.status == 200:
-                        pos_data = await r2.json()
-                        lines = []
-                        for pos in pos_data.get("rows", []):
-                            name = pos.get("assortment", {}).get("name", "?")
-                            qty = int(pos.get("quantity", 0))
-                            price = (pos.get("price", 0) or 0) / 100
-                            total = qty * price
-                            lines.append(f"  • {name} × {qty} = {total:,.0f} руб.")
-                        if lines:
-                            positions_text = "\n".join(lines)
-        except Exception as e:
-            logger.warning(f"check_order_agreed: не удалось загрузить позиции: {e}")
-
-        # Формируем сообщение
-        delivery = order.get("deliveryPlannedMoment", "")[:10] if order.get("deliveryPlannedMoment") else ""
-
-        # Определяем сегмент клиента по тегам (хорека / опт)
-        segment = None
-        tags = agent.get("tags", [])
-        for tag in tags:
-            if tag.lower() in ("хорека", "horeka"):
-                segment = "хорека"
-                break
-            elif tag.lower() == "опт":
-                segment = "опт"
-                break
-        # Если теги не пришли в expand — загружаем карточку
-        if not tags and agent_id:
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(
-                        f"https://api.moysklad.ru/api/remap/1.2/entity/counterparty/{agent_id}",
-                        headers=get_headers()
-                    ) as r:
-                        if r.status == 200:
-                            cp = await r.json()
-                            for tag in cp.get("tags", []):
-                                if tag.lower() in ("хорека", "horeka"):
-                                    segment = "хорека"
-                                    break
-                                elif tag.lower() == "опт":
-                                    segment = "опт"
-                                    break
-            except Exception:
-                pass
-
-        msg = f"📋 Пожалуйста, проверьте заказ {order_name}\n\n"
-        if positions_text:
-            msg += f"📦 Состав:\n{positions_text}\n\n"
-        msg += f"💰 Итого: {order_sum:,.0f} руб.\n"
-        if delivery:
-            try:
-                from datetime import date as _ddate
-                MONTHS_RU = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
-                d = _ddate.fromisoformat(delivery[:10])
-                delivery_fmt = f"{d.day} {MONTHS_RU[d.month-1]}"
-            except Exception:
-                delivery_fmt = delivery
-            msg += f"📅 Плановая дата отгрузки: {delivery_fmt}\n"
-
-        # ── Квиз + проверка исключений ───────────────────────────────────────
-        excluded = await _is_company_excluded(agent_name) if QUIZ_BASE_URL else False
-        if excluded:
-            logger.info(f"check_order_agreed: {agent_name} в исключениях, рассылка не отправляется")
-            db.save_agreed_notification(order_id_check)
-            return
-
-        if QUIZ_BASE_URL:
-            quiz_url = (
-                f"{QUIZ_BASE_URL}"
-                f"/?order={order_id}"
-                f"&client_id={agent_id}"
-                f"&amount={int(order_sum)}"
-            )
-            msg += (
-                f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
-                f"{quiz_url}"
-            )
-            logger.info(f"check_order_agreed: квиз добавлен для {agent_name}")
-        # ─────────────────────────────────────────────────────────────────────
-
-        # Ищем мессенджер клиента
-        contact = db._fetchone(
-            """SELECT chat_id, channel_id, chat_type, manager
-               FROM wazzup_contact_map
-               WHERE LOWER(company_name) LIKE LOWER(%s)
-               LIMIT 1""",
-            (f"%{agent_name}%",)
-        )
-
-        if not contact:
-            logger.info(f"check_order_agreed: мессенджер {agent_name} не найден, пропускаем")
-            db.save_agreed_notification(order_id_check)
-            return
-        # Отправляем через Wazzup
-        import aiohttp as _aio
-        api_key = os.getenv("WAZZUP_API_KEY", "")
-        async with _aio.ClientSession() as session:
-            payload = {
-                "channelId": contact["channel_id"],
-                "chatType": contact["chat_type"],
-                "chatId": contact["chat_id"],
-                "text": msg,
-            }
-            async with session.post(
-                "https://api.wazzup24.com/v3/message",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=payload
-            ) as r:
-                if r.status in (200, 201):
-                    logger.info(f"check_order_agreed: отправлено {agent_name} в {contact['chat_type']}")
-                    db.save_agreed_notification(order_id_check)
-                else:
-                    body = await r.text()
-                    logger.error(f"check_order_agreed: ошибка отправки {r.status} {body[:100]}")
-
-    except Exception as e:
-        logger.error(f"check_order_agreed: {e}", exc_info=True)
-
 async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
     """Проверяет есть ли у клиента просрочка > 5 дней при новом заказе."""
     try:
@@ -6222,7 +6050,7 @@ async def process_ms_webhook(data: dict, bot):
 
             # Смена статуса на "Согласовано" — отправляем клиенту
             if action == "UPDATE" and not already_checked:
-                await check_order_agreed(order_href, bot)
+                await check_order_agreed(order_href, bot, db)
 
             # ПДЗ алерт — только для новых заказов, только один раз
             if action == "CREATE" and not already_checked:
