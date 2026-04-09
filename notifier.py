@@ -213,6 +213,18 @@ async def check_order_agreed(order_href: str, bot, db):
                 if r.status in (200, 201):
                     logger.info(f"notifier: ✅ отправлено {agent_name} → {contact['chat_type']}")
                     db.save_agreed_notification(order_id)
+                    # Логируем рассылку в квиз-сервис для статистики
+                    logger.info(f"notifier: QUIZ_BASE_URL={QUIZ_BASE_URL!r}")
+                    if QUIZ_BASE_URL:
+                        try:
+                            async with aiohttp.ClientSession() as _s:
+                                await _s.post(
+                                    f"{QUIZ_BASE_URL}/api/log-mailing",
+                                    json={"order_id": order_id, "client_id": agent_id, "company_name": agent_name},
+                                    timeout=aiohttp.ClientTimeout(total=5)
+                                )
+                        except Exception as _e:
+                            logger.warning(f"notifier: log-mailing failed ({_e})")
                 else:
                     body = await r.text()
                     logger.error(f"notifier: ❌ ошибка {r.status} для {agent_name}: {body[:200]}")
