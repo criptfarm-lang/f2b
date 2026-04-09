@@ -25,6 +25,13 @@ from notifier import check_order_agreed  # рассылка при соглас�
 from scheduler import setup_scheduler, record_group_message, PDZ_MANAGERS, get_group_chat_id
 from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion, parse_product_query
 from amocrm import check_connection as amo_check  # оставляем для совместимости
+from amo_alarms import (
+    handle_amo_webhook,
+    handle_take_callback,
+    handle_amo_link_callback,
+    cmd_myamoid,
+    cmd_amo_setup,
+)
 from moysklad import (search_products, search_products_filtered, get_price_list, format_products,
     format_price_list, get_product_image, download_image, get_image_download_url,
     get_counterparty_balance, get_all_debtors, format_debtors_ms, format_counterparty_balance,
@@ -5710,6 +5717,17 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr)"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
+    # ─── Алармы amoCRM ───────────────────────────────────────────────────────
+    app.add_handler(CommandHandler("myamoid", lambda u, c: cmd_myamoid(u, c, db)))
+    app.add_handler(CommandHandler("amo_setup", cmd_amo_setup))
+    app.add_handler(CallbackQueryHandler(
+        lambda u, c: handle_take_callback(u.callback_query, db),
+        pattern="^amo_alarm_take\\|"
+    ))
+    app.add_handler(CallbackQueryHandler(
+        lambda u, c: handle_amo_link_callback(u.callback_query, db),
+        pattern="^amo_link\\|"
+    ))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
 
@@ -5935,6 +5953,11 @@ def main():
         web_app.router.add_post("/webhook/sipuni", handle_sipuni_webhook)
         web_app.router.add_get("/health", handle_health)
         web_app.router.add_get("/report", handle_web_report)
+        # ─── amoCRM алармы ───────────────────────────────────────────────────
+        async def handle_amo_webhook_route(request):
+            await handle_amo_webhook(request, app, db)
+            return web.Response(text="ok")
+        web_app.router.add_post("/webhook/amocrm", handle_amo_webhook_route)
         port = int(os.getenv("PORT", "8080"))
         runner = web.AppRunner(web_app)
         await runner.setup()
