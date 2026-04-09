@@ -671,13 +671,31 @@ async def cmd_amo_setup(update, context):
 
     await update.message.reply_text("🔍 Проверяю подключение к amoCRM...")
 
-    # 1. Проверяем токен
-    account = await _amo_get("/account")
-    if not account:
-        await update.message.reply_text(
-            "❌ Не удалось подключиться к amoCRM.\n"
-            "Проверь AMO_ACCESS_TOKEN в Railway."
-        )
+    # 1. Проверяем токен — с детальной диагностикой
+    token = os.getenv("AMO_ACCESS_TOKEN", "")
+    api_domain = os.getenv("AMO_API_DOMAIN", "api-b.amocrm.ru")
+    url = f"https://{api_domain}/api/v4/account"
+
+    await update.message.reply_text(
+        f"🔍 Диагностика:\n"
+        f"URL: `{url}`\n"
+        f"Токен: `{token[:30]}...`\n"
+        f"Домен: `{api_domain}`",
+        parse_mode="Markdown"
+    )
+
+    try:
+        import aiohttp as _aiohttp
+        async with _aiohttp.ClientSession() as _s:
+            async with _s.get(url, headers={"Authorization": f"Bearer {token}"}) as _r:
+                _body = await _r.text()
+                await update.message.reply_text(f"HTTP {_r.status}:\n{_body[:300]}")
+                if _r.status != 200:
+                    return
+                import json as _j
+                account = _j.loads(_body)
+    except Exception as _e:
+        await update.message.reply_text(f"❌ Ошибка: {_e}")
         return
 
     # 2. Находим воронку и этап
