@@ -25,7 +25,8 @@ from telegram.ext import Application
 logger = logging.getLogger(__name__)
 
 AMO_SUBDOMAIN = os.getenv("AMO_SUBDOMAIN", "victorfishtobiz")
-AMO_BASE_URL = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
+AMO_API_DOMAIN = os.getenv("AMO_API_DOMAIN", "api-b.amocrm.ru")
+AMO_BASE_URL = f"https://{AMO_API_DOMAIN}/api/v4"
 
 # ─── Кэш для хранения активных таймеров и алертов ────────────────────────────
 # lead_id → {
