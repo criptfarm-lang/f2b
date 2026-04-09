@@ -5467,6 +5467,115 @@ async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+async def cmd_set_attestation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/set_attestation [имя] [общая|акб] [процент] — задать аттестацию менеджера."""
+    if not update.effective_user or update.effective_user.id != 360092495:
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Использование: /set_attestation [имя] [общая|акб] [процент]\n"
+            "Пример: /set_attestation Карина общая 35"
+        )
+        return
+    name_part = context.args[0].lower()
+    kind = context.args[1].lower()
+    try:
+        value = int(context.args[2])
+    except ValueError:
+        await update.message.reply_text("❌ Процент должен быть целым числом")
+        return
+    NAME_MAP = {
+        "инесса": "Инесса Скляр", "скляр": "Инесса Скляр",
+        "карина": "Карина Баласанян", "баласанян": "Карина Баласанян",
+        "елена": "Елена Мерзлякова", "лена": "Елена Мерзлякова", "мерзлякова": "Елена Мерзлякова",
+        "алексей": "Алексей Леонтьев", "леонтьев": "Алексей Леонтьев",
+        "денис": "Денис Коликов", "коликов": "Денис Коликов",
+    }
+    mgr_name = NAME_MAP.get(name_part)
+    if not mgr_name:
+        await update.message.reply_text(f"❌ Менеджер '{context.args[0]}' не найден.")
+        return
+    if kind in ("общая", "general"):
+        key = f"attestation_general_{mgr_name}"
+        label = "общая"
+    elif kind in ("акб", "akb"):
+        key = f"attestation_akb_{mgr_name}"
+        label = "АКБ"
+    else:
+        await update.message.reply_text("❌ Тип должен быть 'общая' или 'акб'")
+        return
+    db._execute(
+        "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
+        (key, str(value), str(value))
+    )
+    await update.message.reply_text(f"✅ Аттестация {label} для {mgr_name}: {value}%")
+
+
+def get_weekly_targets(mgr_name: str) -> dict:
+    """Возвращает накопительные недельные цели менеджера из БД."""
+    result = {}
+    for metric in ["revenue", "shipments", "clients", "new_clients", "attracted"]:
+        try:
+            row = db._fetchone("SELECT value FROM bot_settings WHERE key=%s", (f"weekly_target_{mgr_name}_{metric}",))
+            if row:
+                result[metric] = float(row["value"])
+        except Exception:
+            pass
+    return result
+
+
+async def cmd_set_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/set_weekly [имя] [показатель] [значение] — задать накопительный недельный план."""
+    if not update.effective_user or update.effective_user.id != 360092495:
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Использование: /set_weekly [имя] [показатель] [значение]\n"
+            "Показатели: выручка, отгрузки, акб, новые, привл\n"
+            "Пример: /set_weekly Инесса выручка 4000000"
+        )
+        return
+    name_part = context.args[0].lower()
+    metric_part = context.args[1].lower()
+    try:
+        value = float(context.args[2].replace(',', '.'))
+    except ValueError:
+        await update.message.reply_text("❌ Значение должно быть числом")
+        return
+    NAME_MAP = {
+        "инесса": "Инесса Скляр", "скляр": "Инесса Скляр",
+        "карина": "Карина Баласанян", "баласанян": "Карина Баласанян",
+        "елена": "Елена Мерзлякова", "лена": "Елена Мерзлякова", "мерзлякова": "Елена Мерзлякова",
+        "алексей": "Алексей Леонтьев", "леонтьев": "Алексей Леонтьев",
+        "денис": "Денис Коликов", "коликов": "Денис Коликов",
+    }
+    METRIC_MAP = {
+        "выручка": "revenue", "revenue": "revenue",
+        "отгрузки": "shipments", "отгрузка": "shipments", "shipments": "shipments",
+        "акб": "clients", "клиенты": "clients", "clients": "clients",
+        "новые": "new_clients", "новых": "new_clients", "new_clients": "new_clients",
+        "привл": "attracted", "привлеченные": "attracted", "attracted": "attracted",
+    }
+    mgr_name = NAME_MAP.get(name_part)
+    if not mgr_name:
+        await update.message.reply_text(f"❌ Менеджер '{context.args[0]}' не найден.")
+        return
+    metric_key = METRIC_MAP.get(metric_part)
+    if not metric_key:
+        await update.message.reply_text(f"❌ Показатель '{context.args[1]}' не найден.\nДоступные: выручка, отгрузки, акб, новые, привл")
+        return
+    key = f"weekly_target_{mgr_name}_{metric_key}"
+    db._execute(
+        "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
+        (key, str(value), str(value))
+    )
+    METRIC_LABELS = {"revenue": "Выручка", "shipments": "Отгрузки", "clients": "АКБ", "new_clients": "Новые", "attracted": "Привл. товары"}
+    label = METRIC_LABELS.get(metric_key, metric_key)
+    await update.message.reply_text(f"✅ Недельный план *{label}* для *{mgr_name}*: {value:,.0f}", parse_mode="Markdown")
+
+
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -5551,6 +5660,8 @@ def main():
     app.add_handler(CommandHandler("pdz", cmd_pdz))
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
+    app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
+    app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
