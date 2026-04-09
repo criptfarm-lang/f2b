@@ -5348,6 +5348,45 @@ async def _build_report_data() -> dict:
     }
     SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Алексей Леонтьев":"Алексей"}
 
+    # Загружаем накопительные недельные цели из БД (set_weekly) — перекрывают WEEKLY_PLANS
+    weekly_targets = {}
+    METRICS_KEYS = ["revenue", "shipments", "clients", "new_clients", "attracted"]
+    all_mgr_names = list(PLANS.keys())
+    for mgr_name in all_mgr_names:
+        targets = {}
+        for metric in METRICS_KEYS:
+            try:
+                row = db._fetchone(
+                    "SELECT value FROM bot_settings WHERE key=%s",
+                    (f"weekly_target_{mgr_name}_{metric}",)
+                )
+                if row:
+                    targets[metric] = float(row["value"])
+            except Exception:
+                pass
+        # Fallback на WEEKLY_PLANS если в БД нет данных
+        if targets:
+            weekly_targets[mgr_name] = targets
+        else:
+            weekly_targets[mgr_name] = WEEKLY_PLANS.get(mgr_name, {})
+
+    # Аттестация из БД
+    attestation = {}
+    for mgr_name in all_mgr_names:
+        att = {}
+        for kind in ["general", "akb"]:
+            try:
+                row = db._fetchone(
+                    "SELECT value FROM bot_settings WHERE key=%s",
+                    (f"attestation_{kind}_{mgr_name}",)
+                )
+                if row:
+                    att[kind] = int(row["value"])
+            except Exception:
+                pass
+        if att:
+            attestation[mgr_name] = att
+
     # Синхронизируем счётчики с реальными списками имён
     for mgr_name in facts:
         facts[mgr_name]["new_clients"] = len(new_client_names.get(mgr_name, []))
@@ -5358,6 +5397,8 @@ async def _build_report_data() -> dict:
         "facts": facts,
         "plans": PLANS,
         "weekly_plans": WEEKLY_PLANS,
+        "weekly_targets": weekly_targets,
+        "attestation": attestation,
         "short_names": SHORT_NAMES,
         "new_client_names": new_client_names,
         "lost_client_names": lost_client_names,
@@ -5455,7 +5496,7 @@ async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not_sent:
             lines.append(f"Не получили ({len(not_sent)}):")
             lines.extend(not_sent)
-            lines.append("\nЧтобы дослать: /reset\_agreed [номер заказа]")
+            lines.append("\nЧтобы дослать: /reset_agreed [номер заказа]")
         else:
             lines.append("✅ Все получили рассылку!")
         if sent:
