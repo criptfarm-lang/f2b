@@ -453,20 +453,24 @@ async def handle_amo_webhook(request, app: Application, db):
         target_pipeline_id = stage_info["pipeline_id"]
         target_stage_id = stage_info["stage_id"]
 
+        # Логируем все ключи для диагностики
+        all_keys = dict(data)
+        logger.info(f"AMO webhook raw keys: {list(all_keys.keys())[:20]}")
+        logger.info(f"AMO webhook raw data: {dict(list(all_keys.items())[:10])}")
+
         # amoCRM шлёт данные в формате leads[status][0][id] и т.д.
         # Парсим все leads из формы
         leads_raw = {}
+        import re as _re
         for key, value in data.items():
-            # Пример ключа: leads[status][0][id]
-            if key.startswith("leads[status]"):
-                import re
-                m = re.match(r"leads\[status\]\[(\d+)\]\[(.+)\]", key)
-                if m:
-                    idx = int(m.group(1))
-                    field = m.group(2)
-                    if idx not in leads_raw:
-                        leads_raw[idx] = {}
-                    leads_raw[idx][field] = value
+            # Пробуем несколько форматов: leads[status][0][id] и leads[add][0][id]
+            m = _re.match(r"leads\[(?:status|add|update)\]\[(\d+)\]\[(.+)\]", key)
+            if m:
+                idx = int(m.group(1))
+                field = m.group(2)
+                if idx not in leads_raw:
+                    leads_raw[idx] = {}
+                leads_raw[idx][field] = value
 
         logger.info(f"AMO webhook: получено {len(leads_raw)} событий")
 
