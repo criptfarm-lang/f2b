@@ -46,7 +46,7 @@ _pipeline_cache: dict = {}  # {"pipeline_id": int, "stage_id": int, "stage_name"
 # ─── amoCRM API helpers ───────────────────────────────────────────────────────
 
 def _amo_headers() -> dict:
-    token = os.getenv("AMO_ACCESS_TOKEN", "")
+    token = os.getenv("AMO_ACCESS_TOKEN", "").strip()
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -672,8 +672,8 @@ async def cmd_amo_setup(update, context):
     await update.message.reply_text("🔍 Проверяю подключение к amoCRM...")
 
     # 1. Проверяем токен — с детальной диагностикой
-    token = os.getenv("AMO_ACCESS_TOKEN", "")
-    api_domain = os.getenv("AMO_API_DOMAIN", "api-b.amocrm.ru")
+    token = os.getenv("AMO_ACCESS_TOKEN", "").strip()
+    api_domain = os.getenv("AMO_API_DOMAIN", "api-b.amocrm.ru").strip()
     url = f"https://{api_domain}/api/v4/account"
 
     await update.message.reply_text(
