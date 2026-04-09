@@ -21,10 +21,10 @@ from telegram.ext import (
 )
 
 from database import Database
+from notifier import check_order_agreed  # рассылка при согласовании — не трогать!
 from scheduler import setup_scheduler, record_group_message, PDZ_MANAGERS, get_group_chat_id
 from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion, parse_product_query
 from amocrm import check_connection as amo_check  # оставляем для совместимости
-from notifier import check_order_agreed  # рассылка при согласовании — не трогать!
 from moysklad import (search_products, search_products_filtered, get_price_list, format_products,
     format_price_list, get_product_image, download_image, get_image_download_url,
     get_counterparty_balance, get_all_debtors, format_debtors_ms, format_counterparty_balance,
@@ -4626,7 +4626,7 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (company_name, chat_id)
     )
     rows = db._fetchall(
-        "SELECT chat_id, wazzup_name, company_name, manager FROM wazzup_contact_map WHERE chat_id=%s",
+        "SELECT chat_id, contact_name, company_name, manager FROM wazzup_contact_map WHERE chat_id=%s",
         (chat_id,)
     )
     if rows:
@@ -5042,109 +5042,6 @@ async def cmd_pdz_evening_test(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
-async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/reset_agreed [номер заказа] — сбросить флаг отправки уведомления."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /reset_agreed [номер заказа, например 01645]")
-        return
-    query = " ".join(context.args)
-    # Полный UUID — удаляем напрямую
-    if len(query) > 20 and "-" in query:
-        db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (query,))
-        await update.message.reply_text(f"✅ Флаг сброшен для `{query}`", parse_mode="Markdown")
-        return
-    try:
-        import aiohttp
-        from moysklad import get_headers, MS_BASE
-        await update.message.reply_text(f"🔍 Ищу заказ №{query}...")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{MS_BASE}/entity/customerorder",
-                headers=get_headers(),
-                params={"filter": f"name~{query}", "limit": 5}
-            ) as resp:
-                data = await resp.json()
-        rows = data.get("rows", [])
-        if not rows:
-            await update.message.reply_text(f"❌ Заказ №{query} не найден в МойСклад.")
-            return
-        results = []
-        for row in rows:
-            order_id = row["id"]
-            order_name = row.get("name", "")
-            agent_name = row.get("agent", {}).get("name", "")
-            db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
-            results.append(f"\u2705 \u2116{order_name} \u2014 {agent_name}\n   ID: `{order_id}`")
-        await update.message.reply_text(
-            "Флаги сброшены:\n\n" + "\n".join(results) +
-            "\n\nТеперь смени статус заказа на «Согласовано» — уведомление отправится.",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
-async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/notifier_status — заказы за сегодня которым не ушла рассылка."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    await update.message.reply_text("🔍 Проверяю заказы за сегодня...")
-    try:
-        import aiohttp
-        from moysklad import get_headers, MS_BASE
-        from datetime import date
-        today = date.today().isoformat()
-        MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{MS_BASE}/entity/customerorder",
-                headers=get_headers(),
-                params={
-                    "filter": f"state={MS_BASE}/entity/customerorderstatus/{MS_STATE_AGREED};moment>={today} 00:00:00",
-                    "expand": "agent,state",
-                    "limit": 100,
-                }
-            ) as resp:
-                data = await resp.json()
-        rows = data.get("rows", [])
-        if not rows:
-            await update.message.reply_text("✅ Сегодня согласованных заказов нет.")
-            return
-        sent, not_sent = [], []
-        for row in rows:
-            order_id = row["id"]
-            order_name = row.get("name", "")
-            agent_name = row.get("agent", {}).get("name", "")
-            notified = db._fetchone("SELECT order_id FROM agreed_notifications WHERE order_id=%s", (order_id,))
-            if notified:
-                sent.append(f"  ✅ №{order_name} — {agent_name}")
-            else:
-                contact = db._fetchone(
-                    "SELECT chat_id FROM wazzup_contact_map WHERE LOWER(company_name) LIKE LOWER(%s) LIMIT 1",
-                    (f"%{agent_name}%",)
-                )
-                reason = "нет контакта в базе" if not contact else "неизвестно"
-                not_sent.append(f"  ❌ №{order_name} — {agent_name} ({reason})")
-        lines = [f"📊 Рассылка за {today} — всего {len(rows)} заказов\n"]
-        if not_sent:
-            lines.append(f"Не получили ({len(not_sent)}):")
-            lines.extend(not_sent)
-            lines.append("\nЧтобы дослать: /reset\_agreed [номер заказа]")
-        else:
-            lines.append("✅ Все получили рассылку!")
-        if sent:
-            lines.append(f"\nПолучили ({len(sent)}):")
-            lines.extend(sent)
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"cmd_notifier_status: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-
 async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает нажатия кнопок на алерте о цене."""
     query = update.callback_query
@@ -5468,6 +5365,108 @@ async def _build_report_data() -> dict:
     }
 
 
+async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/reset_agreed [номер заказа] — сбросить флаг отправки уведомления."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /reset_agreed [номер заказа, например 01645]")
+        return
+    query_val = " ".join(context.args)
+    if len(query_val) > 20 and "-" in query_val:
+        db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (query_val,))
+        await update.message.reply_text(f"✅ Флаг сброшен для `{query_val}`", parse_mode="Markdown")
+        return
+    try:
+        import aiohttp
+        from moysklad import get_headers, MS_BASE
+        await update.message.reply_text(f"🔍 Ищу заказ №{query_val}...")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder",
+                headers=get_headers(),
+                params={"filter": f"name~{query_val}", "limit": 5}
+            ) as resp:
+                data = await resp.json()
+        rows = data.get("rows", [])
+        if not rows:
+            await update.message.reply_text(f"❌ Заказ №{query_val} не найден в МойСклад.")
+            return
+        results = []
+        for row in rows:
+            order_id = row["id"]
+            order_name = row.get("name", "")
+            agent_name = row.get("agent", {}).get("name", "")
+            db._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
+            results.append(f"✅ №{order_name} — {agent_name}\n   ID: `{order_id}`")
+        await update.message.reply_text(
+            "Флаги сброшены:\n\n" + "\n".join(results) +
+            "\n\nТеперь смени статус заказа на «Согласовано» — уведомление отправится.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/notifier_status — заказы за сегодня которым не ушла рассылка."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    await update.message.reply_text("🔍 Проверяю заказы за сегодня...")
+    try:
+        import aiohttp
+        from moysklad import get_headers, MS_BASE
+        from datetime import date
+        today = date.today().isoformat()
+        MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder",
+                headers=get_headers(),
+                params={
+                    "filter": f"state={MS_BASE}/entity/customerorderstatus/{MS_STATE_AGREED};moment>={today} 00:00:00",
+                    "expand": "agent,state",
+                    "limit": 100,
+                }
+            ) as resp:
+                data = await resp.json()
+        rows = data.get("rows", [])
+        if not rows:
+            await update.message.reply_text("✅ Сегодня согласованных заказов нет.")
+            return
+        sent, not_sent = [], []
+        for row in rows:
+            order_id = row["id"]
+            order_name = row.get("name", "")
+            agent_name = row.get("agent", {}).get("name", "")
+            notified = db._fetchone("SELECT order_id FROM agreed_notifications WHERE order_id=%s", (order_id,))
+            if notified:
+                sent.append(f"  ✅ №{order_name} — {agent_name}")
+            else:
+                contact = db._fetchone(
+                    "SELECT chat_id FROM wazzup_contact_map WHERE LOWER(company_name) LIKE LOWER(%s) LIMIT 1",
+                    (f"%{agent_name}%",)
+                )
+                reason = "нет контакта в базе" if not contact else "неизвестно"
+                not_sent.append(f"  ❌ №{order_name} — {agent_name} ({reason})")
+        lines = [f"📊 Рассылка за {today} — всего {len(rows)} заказов\n"]
+        if not_sent:
+            lines.append(f"Не получили ({len(not_sent)}):")
+            lines.extend(not_sent)
+            lines.append("\nЧтобы дослать: /reset\_agreed [номер заказа]")
+        else:
+            lines.append("✅ Все получили рассылку!")
+        if sent:
+            lines.append(f"\nПолучили ({len(sent)}):")
+            lines.extend(sent)
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"cmd_notifier_status: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -5552,8 +5551,6 @@ def main():
     app.add_handler(CommandHandler("pdz", cmd_pdz))
     app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
-    app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
-    app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
@@ -5894,45 +5891,6 @@ async def load_wazzup_managers():
 _price_check_cache: dict = {}
 # Хранилище данных алертов ПДЗ — order_id → {client, manager, debt_amount, debt_days, order_name}
 _pdz_alert_data: dict = {}
-
-async def _is_company_excluded(company_name: str) -> bool:
-    """Проверяет — находится ли компания в списке исключений квиза."""
-    import aiohttp as _aio_excl
-    if not QUIZ_BASE_URL:
-        return False
-    try:
-        async with _aio_excl.ClientSession() as session:
-            async with session.get(
-                f"{QUIZ_BASE_URL}/api/check-exclusion",
-                params={"company_name": company_name},
-                timeout=_aio_excl.ClientTimeout(total=5)
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    return data.get("excluded", False)
-    except Exception as e:
-        logger.warning(f"_is_company_excluded: не удалось проверить ({e}), квиз отправляем (API недоступен)")
-    return False
-
-
-async def _is_company_whitelisted(company_name: str) -> bool:
-    """Проверяет — в белом списке ли компания (опт, которому разрешён квиз)."""
-    import aiohttp as _aio_wl
-    if not QUIZ_BASE_URL:
-        return False
-    try:
-        async with _aio_wl.ClientSession() as session:
-            async with session.get(
-                f"{QUIZ_BASE_URL}/api/check-whitelist",
-                params={"company_name": company_name},
-                timeout=_aio_wl.ClientTimeout(total=5)
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    return data.get("whitelisted", False)
-    except Exception as e:
-        logger.warning(f"_is_company_whitelisted: ошибка ({e}), считаем не в белом списке")
-    return False
 
 
 async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
