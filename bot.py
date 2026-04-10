@@ -585,12 +585,78 @@ async def handle_wazzup_ignore_callback(update: Update, context: ContextTypes.DE
         )
     await query.message.edit_text("🚫 Контакт помечен как 'не наш клиент'. Уведомления больше не придут.")
 
+# UUID полей контрагентов в МойСклад для рассылок
+MS_ATTR_TELEGRAM = "15052610-34d7-11f1-0a80-1489000ec44a"
+MS_ATTR_WHATSAPP = "1505270f-34d7-11f1-0a80-1489000ec44b"
+MS_ATTR_MAX      = "1505236e-34d7-11f1-0a80-1489000ec449"
+MS_ATTR_BY_TYPE  = {
+    "telegram": MS_ATTR_TELEGRAM,
+    "tgapi":    MS_ATTR_TELEGRAM,
+    "whatsapp": MS_ATTR_WHATSAPP,
+    "max":      MS_ATTR_MAX,
+}
+
+async def _write_contact_to_ms(agent_href: str, chat_type: str, chat_id: str) -> bool:
+    """Записывает chat_id в поле контрагента в МойСклад."""
+    import aiohttp
+    from moysklad import get_headers
+    attr_id = MS_ATTR_BY_TYPE.get(chat_type.lower())
+    if not attr_id:
+        return False
+    MS_BASE_URL = "https://api.moysklad.ru/api/remap/1.2"
+    payload = {"attributes": [{"meta": {
+        "href": f"{MS_BASE_URL}/entity/counterparty/metadata/attributes/{attr_id}",
+        "type": "attributemetadata",
+        "mediaType": "application/json"
+    }, "value": str(chat_id)}]}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(agent_href, headers=get_headers(), json=payload) as r:
+                return r.status in (200, 201)
+    except Exception as e:
+        logger.warning(f"_write_contact_to_ms: {e}")
+        return False
+
+
 async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает нажатие кнопки привязки Telegram контакта к компании."""
     query = update.callback_query
     await query.answer()
 
     parts = query.data.split("|")
+
+    # Новый контакт для рассылок: wazzup_mailing|link_key
+    if parts[0] == "wazzup_mailing":
+        if len(parts) < 2:
+            return
+        link_key = parts[1]
+        pending = _pending_links.get(link_key)
+        if not pending:
+            await query.message.edit_text("❌ Сессия истекла, попробуй снова.")
+            return
+        # Помечаем как "для рассылок"
+        pending["for_mailing"] = True
+        _pending_links[link_key] = pending
+        # Добавляем в стек пользователя
+        if query.from_user.id not in _pending_links:
+            _pending_links[query.from_user.id] = []
+        existing_keys = [p.get("link_key") for p in _pending_links[query.from_user.id]] if isinstance(_pending_links.get(query.from_user.id), list) else []
+        if link_key not in existing_keys:
+            entry = {**pending, "link_key": link_key}
+            if isinstance(_pending_links[query.from_user.id], list):
+                _pending_links[query.from_user.id].append(entry)
+            else:
+                _pending_links[query.from_user.id] = [entry]
+        CHANNEL_NAMES = {"telegram": "Telegram", "tgapi": "Telegram", "max": "Max", "whatsapp": "WhatsApp"}
+        channel_label = CHANNEL_NAMES.get(pending.get("chat_type", ""), "")
+        await query.message.edit_text(
+            f"✅ Контакт для рассылок ({channel_label})\n\n"
+            f"👤 *{pending['wazzup_name']}*\n\n"
+            f"Как называется компания в МойСклад?\n"
+            f"_(напиши название или часть)_",
+            parse_mode="Markdown"
+        )
+        return
 
     # Выбор компании из списка похожих: wazzup_pick|index|link_key
     if parts[0] == "wazzup_pick":
@@ -2328,10 +2394,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 manager=cp_data.get("manager", ""),
                                 segment=cp_data.get("buyer_type", ""),
                             )
+                            # Если контакт для рассылок — записываем в МойСклад
+                            if pending_link.get("for_mailing"):
+                                cp_href = cp_data.get("href") or f"https://api.moysklad.ru/api/remap/1.2/entity/counterparty/{cp_data.get('id', '')}"
+                                ms_ok = await _write_contact_to_ms(
+                                    cp_href,
+                                    pending_link["chat_type"],
+                                    pending_link["chat_id"]
+                                )
+                                if ms_ok:
+                                    logger.info(f"МойСклад: записан контакт {cp_name} → {pending_link['chat_type']}")
+                                else:
+                                    logger.warning(f"МойСклад: не удалось записать контакт {cp_name}")
                     except Exception as e:
                         logger.warning(f"Теги МойСклад: {e}")
+                    mailing_note = " (для рассылок 📨)" if pending_link.get("for_mailing") else ""
                     await safe_reply(
-                        f"✅ *{pending_link['wazzup_name']}* → *{cp_name}*\nЭф запомнил!",
+                        f"✅ *{pending_link['wazzup_name']}* → *{cp_name}*{mailing_note}\nЭф запомнил!",
                         parse_mode="Markdown"
                     )
                 # Если есть ещё ожидающие в стеке — спрашиваем следующего
@@ -5755,7 +5834,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
-    app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr)"))
+    app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing)"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
     # ─── Алармы amoCRM ───────────────────────────────────────────────────────
     app.add_handler(CommandHandler("myamoid", lambda u, c: cmd_myamoid(u, c, db)))
@@ -5892,8 +5971,8 @@ def main():
                                     chat_type=chat_type,
                                 )
                                 keyboard = InlineKeyboardMarkup([[
-                                    InlineKeyboardButton("🏢 Привязать компанию", callback_data=f"wazzup_link|{link_key}"),
-                                    InlineKeyboardButton("🚫 Не привязывать", callback_data=f"wazzup_ignore|{chat_id_val}")
+                                    InlineKeyboardButton("✅ Для рассылок", callback_data=f"wazzup_mailing|{link_key}"),
+                                    InlineKeyboardButton("👤 Просто контакт", callback_data=f"wazzup_link|{link_key}"),
                                 ]])
                                 preview = (text or "").replace("\n", " ").strip()
                                 if len(preview) > 120:
@@ -5903,10 +5982,10 @@ def main():
                                 await app.bot.send_message(
                                     chat_id=group_chat_id,
                                     text=(
-                                        f"📩 *Новый неизвестный контакт — {channel_label}*\n\n"
+                                        f"📩 *Новый контакт — {channel_label}*\n\n"
                                         f"👤 Имя: *{contact_name}*\n"
                                         f"💬 _{preview}_\n\n"
-                                        f"Чей клиент? Нажми и напиши как он называется в МойСклад"
+                                        f"Этот контакт для рассылок при согласовании заказов?"
                                     ),
                                     parse_mode="Markdown",
                                     reply_markup=keyboard
