@@ -5624,6 +5624,24 @@ async def cmd_set_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/managers — показать всех зарегистрированных пользователей и их chat_id."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    rows = db._fetchall(
+        "SELECT user_id, full_name, is_blocked FROM manager_chats ORDER BY full_name"
+    )
+    if not rows:
+        await update.message.reply_text("❌ Пользователи не найдены.")
+        return
+    lines = ["👥 *Зарегистрированные пользователи:*\n"]
+    for r in rows:
+        blocked = " 🚫" if r.get("is_blocked") else ""
+        lines.append(f"• {r['full_name']}{blocked}\n  ID: `{r['user_id']}`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -5666,6 +5684,7 @@ def main():
     app.add_handler(CommandHandler("unlink", cmd_unlink))
     app.add_handler(CommandHandler("relink", cmd_relink))
     app.add_handler(CommandHandler("sync_managers", cmd_sync_managers))
+    app.add_handler(CommandHandler("managers", cmd_managers))
     app.add_handler(CommandHandler("search_msg", cmd_search_msg))
     app.add_handler(CommandHandler("aging", cmd_aging))
     app.add_handler(CommandHandler("block", cmd_block_user))
