@@ -294,7 +294,6 @@ async def send_first_alarm(
     text = (
         f"⚡️ *Новая заявка!*\n\n"
         f"👤 Клиент: *{client_name}*\n"
-        f"👔 Менеджер: *{manager_name}*\n"
         f"🔗 {_lead_url(lead_id)}"
     )
     try:
@@ -362,7 +361,6 @@ async def _run_second_alarm_timer(
         text = (
             f"⏰ *Заявка висит без ответа уже 5 минут!*\n\n"
             f"👤 Клиент: *{client_name}*\n"
-            f"👔 Менеджер: *{manager_name}*\n"
             f"🔗 {_lead_url(lead_id)}"
         )
 
@@ -372,7 +370,6 @@ async def _run_second_alarm_timer(
         text = (
             f"⚠️ *Этап сменён без контакта с клиентом!*\n\n"
             f"👤 Клиент: *{client_name}*\n"
-            f"👔 Менеджер: *{manager_name}*\n"
             f"📋 Новый этап: *{new_stage_name}*\n"
             f"🔗 {_lead_url(lead_id)}"
         )
