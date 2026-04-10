@@ -5642,6 +5642,26 @@ async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_ms_attributes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ms_attributes — показать UUID дополнительных полей контрагентов."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    import aiohttp
+    from moysklad import get_headers
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://api.moysklad.ru/api/remap/1.2/entity/counterparty/metadata/attributes",
+            headers=get_headers()
+        ) as r:
+            data = await r.json()
+    rows = data.get("rows", [])
+    lines = ["Дополнительные поля контрагентов:\n"]
+    for row in rows:
+        lines.append(f"{row.get('name')} — {row.get('id')}")
+    await update.message.reply_text("\n".join(lines))
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -5730,6 +5750,7 @@ def main():
     app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
     app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
+    app.add_handler(CommandHandler("ms_attributes", cmd_ms_attributes))
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
