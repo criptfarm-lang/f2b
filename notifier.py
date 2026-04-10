@@ -17,6 +17,16 @@ QUIZ_BASE_URL = os.getenv("QUIZ_BASE_URL", "")
 MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
 WAZZUP_API_URL = "https://api.wazzup24.com/v3/message"
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
+# UUID дополнительных полей контрагентов в МойСклад
+ATTR_TELEGRAM = "15052610-34d7-11f1-0a80-1489000ec44a"
+ATTR_WHATSAPP = "1505270f-34d7-11f1-0a80-1489000ec44b"
+ATTR_MAX      = "1505236e-34d7-11f1-0a80-1489000ec449"
+
+# Каналы Wazzup
+CHANNEL_TELEGRAM = "ddd24a95-9304-4098-a320-3e47fcd1020a"
+CHANNEL_WHATSAPP = "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03"
+CHANNEL_MAX      = "1d5bc70a-7ca6-4895-8d1f-9690cf448214"
+
 
 MONTHS_RU = [
     "января", "февраля", "марта", "апреля", "мая", "июня",
@@ -88,6 +98,51 @@ async def _get_agent_tags(agent_id: str, headers: dict) -> list:
     return []
 
 
+async def _get_contact_from_ms(agent_id: str, headers: dict) -> dict | None:
+    """Читает контакт для рассылки из дополнительных полей контрагента в МойСклад.
+    Возвращает {chat_id, chat_type, channel_id} или None."""
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/counterparty/{agent_id}",
+                headers=headers,
+                params={"expand": "attributes"}
+            ) as r:
+                if r.status != 200:
+                    return None
+                cp = await r.json()
+
+        attributes = cp.get("attributes", [])
+        telegram_id = None
+        whatsapp_id = None
+        max_id = None
+
+        for attr in attributes:
+            attr_href = attr.get("meta", {}).get("href", "")
+            value = attr.get("value", "")
+            if not value:
+                continue
+            if ATTR_TELEGRAM in attr_href:
+                telegram_id = str(value)
+            elif ATTR_WHATSAPP in attr_href:
+                whatsapp_id = str(value)
+            elif ATTR_MAX in attr_href:
+                max_id = str(value)
+
+        # Приоритет: Telegram → Max → WhatsApp
+        if telegram_id:
+            return {"chat_id": telegram_id, "chat_type": "telegram", "channel_id": CHANNEL_TELEGRAM}
+        if max_id:
+            return {"chat_id": max_id, "chat_type": "max", "channel_id": CHANNEL_MAX}
+        if whatsapp_id:
+            return {"chat_id": whatsapp_id, "chat_type": "whatsapp", "channel_id": CHANNEL_WHATSAPP}
+
+    except Exception as e:
+        logger.warning(f"_get_contact_from_ms: {e}")
+    return None
+
+
 async def check_order_agreed(order_href: str, bot, db):
     """При смене статуса заказа на Согласовано — отправляем клиенту в мессенджер.
 
@@ -146,17 +201,13 @@ async def check_order_agreed(order_href: str, bot, db):
             db.save_agreed_notification(order_id)
             return
 
-        # ── 6. Ищем контакт в базе ────────────────────────────────────────
-        contact = db._fetchone(
-            """SELECT chat_id, channel_id, chat_type
-               FROM wazzup_contact_map
-               WHERE LOWER(company_name) LIKE LOWER(%s)
-               LIMIT 1""",
-            (f"%{agent_name}%",)
-        )
-        if not contact:
-            logger.info(f"notifier: контакт {agent_name} не найден в базе, пропускаем")
-            # НЕ сохраняем флаг — попробуем снова когда контакт появится
+        # ── 6. Ищем контакт в МойСклад ──────────────────────────────────
+        contact = await _get_contact_from_ms(agent_id, headers)
+        if contact:
+            logger.info(f"notifier: контакт {agent_name} найден в МойСклад → {contact['chat_type']}")
+        else:
+            logger.info(f"notifier: контакт {agent_name} не найден в МойСклад, пропускаем")
+            # НЕ сохраняем флаг — заполни поля Telegram/Max/WhatsApp в карточке контрагента
             return
 
         # ── 7. Позиции заказа ─────────────────────────────────────────────
