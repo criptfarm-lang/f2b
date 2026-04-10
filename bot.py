@@ -5509,7 +5509,7 @@ async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE
         if sent:
             lines.append(f"\nПолучили ({len(sent)}):")
             lines.extend(sent)
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(lines))
     except Exception as e:
         logger.error(f"cmd_notifier_status: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {e}")
