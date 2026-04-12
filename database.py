@@ -954,11 +954,31 @@ class Database:
             logger.warning(f"save_pending_ident: {e}")
 
     def get_pending_idents(self) -> list:
-        """Возвращает все ожидающие идентификации."""
+        """Возвращает все ожидающие идентификации (без отложенных)."""
         return self._fetchall(
-            "SELECT * FROM wazzup_pending_ident ORDER BY created_at",
+            "SELECT * FROM wazzup_pending_ident WHERE retry_after IS NULL OR retry_after <= NOW() ORDER BY created_at",
             []
         )
+
+    def get_retry_idents(self) -> list:
+        """Возвращает отложенные идентификации у которых пришло время повтора."""
+        return self._fetchall(
+            "SELECT * FROM wazzup_pending_ident WHERE retry_after IS NOT NULL AND retry_after <= NOW()",
+            []
+        )
+
+    def postpone_pending_ident(self, link_key: str, hours: int = 24):
+        """Откладывает идентификацию на N часов."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE wazzup_pending_ident SET retry_after = NOW() + INTERVAL '%s hours' WHERE link_key=%s",
+                    (hours, link_key)
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(f"postpone_pending_ident: {e}")
 
     def delete_pending_ident(self, link_key: str):
         """Удаляет идентификацию после завершения."""

@@ -840,6 +840,15 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
         )
         return
 
+    # Откладываем идентификацию на 24 часа: wazzup_later|link_key
+    if parts[0] == "wazzup_later":
+        link_key = parts[1] if len(parts) > 1 else ""
+        if link_key:
+            db.postpone_pending_ident(link_key, hours=24)
+            _wazzup_notified.discard(_pending_links.get(link_key, {}).get("chat_id", ""))
+        await query.message.edit_text("⏰ Напомню через 24 часа.")
+        return
+
     # Первое нажатие — запрашиваем название компании: wazzup_link|link_key
     if len(parts) < 2:
         return
@@ -5846,7 +5855,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
-    app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing)"))
+    app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing|wazzup_later)"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
     # ─── Алармы amoCRM ───────────────────────────────────────────────────────
     app.add_handler(CommandHandler("myamoid", lambda u, c: cmd_myamoid(u, c, db)))
@@ -5864,6 +5873,61 @@ def main():
 
     # Планировщик
     setup_scheduler(app, db)
+
+    async def retry_pending_idents(context):
+        """Каждый час проверяем отложенные идентификации и повторяем запрос."""
+        try:
+            rows = db.get_retry_idents()
+            if not rows:
+                return
+            group_chat_id = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
+            if not group_chat_id:
+                return
+            import uuid as _uuid3
+            for row in rows:
+                old_link_key = row["link_key"]
+                chat_id_val = row["chat_id"]
+                channel_id_val = row.get("channel_id", "")
+                wazzup_name = row.get("wazzup_name", "")
+                chat_type = row.get("chat_type", "telegram")
+
+                # Создаём новый link_key
+                link_key = str(_uuid3.uuid4())[:8]
+                _pending_links[link_key] = {
+                    "chat_id": chat_id_val,
+                    "channel_id": channel_id_val,
+                    "wazzup_name": wazzup_name,
+                    "chat_type": chat_type,
+                }
+                db.save_pending_link(link_key, chat_id_val, channel_id_val, wazzup_name, chat_type)
+                db.delete_pending_ident(old_link_key)
+
+                CHANNEL_NAMES = {"telegram": "Telegram", "tgapi": "Telegram", "max": "Max", "whatsapp": "WhatsApp"}
+                channel_label = CHANNEL_NAMES.get(chat_type, chat_type)
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Для рассылок", callback_data=f"wazzup_mailing|{link_key}"),
+                        InlineKeyboardButton("👤 Просто контакт", callback_data=f"wazzup_link|{link_key}"),
+                    ],
+                    [
+                        InlineKeyboardButton("⏰ Привязать позже", callback_data=f"wazzup_later|{link_key}"),
+                    ]
+                ])
+                await context.bot.send_message(
+                    chat_id=group_chat_id,
+                    text=(
+                        f"🔔 *Напоминание — {channel_label}*\n\n"
+                        f"👤 *{wazzup_name}* ещё не привязан к компании.\n\n"
+                        f"Этот контакт для рассылок при согласовании заказов?"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=keyboard,
+                )
+                logger.info(f"retry_pending_idents: повторный запрос для {wazzup_name} ({chat_id_val})")
+        except Exception as e:
+            logger.error(f"retry_pending_idents: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(retry_pending_idents, interval=3600, first=300)
 
     # Запускаем webhook-сервер и polling параллельно
     import aiohttp.web as web
@@ -6011,10 +6075,15 @@ def main():
                                     wazzup_name=contact_name,
                                     chat_type=chat_type,
                                 )
-                                keyboard = InlineKeyboardMarkup([[
-                                    InlineKeyboardButton("✅ Для рассылок", callback_data=f"wazzup_mailing|{link_key}"),
-                                    InlineKeyboardButton("👤 Просто контакт", callback_data=f"wazzup_link|{link_key}"),
-                                ]])
+                                keyboard = InlineKeyboardMarkup([
+                                    [
+                                        InlineKeyboardButton("✅ Для рассылок", callback_data=f"wazzup_mailing|{link_key}"),
+                                        InlineKeyboardButton("👤 Просто контакт", callback_data=f"wazzup_link|{link_key}"),
+                                    ],
+                                    [
+                                        InlineKeyboardButton("⏰ Привязать позже", callback_data=f"wazzup_later|{link_key}"),
+                                    ]
+                                ])
                                 preview = (text or "").replace("\n", " ").strip()
                                 if len(preview) > 120:
                                     preview = preview[:120] + "..."
