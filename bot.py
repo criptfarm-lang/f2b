@@ -695,6 +695,18 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
                         manager=cp_data.get("manager", ""),
                         segment=cp_data.get("buyer_type", ""),
                     )
+                    # Записываем chat_id в МойСклад
+                    agent_href = cp_data.get("href", "")
+                    if agent_href and pending.get("chat_type"):
+                        ms_ok = await _write_contact_to_ms(
+                            agent_href=agent_href,
+                            chat_type=pending["chat_type"],
+                            chat_id=pending["chat_id"],
+                        )
+                        if ms_ok:
+                            logger.info(f"_write_contact_to_ms: {pending['chat_id']} ({pending['chat_type']}) → {cp_name}")
+                        else:
+                            logger.warning(f"_write_contact_to_ms: не удалось записать {pending['chat_id']} → {cp_name}")
             except Exception as e:
                 logger.warning(f"Теги МойСклад: {e}")
             await query.message.edit_text(
