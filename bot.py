@@ -5962,6 +5962,35 @@ def main():
                         )
                         if ignored:
                             continue
+                        # Проверяем есть ли уже chat_id в МойСклад — если да, идентификация не нужна
+                        try:
+                            from moysklad import get_headers
+                            import aiohttp as _aiohttp
+                            _attr_id = MS_ATTR_BY_TYPE.get(chat_type.lower(), "")
+                            if _attr_id:
+                                _ms_url = f"https://api.moysklad.ru/api/remap/1.2/entity/counterparty"
+                                async with _aiohttp.ClientSession() as _s:
+                                    async with _s.get(
+                                        _ms_url,
+                                        headers=get_headers(),
+                                        params={"filter": f"attributes.{_attr_id}={chat_id_val}", "limit": 1}
+                                    ) as _r:
+                                        if _r.status == 200:
+                                            _data = await _r.json()
+                                            if _data.get("rows"):
+                                                _cp_name = _data["rows"][0].get("name", "")
+                                                logger.info(f"Wazzup: {chat_id_val} уже в МойСклад ({_cp_name}), идентификация не нужна")
+                                                db.link_wazzup_contact(
+                                                    chat_id=chat_id_val,
+                                                    chat_type=chat_type,
+                                                    channel_id=channel_id_val,
+                                                    company_name=_cp_name,
+                                                    wazzup_name=contact_name,
+                                                    role="рассылка",
+                                                )
+                                                continue
+                        except Exception as _e:
+                            logger.warning(f"Wazzup: проверка МойСклад не удалась: {_e}")
                         group_chat_id = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
                         logger.info(f"Wazzup: отправляю уведомление в группу {group_chat_id}")
                         if group_chat_id:
