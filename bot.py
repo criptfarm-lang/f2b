@@ -4366,9 +4366,27 @@ async def cmd_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or user.id != 360092495:
         return
-    await update.message.reply_text("🔄 Запускаю обновление кэша... (займёт несколько минут)")
-    import asyncio
-    asyncio.ensure_future(_refresh_report_cache())
+    await update.message.reply_text("🔄 Собираю данные из МойСклад... (3-5 мин)")
+    try:
+        # Сначала удаляем старый кэш
+        db._execute("DELETE FROM report_cache")
+        # Собираем синхронно — ждём результата
+        data = await _build_report_data()
+        db.set_report_cache(data)
+        mgrs = list(data.get("facts", {}).keys())
+        att = data.get("attestation", {})
+        wt = data.get("weekly_targets", {})
+        lines = ["✅ Кэш обновлён!\n"]
+        for mg in mgrs:
+            short = data.get("short_names", {}).get(mg, mg)
+            a = att.get(mg, {})
+            w = wt.get(mg, {})
+            att_str = f"общая {a.get('general','—')}% / АКБ {a.get('akb','—')}%" if a else "аттестация не задана"
+            lines.append(f"*{short}*: {att_str}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"cmd_refresh_cache: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 async def cmd_web_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
