@@ -6301,7 +6301,8 @@ async def process_ms_webhook(data: dict, bot):
             logger.info(f"Webhook: заказ {order_id} action={action} already_checked={already_checked}")
 
             # Смена статуса на "Согласовано" — отправляем клиенту
-            if action == "UPDATE" and not already_checked:
+            # Notifier сам делает дедупликацию через agreed_notifications
+            if action == "UPDATE":
                 await check_order_agreed(order_href, bot, db)
 
             # ПДЗ алерт — только для новых заказов, только один раз
