@@ -669,6 +669,7 @@ def format_counterparty_balance(counterparties: list, query: str) -> str:
 MANAGER_TAGS = {
     "баласанян": "Карина Баласанян",
     "леонтьев":  "Алексей Леонтьев",
+    "коликов":   "Денис Коликов",
     "мерзлякова": "Елена Мерзлякова",
     "скляр":     "Инесса Скляр",
 }
@@ -813,20 +814,6 @@ async def get_counterparty_requisites(counterparty_id: str) -> dict:
                 initials += lm[0] + "."
             director = f"{ll} {initials}".strip()
 
-        cp_type = cp.get("companyType", "")
-
-        # Для ИП: полное ФИО из legalLastName + legalFirstName + legalMiddleName
-        full_fio_ip = ""
-        if cp_type == "entrepreneur" and ll:
-            full_fio_ip = " ".join(filter(None, [ll, lf, lm]))
-
-        # buyer_legal_title: для ИП берём "ИП Фамилия Имя Отчество" если legalTitle пустой
-        legal_title = cp.get("legalTitle", "") or ""
-        if not legal_title and cp_type == "entrepreneur" and full_fio_ip:
-            legal_title = f"ИП {full_fio_ip}"
-        if not legal_title:
-            legal_title = cp.get("name", "")
-
         result = {
             "buyer_inn": cp.get("inn", "") or "",
             "buyer_ogrn": cp.get("ogrn", "") or cp.get("ogrnip", "") or "",
@@ -835,11 +822,7 @@ async def get_counterparty_requisites(counterparty_id: str) -> dict:
             "buyer_email": cp.get("email", "") or "",
             "buyer_director_name": director,
             "buyer_name": cp.get("name", ""),
-            "buyer_legal_title": legal_title,
-            # Поля ФИО для ИП — используются в bot.py
-            "buyer_last_name": ll,
-            "buyer_first_name": lf,
-            "buyer_middle_name": lm,
+            "buyer_legal_title": cp.get("legalTitle", "") or cp.get("name", ""),
             "href": f"{MS_BASE}/entity/counterparty/{counterparty_id}",
             "id": counterparty_id,
         }
@@ -847,6 +830,8 @@ async def get_counterparty_requisites(counterparty_id: str) -> dict:
 
         # Представитель для договора
         if director:
+            # Определяем должность по типу контрагента
+            cp_type = cp.get("companyType", "")
             if cp_type == "entrepreneur":
                 result["buyer_representative"] = f"индивидуального предпринимателя {director}"
             else:
@@ -2453,9 +2438,6 @@ async def get_aging_clients(days: int = 50) -> list:
             result.sort(key=lambda x: x["days"], reverse=True)
 
             # Дозагружаем имена и теги через карточки контрагентов
-            # Фильтруем закрытых и переименованных
-            EXCLUDED_STATUSES = {"закрылся", "переименован"}
-            filtered_result = []
             async with aiohttp.ClientSession() as session2:
                 for client in result:
                     try:
@@ -2465,18 +2447,10 @@ async def get_aging_clients(days: int = 50) -> list:
                         ) as r:
                             if r.status == 200:
                                 cp = await r.json()
-                                # Проверяем статус — исключаем закрытых и переименованных
-                                cp_status = (cp.get("state") or {}).get("name", "").lower().strip()
-                                if cp_status in EXCLUDED_STATUSES:
-                                    logger.info(f"get_aging_clients: исключён {cp.get('name')} — статус '{cp_status}'")
-                                    continue
                                 client["name"] = cp.get("name", client["name"])
                                 client["tags"] = [t.lower() for t in cp.get("tags", [])]
-                                filtered_result.append(client)
                     except Exception:
-                        filtered_result.append(client)
-
-            result = filtered_result
+                        pass
 
             logger.info(f"get_aging_clients: стареющих клиентов = {len(result)}")
             return result
@@ -2497,6 +2471,7 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
         "мерзлякова": "Елена Мерзлякова",
         "баласанян":  "Карина Баласанян",
         "леонтьев":   "Алексей Леонтьев",
+        "коликов":    "Денис Коликов",
     }
 
     result = {name: {"shipments": 0, "revenue": 0.0, "clients": set(), "new_clients": 0}
@@ -2594,6 +2569,7 @@ async def get_attracted_goods_by_manager(date_from: str, date_to: str) -> dict:
         "мерзлякова": "Елена Мерзлякова",
         "баласанян":  "Карина Баласанян",
         "леонтьев":   "Алексей Леонтьев",
+        "коликов":    "Денис Коликов",
     }
     GROUP_NAMES = ["ПРИВЛЕЧЕННЫЕ ТОВАРЫ", "Акционный прайс-лист"]
 
@@ -2691,6 +2667,7 @@ async def get_lost_clients_by_manager(date_from: str, date_to: str) -> dict:
         "мерзлякова": "Елена Мерзлякова",
         "баласанян":  "Карина Баласанян",
         "леонтьев":   "Алексей Леонтьев",
+        "коликов":    "Денис Коликов",
     }
 
     result = {name: 0 for name in MANAGERS.values()}

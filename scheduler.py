@@ -34,6 +34,7 @@ PDZ_MANAGERS = [
     {"name": "Елена",    "tag": "мерзлякова", "name_fragment": "Мерзлякова"},
     {"name": "Инесса",   "tag": "скляр",      "name_fragment": "Скляр"},
     {"name": "Алексей",  "tag": "леонтьев",   "name_fragment": "Леонтьев"},
+    {"name": "Денис",    "tag": "коликов",    "name_fragment": "Коликов"},
 ]
 
 # Флаг — был ли запущен /pdz сегодня (для вечерней сводки)
@@ -83,14 +84,6 @@ def setup_scheduler(app: Application, db):
         CronTrigger(hour=2, minute=0),
         args=[app],
         id="sync_managers"
-    )
-
-    # 09:00 МСК (06:00 UTC) — обновление кэша отчёта ОП
-    scheduler.add_job(
-        refresh_report_cache_job,
-        CronTrigger(hour=6, minute=0, timezone="UTC"),
-        args=[app],
-        id="refresh_report_cache"
     )
 
     scheduler.start()
@@ -296,17 +289,6 @@ async def sync_managers_job(app: Application):
     except Exception as e:
         logger.error(f"sync_managers_job: {e}", exc_info=True)
 
-
-async def refresh_report_cache_job(app: Application):
-    """Каждые 30 минут обновляет кэш отчёта ОП."""
-    try:
-        from bot import _refresh_report_cache
-        logger.info("refresh_report_cache_job: обновляю кэш отчёта...")
-        await _refresh_report_cache()
-        logger.info("refresh_report_cache_job: кэш обновлён")
-    except Exception as e:
-        logger.error(f"refresh_report_cache_job: {e}", exc_info=True)
-
 async def check_aging_clients(app: Application):
     """Ежедневно в 12:00 — алерт по новым стареющим клиентам (40+ дней без отгрузок)."""
     from moysklad import get_aging_clients
@@ -339,6 +321,7 @@ async def check_aging_clients(app: Application):
             "мерзлякова": "Елена Мерзлякова",
             "скляр": "Инесса Скляр",
             "леонтьев": "Алексей Леонтьев",
+            "коликов": "Денис Коликов",
         }
 
         import asyncio
