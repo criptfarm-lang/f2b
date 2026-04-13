@@ -33,8 +33,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .dc-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; font-size: 12px; }
 .dc-row .dl { color: #6b7280; }
 .dc-row .dv { font-weight: 500; }
-.bar-mini { height: 3px; background: #e8e5f5; border-radius: 2px; margin-bottom: 5px; }
+.bar-mini { height: 4px; background: #e8e5f5; border-radius: 2px; position: relative; overflow: visible; }
 .bar-fill { height: 100%; border-radius: 2px; }
+/* Weekly tick on manager detail bars */
+.week-tick { position: absolute; top: -4px; width: 2px; height: 12px; border-radius: 1px; }
+.week-tick-label { position: absolute; top: 10px; font-size: 9px; font-weight: 700; white-space: nowrap; transform: translateX(-50%); line-height: 1; }
 .badge { display: inline-flex; align-items: center; gap: 4px; border-radius: 5px; padding: 3px 8px; font-size: 11px; font-weight: 600; margin-top: 6px; cursor: pointer; position: relative; }
 .badge-new { background: #f0fdf4; color: #059669; border: 1px solid #bbf7d0; }
 .badge-lost { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; margin-left: 6px; }
@@ -45,27 +48,32 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .hist-section.visible { display: block; }
 .hist-title { font-size: 15px; font-weight: 600; margin-bottom: 16px; color: #1e1b4b; }
 .hist-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+/* ── Plan bars section ── */
+.plan-section { background: #fff; border-radius: 10px; border: 1px solid #e8e5f5; padding: 18px 20px; margin-bottom: 20px; }
+.plan-section-title { font-size: 11px; font-weight: 600; color: #6b7280; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 14px; }
+.plan-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid #f0effe; }
+.plan-legend-item { display: flex; align-items: center; gap: 5px; font-size: 11px; }
+.plan-legend-dot { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.plan-row { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
+.plan-row:last-child { margin-bottom: 0; }
+.plan-row-label { font-size: 12px; color: #6b7280; width: 105px; flex-shrink: 0; }
+.plan-stacked-wrap { flex: 1; position: relative; padding-top: 20px; }
+.plan-bar-outer { height: 10px; background: #f0effe; border-radius: 5px; display: flex; overflow: hidden; }
+.plan-seg { height: 100%; }
+/* tick line above bar (rendered inside padding-top space) */
+.plan-tick { position: absolute; bottom: 0; width: 2px; height: 26px; border-radius: 1px; z-index: 2; }
+.plan-tick-label { position: absolute; bottom: 28px; font-size: 10px; font-weight: 700; white-space: nowrap; transform: translateX(-50%); line-height: 1; }
+.plan-row-right { display: flex; flex-direction: column; align-items: flex-end; width: 120px; flex-shrink: 0; }
+.plan-row-pct { font-size: 14px; font-weight: 700; line-height: 1; }
+.plan-row-vals { font-size: 10px; color: #9ca3af; margin-top: 3px; }
+/* Attestation badges */
+.att-badge { display: inline-flex; align-items: center; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 700; margin-left: 4px; }
+.att-ok   { background: #f0fdf4; color: #059669; border: 1px solid #bbf7d0; }
+.att-warn { background: #fffbeb; color: #d97706; border: 1px solid #fde68a; }
+.att-bad  { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
 .loading { text-align: center; padding: 60px 20px; color: #6b7280; }
 .spinner { width: 28px; height: 28px; border: 3px solid #e8e5f5; border-top-color: #7c3aed; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px; }
 @keyframes spin { to { transform: rotate(360deg); } }
-/* Plan bars section */
-.plan-section { background: #fff; border-radius: 10px; border: 1px solid #e8e5f5; padding: 16px; margin-bottom: 20px; }
-.plan-section-title { font-size: 13px; font-weight: 600; color: #6b7280; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 14px; }
-.plan-mgr-block { margin-bottom: 14px; }
-.plan-mgr-block:last-child { margin-bottom: 0; }
-.plan-mgr-name { font-size: 12px; font-weight: 600; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
-.plan-bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-.plan-bar-label { font-size: 11px; color: #6b7280; width: 90px; flex-shrink: 0; }
-.plan-bar-track { flex: 1; height: 8px; background: #f0effe; border-radius: 4px; position: relative; overflow: visible; }
-.plan-bar-fact { height: 100%; border-radius: 4px; transition: width 0.3s; }
-.plan-bar-week-tick { position: absolute; top: -3px; width: 2px; height: 14px; border-radius: 1px; }
-.plan-bar-pct { font-size: 11px; font-weight: 600; width: 36px; text-align: right; flex-shrink: 0; }
-.plan-bar-vals { font-size: 10px; color: #9ca3af; text-align: right; width: 100px; flex-shrink: 0; }
-/* Attestation badge */
-.att-badge { display: inline-flex; align-items: center; gap: 3px; border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: 700; margin-left: 6px; }
-.att-ok  { background: #f0fdf4; color: #059669; border: 1px solid #bbf7d0; }
-.att-warn{ background: #fffbeb; color: #d97706; border: 1px solid #fde68a; }
-.att-bad { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
 </style>
 </head>
 <body>
@@ -94,18 +102,18 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 </div>
 <script>
 const DATA = __REPORT_DATA__;
-const MGR_COLORS = ['#7c3aed','#a855f7','#c084fc','#e879f9'];
+const MGR_COLORS = ['#7c3aed','#a855f7','#c084fc','#e879f9','#60a5fa'];
 const METRICS = [
-  { key:'revenue',     label:'Выручка',      divisor:1e6, fmt: v => v.toFixed(1)+' млн' },
-  { key:'shipments',   label:'Отгрузки',      divisor:1,   fmt: v => Math.round(v)+' шт' },
-  { key:'clients',     label:'АКБ',           divisor:1,   fmt: v => Math.round(v)+' кл' },
-  { key:'new_clients', label:'Новые клиенты', divisor:1,   fmt: v => Math.round(v)+' кл' },
-  { key:'attracted',   label:'Привл. товары', divisor:1e6, fmt: v => v.toFixed(2)+' млн' },
+  { key:'revenue',     label:'Выручка',        divisor:1e6, fmt: v => v.toFixed(1)+' млн' },
+  { key:'shipments',   label:'Отгрузки',        divisor:1,   fmt: v => Math.round(v)+' шт' },
+  { key:'clients',     label:'АКБ',             divisor:1,   fmt: v => Math.round(v)+' кл' },
+  { key:'new_clients', label:'Новые клиенты',   divisor:1,   fmt: v => Math.round(v)+' кл' },
+  { key:'attracted',   label:'Привл. товары',   divisor:1e6, fmt: v => v.toFixed(2)+' млн' },
 ];
 const HIST_METRICS = [
-  { key:'revenue',   label:'Выручка по месяцам', divisor:1e6, fmt: v => v.toFixed(1)+' млн' },
-  { key:'shipments', label:'Отгрузки по месяцам', divisor:1,  fmt: v => Math.round(v)+'' },
-  { key:'clients',   label:'АКБ по месяцам',      divisor:1,  fmt: v => Math.round(v)+'' },
+  { key:'revenue',   label:'Выручка по месяцам',  divisor:1e6, fmt: v => v.toFixed(1)+' млн' },
+  { key:'shipments', label:'Отгрузки по месяцам', divisor:1,   fmt: v => Math.round(v)+'' },
+  { key:'clients',   label:'АКБ по месяцам',      divisor:1,   fmt: v => Math.round(v)+'' },
 ];
 let charts = {};
 let histCharts = {};
@@ -119,23 +127,26 @@ function avgPct(mg){
   const vals=METRICS.map(m=>pct(f[m.key]||0,p[m.key]||0));
   return Math.round(vals.reduce((a,b)=>a+b,0)/vals.length);
 }
-
 function fmtMonth(ym){
   const [y,m]=ym.split('-');
   const names=['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
   return names[parseInt(m)-1]+' '+y.slice(2);
 }
 
+/* ── Summary cards ── */
 function renderSummary(){
+  const allMgrs=Object.keys(DATA.plans);
   document.getElementById('summary').innerHTML = METRICS.map(m=>{
-    const allMgrs=Object.keys(DATA.plans);
     const tf=allMgrs.reduce((s,mg)=>s+(DATA.facts[mg]?.[m.key]||0),0);
     const tp=allMgrs.reduce((s,mg)=>s+(DATA.plans[mg]?.[m.key]||0),0);
     const p=pct(tf,tp);
-    return '<div class="s-card"><div class="label">'+m.label+'</div><div class="value">'+m.fmt(tf/m.divisor)+'</div><div class="pct '+pClass(p)+'">'+p+'% из '+m.fmt(tp/m.divisor)+'</div></div>';
+    return '<div class="s-card"><div class="label">'+m.label+'</div>'
+          +'<div class="value">'+m.fmt(tf/m.divisor)+'</div>'
+          +'<div class="pct '+pClass(p)+'">'+p+'% из '+m.fmt(tp/m.divisor)+'</div></div>';
   }).join('');
 }
 
+/* ── Tabs ── */
 function renderTabs(){
   const tabs=[['all','Все'],...mgrs.map(m=>[m,DATA.short_names[m]||m])];
   document.getElementById('tabs').innerHTML=tabs.map(([id,label])=>
@@ -143,11 +154,13 @@ function renderTabs(){
   ).join('');
 }
 
+/* ── Bar charts (Chart.js) ── */
 function renderAllCharts(){
   const labels=mgrs.map(m=>DATA.short_names[m]||m);
   const colors=mgrs.map((_,i)=>MGR_COLORS[i%MGR_COLORS.length]);
   document.getElementById('charts').innerHTML=METRICS.map((m,mi)=>
-    '<div class="chart-wrap"><div class="chart-label">'+m.label+'</div><div style="position:relative;height:200px"><canvas id="chart_'+mi+'"></canvas></div></div>'
+    '<div class="chart-wrap"><div class="chart-label">'+m.label+'</div>'
+    +'<div style="position:relative;height:200px"><canvas id="chart_'+mi+'"></canvas></div></div>'
   ).join('');
   Object.values(charts).forEach(c=>c.destroy()); charts={};
   METRICS.forEach((m,mi)=>{
@@ -157,7 +170,11 @@ function renderAllCharts(){
       type:'bar',
       data:{labels,datasets:[
         {label:'Факт',data:fData,backgroundColor:colors.map(c=>c+'bb'),borderColor:colors,borderWidth:1,borderRadius:4},
-        {label:'План',data:pData,type:'line',borderColor:fData.map((f,i)=>f>=(pData[i]||0)?'#22c55e':'#ef4444'),borderWidth:2,borderDash:[4,3],pointRadius:4,pointBackgroundColor:fData.map((f,i)=>f>=(pData[i]||0)?'#22c55e':'#ef4444'),fill:false,tension:0}
+        {label:'План',data:pData,type:'line',
+         borderColor:fData.map((f,i)=>f>=(pData[i]||0)?'#22c55e':'#ef4444'),
+         borderWidth:2,borderDash:[4,3],pointRadius:4,
+         pointBackgroundColor:fData.map((f,i)=>f>=(pData[i]||0)?'#22c55e':'#ef4444'),
+         fill:false,tension:0}
       ]},
       options:{responsive:true,maintainAspectRatio:false,
         plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>' '+(ctx.dataset.label||'')+': '+m.fmt(ctx.raw)}}},
@@ -167,6 +184,91 @@ function renderAllCharts(){
   });
 }
 
+/* ── Plan bars: ONE stacked bar per metric, tick = total weekly target ── */
+function renderPlanBars(){
+  const allMgrs = Object.keys(DATA.plans);
+  const wt  = DATA.weekly_targets || {};
+  const att = DATA.attestation    || {};
+  if(!allMgrs.length){ document.getElementById('plan-bars-section').innerHTML=''; return; }
+
+  // Legend with attestation badges
+  let legendHtml = '<div class="plan-legend">';
+  allMgrs.forEach((mg,i)=>{
+    const short = DATA.short_names[mg]||mg;
+    const color = MGR_COLORS[i%MGR_COLORS.length];
+    const avg   = avgPct(mg);
+    const a     = att[mg]||{};
+    let attH = '';
+    if(a.general!==undefined){const c=a.general>=80?'att-ok':a.general>=50?'att-warn':'att-bad';attH+='<span class="att-badge '+c+'">АТТ '+a.general+'%</span>';}
+    if(a.akb!==undefined){const c=a.akb>=80?'att-ok':a.akb>=50?'att-warn':'att-bad';attH+='<span class="att-badge '+c+'">АКБ '+a.akb+'%</span>';}
+    legendHtml += '<div class="plan-legend-item">'
+      +'<div class="plan-legend-dot" style="background:'+color+'"></div>'
+      +'<span style="font-weight:600;color:'+color+'">'+short+'</span>'
+      +'<span class="'+pClass(avg)+'" style="font-weight:700;font-size:11px">&nbsp;'+avg+'%</span>'
+      +attH+'</div>';
+  });
+  legendHtml += '</div>';
+
+  // One row per metric
+  let rowsHtml = '';
+  METRICS.forEach(m => {
+    const totalPlan = allMgrs.reduce((s,mg)=>s+(DATA.plans[mg]?.[m.key]||0),0);
+    const totalFact = allMgrs.reduce((s,mg)=>s+(DATA.facts[mg]?.[m.key]||0),0);
+    const totalWeek = allMgrs.reduce((s,mg)=>s+((wt[mg]?.[m.key])||0),0);
+    if(!totalPlan) return;
+
+    const overallPct = Math.min(Math.round(totalFact/totalPlan*100),100);
+    const cls = pClass(overallPct);
+
+    // Stacked segments: width of each segment = mgr_fact / total_plan * 100%
+    // Total width of all segments capped at 100% combined
+    let segsHtml = '';
+    let usedPct = 0;
+    allMgrs.forEach((mg,i)=>{
+      const fv = DATA.facts[mg]?.[m.key]||0;
+      let segW = (fv/totalPlan)*100;
+      segW = Math.min(segW, 100 - usedPct);
+      if(segW <= 0) return;
+      usedPct += segW;
+      const color = MGR_COLORS[i%MGR_COLORS.length];
+      const isFirst = segsHtml === '';
+      segsHtml += '<div style="width:'+segW.toFixed(2)+'%;height:100%;background:'+color+'bb;'+(isFirst?'border-radius:5px 0 0 5px':'')+'"></div>';
+    });
+    // Round last segment right corners
+    if(segsHtml) segsHtml = segsHtml.replace(/(<div[^>]+)(<\/div>)$/, '$1 border-radius:0 5px 5px 0">');
+
+    // Weekly tick: position = totalWeek / totalPlan * 100%, capped at 97%
+    let tickHtml = '';
+    if(totalWeek > 0){
+      const tickPct = Math.min((totalWeek/totalPlan)*100, 97);
+      const tickColor = totalFact >= totalWeek ? '#22c55e' : '#ef4444';
+      const tickLabel = m.fmt(totalWeek/m.divisor);
+      tickHtml = '<div class="plan-tick" style="left:'+tickPct.toFixed(2)+'%;background:'+tickColor+';">'
+                +'<div class="plan-tick-label" style="color:'+tickColor+'">'+tickLabel+'</div>'
+                +'</div>';
+    }
+
+    rowsHtml += '<div class="plan-row">'
+      +'<div class="plan-row-label">'+m.label+'</div>'
+      +'<div class="plan-stacked-wrap">'
+      +  tickHtml
+      +  '<div class="plan-bar-outer">'+segsHtml+'</div>'
+      +'</div>'
+      +'<div class="plan-row-right">'
+      +  '<span class="plan-row-pct '+cls+'">'+overallPct+'%</span>'
+      +  '<span class="plan-row-vals">'+m.fmt(totalFact/m.divisor)+' / '+m.fmt(totalPlan/m.divisor)+'</span>'
+      +'</div>'
+      +'</div>';
+  });
+
+  document.getElementById('plan-bars-section').innerHTML =
+    '<div class="plan-section">'
+    +'<div class="plan-section-title">Выполнение плана — общий</div>'
+    +legendHtml+rowsHtml
+    +'</div>';
+}
+
+/* ── All-view manager mini-cards ── */
 function renderAllDetail(){
   document.getElementById('detail').innerHTML=mgrs.map((mg,i)=>{
     const f=DATA.facts[mg]||{},p=DATA.plans[mg]||{};
@@ -177,91 +279,24 @@ function renderAllDetail(){
     const lostNames=(DATA.lost_client_names||{})[mg]||[];
     const rows=METRICS.map(m=>{
       const pc=pct(f[m.key]||0,p[m.key]||0);
-      return '<div class="dc-row"><span class="dl">'+m.label+'</span><span class="dv '+pClass(pc)+'">'+m.fmt((f[m.key]||0)/m.divisor)+' / '+m.fmt((p[m.key]||0)/m.divisor)+'</span></div><div class="bar-mini"><div class="bar-fill" style="width:'+Math.min(pc,100)+'%;background:'+color+'"></div></div>';
+      return '<div class="dc-row"><span class="dl">'+m.label+'</span>'
+            +'<span class="dv '+pClass(pc)+'">'+m.fmt((f[m.key]||0)/m.divisor)+' / '+m.fmt((p[m.key]||0)/m.divisor)+'</span></div>'
+            +'<div class="bar-mini" style="margin-bottom:5px;">'
+            +'<div class="bar-fill" style="width:'+Math.min(pc,100)+'%;background:'+color+'"></div>'
+            +'</div>';
     }).join('');
     const newTip=newNames.length?newNames.join('<br>'):'нет данных';
     const lostTip=lostNames.length?lostNames.join('<br>'):'нет данных';
     const badges=(newCl>0?'<span class="badge badge-new">+ новых: '+newCl+'<span class="tooltip">'+newTip+'</span></span>':'')
                 +(lost>0?'<span class="badge badge-lost">▼ выбыли: '+lost+'<span class="tooltip">'+lostTip+'</span></span>':'');
-    return '<div class="detail-card"><div class="dc-header"><span class="dc-name" style="color:'+color+'">'+short+'</span><span class="dc-avg '+pClass(avg)+'">'+avg+'%</span></div>'+rows+(badges?'<div style="margin-top:8px">'+badges+'</div>':'')+'</div>';
+    return '<div class="detail-card"><div class="dc-header">'
+          +'<span class="dc-name" style="color:'+color+'">'+short+'</span>'
+          +'<span class="dc-avg '+pClass(avg)+'">'+avg+'%</span></div>'
+          +rows+(badges?'<div style="margin-top:8px">'+badges+'</div>':'')+'</div>';
   }).join('');
 }
 
-function renderPlanBars(){
-  const wt = DATA.weekly_targets || {};
-  const att = DATA.attestation || {};
-  const today = new Date();
-  const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
-  const monthEnd   = new Date(today.getFullYear(), today.getMonth()+1, 0);
-  const totalDays  = monthEnd.getDate();
-  const passedDays = today.getDate();
-  // Ожидаемый прогресс на сегодня (0..1)
-  const dayRatio   = passedDays / totalDays;
-
-  const allMgrs = Object.keys(DATA.plans);
-  if(!allMgrs.length){ document.getElementById('plan-bars-section').innerHTML=''; return; }
-
-  let html = '<div class="plan-section"><div class="plan-section-title">Выполнение плана — общий</div>';
-
-  allMgrs.forEach((mg, mi) => {
-    const f    = DATA.facts[mg]  || {};
-    const p    = DATA.plans[mg]  || {};
-    const w    = wt[mg]          || {};
-    const a    = att[mg]         || {};
-    const short= DATA.short_names[mg] || mg;
-    const color= MGR_COLORS[mi % MGR_COLORS.length];
-    const avg  = avgPct(mg);
-
-    // Аттестация
-    let attHtml = '';
-    if(a.general !== undefined){
-      const ac = a.general >= 80 ? 'att-ok' : a.general >= 50 ? 'att-warn' : 'att-bad';
-      attHtml += '<span class="att-badge '+ac+'">АТТ '+a.general+'%</span>';
-    }
-    if(a.akb !== undefined){
-      const ac2 = a.akb >= 80 ? 'att-ok' : a.akb >= 50 ? 'att-warn' : 'att-bad';
-      attHtml += '<span class="att-badge '+ac2+'">АКБ '+a.akb+'%</span>';
-    }
-
-    html += '<div class="plan-mgr-block">';
-    html += '<div class="plan-mgr-name" style="color:'+color+'">'+short
-          + '<span style="font-size:11px;font-weight:700;color:'+(avg>=80?'#059669':avg>=50?'#d97706':'#dc2626')+'">'+avg+'%</span>'
-          + attHtml+'</div>';
-
-    METRICS.forEach(m => {
-      const fv  = f[m.key] || 0;
-      const pv  = p[m.key] || 0;
-      const wv  = w[m.key] || 0;
-      if(!pv) return;
-      const pc  = Math.min(Math.round(fv / pv * 100), 100);
-      const cls = pc >= 80 ? 'good' : pc >= 50 ? 'warn' : 'bad';
-
-      // Риска недельного плана: позиция = wv/pv * 100% (кап 95%)
-      let tickHtml = '';
-      if(wv > 0 && pv > 0){
-        const tickPct = Math.min(Math.round(wv / pv * 100), 95);
-        const tickColor = fv >= wv ? '#22c55e' : '#ef4444';
-        tickHtml = '<div class="plan-bar-week-tick" style="left:'+tickPct+'%;background:'+tickColor+';"></div>';
-      }
-
-      html += '<div class="plan-bar-row">'
-            + '<span class="plan-bar-label">'+m.label+'</span>'
-            + '<div class="plan-bar-track">'
-            +   '<div class="plan-bar-fact" style="width:'+pc+'%;background:'+color+'bb;"></div>'
-            +   tickHtml
-            + '</div>'
-            + '<span class="plan-bar-pct '+cls+'">'+pc+'%</span>'
-            + '<span class="plan-bar-vals">'+m.fmt(fv/m.divisor)+' / '+m.fmt(pv/m.divisor)+'</span>'
-            + '</div>';
-    });
-
-    html += '</div>'; // plan-mgr-block
-  });
-
-  html += '</div>'; // plan-section
-  document.getElementById('plan-bars-section').innerHTML = html;
-}
-
+/* ── Manager detail (weekly tick + label on each bar) ── */
 function renderMgrDetail(mg){
   const i=mgrs.indexOf(mg);
   const color=MGR_COLORS[i%MGR_COLORS.length];
@@ -272,80 +307,80 @@ function renderMgrDetail(mg){
   const lost=f.lost_clients||0,newCl=f.new_clients||0;
   const newNames=(DATA.new_client_names||{})[mg]||[];
   const lostNames=(DATA.lost_client_names||{})[mg]||[];
+
   const rows=METRICS.map(m=>{
     const fv=f[m.key]||0, pv=p[m.key]||0, wv=w[m.key]||0;
     const pc=pct(fv,pv);
-    // Риска недельного плана на баре
+    // Tick with label
     let tickHtml='';
     if(wv>0 && pv>0){
-      const tickPct=Math.min(Math.round(wv/pv*100),95);
-      const tickColor=fv>=wv?'#22c55e':'#ef4444';
-      tickHtml='<div style="position:absolute;top:-3px;left:'+tickPct+'%;width:2px;height:9px;background:'+tickColor+';border-radius:1px;"></div>';
+      const tickPct = Math.min((wv/pv)*100, 95);
+      const tickColor = fv>=wv ? '#22c55e' : '#ef4444';
+      const tickLabel = m.fmt(wv/m.divisor);
+      tickHtml = '<div class="week-tick" style="left:'+tickPct.toFixed(1)+'%;background:'+tickColor+';">'
+                +'<div class="week-tick-label" style="color:'+tickColor+'">'+tickLabel+'</div>'
+                +'</div>';
     }
-    return '<div class="dc-row"><span class="dl">'+m.label+'</span><span class="dv '+pClass(pc)+'">'+m.fmt(fv/m.divisor)+' / '+m.fmt(pv/m.divisor)+'</span></div>'
-          +'<div class="bar-mini" style="position:relative;overflow:visible;">'
+    return '<div class="dc-row"><span class="dl">'+m.label+'</span>'
+          +'<span class="dv '+pClass(pc)+'">'+m.fmt(fv/m.divisor)+' / '+m.fmt(pv/m.divisor)+'</span></div>'
+          +'<div class="bar-mini" style="margin-bottom:16px;">'
           +  '<div class="bar-fill" style="width:'+Math.min(pc,100)+'%;background:'+color+'"></div>'
           +  tickHtml
           +'</div>';
   }).join('');
+
   const newTip=newNames.length?newNames.join('<br>'):'нет данных';
   const lostTip=lostNames.length?lostNames.join('<br>'):'нет данных';
   const badges=(newCl>0?'<span class="badge badge-new">+ новых: '+newCl+'<span class="tooltip">'+newTip+'</span></span>':'')
               +(lost>0?'<span class="badge badge-lost">▼ выбыли: '+lost+'<span class="tooltip">'+lostTip+'</span></span>':'');
-  // Аттестация
+
   const a=(DATA.attestation||{})[mg]||{};
   let attHtml='';
-  if(a.general!==undefined){const ac=a.general>=80?'att-ok':a.general>=50?'att-warn':'att-bad';attHtml+='<span class="att-badge '+ac+'">АТТ '+a.general+'%</span>';}
-  if(a.akb!==undefined){const ac2=a.akb>=80?'att-ok':a.akb>=50?'att-warn':'att-bad';attHtml+='<span class="att-badge '+ac2+'">АКБ '+a.akb+'%</span>';}
+  if(a.general!==undefined){const c=a.general>=80?'att-ok':a.general>=50?'att-warn':'att-bad';attHtml+='<span class="att-badge '+c+'">АТТ '+a.general+'%</span>';}
+  if(a.akb!==undefined){const c=a.akb>=80?'att-ok':a.akb>=50?'att-warn':'att-bad';attHtml+='<span class="att-badge '+c+'">АКБ '+a.akb+'%</span>';}
+
   document.getElementById('mgr-detail').innerHTML=
     '<div class="detail-card" style="border:2px solid '+color+'">'
-   +'<div class="dc-header"><span class="dc-name" style="color:'+color+'">'+short+(attHtml?'<span style="margin-left:6px">'+attHtml+'</span>':'')+'</span><span class="dc-avg '+pClass(avg)+'">'+avg+'%</span></div>'
+   +'<div class="dc-header">'
+   +  '<span class="dc-name" style="color:'+color+'">'+short+(attHtml?' <span>'+attHtml+'</span>':'')+'</span>'
+   +  '<span class="dc-avg '+pClass(avg)+'">'+avg+'%</span>'
+   +'</div>'
    +rows
    +(badges?'<div style="margin-top:8px">'+badges+'</div>':'')
    +'</div>';
 }
 
+/* ── History charts ── */
 function renderHistCharts(mg){
   const hist=(DATA.mgr_history||{})[mg]||[];
   const short=DATA.short_names[mg]||mg;
   const i=mgrs.indexOf(mg);
   const color=MGR_COLORS[i%MGR_COLORS.length];
-
   document.getElementById('hist-title').textContent='История продаж — '+short;
-
   if(!hist.length){
     document.getElementById('hist-charts').innerHTML='<p style="color:#6b7280;font-size:13px">История недоступна</p>';
     return;
   }
-
   const labels=hist.map(h=>fmtMonth(h.month));
   document.getElementById('hist-charts').innerHTML=HIST_METRICS.map((m,mi)=>
-    '<div class="chart-wrap"><div class="chart-label">'+m.label+'</div><div style="position:relative;height:200px"><canvas id="hchart_'+mi+'"></canvas></div></div>'
+    '<div class="chart-wrap"><div class="chart-label">'+m.label+'</div>'
+    +'<div style="position:relative;height:200px"><canvas id="hchart_'+mi+'"></canvas></div></div>'
   ).join('');
-
   Object.values(histCharts).forEach(c=>c.destroy()); histCharts={};
-
   HIST_METRICS.forEach((m,mi)=>{
     const data=hist.map(h=>{ const v=(h[m.key]||0)/m.divisor; return m.divisor===1e6?Math.round(v*100)/100:Math.round(v); });
     histCharts[mi]=new Chart(document.getElementById('hchart_'+mi),{
       type:'line',
-      data:{labels,datasets:[{
-        label:m.label,data,
-        borderColor:color,borderWidth:2,
-        backgroundColor:color+'22',fill:true,
-        pointBackgroundColor:color,pointRadius:4,tension:0.3
-      }]},
+      data:{labels,datasets:[{label:m.label,data,borderColor:color,borderWidth:2,backgroundColor:color+'22',fill:true,pointBackgroundColor:color,pointRadius:4,tension:0.3}]},
       options:{responsive:true,maintainAspectRatio:false,
         plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>' '+m.fmt(ctx.raw)}}},
-        scales:{
-          x:{grid:{display:false},ticks:{font:{size:10},maxTicksLimit:12}},
-          y:{min:0,grid:{color:'#f0effe'},ticks:{font:{size:10},callback:v=>m.fmt(v)}}
-        }
+        scales:{x:{grid:{display:false},ticks:{font:{size:10},maxTicksLimit:12}},y:{min:0,grid:{color:'#f0effe'},ticks:{font:{size:10},callback:v=>m.fmt(v)}}}
       }
     });
   });
 }
 
+/* ── Tab switch ── */
 function selectMgr(id){
   selectedMgr=id;
   renderTabs();
@@ -363,6 +398,7 @@ function selectMgr(id){
   }
 }
 
+/* ── Init ── */
 document.getElementById('report-date').textContent=DATA.date;
 document.getElementById('loading').style.display='none';
 document.getElementById('content').style.display='block';
