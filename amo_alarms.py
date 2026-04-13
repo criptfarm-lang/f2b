@@ -447,13 +447,13 @@ async def handle_amo_webhook(request, app: Application, db):
             logger.error("handle_amo_webhook: не удалось получить stage_info")
             return
 
-        target_pipeline_id = stage_info["pipeline_id"]
-        target_stage_id = stage_info["stage_id"]
+        # Жёсткие ID воронки РЕКЛАМА и этапа НОВАЯ ЗАЯВКА
+        REKLAMA_PIPELINE_ID = int(os.getenv("AMO_PIPELINE_ID", str(stage_info.get("pipeline_id", 10257578))))
+        REKLAMA_STAGE_ID = int(os.getenv("AMO_STAGE_ID", str(stage_info.get("stage_id", 81602946))))
+        target_pipeline_id = REKLAMA_PIPELINE_ID
+        target_stage_id = REKLAMA_STAGE_ID
 
-        # Логируем все ключи для диагностики
-        all_keys = dict(data)
-        logger.info(f"AMO webhook raw keys: {list(all_keys.keys())[:20]}")
-        logger.info(f"AMO webhook raw data: {dict(list(all_keys.items())[:10])}")
+        logger.info(f"AMO webhook: target_pipeline={target_pipeline_id} target_stage={target_stage_id}")
 
         # amoCRM шлёт данные в формате leads[status][0][id] и т.д.
         # Парсим все leads из формы
