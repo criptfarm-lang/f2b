@@ -78,6 +78,10 @@ EMPLOYEES = {
         "марзлякова", "марзляковой",
         "лена", "лены", "лене", "лену", "леной",
     ],
+    "Денис Коликов": [
+        "денис", "дениса", "денису", "денисом",
+        "коликов", "коликова", "коликову",
+    ],
 }
 
 # Менеджеры отдела продаж — "всем менеджерам"
@@ -86,6 +90,7 @@ MOP_MANAGERS = [
     "Елена Мерзлякова",
     "Инесса Скляр",
     "Алексей Леонтьев",
+    "Денис Коликов",
 ]
 
 def find_employee(query: str) -> str | None:
@@ -5367,7 +5372,7 @@ async def _build_report_data() -> dict:
         facts[mgr_name]["attracted"] = attracted.get(mgr_name, 0.0)
         facts[mgr_name]["lost_clients"] = lost.get(mgr_name, 0)
 
-    TAGS = {"скляр":"Инесса Скляр","мерзлякова":"Елена Мерзлякова","баласанян":"Карина Баласанян","леонтьев":"Алексей Леонтьев"}
+    TAGS = {"скляр":"Инесса Скляр","мерзлякова":"Елена Мерзлякова","баласанян":"Карина Баласанян","леонтьев":"Алексей Леонтьев","коликов":"Денис Коликов"}
 
     # История по месяцам (кэшируется раз в месяц)
     from moysklad import get_manager_monthly_history
@@ -5464,14 +5469,16 @@ async def _build_report_data() -> dict:
         "Карина Баласанян": {"shipments": 170, "revenue": 6_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
         "Елена Мерзлякова": {"shipments": 80,  "revenue": 6_700_000,  "clients": 30, "new_clients": 5, "attracted": 300_000},
         "Алексей Леонтьев": {"shipments": 17,  "revenue": 500_000,    "clients": 8,  "new_clients": 7, "attracted": 300_000},
+        "Денис Коликов":    {"shipments": 1,   "revenue": 200_000,    "clients": 1,  "new_clients": 5, "attracted": 50_000},
     }
     WEEKLY_PLANS = {
         "Инесса Скляр":     {"shipments": 25,  "revenue": 2_000_000,  "clients": 10, "new_clients": 1, "attracted": 250_000},
         "Карина Баласанян": {"shipments": 40,  "revenue": 1_200_000,  "clients": 16, "new_clients": 1, "attracted": 275_000},
         "Елена Мерзлякова": {"shipments": 10,  "revenue": 1_000_000,  "clients": 5,  "new_clients": 1, "attracted": 75_000},
         "Алексей Леонтьев": {"shipments": 3,   "revenue": 100_000,    "clients": 3,  "new_clients": 1, "attracted": 75_000},
+        "Денис Коликов":    {"shipments": 1,   "revenue": 50_000,     "clients": 1,  "new_clients": 1, "attracted": 12_500},
     }
-    SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Алексей Леонтьев":"Алексей"}
+    SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Алексей Леонтьев":"Алексей","Денис Коликов":"Денис"}
 
     # Загружаем накопительные недельные цели из БД (set_weekly) — перекрывают WEEKLY_PLANS
     weekly_targets = {}
