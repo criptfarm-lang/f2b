@@ -198,14 +198,11 @@ function renderPlanBars(){
     const color = MGR_COLORS[i%MGR_COLORS.length];
     const avg   = avgPct(mg);
     const a     = att[mg]||{};
-    let attH = '';
-    if(a.general!==undefined){const c=a.general>=80?'att-ok':a.general>=50?'att-warn':'att-bad';attH+='<span class="att-badge '+c+'">АТТ '+a.general+'%</span>';}
-    if(a.akb!==undefined){const c=a.akb>=80?'att-ok':a.akb>=50?'att-warn':'att-bad';attH+='<span class="att-badge '+c+'">АКБ '+a.akb+'%</span>';}
     legendHtml += '<div class="plan-legend-item">'
       +'<div class="plan-legend-dot" style="background:'+color+'"></div>'
       +'<span style="font-weight:600;color:'+color+'">'+short+'</span>'
       +'<span class="'+pClass(avg)+'" style="font-weight:700;font-size:11px">&nbsp;'+avg+'%</span>'
-      +attH+'</div>';
+      +'</div>';
   });
   legendHtml += '</div>';
 
@@ -334,18 +331,37 @@ function renderMgrDetail(mg){
   const badges=(newCl>0?'<span class="badge badge-new">+ новых: '+newCl+'<span class="tooltip">'+newTip+'</span></span>':'')
               +(lost>0?'<span class="badge badge-lost">▼ выбыли: '+lost+'<span class="tooltip">'+lostTip+'</span></span>':'');
 
+  // Attestation bars (plan always 100%)
   const a=(DATA.attestation||{})[mg]||{};
-  let attHtml='';
-  if(a.general!==undefined){const c=a.general>=80?'att-ok':a.general>=50?'att-warn':'att-bad';attHtml+='<span class="att-badge '+c+'">АТТ '+a.general+'%</span>';}
-  if(a.akb!==undefined){const c=a.akb>=80?'att-ok':a.akb>=50?'att-warn':'att-bad';attHtml+='<span class="att-badge '+c+'">АКБ '+a.akb+'%</span>';}
+  let attBarsHtml='';
+  if(a.general!==undefined || a.akb!==undefined){
+    attBarsHtml='<div style="margin-top:12px;padding-top:10px;border-top:1px solid #e8e5f5;">';
+    const attItems=[
+      {label:'Аттестация общая', val:a.general},
+      {label:'Аттестация АКБ',   val:a.akb},
+    ];
+    attItems.forEach(item=>{
+      if(item.val===undefined) return;
+      const pc=Math.min(item.val,100);
+      const bc=pc>=80?'#059669':pc>=50?'#d97706':'#dc2626';
+      attBarsHtml+=
+        '<div class="dc-row" style="margin-top:4px;"><span class="dl">'+item.label+'</span>'
+       +'<span class="dv" style="color:'+bc+';font-weight:700;">'+item.val+'%</span></div>'
+       +'<div class="bar-mini" style="margin-bottom:8px;">'
+       +  '<div class="bar-fill" style="width:'+pc+'%;background:'+bc+'80;"></div>'
+       +'</div>';
+    });
+    attBarsHtml+='</div>';
+  }
 
   document.getElementById('mgr-detail').innerHTML=
     '<div class="detail-card" style="border:2px solid '+color+'">'
    +'<div class="dc-header">'
-   +  '<span class="dc-name" style="color:'+color+'">'+short+(attHtml?' <span>'+attHtml+'</span>':'')+'</span>'
+   +  '<span class="dc-name" style="color:'+color+'">'+short+'</span>'
    +  '<span class="dc-avg '+pClass(avg)+'">'+avg+'%</span>'
    +'</div>'
    +rows
+   +attBarsHtml
    +(badges?'<div style="margin-top:8px">'+badges+'</div>':'')
    +'</div>';
 }
