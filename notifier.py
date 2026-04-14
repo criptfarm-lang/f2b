@@ -14,6 +14,9 @@ import os
 logger = logging.getLogger(__name__)
 
 QUIZ_BASE_URL = os.getenv("QUIZ_BASE_URL", "")
+
+# In-memory кэш отправленных уведомлений — защита от дублей при параллельных вызовах
+_notified_orders: set = set()
 MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
 WAZZUP_API_URL = "https://api.wazzup24.com/v3/message"
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
@@ -74,7 +77,7 @@ async def _load_order_positions(order_id: str, headers: dict) -> str:
                     qty = int(pos.get("quantity", 0))
                     price = (pos.get("price", 0) or 0) / 100
                     total = qty * price
-                    lines.append(f"  • {name} × {qty} = {total:,.0f} руб.")
+                    lines.append(f"  • {name} — {qty} кг × {price:,.0f} руб/кг = {total:,.0f} руб.")
                 return "\n".join(lines)
     except Exception as e:
         logger.warning(f"_load_order_positions: {e}")
@@ -176,9 +179,11 @@ async def check_order_agreed(order_href: str, bot, db):
         order_id = order_href.split("/")[-1].split("?")[0]
 
         # ── 3. Дедупликация — не отправлять дважды ───────────────────────
-        if db.is_agreed_notified(order_id):
+        if order_id in _notified_orders or db.is_agreed_notified(order_id):
             logger.info(f"notifier: заказ {order_id} уже уведомлялся, пропускаем")
             return
+        # Сразу помечаем в памяти чтобы параллельный вызов не прошёл
+        _notified_orders.add(order_id)
 
         # ── 4. Данные заказа ──────────────────────────────────────────────
         order_name = order.get("name", "")
@@ -234,7 +239,9 @@ async def check_order_agreed(order_href: str, bot, db):
 
         # ── 10. Квиз (всем кроме исключённых, исключённые уже отфильтрованы) ──
         if QUIZ_BASE_URL:
-            import urllib.parse
+            import urllib.parse, hashlib
+            # Короткий код заказа для ссылки
+            short_code = hashlib.md5(order_id.encode()).hexdigest()[:8]
             quiz_url = (
                 f"{QUIZ_BASE_URL}"
                 f"/?order={order_id}"
@@ -243,7 +250,8 @@ async def check_order_agreed(order_href: str, bot, db):
                 f"&company={urllib.parse.quote(agent_name)}"
             )
             msg += (
-                f"\n\n🐟 Хотите бесплатный пласт форели? Сыграйте в нашу викторину FISHки! 🎣\n"
+                f"\n\n🎣 *Выиграйте пласт форели!*\n"
+                f"Ответьте на 4 вопроса о рыбе и получите подарок к следующему заказу 🐟\n"
                 f"{quiz_url}"
             )
             logger.info(f"notifier: квиз добавлен для {agent_name}")
