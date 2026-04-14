@@ -239,19 +239,34 @@ async def check_order_agreed(order_href: str, bot, db):
 
         # ── 10. Квиз (всем кроме исключённых, исключённые уже отфильтрованы) ──
         if QUIZ_BASE_URL:
-            import urllib.parse, hashlib
-            # Короткий код заказа для ссылки
-            short_code = hashlib.md5(order_id.encode()).hexdigest()[:8]
-            quiz_url = (
-                f"{QUIZ_BASE_URL}"
-                f"/?order={order_id}"
-                f"&client_id={agent_id}"
-                f"&amount={int(order_sum)}"
-                f"&company={urllib.parse.quote(agent_name)}"
-            )
+            import urllib.parse, hashlib, aiohttp as _ah
+            # Создаём короткую ссылку через квиз-сервер
+            short_code = hashlib.md5(f"{order_id}{agent_id}".encode()).hexdigest()[:8]
+            quiz_url = f"{QUIZ_BASE_URL}/q/{short_code}"
+            try:
+                async with _ah.ClientSession() as _qs:
+                    await _qs.post(
+                        f"{QUIZ_BASE_URL}/api/short-link",
+                        params={
+                            "order_id": order_id,
+                            "client_id": agent_id,
+                            "amount": int(order_sum),
+                            "company_name": agent_name,
+                        },
+                        timeout=_ah.ClientTimeout(total=5)
+                    )
+            except Exception as _e:
+                # Если не удалось создать короткую ссылку — используем длинную
+                quiz_url = (
+                    f"{QUIZ_BASE_URL}"
+                    f"/?order={order_id}"
+                    f"&client_id={agent_id}"
+                    f"&amount={int(order_sum)}"
+                    f"&company={urllib.parse.quote(agent_name)}"
+                )
+                logger.warning(f"notifier: short-link failed ({_e}), используем длинную")
             msg += (
-                f"\n\n🎣 *Выиграйте пласт форели!*\n"
-                f"Ответьте на 4 вопроса о рыбе и получите подарок к следующему заказу 🐟\n"
+                f"\n\n🎣 Дарим 300 кг филе форели! Играйте в викторину, копите FISHки и обменивайте на филе!\n"
                 f"{quiz_url}"
             )
             logger.info(f"notifier: квиз добавлен для {agent_name}")
