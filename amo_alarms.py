@@ -365,14 +365,10 @@ async def _run_second_alarm_timer(
         )
 
     else:
-        # Этап сменился без контакта
-        new_stage_name = activity.get("current_stage_name", "")
-        text = (
-            f"⚠️ *Этап сменён без контакта с клиентом!*\n\n"
-            f"👤 Клиент: *{client_name}*\n"
-            f"📋 Новый этап: *{new_stage_name}*\n"
-            f"🔗 {_lead_url(lead_id)}"
-        )
+        # Этап сменился — молчим
+        logger.info(f"Таймер lead_id={lead_id}: этап сменился, молчим")
+        _active_alarms.pop(lead_id, None)
+        return
 
     if text:
         try:
