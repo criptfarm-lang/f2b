@@ -1,6 +1,6 @@
 """
 F2B PRO — Telegram Bot
-Ассистент отдела продаж: задачи, фото, прайсы, дебиторка
+Ассистент отдела продаж: фото, прайсы, дебиторка
 """
 
 import asyncio
@@ -23,7 +23,7 @@ from telegram.ext import (
 from database import Database
 from notifier import check_order_agreed  # рассылка при согласовании — не трогать!
 from scheduler import setup_scheduler, record_group_message, PDZ_MANAGERS, get_group_chat_id
-from claude_ai import dispatch, smart_answer, extract_tasks_from_message, detect_task_completion, parse_product_query
+from claude_ai import dispatch, smart_answer, parse_product_query
 from amocrm import check_connection as amo_check  # оставляем для совместимости
 from amo_alarms import (
     handle_amo_webhook,
@@ -52,14 +52,6 @@ EMPLOYEES = {
         "алексей", "алексея", "алексею", "алексеем",
         "леонтьев", "леонтьева", "леонтьеву",
         "лёша", "лёши", "лёше", "леша", "леши", "лёшу",
-    ],
-    "Ярослав": [
-        "ярослав", "ярослава", "ярославу", "ярославом",
-        "ярик", "ярика", "ярику",
-    ],
-    "Андрей Иванов": [
-        "андрей", "андрея", "андрею", "андреем",
-        "иванов", "иванова", "иванову",
     ],
     "Инесса Скляр": [
         "инесса", "инессы", "инессе", "инессу", "инессой",
@@ -166,7 +158,7 @@ def _user_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
-            InlineKeyboardButton("📋 Мои задачи", callback_data="user_my_tasks"),
+            InlineKeyboardButton("📊 Акт сверки", callback_data="user_reconciliation"),
         ],
         [
             InlineKeyboardButton("📊 Отчёт ОП", callback_data="user_op_report"),
@@ -214,26 +206,14 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
     elif action == "user_op_report":
         await cmd_op_report(update, context)
 
-    elif action == "user_my_tasks":
-        tasks = db.get_tasks_by_executor(user.full_name)
-        if not tasks:
-            await query.message.reply_text("✅ У тебя нет открытых задач.")
-        else:
-            lines = [f"📋 *Твои задачи ({len(tasks)}):*\n"]
-            for t in tasks:
-                deadline = t.get("deadline")
-                if deadline:
-                    from datetime import date as _d
-                    MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-                    try:
-                        d = _d.fromisoformat(str(deadline)[:10])
-                        dl = f" · до {d.day} {MONTHS[d.month-1]}"
-                    except Exception:
-                        dl = f" · до {deadline}"
-                else:
-                    dl = ""
-                lines.append(f"• {t.get('text','')}{dl}")
-            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    elif action == "user_reconciliation":
+        await query.message.reply_text(
+            "📊 Напиши название компании — сформирую акт сверки.\n"
+            "Например: _Атмосфера_ или _ИТФИШ_",
+            parse_mode="Markdown"
+        )
+        _user_awaiting[query.from_user.id] = "reconciliation"
+
 
 async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает chat_id пользователя."""
@@ -250,19 +230,13 @@ async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *Все команды:*\n\n"
-        "*Задачи:*\n"
-        "/tasks — мои задачи\n"
-        "/all_tasks — все задачи команды\n"
-        "/overdue — просроченные задачи\n\n"
         "*Отчёты:*\n"
         "/report — недельный отчёт\n"
         "/дебиторка — срез по дебиторке\n\n"
         "*Управление:*\n"
         "/menu — панель управления\n"
         "/pdz — запустить работу с дебиторкой\n"
-        "/mychatid — мой chat ID\n"
-        "/clearall — очистить открытые задачи\n"
-        "/cleartasksall — очистить все задачи",
+        "/mychatid — мой chat ID",
         parse_mode="Markdown"
     )
 
@@ -286,17 +260,13 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
-            InlineKeyboardButton("📋 Мои задачи", callback_data="user_my_tasks"),
+            InlineKeyboardButton("📊 Акт сверки", callback_data="user_reconciliation"),
         ],
         [
             InlineKeyboardButton("📊 Отчёт ОП", callback_data="menu_evening"),
         ],
         # ── Только руководитель ────────────────────────────────────
         [InlineKeyboardButton("── Только для меня ──", callback_data="menu_noop")],
-        [
-            InlineKeyboardButton("📋 Все задачи", callback_data="menu_all_tasks"),
-            InlineKeyboardButton("⏰ Просроченные", callback_data="menu_overdue"),
-        ],
         [
             InlineKeyboardButton("🚀 Запустить /pdz", callback_data="menu_pdz_run"),
             InlineKeyboardButton("📊 Результат ПДЗ", callback_data="menu_pdz_results"),
@@ -308,13 +278,6 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("📊 Статистика бота", callback_data="menu_stats"),
             InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
-        ],
-        [
-            InlineKeyboardButton("📢 Промо хорека", callback_data="menu_promo_horeka"),
-            InlineKeyboardButton("📢 Промо опт", callback_data="menu_promo_opt"),
-        ],
-        [
-            InlineKeyboardButton("💣 Очистить ВСЕ", callback_data="menu_clearall"),
         ],
     ])
 
@@ -352,27 +315,6 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         _user_awaiting[query.from_user.id] = "pdz_client"
 
-    elif action == "menu_all_tasks":
-        from database import Database
-        tasks = db.get_all_open_tasks()
-        if not tasks:
-            await query.message.reply_text("✅ Открытых задач нет.")
-        else:
-            lines = [f"📋 *Все открытые задачи ({len(tasks)}):*\n"]
-            for t in tasks[:30]:
-                lines.append(f"• *{t.get('executor','')}*: {t.get('text','')[:60]}")
-            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    elif action == "menu_overdue":
-        tasks = db.get_overdue_tasks()
-        if not tasks:
-            await query.message.reply_text("✅ Просроченных задач нет.")
-        else:
-            lines = [f"⏰ *Просроченные задачи ({len(tasks)}):*\n"]
-            for t in tasks[:20]:
-                lines.append(f"• *{t.get('executor','')}*: {t.get('text','')[:60]}")
-            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
     elif action == "menu_pdz_all":
         await query.message.reply_text("⏳ Запрашиваю ПДЗ...")
         from moysklad import get_overdue_demands
@@ -385,7 +327,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif action == "menu_pdz_run":
         await query.message.reply_text(
-            "🚀 Запускаю ПДЗ задачи?\nЭто разошлёт задачи всем менеджерам.",
+            "🚀 Запустить ПДЗ?\nЭто разошлёт напоминания по дебиторке всем менеджерам.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Да, запустить", callback_data="menu_pdz_confirm"),
                 InlineKeyboardButton("❌ Отмена", callback_data="menu_cancel"),
@@ -414,22 +356,6 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     elif action == "menu_evening":
         await cmd_op_report(update, context)
 
-    elif action == "menu_promo_horeka":
-        current = db.get_promo("хорека")
-        await query.message.reply_text(
-            f"📢 *Промо хорека:*\n\n{current or '— не задан'}\n\n"
-            f"Чтобы изменить: `/set_promo хорека [текст]`",
-            parse_mode="Markdown"
-        )
-
-    elif action == "menu_promo_opt":
-        current = db.get_promo("опт")
-        await query.message.reply_text(
-            f"📢 *Промо опт:*\n\n{current or '— не задан'}\n\n"
-            f"Чтобы изменить: `/set_promo опт [текст]`",
-            parse_mode="Markdown"
-        )
-
     elif action == "menu_aging":
         await cmd_aging(update, context)
 
@@ -445,42 +371,6 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         from claude_ai import smart_answer
         text = await smart_answer("Дай краткий недельный отчёт по задачам команды", context2)
         await query.message.reply_text(text, parse_mode="Markdown")
-
-    elif action == "menu_clearopen":
-        await query.message.reply_text(
-            "🗑 Очистить все ОТКРЫТЫЕ задачи?",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Да", callback_data="menu_clearopen_confirm"),
-                InlineKeyboardButton("❌ Нет", callback_data="menu_cancel"),
-            ]])
-        )
-
-    elif action == "menu_clearopen_confirm":
-        db._ensure_connection()
-        with db.conn.cursor() as cur:
-            cur.execute("UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE status='open'")
-            count = cur.rowcount
-        db.conn.commit()
-        await query.message.reply_text(f"✅ Очищено открытых задач: {count}")
-
-    elif action == "menu_clearall":
-        await query.message.reply_text(
-            "💣 Удалить ВСЕ задачи включая выполненные?\nЭто нельзя отменить!",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💣 Да, удалить всё", callback_data="menu_clearall_confirm"),
-                InlineKeyboardButton("❌ Отмена", callback_data="menu_cancel"),
-            ]])
-        )
-
-    elif action == "menu_clearall_confirm":
-        db._ensure_connection()
-        with db.conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as cnt FROM tasks")
-            row = cur.fetchone()
-            total = row["cnt"] if row else 0
-            cur.execute("TRUNCATE TABLE tasks RESTART IDENTITY")
-        db.conn.commit()
-        await query.message.reply_text(f"💣 Удалено задач: {total}. Таблица очищена.")
 
     elif action == "menu_test":
         await query.message.reply_text("🔍 Запускаю диагностику...")
@@ -549,10 +439,6 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *Все команды:*\n\n"
-        "*Задачи:*\n"
-        "/tasks — мои задачи\n"
-        "/all_tasks — все задачи команды\n"
-        "/overdue — просроченные задачи\n\n"
         "*Отчёты:*\n"
         "/report — недельный отчёт\n"
         "/дебиторка — срез по дебиторке\n\n"
@@ -569,7 +455,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _wazzup_notified: set = set()
 
 _pending_links: dict = {}
-_pending_task_results: dict = {}  # user_id → {task_id, task_text, executor}
 _user_awaiting: dict = {}  # user_id → "photo" | "pdz_client"
 _pending_price_comments: dict = {}  # manager_user_id → {alert_id, order_id, mgr_name}
 
@@ -1113,40 +998,6 @@ async def cmd_wazzup_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = await resp.text()
                 await update.message.reply_text(f"❌ Ошибка: {resp.status} {text[:200]}")
 
-async def cmd_clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет ВСЕ открытые задачи. Только для руководителя."""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-    try:
-        with db.conn.cursor() as cur:
-            cur.execute("UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE status='open'")
-        db.conn.commit()
-        await update.message.reply_text("✅ Все открытые задачи очищены.")
-    except Exception as e:
-        logger.error(f"cmd_clear_all error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-async def cmd_clear_tasks_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет ВСЕ задачи включая выполненные. Только для руководителя."""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-    try:
-        db._ensure_connection()
-        with db.conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as cnt FROM tasks")
-            row = cur.fetchone()
-            total = row["cnt"] if row else 0
-            cur.execute("TRUNCATE TABLE tasks RESTART IDENTITY")
-        db.conn.commit()
-        await update.message.reply_text(f"🗑 Удалено задач: {total}. Таблица очищена полностью.")
-    except Exception as e:
-        logger.error(f"cmd_clear_tasks_all error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Проверяет все основные функции Эфа. Только для руководителя."""
     user = update.effective_user
@@ -1170,10 +1021,10 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             results.append(f"❌ {name} — {str(e)[:60]}")
 
-    # 1. БД — задачи
+    # 1. БД — базовая проверка
     try:
-        tasks = db.get_all_open_tasks()
-        results.append(f"✅ База данных — {len(tasks)} открытых задач")
+        db._ensure_connection()
+        results.append("✅ База данных — соединение OK")
     except Exception as e:
         results.append(f"❌ База данных — {e}")
 
@@ -1249,31 +1100,6 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     header = f"📊 Диагностика Эфа\n✅ {ok} ок  ⚠️ {warn} предупреждений  ❌ {err} ошибок\n\n"
     await update.message.reply_text(header + "\n".join(results))
-
-async def cmd_del_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет задачу по ID. /deltask 5"""
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /deltask <ID>\nСписок ID: /cleartasks")
-        return
-    try:
-        task_id = int(context.args[0])
-        with db.conn.cursor() as cur:
-            cur.execute(
-                "UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE id=%s AND status='open'",
-                (task_id,)
-            )
-            deleted = cur.rowcount
-        db.conn.commit()
-        if deleted:
-            await update.message.reply_text(f"✅ Задача #{task_id} удалена.")
-        else:
-            await update.message.reply_text(f"❌ Задача #{task_id} не найдена или уже закрыта.")
-    except ValueError:
-        await update.message.reply_text("❌ Укажи числовой ID задачи.")
 
 async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопок подтверждения создания договора."""
@@ -1361,180 +1187,6 @@ async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT
             await _create_and_send_contract(
                 contract_data, user.full_name, query.message, context
             )
-
-async def handle_task_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопки 'Выполнено' — запрашивает результат."""
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split("|")
-    task_id = int(parts[1]) if len(parts) > 1 else 0
-
-    task = db._fetchone("SELECT * FROM tasks WHERE id=%s", (task_id,))
-    if not task:
-        await query.edit_message_text("❌ Задача не найдена.")
-        return
-
-    if task.get("status") == "done":
-        await query.edit_message_text(
-            query.message.text + "\n\n✅ *Уже выполнено*",
-            parse_mode="Markdown"
-        )
-        return
-
-    # Сохраняем ожидание результата
-    _pending_task_results[query.from_user.id] = {
-        "task_id": task_id,
-        "task_text": task.get("text", ""),
-        "executor": task.get("executor", ""),
-        "msg_id": query.message.message_id,
-    }
-
-    await query.edit_message_text(
-        query.message.text + "\n\n✏️ *Напиши результат выполнения:*",
-        parse_mode="Markdown"
-    )
-
-async def cmd_deltask_by_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удалить задачу ответом 'удали' на сообщение бота с задачей."""
-    msg = update.message
-    if not msg or not msg.reply_to_message:
-        return
-    user = msg.from_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if not user or user.id not in manager_ids:
-        return
-    replied = msg.reply_to_message
-    # Проверяем что это сообщение бота
-    if not replied.from_user or not replied.from_user.is_bot:
-        return
-    bot_msg_id = replied.message_id
-    chat_id = msg.chat_id
-    deleted = db.delete_tasks_by_bot_message_id(bot_msg_id, chat_id)
-    if deleted:
-        names = [f"• *{t['executor']}*: {t['text']}" for t in deleted]
-        await msg.reply_text(
-            f"🗑 Задач удалено: {len(deleted)}\n" + "\n".join(names),
-            parse_mode="Markdown"
-        )
-        # Удаляем само сообщение бота о задачах
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=bot_msg_id)
-        except Exception:
-            pass
-    else:
-        await msg.reply_text("Задачи не найдены или уже закрыты.")
-
-async def cmd_clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет все открытые задачи кроме указанных ID. Только для руководителя."""
-    logger.info(f"cmd_clear_tasks вызван от {update.effective_user.id} args={context.args}")
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        return
-    try:
-        args = context.args
-        if args and args[0] == "keep":
-            keep_ids = [int(x) for x in args[1:] if x.isdigit()]
-            db = Database()
-            with db.conn.cursor() as cur:
-                if keep_ids:
-                    placeholders = ",".join(["%s"] * len(keep_ids))
-                    cur.execute(f"UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE status='open' AND id NOT IN ({placeholders})", keep_ids)
-                else:
-                    cur.execute("UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено руководителем' WHERE status='open'")
-            db.conn.commit()
-            db.conn.close()
-            await update.message.reply_text(f"✅ Все задачи очищены." if not keep_ids else f"✅ Задачи очищены. Оставлены ID: {keep_ids}")
-        else:
-            db = Database()
-            tasks = db.get_all_open_tasks()
-            if not tasks:
-                await update.message.reply_text("Нет открытых задач.")
-                return
-            lines = [f"ID {t['id']}: {t.get('executor','—')} — {t.get('text','')}" for t in tasks]
-            lines.append("\nЧтобы оставить только нужные: /cleartasks keep 5 12")
-            await update.message.reply_text("\n".join(lines))
-    except Exception as e:
-        logger.error(f"cmd_clear_tasks error: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-async def cmd_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает задачи текущего пользователя."""
-    user = update.effective_user
-    name = user.full_name
-    tasks = db.get_tasks_for_user(name)
-
-    if not tasks:
-        await update.message.reply_text(f"✅ {name}, у тебя нет открытых задач!")
-        return
-
-    lines = [f"📋 *Задачи для {name}:*\n"]
-    for t in tasks:
-        deadline_str = f" — до {t['deadline']}" if t.get('deadline') else ""
-        status_icon = "🔴" if t.get('overdue') else "🟡"
-        lines.append(f"{status_icon} {t['text']}{deadline_str}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def cmd_all_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Все открытые и недавно выполненные задачи команды."""
-    tasks = db.get_all_open_tasks()
-    done_tasks = db.get_recently_done(hours=24)
-
-    if not tasks and not done_tasks:
-        await update.message.reply_text("✅ Нет открытых задач!")
-        return
-
-    lines = []
-
-    if tasks:
-        # Группируем открытые по исполнителю
-        by_user = {}
-        for t in tasks:
-            exe = t.get('executor') or 'Неизвестно'
-            by_user.setdefault(exe, []).append(t)
-
-        lines.append("📋 *Открытые задачи:*\n")
-        MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-        for user, utasks in by_user.items():
-            lines.append(f"*{user}* ({len(utasks)}):")
-            for t in utasks:
-                icon = "🔴" if t.get('overdue') else "🟡"
-                dl = t.get('deadline')
-                if dl:
-                    try:
-                        from datetime import date as _date
-                        d = _date.fromisoformat(str(dl)[:10])
-                        deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
-                    except Exception:
-                        deadline_str = f" · до {dl}"
-                else:
-                    deadline_str = ""
-                lines.append(f"  {icon} {t['text']}{deadline_str}")
-            lines.append("")
-
-    if done_tasks:
-        lines.append("✅ *Выполнено за 24 часа:*\n")
-        for t in done_tasks:
-            exe = t.get('executor') or ''
-            result = t.get('result') or ''
-            result_str = f" — {result}" if result else ""
-            lines.append(f"  ✅ *{exe}*: {t['text']}{result_str}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def cmd_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Просроченные задачи."""
-    tasks = db.get_overdue_tasks()
-    if not tasks:
-        await update.message.reply_text("✅ Просроченных задач нет!")
-        return
-
-    lines = [f"🔴 *Просроченные задачи ({len(tasks)}):*\n"]
-    for t in tasks:
-        lines.append(f"• *{t.get('executor', '?')}*: {t['text']} [срок: {t.get('deadline', '?')}]")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Недельный отчёт по команде."""
@@ -1735,13 +1387,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
             return
 
-        elif awaiting and awaiting.startswith("promo_"):
-            segment = awaiting.replace("promo_", "")
-            db.set_promo(text, segment)
+
+        elif awaiting == "reconciliation":
+            await message.reply_chat_action("typing")
+            from datetime import datetime as _datetime
+            buyer_query = text
+            counterparties = await get_counterparty_balance(buyer_query)
+            if not counterparties:
+                await message.reply_text(
+                    f"❌ Компания *{buyer_query}* не найдена в МойСклад.",
+                    parse_mode="Markdown"
+                )
+                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+                return
+            cp = counterparties[0]
+            cp_id = cp.get("id", "")
+            cp_name = cp.get("name", buyer_query)
+            date_from = f"{_datetime.now().year}-01-01"
+            date_to = _datetime.now().strftime("%Y-%m-%d")
             await message.reply_text(
-                f"✅ Промо для *{segment}* сохранён:\n\n{text}",
+                f"📊 Формирую акт сверки *{cp_name}*\n"
+                f"📅 Период: {date_from} — {date_to}\n"
+                f"⏳ Запрашиваю данные из МойСклад...",
                 parse_mode="Markdown"
             )
+            try:
+                import io as _io
+                from reconciliation_generator import generate_reconciliation_pdf
+                from moysklad import get_reconciliation_data
+                rec_data = await get_reconciliation_data(cp_id, date_from, date_to)
+                if not rec_data or not rec_data.get("rows"):
+                    await message.reply_text(
+                        f"😕 За период {date_from} — {date_to} операций с *{cp_name}* не найдено.",
+                        parse_mode="Markdown"
+                    )
+                    return
+                pdf_bytes = generate_reconciliation_pdf(rec_data)
+                closing = rec_data.get("closing_balance", 0)
+                if closing > 0:
+                    balance_str = f"💰 Долг клиента: *{closing:,.2f} руб.*"
+                elif closing < 0:
+                    balance_str = f"💰 Переплата: *{abs(closing):,.2f} руб.*"
+                else:
+                    balance_str = "✅ Взаиморасчёты согласованы"
+                caption = (
+                    f"📊 *Акт сверки — {cp_name}*\n"
+                    f"📅 {date_from} — {date_to}\n"
+                    f"{balance_str}"
+                )
+                await message.reply_document(
+                    document=_io.BytesIO(pdf_bytes),
+                    filename=f"Акт_сверки_{cp_name[:30]}_{date_to}.pdf",
+                    caption=caption,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"reconciliation awaiting error: {e}", exc_info=True)
+                await message.reply_text(f"❌ Ошибка формирования акта: {e}")
+            await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
             return
 
         elif awaiting == "contract":
@@ -1916,38 +1619,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     OWNER_ID = 360092495
     if user and chat_id == user.id and chat_id != OWNER_ID and text:
 
-        # 1. Ожидаем результат выполнения задачи
-        if user.id in _pending_task_results:
-            pending_tr = _pending_task_results.pop(user.id)
-            task_id = pending_tr["task_id"]
-            task_text = pending_tr["task_text"]
-            executor = pending_tr["executor"]
-            db.complete_task(task_id, result=text, completed_by=user.full_name)
-            # Уведомляем Виктора
-            await context.bot.send_message(
-                chat_id=OWNER_ID,
-                text=(
-                    f"✅ *Задача выполнена*\n"
-                    f"👤 *{executor}*\n"
-                    f"📋 {task_text}\n\n"
-                    f"💬 Результат: {text}"
-                ),
-                parse_mode="Markdown"
-            )
-            # Обновляем в группе PRO
-            group_chat_id_tr = int(os.getenv("GROUP_CHAT_ID", "0"))
-            if group_chat_id_tr:
-                await context.bot.send_message(
-                    chat_id=group_chat_id_tr,
-                    text=(
-                        f"✅ *{executor}* выполнил задачу:\n"
-                        f"_{task_text}_\n\n"
-                        f"💬 {text}"
-                    ),
-                    parse_mode="Markdown"
-                )
-            await message.reply_text("✅ Результат сохранён, руководитель уведомлён.")
-            return
 
         # 2. Ответ на запрос комментария по цене
         if user.id in _pending_price_comments:
@@ -2190,123 +1861,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Логируем ID для диагностики
     logger.info(f"Message from user.id={user.id}, name={user.full_name}, chat_id={message.chat_id}, manager_ids={manager_ids}")
 
-    if user.id in manager_ids and len(text) > 5:
-        text_lower = text.lower()
-
-        # Задачи фиксируем ТОЛЬКО если в тексте есть слово "задача"
-        if "задач" in text_lower:
-            DATA_QUERY_KEYWORDS = [
-                "пдз", "долг", "дебитор", "остатк", "отчёт", "отчет",
-                "сводк", "покажи", "дай", "сколько", "кто",
-                "активност", "упоминани", "договор", "баланс", "прайс",
-                "задолженност", "статистик", "аналитик", "кратко", "итог",
-                "просрочка", "просроченн", "должник",
-            ]
-            if not any(kw in text_lower for kw in DATA_QUERY_KEYWORDS):
-                tasks = await extract_tasks_from_message(text, user.full_name)
-                group_chat_id_for_tasks = int(os.getenv("GROUP_CHAT_ID", "0"))
-
-                for task in tasks:
-                    executor = task.get("executor", "")
-                    if not task.get("task") or not executor:
-                        continue
-
-                    # Если "всем менеджерам" — разворачиваем в список МОП
-                    executors = []
-                    exec_lower = executor.lower()
-                    if any(w in exec_lower for w in ["всем", "все менеджер", "мop", "мoп", "отдел продаж", "команда"]):
-                        executors = MOP_MANAGERS
-                    else:
-                        executors = [executor]
-
-                    for exec_name in executors:
-                        task_id = db.save_task(
-                            text=task["task"],
-                            executor=exec_name,
-                            deadline=task.get("deadline"),
-                            source_chat=chat_id,
-                            source_message_id=message.message_id,
-                            created_by=user.full_name
-                        )
-
-                        deadline = task.get("deadline")
-                        if deadline:
-                            from datetime import date as _date
-                            MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-                            try:
-                                d = _date.fromisoformat(deadline)
-                                deadline_str = f" · до {d.day} {MONTHS[d.month-1]}"
-                            except Exception:
-                                deadline_str = f" · до {deadline}"
-                        else:
-                            deadline_str = ""
-
-                        # 1. Публикуем в группу PRO без кнопок
-                        if group_chat_id_for_tasks:
-                            pub_text = (
-                                f"📌 *Задача*\n"
-                                f"👤 *{exec_name}*{deadline_str}\n"
-                                f"{task['task']}\n\n"
-                                f"_От: {user.full_name}_"
-                            )
-                            sent = await context.bot.send_message(
-                                chat_id=group_chat_id_for_tasks,
-                                text=pub_text,
-                                parse_mode="Markdown"
-                            )
-                            if sent:
-                                db.set_task_bot_message_id(task_id, sent.message_id)
-
-                        # 2. Дублируем исполнителю в личку с кнопкой
-                        mgr_chat_id = db.get_manager_chat_id(exec_name.split()[0])
-                        if mgr_chat_id:
-                            personal_text = (
-                                f"📋 *Тебе задача*{deadline_str}:\n\n"
-                                f"{task['task']}\n\n"
-                                f"_От: {user.full_name}_"
-                            )
-                            await context.bot.send_message(
-                                chat_id=mgr_chat_id,
-                                text=personal_text,
-                                parse_mode="Markdown",
-                                reply_markup=InlineKeyboardMarkup([[
-                                    InlineKeyboardButton("✅ Выполнено", callback_data=f"task_done|{task_id}")
-                                ]])
-                            )
-
-                        logger.info(f"Задача #{task_id}: {exec_name} → {task['task']}")
-
-    # 3. Автозакрытие задач — Claude анализирует контекст
-    sender_name = update.effective_user.full_name if update.effective_user else ""
-    text_lower_ac = text.lower().strip()
-    is_task_assignment = (
-        text_lower_ac.startswith("задача ") or
-        text_lower_ac.startswith("задачи ") or
-        "задач" in text_lower_ac and any(
-            name in text_lower_ac for name in
-            ["карин", "инесс", "скляр", "алексей", "леонтьев", "мерзляков", "баласанян"]
-        )
-    )
-    if not is_bot_addressed(text) and len(text) > 5 and not is_task_assignment:
-        open_tasks = db.get_all_open_tasks()
-        if open_tasks:
-            completed_items = await detect_task_completion(text, open_tasks, author=sender_name)
-            if completed_items:
-                closed = []
-                for item in completed_items:
-                    task_id = item["id"]
-                    result = item.get("result", "")
-                    task = next((t for t in open_tasks if t['id'] == task_id), None)
-                    if task:
-                        db.complete_task(task_id, result=result, completed_by=sender_name)
-                        executor = task.get('executor', '')
-                        result_str = f" — {result}" if result else ""
-                        closed.append(f"✅ *{executor}*: {task['text']}{result_str}")
-                        logger.info(f"Автозакрытие задачи {task_id}: {task['text']} | результат: {result}")
-                if closed:
-                    lines = ["🤖 Эф зафиксировал выполнение:\n"] + closed
-                    await message.reply_text("\n".join(lines), parse_mode="Markdown")
-
     # 4. Реагируем на обращение к боту
     # Автоматически реагируем на IT-проблемы даже без обращения "Эф,"
     IT_KEYWORDS = [
@@ -2324,132 +1878,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-
-    # Проверяем ожидание привязки Wazzup контакта — из группы ИДЕНТИФИКАЦИИ или лички бота
-    wazzup_id_chat_for_ident = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
-    is_ident_chat = (chat_id == wazzup_id_chat_for_ident)
-    is_private_chat = (user and chat_id == user.id)
-    if user and user.id in _pending_links and not is_bot_addressed(text) and (is_ident_chat or is_private_chat):
-        _pl = _pending_links[user.id]
-        pending_link = _pl[0] if isinstance(_pl, list) and _pl else (_pl if isinstance(_pl, dict) else None)
-        if not pending_link:
-            _pending_links.pop(user.id, None)
-        else:
-            logger.info(f"pending_links: user={user.id} contact={pending_link.get('wazzup_name')} text={text[:30]}")
-            if "company_name" not in pending_link:
-                # Если уже показали варианты — просим нажать кнопку
-                if pending_link.get("suggestions") and text.strip() == pending_link.get("last_query", ""):
-                    await safe_reply("👆 Выбери компанию из списка выше или нажми «Не привязывать».")
-                    return
-                # Сбрасываем старые варианты при новом вводе
-                pending_link.pop("suggestions", None)
-                pending_link["last_query"] = text.strip()
-                # Ищем компанию в МойСклад
-                company_query = text.strip()
-                counterparties = await get_counterparty_balance(company_query)
-                if not counterparties:
-                    words = company_query.split()
-                    suggestions = []
-                    for word in words:
-                        if len(word) >= 3:
-                            found = await get_counterparty_balance(word)
-                            for c in found:
-                                if c not in suggestions:
-                                    suggestions.append(c)
-                    if suggestions:
-                        link_key = pending_link.get("link_key", str(user.id))
-                        pending_link["suggestions"] = [c.get("name","") for c in suggestions[:5]]
-                        buttons = []
-                        for i, c in enumerate(suggestions[:5]):
-                            cp_name = c.get("name", "")
-                            buttons.append([InlineKeyboardButton(
-                                cp_name[:40],
-                                callback_data=f"wazzup_pick|{i}|{link_key}"
-                            )])
-                        buttons.append([InlineKeyboardButton(
-                            "🚫 Не привязывать",
-                            callback_data=f"wazzup_role|отмена|{link_key}"
-                        )])
-                        await safe_reply(
-                            f"❓ *{company_query}* не найдена точно.\n\nВозможно имеется в виду:",
-                            parse_mode="Markdown",
-                            reply_markup=InlineKeyboardMarkup(buttons)
-                        )
-                    else:
-                        keyboard = InlineKeyboardMarkup([[
-                            InlineKeyboardButton("🚫 Не привязывать", callback_data=f"wazzup_role|отмена|{pending_link.get('link_key', str(user.id))}")
-                        ]])
-                        await safe_reply(
-                            f"❌ Компания *{company_query}* не найдена в МойСклад.\n"
-                            f"Попробуй написать название точнее или отмени привязку.",
-                            parse_mode="Markdown",
-                            reply_markup=keyboard
-                        )
-                    return
-                cp = counterparties[0]
-                cp_name = cp.get("name", company_query)
-                pending_link["company_name"] = cp_name
-                link_key = pending_link.get("link_key", str(user.id))
-                # Удаляем из стека
-                if isinstance(_pending_links.get(user.id), list):
-                    _pending_links[user.id] = [p for p in _pending_links[user.id] if p.get("link_key") != link_key]
-                    if not _pending_links[user.id]:
-                        _pending_links.pop(user.id, None)
-                else:
-                    _pending_links.pop(user.id, None)
-                _pending_links.pop(link_key, None)
-                db.delete_pending_link(link_key)
-                ok = db.link_wazzup_contact(
-                    chat_id=pending_link["chat_id"],
-                    chat_type=pending_link["chat_type"],
-                    channel_id=pending_link["channel_id"],
-                    company_name=cp_name,
-                    wazzup_name=pending_link["wazzup_name"],
-                    role="рассылка",
-                )
-                if ok:
-                    _wazzup_notified.discard(pending_link["chat_id"])
-                    try:
-                        from moysklad import find_counterparty_info
-                        cp_list = await find_counterparty_info(cp_name)
-                        if cp_list:
-                            cp_data = cp_list[0]
-                            db.update_wazzup_contact_tags(
-                                chat_id=pending_link["chat_id"],
-                                tags=cp_data.get("tags", []),
-                                manager=cp_data.get("manager", ""),
-                                segment=cp_data.get("buyer_type", ""),
-                            )
-                            # Если контакт для рассылок — записываем в МойСклад
-                            if pending_link.get("for_mailing"):
-                                cp_href = cp_data.get("href") or f"https://api.moysklad.ru/api/remap/1.2/entity/counterparty/{cp_data.get('id', '')}"
-                                ms_ok = await _write_contact_to_ms(
-                                    cp_href,
-                                    pending_link["chat_type"],
-                                    pending_link["chat_id"]
-                                )
-                                if ms_ok:
-                                    logger.info(f"МойСклад: записан контакт {cp_name} → {pending_link['chat_type']}")
-                                else:
-                                    logger.warning(f"МойСклад: не удалось записать контакт {cp_name}")
-                    except Exception as e:
-                        logger.warning(f"Теги МойСклад: {e}")
-                    mailing_note = " (для рассылок 📨)" if pending_link.get("for_mailing") else ""
-                    await safe_reply(
-                        f"✅ *{pending_link['wazzup_name']}* → *{cp_name}*{mailing_note}\nЭф запомнил!",
-                        parse_mode="Markdown"
-                    )
-                # Если есть ещё ожидающие в стеке — спрашиваем следующего
-                next_pl = _pending_links.get(user.id)
-                next_pending = next_pl[0] if isinstance(next_pl, list) and next_pl else None
-                if next_pending:
-                    await safe_reply(
-                        f"👤 Следующий контакт: *{next_pending['wazzup_name']}*\n\n"
-                        f"Как этот клиент называется в МойСклад?\n"
-                        f"_(напиши название или часть названия)_",
-                        parse_mode="Markdown"
-                    )
-            return
 
     # Проверяем ожидание данных для договора (ПОСЛЕ идентификации)
     if user and user.id in _pending_contracts:
@@ -2556,33 +1984,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = result.get("action", "answer")
     params = result.get("params", {})
 
-    if action == "get_tasks":
-        employee = params.get("employee")
-        if employee:
-            tasks = db.get_tasks_for_user(employee)
-            done = [t for t in db.get_recently_done(hours=24)
-                    if employee.lower() in (t.get('executor') or '').lower()]
-            if not tasks and not done:
-                await message.reply_text(f"✅ У *{employee}* нет задач.", parse_mode="Markdown")
-            else:
-                lines = [f"📋 *Задачи — {employee}:*\n"]
-                for t in tasks:
-                    deadline_str = f" — до {t['deadline']}" if t.get("deadline") else ""
-                    icon = "🔴" if t.get("overdue") else "🟡"
-                    lines.append(f"{icon} {t['text']}{deadline_str}")
-                if done:
-                    lines.append("")
-                    for t in done:
-                        result_str = f" — {t['result']}" if t.get('result') else ""
-                        lines.append(f"✅ {t['text']}{result_str}")
-                await message.reply_text("\n".join(lines), parse_mode="Markdown")
-        else:
-            await cmd_all_tasks(update, context)
-
-    elif action == "get_all_tasks":
-        await cmd_all_tasks(update, context)
-
-    elif action == "get_report":
+    if action == "get_report":
         await cmd_report(update, context)
 
     elif action == "get_debtors":
@@ -3803,25 +3205,6 @@ async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ Готово. Сводка результатов придёт в 17:00.")
 
-async def cmd_delete_executor_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/del_tasks [имя] — удалить все открытые задачи конкретного исполнителя."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-    if not context.args:
-        return
-    name = " ".join(context.args)
-    db._ensure_connection()
-    with db.conn.cursor() as cur:
-        cur.execute(
-            "UPDATE tasks SET status='done', completed_at=NOW(), result='Удалено — сотрудник уволен' "
-            "WHERE LOWER(executor) LIKE LOWER(%s) AND status='open'",
-            (f"%{name}%",)
-        )
-        count = cur.rowcount
-    db.conn.commit()
-    await update.message.reply_text(f"✅ Закрыто задач для *{name}*: {count}", parse_mode="Markdown")
-
 async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_group [название группы] — сумма продаж по группе товаров за текущий месяц по менеджерам."""
     user = update.effective_user
@@ -4083,52 +3466,6 @@ async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
-async def cmd_set_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/set_promo [хорека|опт] [текст] — задать рекламный текст по сегменту."""
-    user = update.effective_user
-    if not user or user.id != 360092495:
-        return
-
-    # Берём сырой текст сообщения чтобы не потерять URL и спецсимволы
-    raw = update.message.text or ""
-    # Убираем команду /set_promo
-    raw_args = raw.split(" ", 1)[1].strip() if " " in raw else ""
-
-    if not raw_args:
-        хорека = db.get_promo("хорека")
-        опт = db.get_promo("опт")
-        общий = db.get_promo()
-        msg = (
-            "📢 *Текущие промо-тексты:*\n\n"
-            f"*Хорека:*\n{хорека or '— не задан'}\n\n"
-            f"*Опт:*\n{опт or '— не задан'}\n\n"
-            f"*Общий:*\n{общий or '— не задан'}\n\n"
-            "Чтобы изменить:\n"
-            "`/set_promo хорека [текст]`\n"
-            "`/set_promo опт [текст]`\n"
-            "`/set_promo [текст]` — общий"
-        )
-        await update.message.reply_text(msg, parse_mode="Markdown")
-        return
-
-    first_word = raw_args.split(" ", 1)[0].lower()
-    if first_word in ("хорека", "horeka", "опт", "opt"):
-        segment = "хорека" if first_word in ("хорека", "horeka") else "опт"
-        text = raw_args.split(" ", 1)[1].strip() if " " in raw_args else ""
-        if not text:
-            # Текст не указан — просим прислать следующим сообщением
-            _user_awaiting[user.id] = f"promo_{segment}"
-            await update.message.reply_text(
-                f"📢 Отправь текст промо для *{segment}* следующим сообщением.\n"
-                f"Можно использовать переносы строк, эмодзи и ссылки.",
-                parse_mode="Markdown"
-            )
-            return
-        db.set_promo(text, segment)
-        await update.message.reply_text(f"✅ Промо для *{segment}* сохранён:\n\n{text}", parse_mode="Markdown")
-    else:
-        db.set_promo(raw_args)
-        await update.message.reply_text(f"✅ Общий промо сохранён:\n\n{raw_args}")
 
 # Временные токены для веб-отчёта: token → {expires, user_id, mgr_filter}
 _report_tokens: dict = {}
@@ -5812,12 +5149,9 @@ def main():
         logger.warning(f"Не удалось восстановить pending_idents: {e}")
 
     # Команды
-    app.add_handler(CallbackQueryHandler(handle_task_done_callback, pattern="^task_done\\|"))
-    app.add_handler(CommandHandler("del_tasks", cmd_delete_executor_tasks))
     app.add_handler(CommandHandler("op_report", cmd_op_report))
     app.add_handler(CommandHandler("test_group", cmd_test_group))
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
-    app.add_handler(CommandHandler("set_promo", cmd_set_promo))
     app.add_handler(CommandHandler("refresh_history", cmd_refresh_history))
     app.add_handler(CommandHandler("reissue_contract", cmd_reissue_contract))
     app.add_handler(CommandHandler("refresh_contract", cmd_refresh_contract))
@@ -5848,18 +5182,8 @@ def main():
     app.add_handler(CommandHandler("wazzup_reset", cmd_wazzup_reset))
     app.add_handler(CommandHandler("wazzup_channels", cmd_wazzup_channels))
     app.add_handler(CommandHandler("wazzup_setup", cmd_wazzup_setup))
-    app.add_handler(CommandHandler("clearall", cmd_clear_all))
-    app.add_handler(CommandHandler("cleartasksall", cmd_clear_tasks_all))
     app.add_handler(CommandHandler("test", cmd_test))
-    app.add_handler(CommandHandler("deltask", cmd_del_task))
-    app.add_handler(MessageHandler(
-        filters.REPLY & filters.Regex(r"(?i)^(удали|удалить|отмени|отменить|убери)"),
-        cmd_deltask_by_reply
-    ))
     app.add_handler(MessageHandler(filters.StatusUpdate.MESSAGE_AUTO_DELETE_TIMER_CHANGED, handle_message))
-    app.add_handler(CommandHandler("cleartasks", cmd_clear_tasks))
-    app.add_handler(CommandHandler("all_tasks", cmd_all_tasks))
-    app.add_handler(CommandHandler("overdue", cmd_overdue))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("debts", cmd_debtors))
     app.add_handler(CommandHandler("photo", cmd_photo))
