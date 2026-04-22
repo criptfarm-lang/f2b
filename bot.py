@@ -3506,14 +3506,42 @@ async def cmd_reissue_contract(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ У вас нет доступа к этой команде.")
         return
     if not context.args:
-        await update.message.reply_text("Использование: /reissue_contract [название компании]")
+        rows = db._fetchall(
+            "SELECT buyer_name, contract_number, created_at FROM contracts ORDER BY created_at DESC LIMIT 10"
+        )
+        if not rows:
+            await update.message.reply_text("📭 В базе нет сохранённых договоров.")
+            return
+        lines = ["📄 *Последние договоры в базе:*\n"]
+        for r in rows:
+            dt = r["created_at"].strftime("%d.%m.%Y") if r.get("created_at") else "—"
+            lines.append(f"• {r['buyer_name']} №{r['contract_number']} от {dt}")
+        lines.append("\nИспользование: /reissue_contract [название компании]")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
 
     buyer_query = " ".join(context.args)
     existing = db.find_contract_by_buyer(buyer_query)
     if not existing:
-        await update.message.reply_text(f"❌ Договор с '{buyer_query}' не найден в базе.")
-        return
+        # Пробуем частичный поиск через LIKE
+        rows = db._fetchall(
+            "SELECT * FROM contracts WHERE LOWER(buyer_name) LIKE LOWER(%s) ORDER BY created_at DESC LIMIT 5",
+            (f"%{buyer_query}%",)
+        )
+        if not rows:
+            await update.message.reply_text(
+                f"❌ Договор с '{buyer_query}' не найден в базе.\n"
+                f"Попробуй часть названия, например: /reissue_contract ПРОДУКТЫ"
+            )
+            return
+        if len(rows) == 1:
+            existing = rows[0]
+        else:
+            lines = ["🔍 Найдено несколько договоров — уточни название:\n"]
+            for r in rows:
+                lines.append(f"• {r['buyer_name']} (№{r['contract_number']})")
+            await update.message.reply_text("\n".join(lines))
+            return
 
     contract_number = existing["contract_number"]
     created_at = existing["created_at"]
@@ -5124,7 +5152,31 @@ async def cmd_ms_attributes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
-def main():
+async def cmd_del_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/del_user [user_id] — полностью удалить пользователя из базы."""
+    user = update.effective_user
+    if not user or user.id != 360092495:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /del_user [user_id]\nПример: /del_user 1337598287")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id должен быть числом.")
+        return
+    try:
+        row = db._fetchone("SELECT full_name FROM manager_chats WHERE user_id=%s", (target_id,))
+        if not row:
+            await update.message.reply_text(f"❌ Пользователь {target_id} не найден в базе.")
+            return
+        name = row["full_name"]
+        db._execute("DELETE FROM manager_chats WHERE user_id=%s", (target_id,))
+        await update.message.reply_text(f"✅ Удалён: {name} (ID: {target_id})")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("Не задан TELEGRAM_BOT_TOKEN в переменных окружения!")
@@ -5168,6 +5220,7 @@ def main():
     app.add_handler(CommandHandler("aging", cmd_aging))
     app.add_handler(CommandHandler("block", cmd_block_user))
     app.add_handler(CommandHandler("unblock", cmd_unblock_user))
+    app.add_handler(CommandHandler("del_user", cmd_del_user))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("usermenu", cmd_user_menu))
     app.add_handler(CallbackQueryHandler(handle_user_menu_callback, pattern="^user_"))
