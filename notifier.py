@@ -273,16 +273,24 @@ async def check_order_agreed(order_href: str, bot, db):
 
         # ── 11. Отправляем через Wazzup ───────────────────────────────────
         api_key = os.getenv("WAZZUP_API_KEY", "")
+        # Определяем chatId или username
+        chat_id_value = contact["chat_id"]
+        wazzup_payload = {
+            "channelId": contact["channel_id"],
+            "chatType":  contact["chat_type"],
+            "text":      msg,
+        }
+        if chat_id_value.startswith("@"):
+            # Username — передаём без @
+            wazzup_payload["username"] = chat_id_value.lstrip("@")
+        else:
+            wazzup_payload["chatId"] = chat_id_value
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 WAZZUP_API_URL,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "channelId": contact["channel_id"],
-                    "chatType":  contact["chat_type"],
-                    "chatId":    contact["chat_id"],
-                    "text":      msg,
-                }
+                json=wazzup_payload,
             ) as r:
                 if r.status in (200, 201):
                     logger.info(f"notifier: ✅ отправлено {agent_name} → {contact['chat_type']}")
