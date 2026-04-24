@@ -183,7 +183,6 @@ def _user_menu_keyboard(include_task_button: bool = False) -> InlineKeyboardMark
         ],
         [
             InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
-            InlineKeyboardButton("📊 Акт сверки", callback_data="user_reconciliation"),
         ],
         [
             InlineKeyboardButton("📊 Отчёт ОП", callback_data="user_op_report"),
@@ -297,7 +296,6 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
-            InlineKeyboardButton("📊 Акт сверки", callback_data="user_reconciliation"),
         ],
         [
             InlineKeyboardButton("📊 Отчёт ОП", callback_data="menu_evening"),
@@ -309,12 +307,7 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("📊 Результат ПДЗ", callback_data="menu_pdz_results"),
         ],
         [
-            InlineKeyboardButton("📈 Активность", callback_data="menu_activity"),
             InlineKeyboardButton("⏳ Стареющие", callback_data="menu_aging"),
-        ],
-        [
-            InlineKeyboardButton("📊 Статистика бота", callback_data="menu_stats"),
-            InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
         ],
         # ── Постановка задач в МойСклад ────────────────────────────
         [InlineKeyboardButton("── Постановка задач ──", callback_data="menu_noop")],
