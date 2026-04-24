@@ -47,21 +47,26 @@ pdz_launched_today: set = set()  # хранит даты когда был за�
 pdz_day_messages: dict = {}
 
 def setup_scheduler(app: Application, db):
-    """Настраивает и запускает все запланированные задачи."""
-    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    """Настраивает и запускает все запланированные задачи.
 
-    # 09:00 — утренняя сводка
+    ВАЖНО: у каждого CronTrigger timezone задан явно. AsyncIOScheduler(timezone=...)
+    на CronTrigger без явной таймзоны НЕ распространяется — он берёт локальную TZ
+    контейнера (UTC на Railway), и часы съезжают на +3.
+    """
+    scheduler = AsyncIOScheduler(timezone=MSK)
+
+    # 09:00 МСК — утренняя сводка
     scheduler.add_job(
         morning_summary,
-        CronTrigger(hour=9, minute=0),
+        CronTrigger(hour=9, minute=0, timezone=MSK),
         args=[app, db],
         id="morning_summary"
     )
 
-    # 10:00 — напоминание о задачах на сегодня
+    # 10:00 МСК — напоминание о задачах на сегодня
     scheduler.add_job(
         remind_today_tasks,
-        CronTrigger(hour=10, minute=0),
+        CronTrigger(hour=10, minute=0, timezone=MSK),
         args=[app, db],
         id="remind_today_tasks"
     )
@@ -69,7 +74,7 @@ def setup_scheduler(app: Application, db):
     # 12:00 МСК — проверка стареющих клиентов
     scheduler.add_job(
         check_aging_clients,
-        CronTrigger(hour=12, minute=0),
+        CronTrigger(hour=12, minute=0, timezone=MSK),
         args=[app],
         id="aging_clients"
     )
@@ -77,14 +82,14 @@ def setup_scheduler(app: Application, db):
     # 03:00 МСК — очистка старых задач
     scheduler.add_job(
         cleanup_done_tasks,
-        CronTrigger(hour=3, minute=0),
+        CronTrigger(hour=3, minute=0, timezone=MSK),
         id="cleanup_done_tasks"
     )
 
     # 02:00 МСК — синхронизация менеджеров в wazzup_contact_map
     scheduler.add_job(
         sync_managers_job,
-        CronTrigger(hour=2, minute=0),
+        CronTrigger(hour=2, minute=0, timezone=MSK),
         args=[app],
         id="sync_managers"
     )
