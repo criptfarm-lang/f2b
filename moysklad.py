@@ -15,7 +15,12 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-YANDEX_GEOCODER_KEY = os.getenv("YANDEX_GEOCODER_KEY", "5a133f74-30f1-4296-9dc4-a780332987cc")
+YANDEX_GEOCODER_KEY = os.getenv("YANDEX_GEOCODER_KEY")
+if not YANDEX_GEOCODER_KEY:
+    raise RuntimeError(
+        "YANDEX_GEOCODER_KEY env not set. "
+        "Выпустить ключ в Яндекс.Разработчики и задать в Railway → Variables."
+    )
 
 # Координаты центров направлений (lat, lon)
 DELIVERY_CITIES_COORDS = {
