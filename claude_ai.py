@@ -856,3 +856,95 @@ async def analyze_call(transcript: str, manager: str, client_phone: str) -> str:
     except Exception as e:
         logger.error(f"analyze_call error: {e}")
         return f"_Анализ недоступен: {e}_"
+
+
+# ============================================================================
+# Парсер свободного текста в драфт задачи (фича /задача в TG-боте)
+# ============================================================================
+
+_WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+
+
+async def parse_task_draft(user_text: str, employees: list, now_msk) -> dict:
+    """Извлечь из свободного текста драфт задачи для постановки в МойСклад.
+
+    Args:
+        user_text: что написал пользователь (Виктор или Александр).
+        employees: closed-list активных сотрудников МС (из moysklad.list_employees).
+            Каждый: {"id", "name", "email"}. Claude выбирает assignee_id ТОЛЬКО из этих id.
+        now_msk: datetime с tzinfo Europe/Moscow — база для относительных дат.
+
+    Returns:
+        dict:
+          - assignee_id: str | None — UUID выбранного сотрудника.
+          - assignee_candidates: list[{"id","name"}] | None — если имя неоднозначно.
+          - description: str — краткая формулировка задачи (код потом обрежет до 200).
+          - due_msk: str "YYYY-MM-DD HH:MM" | None — дедлайн в МСК.
+
+    Raises:
+        Exception — если Claude API упал или JSON невалиден (обрабатывать на уровне хендлера).
+    """
+    weekday_ru = _WEEKDAYS_RU[now_msk.weekday()]
+    # Компактный список для промпта — берём id и name, e-mail не нужен.
+    emp_lines = "\n".join(f'  - id={e["id"]}  name="{e["name"]}"' for e in employees)
+
+    prompt = f"""Ты парсер свободного текста в драфт задачи для МойСклада.
+
+Сейчас: {now_msk.strftime('%Y-%m-%d %H:%M')} МСК ({weekday_ru}).
+
+СОТРУДНИКИ КОМПАНИИ F2B (closed list — assignee_id ВЫБИРАЙ ТОЛЬКО из этих id):
+{emp_lines}
+
+ПРАВИЛА ПАРСИНГА:
+1. Исполнитель.
+   - Если руководитель назвал имя однозначно («Карине», «Малышкину», «Инессе») — выбери соответствующий id из списка.
+   - Если имя неоднозначное («Саше» при двух Александрах — Маланчук и Белякова, «Елене») — верни всех подходящих в assignee_candidates, а assignee_id = null.
+   - Если имя не названо или никого не нашёл в списке — assignee_id = null, assignee_candidates = null.
+   - НИКОГДА не придумывай id. Только из списка выше.
+2. Описание.
+   - Краткая императивная формулировка задачи. До 200 символов.
+   - Без обращения к исполнителю ("сделать X", а не "Карина, сделай X").
+3. Дедлайн (due_msk).
+   - Формат "YYYY-MM-DD HH:MM" (МСК).
+   - «завтра 14:00» → завтрашняя дата 14:00.
+   - Относительные даты БЕЗ времени («до пятницы», «до конца недели», «до понедельника», «завтра») → 18:00 МСК.
+   - «утром» → 09:00. «к концу дня» / «вечером» → 18:00.
+   - Если дедлайн не указан — due_msk = null.
+   - Прошлые даты невозможны — если «до пятницы» и сегодня пятница после 18:00, бери следующую пятницу.
+
+ПРИМЕРЫ:
+
+Текст: «Карине подготовить коммерческое для Global Foods до завтра 14:00»
+→ {{"assignee_id": "<id Баласанян К.>", "assignee_candidates": null, "description": "подготовить коммерческое для Global Foods", "due_msk": "<завтра> 14:00"}}
+
+Текст: «Саше сверься с Ореховым по оплате до пятницы»
+→ {{"assignee_id": null, "assignee_candidates": [{{"id":"<Маланчук А. В.>","name":"Маланчук А. В."}},{{"id":"<Белякова А.>","name":"Белякова А."}}], "description": "сверься с Ореховым по оплате", "due_msk": "<пятница> 18:00"}}
+
+Текст: «Малышкину уточнить цену трески у Хотенко»
+→ {{"assignee_id": "<id Малышкин А. А.>", "assignee_candidates": null, "description": "уточнить цену трески у Хотенко", "due_msk": null}}
+
+Текст: «нужно сделать сверку по Global Foods до конца недели» (без имени)
+→ {{"assignee_id": null, "assignee_candidates": null, "description": "сделать сверку по Global Foods", "due_msk": "<воскресенье этой недели> 18:00"}}
+
+Теперь распарси:
+«{user_text}»
+
+Верни ТОЛЬКО JSON, без комментариев и без ```."""
+
+    response = await get_client().messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=600,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = response.content[0].text.strip()
+    raw = re.sub(r"```json|```", "", raw).strip()
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError(f"parse_task_draft: ожидали dict, получили {type(data).__name__}")
+    # Нормализация структуры
+    return {
+        "assignee_id": data.get("assignee_id") or None,
+        "assignee_candidates": data.get("assignee_candidates") or None,
+        "description": (data.get("description") or "").strip(),
+        "due_msk": data.get("due_msk") or None,
+    }

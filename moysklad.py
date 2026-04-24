@@ -2908,3 +2908,122 @@ async def get_manager_monthly_history(tag: str, mgr_name: str) -> list:
     except Exception as e:
         logger.error(f"get_manager_monthly_history {mgr_name}: {e}", exc_info=True)
         return []
+
+
+# ============================================================================
+# Задачи и сотрудники (фича: постановка задач через /задача в TG-боте)
+# ============================================================================
+
+MS_TASK_EDIT_URL = "https://online.moysklad.ru/app/#task/edit?id={task_id}"
+TASK_DESCRIPTION_SOFT_LIMIT = 200
+
+_employees_cache: Optional[list] = None
+_employees_cached_at: Optional[float] = None
+_EMPLOYEES_CACHE_TTL_SECONDS = 3600
+
+
+async def list_employees(force_refresh: bool = False) -> list:
+    """Список активных сотрудников МойСклада с модульным кешем на 1 ч.
+
+    Возвращает список словарей вида {"id", "name", "email"}.
+    Кеш используется как closed-list для промпта Claude и для валидации
+    assignee_id в Python до вызова create_task.
+    """
+    global _employees_cache, _employees_cached_at
+    import time
+    now_ts = time.time()
+    if (not force_refresh
+            and _employees_cache is not None
+            and _employees_cached_at is not None
+            and now_ts - _employees_cached_at < _EMPLOYEES_CACHE_TTL_SECONDS):
+        return _employees_cache
+
+    url = f"{MS_BASE}/entity/employee?limit=100"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url,
+            headers=get_headers(),
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+    employees = []
+    for emp in data.get("rows", []):
+        if emp.get("archived"):
+            continue
+        employees.append({
+            "id": emp.get("id"),
+            "name": emp.get("shortFio") or emp.get("name") or emp.get("fullName") or "",
+            "email": emp.get("email") or "",
+        })
+    _employees_cache = employees
+    _employees_cached_at = now_ts
+    logger.info(f"list_employees: {len(employees)} активных сотрудников (кеш обновлён)")
+    return employees
+
+
+def invalidate_employees_cache() -> None:
+    """Сбросить кеш сотрудников. Вызывать после 404/403 на create_task."""
+    global _employees_cache, _employees_cached_at
+    _employees_cache = None
+    _employees_cached_at = None
+    logger.info("invalidate_employees_cache: кеш сотрудников сброшен")
+
+
+async def create_task(assignee_id: str, description: str, due_msk) -> dict:
+    """Создать задачу в МойСкладе на конкретного сотрудника.
+
+    Args:
+        assignee_id: UUID сотрудника (из list_employees).
+        description: текст задачи. Если > TASK_DESCRIPTION_SOFT_LIMIT (200) —
+            обрезается до 199 + '…'.
+        due_msk: datetime в МСК (naive или с tzinfo). МС трактует dueToDate
+            без TZ как МСК. Если None — задача без дедлайна.
+
+    Returns:
+        {"id": str, "url": str} — id задачи и URL карточки в веб-МС.
+
+    Raises:
+        ValueError: пустой assignee_id или description.
+        aiohttp.ClientResponseError: HTTP-ошибка от МС (status 4xx/5xx).
+        RuntimeError: МС вернул успешный ответ без id.
+    """
+    if not assignee_id:
+        raise ValueError("create_task: пустой assignee_id")
+    text = (description or "").strip()
+    if not text:
+        raise ValueError("create_task: пустой description")
+    if len(text) > TASK_DESCRIPTION_SOFT_LIMIT:
+        text = text[: TASK_DESCRIPTION_SOFT_LIMIT - 1] + "…"
+
+    payload = {
+        "description": text,
+        "assignee": {
+            "meta": {
+                "href": f"{MS_BASE}/entity/employee/{assignee_id}",
+                "type": "employee",
+                "mediaType": "application/json",
+            }
+        },
+    }
+    if due_msk is not None:
+        payload["dueToDate"] = due_msk.strftime("%Y-%m-%d %H:%M:%S.000")
+
+    url = f"{MS_BASE}/entity/task"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url,
+            headers=get_headers(),
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+    task_id = data.get("id")
+    if not task_id:
+        raise RuntimeError(f"create_task: МС вернул ответ без id: {data}")
+    task_url = MS_TASK_EDIT_URL.format(task_id=task_id)
+    logger.info(f"create_task: создана задача {task_id} для assignee={assignee_id}")
+    return {"id": task_id, "url": task_url}
