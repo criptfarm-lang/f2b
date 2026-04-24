@@ -5760,8 +5760,18 @@ def main():
         pattern="^amo_link\\|"
     ))
     # ─── Постановка задач в МойСклад (/задача) ───────────────────────────────
-    app.add_handler(CommandHandler(["задача", "поставить", "task"], cmd_task))
-    app.add_handler(CommandHandler("отмена", cmd_task_cancel))
+    # PTB не принимает кириллицу в CommandHandler (ValueError: not a valid bot command),
+    # поэтому маршрутизируем /задача /поставить /отмена через MessageHandler + Regex.
+    # /task — ASCII alias, можно зарегистрировать BotFather'ом в меню команд.
+    app.add_handler(CommandHandler("task", cmd_task))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^/(задача|поставить)(@\w+)?(\s|$)"),
+        cmd_task,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^/отмена(@\w+)?(\s|$)"),
+        cmd_task_cancel,
+    ))
     # Текст в активной /задача-conversation (только для whitelist в личке) — ДО общего handle_message
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & _task_conv_active_filter,
