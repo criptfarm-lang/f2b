@@ -162,16 +162,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user and chat_id == user.id:
         db.save_manager_chat_id(user.id, user.full_name)
         logger.info(f"cmd_start: сохранён chat_id={chat_id} name={user.full_name}")
+    is_author = user is not None and _is_task_author(user.id)
     await update.message.reply_text(
         f"👋 Привет, *{user.full_name if user else 'друг'}*! Я Эф — ассистент F2B PRO.\n\n"
         f"Используй меню ниже или обращайся: *Эф, [вопрос]*",
         parse_mode="Markdown",
-        reply_markup=_user_menu_keyboard()
+        reply_markup=_user_menu_keyboard(include_task_button=is_author)
     )
 
-def _user_menu_keyboard() -> InlineKeyboardMarkup:
-    """Общее меню для всех пользователей."""
-    return InlineKeyboardMarkup([
+def _user_menu_keyboard(include_task_button: bool = False) -> InlineKeyboardMarkup:
+    """Общее меню для всех пользователей.
+
+    Если include_task_button=True (только для whitelist Виктор/Александр) —
+    добавляется кнопка «📋 Поставить задачу».
+    """
+    rows = [
         [
             InlineKeyboardButton("📸 Запросить фото товара", callback_data="user_photo"),
             InlineKeyboardButton("💰 ПДЗ клиента", callback_data="user_pdz_client"),
@@ -183,7 +188,10 @@ def _user_menu_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("📊 Отчёт ОП", callback_data="user_op_report"),
         ],
-    ])
+    ]
+    if include_task_button:
+        rows.append([InlineKeyboardButton("📋 Поставить задачу", callback_data="menu_task")])
+    return InlineKeyboardMarkup(rows)
 
 async def cmd_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/usermenu — общее меню."""
@@ -261,16 +269,25 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Панель управления — только для руководителя."""
+    """Панель управления.
+
+    - Виктор (OWNER): полное меню + секция «Постановка задач».
+    - Александр (PARTNER): общее меню + кнопка «Поставить задачу».
+    - Остальные: общее меню.
+    """
     user = update.effective_user
-    if not user or user.id != OWNER_CHAT_ID:
-        # Для остальных — общее меню
+    if not user:
+        return
+
+    # Не-руководитель — общее меню. Кнопка задач только для whitelist (Александр).
+    if user.id != OWNER_CHAT_ID:
         await update.message.reply_text(
             "Выбери действие:",
-            reply_markup=_user_menu_keyboard()
+            reply_markup=_user_menu_keyboard(include_task_button=_is_task_author(user.id))
         )
         return
 
+    # OWNER — расширенное меню с кнопкой задач в персональном блоке.
     keyboard = InlineKeyboardMarkup([
         # ── Доступно всем ──────────────────────────────────────────
         [InlineKeyboardButton("── Общие функции ──", callback_data="menu_noop")],
@@ -299,6 +316,9 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("📊 Статистика бота", callback_data="menu_stats"),
             InlineKeyboardButton("🔍 Диагностика", callback_data="menu_test"),
         ],
+        # ── Постановка задач в МойСклад ────────────────────────────
+        [InlineKeyboardButton("── Постановка задач ──", callback_data="menu_noop")],
+        [InlineKeyboardButton("📋 Поставить задачу", callback_data="menu_task")],
     ])
 
     await update.message.reply_text(
@@ -5297,6 +5317,43 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_menu_task_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «📋 Поставить задачу» из /menu.
+
+    Эквивалент /задача, но стартует через callback. Доступна только whitelist.
+    """
+    query = update.callback_query
+    user = query.from_user
+    if not user:
+        return
+    # Гейт: только Виктор и Александр
+    if not _is_task_author(user.id):
+        await query.answer("⛔ Доступно только Виктору и Александру", show_alert=True)
+        return
+    chat = query.message.chat if query.message else None
+    if not chat or chat.type != "private":
+        await query.answer("ℹ️ Работает только в личном чате со мной", show_alert=True)
+        return
+    await query.answer()
+    # Если активная conv — закрываем старую, начинаем новую
+    if user.id in _task_conversations:
+        await _task_cancel_existing(user.id, context)
+    _task_conversations[user.id] = {
+        "stage": _STAGE_WAITING_DESCRIPTION,
+        "draft": None,
+        "draft_message_id": None,
+        "started_at": datetime.now(_MSK),
+    }
+    logger.info(
+        f"metric.task_bot.conv_started chat_id={user.id} "
+        f"actor={_task_actor_name(user.id)} via=menu"
+    )
+    await context.bot.send_message(
+        chat_id=user.id,
+        text="✍️ Опиши задачу одним сообщением — кому, что сделать, к какому сроку.",
+    )
+
+
 async def cmd_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/отмена — отменить активную постановку задачи."""
     user = update.effective_user
@@ -5714,6 +5771,8 @@ def main():
     app.add_handler(CommandHandler("usermenu", cmd_user_menu))
     app.add_handler(CallbackQueryHandler(handle_user_menu_callback, pattern="^user_"))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    # Кнопка «📋 Поставить задачу» в /menu — whitelist-гейт внутри; регистрируется ДО общего handle_menu_callback
+    app.add_handler(CallbackQueryHandler(handle_menu_task_button, pattern=r"^menu_task$"))
     app.add_handler(CallbackQueryHandler(handle_menu_callback, pattern="^menu_"))
     app.add_handler(CommandHandler("mychatid", cmd_mychatid))
     app.add_handler(CommandHandler("start", cmd_start))
