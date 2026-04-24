@@ -8,6 +8,7 @@ notifier.py — Рассылка клиентам при согласовани�
     from notifier import check_order_agreed
 """
 
+import asyncio
 import logging
 import os
 
@@ -17,6 +18,9 @@ QUIZ_BASE_URL = os.getenv("QUIZ_BASE_URL", "")
 
 # In-memory кэш отправленных уведомлений — защита от дублей при параллельных вызовах
 _notified_orders: set = set()
+# Узкий lock — только вокруг проверки и записи в _notified_orders,
+# чтобы два параллельных вебхука на один order_id не прошли дедуп одновременно.
+_dedup_lock = asyncio.Lock()
 MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
 WAZZUP_API_URL = "https://api.wazzup24.com/v3/message"
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
@@ -179,11 +183,12 @@ async def check_order_agreed(order_href: str, bot, db):
         order_id = order_href.split("/")[-1].split("?")[0]
 
         # ── 3. Дедупликация — не отправлять дважды ───────────────────────
-        if order_id in _notified_orders or db.is_agreed_notified(order_id):
-            logger.info(f"notifier: заказ {order_id} уже уведомлялся, пропускаем")
-            return
-        # Сразу помечаем в памяти чтобы параллельный вызов не прошёл
-        _notified_orders.add(order_id)
+        async with _dedup_lock:
+            if order_id in _notified_orders or db.is_agreed_notified(order_id):
+                logger.info(f"notifier: заказ {order_id} уже уведомлялся, пропускаем")
+                return
+            # Сразу помечаем в памяти чтобы параллельный вызов не прошёл
+            _notified_orders.add(order_id)
 
         # ── 4. Данные заказа ──────────────────────────────────────────────
         order_name = order.get("name", "")

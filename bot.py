@@ -41,6 +41,15 @@ from moysklad import (search_products, search_products_filtered, get_price_list,
     get_overdue_demands, format_overdue_demands, format_overdue_summary,
     format_reminders_for_manager, format_debt_reminder, fmt_money)
 
+# ─── Владелец бота — TG-id, гейтит админские команды и адрес утренних сводок ─
+_owner_chat_id_raw = os.getenv("OWNER_CHAT_ID")
+if not _owner_chat_id_raw:
+    raise RuntimeError(
+        "OWNER_CHAT_ID env not set. "
+        "Задай числовой Telegram-id владельца в Railway → Variables."
+    )
+OWNER_CHAT_ID = int(_owner_chat_id_raw)
+
 # ─── Словарь сотрудников — варианты имён и склонений ─────────────────────────
 EMPLOYEES = {
     "Белякова Александра": [
@@ -243,7 +252,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Панель управления — только для руководителя."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         # Для остальных — общее меню
         await update.message.reply_text(
             "Выбери действие:",
@@ -292,7 +301,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
 
-    if not query.from_user or query.from_user.id != 360092495:
+    if not query.from_user or query.from_user.id != OWNER_CHAT_ID:
         await query.answer("⛔ Только для руководителя.", show_alert=True)
         return
 
@@ -406,7 +415,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         buttons = []
         for s in stats:
-            if s.get("user_id") == 360092495:
+            if s.get("user_id") == OWNER_CHAT_ID:
                 continue
             status = "🔒" if s.get("is_blocked") else "✅"
             cb = f"menu_toggleblock|{s['user_id']}"
@@ -779,7 +788,7 @@ async def cmd_clear_wazzup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id_val = context.args[0] if context.args else ""
     if not chat_id_val:
-        await update.message.reply_text("Укажи chat_id: /clearwazzup 360092495")
+        await update.message.reply_text("Укажи chat_id: /clearwazzup <id>")
         return
     try:
         with db.conn.cursor() as cur:
@@ -1616,8 +1625,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # Ответ менеджера на алерт цены в личке — пересылаем Виктору
-    OWNER_ID = 360092495
-    if user and chat_id == user.id and chat_id != OWNER_ID and text:
+    if user and chat_id == user.id and chat_id != OWNER_CHAT_ID and text:
 
 
         # 2. Ответ на запрос комментария по цене
@@ -1629,7 +1637,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if alert_id:
                 db.close_price_alert(alert_id, text)
             await context.bot.send_message(
-                chat_id=OWNER_ID,
+                chat_id=OWNER_CHAT_ID,
                 text=(
                     f"💬 *Комментарий по занижению цены*\n"
                     f"👤 Менеджер: *{mgr_name}*\n\n"
@@ -1656,7 +1664,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     order_name = alert_data.get("order_name", "")
                     mgr_name = alert_data.get("manager_name", user.full_name)
                     await context.bot.send_message(
-                        chat_id=OWNER_ID,
+                        chat_id=OWNER_CHAT_ID,
                         text=(
                             f"💬 *Ответ по алерту цены*\n"
                             f"👤 Менеджер: *{mgr_name}*\n"
@@ -3208,7 +3216,7 @@ async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_group [название группы] — сумма продаж по группе товаров за текущий месяц по менеджерам."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
 
     import aiohttp
@@ -3318,7 +3326,7 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_fact [тег] — тест получения отгрузок по тегу за текущий месяц."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
     tag = " ".join(context.args).lower() if context.args else "скляр"
     await update.message.reply_text(f"🔍 Считаю отгрузки за март по тегу {tag}...")
@@ -3474,7 +3482,7 @@ _report_tokens: dict = {}
 async def cmd_refresh_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/refresh_history — принудительно обновить историю менеджеров."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
     await update.message.reply_text("🔄 Собираю историю по месяцам, это займёт несколько минут...")
     try:
@@ -3499,9 +3507,8 @@ async def cmd_refresh_history(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def cmd_reissue_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/reissue_contract [название компании] — перегенерировать договор с теми же номером и датой."""
     user = update.effective_user
-    OWNER_ID = 360092495
     manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    allowed_ids = manager_ids + [OWNER_ID]
+    allowed_ids = manager_ids + [OWNER_CHAT_ID]
     if not user or user.id not in allowed_ids:
         await update.message.reply_text("❌ У вас нет доступа к этой команде.")
         return
@@ -3591,9 +3598,8 @@ async def cmd_reissue_contract(update: Update, context: ContextTypes.DEFAULT_TYP
 async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/refresh_contract [название компании] — обновить реквизиты из МойСклад и переиздать договор с тем же номером и датой."""
     user = update.effective_user
-    OWNER_ID = 360092495
     manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    allowed_ids = manager_ids + [OWNER_ID]
+    allowed_ids = manager_ids + [OWNER_CHAT_ID]
     if not user or user.id not in allowed_ids:
         await update.message.reply_text("❌ У вас нет доступа к этой команде.")
         return
@@ -3734,7 +3740,7 @@ async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYP
 async def cmd_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/refresh_cache — принудительно обновить кэш отчёта ОП."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
     await update.message.reply_text("🔄 Собираю данные из МойСклад... (3-5 мин)")
     try:
@@ -3762,7 +3768,7 @@ async def cmd_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_web_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/web_report — временная ссылка на интерактивный отчёт ОП (1 час)."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
     token = db.create_report_link(mgr_filter=None, ttl_minutes=60)
     base = os.getenv("RAILWAY_PUBLIC_DOMAIN", "f2b-production.up.railway.app")
@@ -3775,7 +3781,7 @@ async def cmd_web_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_lost_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/lost_clients — клиенты которые грузились в прошлом месяце но не грузились в этом."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
 
     await update.message.reply_text("🔍 Ищу выбывших клиентов...")
@@ -3914,7 +3920,7 @@ async def cmd_lost_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_new_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/new_clients — список новых клиентов текущего месяца."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
 
     await update.message.reply_text("🔍 Ищу новых клиентов за текущий месяц...")
@@ -4031,7 +4037,7 @@ async def cmd_test_publink(update, context):
     from telegram import Update
 
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
 
     order_id = context.args[0] if context.args else "ff0588e7-2766-11f1-0a80-01a1000aa0eb"
@@ -4065,7 +4071,7 @@ async def cmd_test_publink(update, context):
 async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/unlink [chat_id или имя контакта] — удаляет контакт из базы идентификации."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
     if not context.args:
         await update.message.reply_text("Использование: /unlink [chat_id]\nПример: /unlink 1293122998")
@@ -4103,7 +4109,7 @@ async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/relink [chat_id] [новое имя компании] — перепривязывает контакт к другой компании."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
     if len(context.args) < 2:
         await update.message.reply_text(
@@ -4139,7 +4145,7 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_sync_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sync_managers — обновляет менеджеров в базе по тегам МойСклад."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
 
     await update.message.reply_text("🔄 Синхронизирую менеджеров...")
@@ -4197,7 +4203,7 @@ async def sync_contact_managers() -> int:
 async def cmd_search_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/search_msg [слово] — ищет сообщения в БД без ограничения по дате."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
     query = " ".join(context.args).lower() if context.args else ""
     if not query:
@@ -4271,7 +4277,7 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/block [user_id] — заблокировать пользователя."""
-    if not update.effective_user or update.effective_user.id != 360092495:
+    if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
         return
     if not context.args:
         await update.message.reply_text("Использование: /block [user_id]")
@@ -4285,7 +4291,7 @@ async def cmd_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_unblock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/unblock [user_id] — разблокировать пользователя."""
-    if not update.effective_user or update.effective_user.id != 360092495:
+    if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
         return
     if not context.args:
         await update.message.reply_text("Использование: /unblock [user_id]")
@@ -4299,7 +4305,7 @@ async def cmd_unblock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/stats — статистика использования бота."""
-    if not update.effective_user or update.effective_user.id != 360092495:
+    if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
         return
     stats = db.get_usage_stats()
     if not stats:
@@ -4318,10 +4324,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     """/pdz_results — результаты ПДЗ в личку по каждому менеджеру."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
 
-    OWNER_ID = 360092495
     from moysklad import get_overdue_demands
 
     # Берём сегодняшние результаты, если нет — последние доступные
@@ -4332,7 +4337,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         last_date, all_results = db.get_pdz_results_last()
         if not all_results:
-            await context.bot.send_message(chat_id=OWNER_ID, text="📭 Результатов по ПДЗ пока нет.")
+            await context.bot.send_message(chat_id=OWNER_CHAT_ID, text="📭 Результатов по ПДЗ пока нет.")
             return
         date_label = last_date.strftime("%d.%m.%Y") if hasattr(last_date, "strftime") else str(last_date)
 
@@ -4396,21 +4401,20 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
 
         await context.bot.send_message(
-            chat_id=OWNER_ID, text=text,
+            chat_id=OWNER_CHAT_ID, text=text,
             parse_mode="Markdown", reply_markup=keyboard
         )
         sent_any = True
 
     if not sent_any:
-        await context.bot.send_message(chat_id=OWNER_ID, text="📭 Просроченных долгов нет.")
+        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text="📭 Просроченных долгов нет.")
 
 async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/pdz_results — результаты ПДЗ в личку по каждому менеджеру."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
 
-    OWNER_ID = 360092495
     from moysklad import get_overdue_demands
 
     today_results = db.get_pdz_results_today()
@@ -4420,7 +4424,7 @@ async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         last_date, all_results = db.get_pdz_results_last()
         if not all_results:
-            await context.bot.send_message(chat_id=OWNER_ID, text="📭 Результатов по ПДЗ пока нет.")
+            await context.bot.send_message(chat_id=OWNER_CHAT_ID, text="📭 Результатов по ПДЗ пока нет.")
             return
         date_label = last_date.strftime("%d.%m.%Y") if hasattr(last_date, "strftime") else str(last_date)
 
@@ -4480,13 +4484,13 @@ async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
 
         await context.bot.send_message(
-            chat_id=OWNER_ID, text=text,
+            chat_id=OWNER_CHAT_ID, text=text,
             parse_mode="Markdown", reply_markup=keyboard
         )
         sent_any = True
 
     if not sent_any:
-        await context.bot.send_message(chat_id=OWNER_ID, text="📭 Просроченных долгов нет.")
+        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text="📭 Просроченных долгов нет.")
 
 async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тестовый запуск утренних задач ПДЗ. /pdz_test [имя|all]"""
@@ -4669,7 +4673,7 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_reply_markup(reply_markup=None)
             await query.answer("✅ Запрос отправлен менеджеру.")
             await context.bot.send_message(
-                chat_id=360092495,
+                chat_id=OWNER_CHAT_ID,
                 text=f"✅ Запрос комментариев отправлен *{mgr_name}*.",
                 parse_mode="Markdown"
             )
@@ -4906,7 +4910,7 @@ async def _build_report_data() -> dict:
 async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/reset_agreed [номер заказа] — сбросить флаг отправки уведомления."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
     if not context.args:
         await update.message.reply_text("Использование: /reset_agreed [номер заказа, например 01645]")
@@ -4950,7 +4954,7 @@ async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/notifier_status — заказы за сегодня которым не ушла рассылка."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
     await update.message.reply_text("🔍 Проверяю заказы за сегодня...")
     try:
@@ -5007,7 +5011,7 @@ async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def cmd_set_attestation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/set_attestation [имя] [общая|акб] [процент] — задать аттестацию менеджера."""
-    if not update.effective_user or update.effective_user.id != 360092495:
+    if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
         return
     if len(context.args) < 3:
         await update.message.reply_text(
@@ -5064,7 +5068,7 @@ def get_weekly_targets(mgr_name: str) -> dict:
 
 async def cmd_set_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/set_weekly [имя] [показатель] [значение] — задать накопительный недельный план."""
-    if not update.effective_user or update.effective_user.id != 360092495:
+    if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
         return
     if len(context.args) < 3:
         await update.message.reply_text(
@@ -5117,7 +5121,7 @@ async def cmd_set_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/managers — показать всех зарегистрированных пользователей и их chat_id."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
     rows = db._fetchall(
         "SELECT user_id, full_name, is_blocked FROM manager_chats ORDER BY full_name"
@@ -5135,7 +5139,7 @@ async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_ms_attributes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/ms_attributes — показать UUID дополнительных полей контрагентов."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
     import aiohttp
     from moysklad import get_headers
@@ -5155,7 +5159,7 @@ async def cmd_ms_attributes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_del_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/del_user [user_id] — полностью удалить пользователя из базы."""
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
     if not context.args:
         await update.message.reply_text("Использование: /del_user [user_id]\nПример: /del_user 1337598287")
@@ -5840,7 +5844,6 @@ async def process_ms_webhook(data: dict, bot):
             alerts = await check_order_prices(order_href)
 
             if alerts:
-                owner_chat_id = 360092495  # Виктор Васильев
                 text = "⚠️ *Цена ниже минимальной!*\n\n" + "\n\n".join(alerts)
 
                 # Получаем имя менеджера из данных заказа
@@ -5866,7 +5869,7 @@ async def process_ms_webhook(data: dict, bot):
                     InlineKeyboardButton("💬 Комментарий менеджеру", callback_data=f"price_comment|{order_id}|{alert_id}"),
                 ]])
                 await bot.send_message(
-                    chat_id=owner_chat_id,
+                    chat_id=OWNER_CHAT_ID,
                     text=text,
                     parse_mode="Markdown",
                     reply_markup=keyboard
