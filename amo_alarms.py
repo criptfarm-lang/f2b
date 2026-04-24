@@ -38,9 +38,19 @@ AMO_BASE_URL = f"https://{AMO_API_DOMAIN}/api/v4"
 #   "triggered_at": datetime,      # когда пришёл вебхук
 # }
 _active_alarms: dict = {}
+# Lock для дедупликации параллельных webhook'ов на один lead_id
+# (amoCRM может присылать дубли; без lock оба вызова пройдут проверку "lead_id in _active_alarms"
+# одновременно и создадут два таймера на одну сделку).
+_alarms_lock = asyncio.Lock()
 
 # Кэш ID воронки и этапа — заполняется при первом запросе
 _pipeline_cache: dict = {}  # {"pipeline_id": int, "stage_id": int, "stage_name": str}
+
+# Владелец бота — TG-id из env (дублируется с bot.py, чтобы избежать circular import).
+_owner_chat_id_raw = os.getenv("OWNER_CHAT_ID")
+if not _owner_chat_id_raw:
+    raise RuntimeError("OWNER_CHAT_ID env not set.")
+OWNER_CHAT_ID = int(_owner_chat_id_raw)
 
 
 # ─── amoCRM API helpers ───────────────────────────────────────────────────────
@@ -483,55 +493,69 @@ async def handle_amo_webhook(request, app: Application, db):
 
             # Проверяем что это именно "Новая заявка" в воронке "Реклама"
             if pipeline_id == target_pipeline_id and status_id == target_stage_id:
-                # Уже обрабатываем эту сделку — игнорируем дубль
-                if lead_id in _active_alarms:
-                    logger.info(f"AMO webhook: lead_id={lead_id} уже в обработке, пропускаем")
-                    continue
+                # Уже обрабатываем эту сделку — игнорируем дубль.
+                # Проверяем и резервируем lead_id под локом, чтобы параллельный
+                # webhook на ту же сделку не прошёл дедуп.
+                async with _alarms_lock:
+                    if lead_id in _active_alarms:
+                        logger.info(f"AMO webhook: lead_id={lead_id} уже в обработке, пропускаем")
+                        continue
+                    _active_alarms[lead_id] = {"reserved": True}
 
-                # Получаем данные сделки
-                lead_data = await _amo_get(
-                    f"/leads/{lead_id}",
-                    params={"with": "contacts"}
-                )
-                if not lead_data:
-                    logger.error(f"AMO webhook: не удалось получить сделку {lead_id}")
-                    continue
+                timer_started = False
+                try:
+                    # Получаем данные сделки
+                    lead_data = await _amo_get(
+                        f"/leads/{lead_id}",
+                        params={"with": "contacts"}
+                    )
+                    if not lead_data:
+                        logger.error(f"AMO webhook: не удалось получить сделку {lead_id}")
+                        continue
 
-                # Имя клиента
-                client_name = "Неизвестный клиент"
-                contacts = lead_data.get("_embedded", {}).get("contacts", [])
-                if contacts:
-                    c = await _amo_get(f"/contacts/{contacts[0]['id']}")
-                    if c:
-                        client_name = c.get("name", client_name)
+                    # Имя клиента
+                    client_name = "Неизвестный клиент"
+                    contacts = lead_data.get("_embedded", {}).get("contacts", [])
+                    if contacts:
+                        c = await _amo_get(f"/contacts/{contacts[0]['id']}")
+                        if c:
+                            client_name = c.get("name", client_name)
 
-                # Имя менеджера
-                manager_name = "Неизвестный менеджер"
-                resp_id = lead_data.get("responsible_user_id")
-                if resp_id:
-                    manager_name = await get_responsible_user_name(resp_id)
+                    # Имя менеджера
+                    manager_name = "Неизвестный менеджер"
+                    resp_id = lead_data.get("responsible_user_id")
+                    if resp_id:
+                        manager_name = await get_responsible_user_name(resp_id)
 
-                triggered_at = datetime.now(timezone.utc)
+                    triggered_at = datetime.now(timezone.utc)
 
-                # Отправляем первый алерт
-                msg_id = await send_first_alarm(
-                    lead_id=lead_id,
-                    client_name=client_name,
-                    manager_name=manager_name,
-                    app=app,
-                    group_chat_id=group_chat_id,
-                )
-
-                # Запускаем таймер 5 минут
-                if msg_id:
-                    start_alarm_timer(
+                    # Отправляем первый алерт
+                    msg_id = await send_first_alarm(
                         lead_id=lead_id,
-                        msg_id=msg_id,
-                        triggered_at=triggered_at,
+                        client_name=client_name,
+                        manager_name=manager_name,
                         app=app,
                         group_chat_id=group_chat_id,
-                        db=db,
                     )
+
+                    # Запускаем таймер 5 минут
+                    if msg_id:
+                        start_alarm_timer(
+                            lead_id=lead_id,
+                            msg_id=msg_id,
+                            triggered_at=triggered_at,
+                            app=app,
+                            group_chat_id=group_chat_id,
+                            db=db,
+                        )
+                        timer_started = True
+                finally:
+                    # Если таймер так и не запустился — снять placeholder, чтобы будущие webhooks на тот же lead_id не зависли в "уже в обработке"
+                    if not timer_started:
+                        async with _alarms_lock:
+                            cur = _active_alarms.get(lead_id)
+                            if cur and cur.get("reserved") and not cur.get("task"):
+                                _active_alarms.pop(lead_id, None)
 
     except Exception as e:
         logger.error(f"handle_amo_webhook: {e}", exc_info=True)
@@ -663,7 +687,7 @@ async def cmd_amo_setup(update, context):
     Только для руководителя.
     """
     user = update.effective_user
-    if not user or user.id != 360092495:
+    if not user or user.id != OWNER_CHAT_ID:
         return
 
     await update.message.reply_text("🔍 Проверяю подключение к amoCRM...")

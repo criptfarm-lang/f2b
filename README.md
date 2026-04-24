@@ -50,8 +50,15 @@
 | `TELEGRAM_BOT_TOKEN` | токен от BotFather |
 | `ANTHROPIC_API_KEY` | ключ от Anthropic |
 | `GROUP_CHAT_IDS` | ID групп (см. ниже) |
-| `MANAGER_IDS` | Telegram ID руководителя |
-| `DB_PATH` | `/app/f2b_bot.db` |
+| `MANAGER_IDS` | Telegram ID руководителей, чьи сообщения парсим на задачи |
+| `OWNER_CHAT_ID` | Telegram ID владельца бота (гейт админских команд) |
+| `DATABASE_URL` | строка подключения Postgres (Railway plugin подставит автоматически) |
+| `YANDEX_GEOCODER_KEY` | ключ Яндекс-геокодера (для расчётов доставки) |
+| `MOYSKLAD_TOKEN` | токен МойСклад |
+| `WAZZUP_API_KEY` | ключ Wazzup (исходящие сообщения клиентам) |
+| `QUIZ_BASE_URL` | URL квиз-сервера (опционально) |
+
+**Важно:** без `DATABASE_URL`, `YANDEX_GEOCODER_KEY` и `OWNER_CHAT_ID` бот не запустится (упадёт с `RuntimeError: … env not set`). Все три — обязательные.
 
 **Как узнать ID группы:**
 1. Добавь **@userinfobot** в нужную группу

@@ -8,7 +8,8 @@
 
 import logging
 import os
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from telegram.ext import Application
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -18,6 +19,8 @@ from claude_ai import generate_morning_summary
 from moysklad import get_overdue_demands, format_overdue_summary
 
 logger = logging.getLogger(__name__)
+
+MSK = ZoneInfo("Europe/Moscow")
 
 def get_group_ids():
     raw = os.getenv("GROUP_CHAT_IDS", "")
@@ -66,19 +69,19 @@ def setup_scheduler(app: Application, db):
     # 12:00 МСК — проверка стареющих клиентов
     scheduler.add_job(
         check_aging_clients,
-        CronTrigger(hour=9, minute=0, timezone="UTC"),
+        CronTrigger(hour=12, minute=0),
         args=[app],
         id="aging_clients"
     )
 
-    # 03:00 UTC — очистка старых задач
+    # 03:00 МСК — очистка старых задач
     scheduler.add_job(
         cleanup_done_tasks,
         CronTrigger(hour=3, minute=0),
         id="cleanup_done_tasks"
     )
 
-    # 02:00 UTC — синхронизация менеджеров в wazzup_contact_map
+    # 02:00 МСК — синхронизация менеджеров в wazzup_contact_map
     scheduler.add_job(
         sync_managers_job,
         CronTrigger(hour=2, minute=0),
@@ -88,9 +91,13 @@ def setup_scheduler(app: Application, db):
 
     scheduler.start()
     logger.info("✅ Планировщик запущен")
+    for job in scheduler.get_jobs():
+        nxt = job.next_run_time.astimezone(MSK).strftime("%Y-%m-%d %H:%M %Z") if job.next_run_time else "?"
+        logger.info(f"  job={job.id} next_run={nxt}")
 
 async def morning_summary(app: Application, db):
     """Отправляет утреннюю сводку в группы."""
+    logger.info(f"morning_summary стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}")
     group_ids = get_group_ids()
     if not group_ids:
         return
@@ -112,6 +119,7 @@ async def morning_summary(app: Application, db):
 
 async def remind_today_tasks(app: Application, db):
     """Напоминает о задачах на сегодня."""
+    logger.info(f"remind_today_tasks стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}")
     group_ids = get_group_ids()
     tasks = db.get_tasks_due_today()
 
@@ -272,6 +280,7 @@ async def pdz_evening_summary(app: Application):
 
 def cleanup_done_tasks():
     """Удаляет выполненные задачи старше 24 часов."""
+    logger.info(f"cleanup_done_tasks стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}")
     try:
         from database import Database
         db = Database()
@@ -282,6 +291,7 @@ def cleanup_done_tasks():
 
 async def sync_managers_job(app: Application):
     """Ночная синхронизация менеджеров в wazzup_contact_map."""
+    logger.info(f"sync_managers_job стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}")
     try:
         from bot import sync_contact_managers
         updated = await sync_contact_managers()
@@ -291,6 +301,7 @@ async def sync_managers_job(app: Application):
 
 async def check_aging_clients(app: Application):
     """Ежедневно в 12:00 — алерт по новым стареющим клиентам (40+ дней без отгрузок)."""
+    logger.info(f"check_aging_clients стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}")
     from moysklad import get_aging_clients
     from database import Database
 

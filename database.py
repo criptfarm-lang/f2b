@@ -10,7 +10,12 @@ from datetime import datetime, date, timedelta
 from typing import List, Dict, Optional
 
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:REDACTED_POSTGRES_PASSWORD@switchback.proxy.rlwy.net:44165/railway")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL env not set. "
+        "Задай переменную в Railway → Variables (строка подключения Postgres-плагина)."
+    )
 
 
 class Database:
