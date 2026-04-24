@@ -5491,7 +5491,16 @@ class _TaskConvActiveFilter(filters.MessageFilter):
         chat = getattr(message, "chat", None)
         if not user or not chat or chat.type != "private":
             return False
-        return user.id in _task_conversations
+        active = user.id in _task_conversations
+        # Диагностика: логируем попытку для whitelist-юзеров, чтобы увидеть,
+        # почему filter не совпадает, если пользователь в conv ожидает.
+        if _is_task_author(user.id):
+            logger.info(
+                f"metric.task_bot.filter_check user_id={user.id} "
+                f"active={active} conv_keys={list(_task_conversations.keys())} "
+                f"text={(message.text or '')[:60]!r}"
+            )
+        return active
 
 
 _task_conv_active_filter = _TaskConvActiveFilter()
@@ -5503,6 +5512,11 @@ async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat = update.effective_chat
     if not user or not chat or chat.type != "private":
         return
+    logger.info(
+        f"metric.task_bot.message_received user_id={user.id} "
+        f"in_conv={user.id in _task_conversations} "
+        f"stage={_task_conversations.get(user.id, {}).get('stage')}"
+    )
     if user.id not in _task_conversations:
         return
     conv = _task_conversations[user.id]
