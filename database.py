@@ -324,6 +324,28 @@ class Database:
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
+            # Структурированный лог срабатываний алярма «Цена ниже минимальной»
+            # по каждой заниженной позиции — для аналитики (топ SKU, разрезы по
+            # менеджерам/клиентам, динамика). 1:N к price_alerts.
+            """CREATE TABLE IF NOT EXISTS price_alert_items (
+                id SERIAL PRIMARY KEY,
+                price_alert_id INT REFERENCES price_alerts(id) ON DELETE CASCADE,
+                order_id TEXT,
+                order_name TEXT,
+                agent_id TEXT,
+                agent_name TEXT,
+                client_type TEXT,
+                manager_name TEXT,
+                product_id TEXT,
+                product_code TEXT,
+                product_name TEXT,
+                order_price NUMERIC(12,2),
+                min_price NUMERIC(12,2),
+                delta NUMERIC(12,2),
+                raised_at TIMESTAMPTZ DEFAULT NOW()
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_price_alert_items_raised_at ON price_alert_items(raised_at)",
+            "CREATE INDEX IF NOT EXISTS idx_price_alert_items_product_raised ON price_alert_items(product_id, raised_at)",
             """CREATE TABLE IF NOT EXISTS pdz_results (
                 id SERIAL PRIMARY KEY,
                 manager_name TEXT,
@@ -592,6 +614,45 @@ class Database:
         self._execute(
             "UPDATE price_alerts SET status='answered', alert_text=alert_text||%s WHERE id=%s",
             (f"\n💬 Ответ: {comment}", alert_id)
+        )
+
+    def save_price_alert_item(self, price_alert_id: int, item: dict) -> int:
+        """Структурированная запись об одной заниженной позиции внутри алярма."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO price_alert_items (
+                       price_alert_id, order_id, order_name,
+                       agent_id, agent_name, client_type, manager_name,
+                       product_id, product_code, product_name,
+                       order_price, min_price, delta
+                   ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (
+                    price_alert_id,
+                    item.get("order_id"),
+                    item.get("order_name"),
+                    item.get("agent_id"),
+                    item.get("agent_name"),
+                    item.get("client_type"),
+                    item.get("manager_name"),
+                    item.get("product_id"),
+                    item.get("product_code"),
+                    item.get("product_name"),
+                    item.get("order_price"),
+                    item.get("min_price"),
+                    item.get("delta"),
+                )
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row["id"]
+
+    def get_price_alert_items_since(self, days: int = 14) -> list:
+        """Срез лога занижений за последние N дней — для ad-hoc аналитики."""
+        return self._fetchall(
+            """SELECT * FROM price_alert_items
+               WHERE raised_at > NOW() - make_interval(days := %s)
+               ORDER BY raised_at DESC""",
+            (days,)
         )
 
     # ─── ЗАДАЧИ ─────────────────────────────────────────────────────────────────

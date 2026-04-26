@@ -6421,25 +6421,32 @@ async def process_ms_webhook(data: dict, bot):
             alerts = await check_order_prices(order_href)
 
             if alerts:
-                text = "⚠️ *Цена ниже минимальной!*\n\n" + "\n\n".join(alerts)
+                text = "⚠️ *Цена ниже минимальной!*\n\n" + "\n\n".join(a["text"] for a in alerts)
 
-                # Получаем имя менеджера из данных заказа
-                mgr_name = ""
-                for a in alerts:
-                    for line in a.split("\n"):
-                        if "Менеджер:" in line:
-                            mgr_name = line.replace("Менеджер:", "").strip()
-                            break
+                # Структурированные поля берём из первого алярма по заказу
+                first = alerts[0]
+                mgr_name = first.get("manager_name", "")
+                ord_name = first.get("order_name", "")
+                client_name = first.get("agent_name", "")
 
-                # Сохраняем алерт в БД
+                # Сохраняем заголовок алерта в БД (как сейчас)
                 alert_id = db.save_price_alert(
                     order_id=order_id,
-                    order_name="",
-                    client_name="",
+                    order_name=ord_name,
+                    client_name=client_name,
                     manager_name=mgr_name,
                     manager_user_id=0,
                     alert_text=text
                 )
+
+                # Структурированный лог по каждой заниженной позиции —
+                # для аналитики (топ SKU, разрезы по менеджерам/клиентам).
+                # Ошибки здесь не должны ломать отправку алярма Виктору.
+                for item in alerts:
+                    try:
+                        db.save_price_alert_item(alert_id, item)
+                    except Exception as e:
+                        logger.error(f"save_price_alert_item failed: {e}")
 
                 keyboard = InlineKeyboardMarkup([[
                     InlineKeyboardButton("✅ Согласовано", callback_data=f"price_ok|{order_id}"),

@@ -1758,6 +1758,11 @@ async def check_order_prices(order_href: str) -> list:
     """
     Проверяет цены в заказе покупателя.
     Пропускает заказы в финальных статусах.
+
+    Возвращает список dict'ов по каждой заниженной позиции. Поле "text" —
+    готовый отрендеренный блок (используется вызывающим кодом для сборки
+    общего текста алярма), остальные поля — структурированные значения
+    (для лога в price_alert_items и аналитики).
     """
     SKIP_STATES = {
         "005f3651-9a9a-11f0-0a80-03a900027474",  # Согласован
@@ -1797,6 +1802,7 @@ async def check_order_prices(order_href: str) -> list:
             agent_name = agent.get("name", "неизвестно")
             agent_id = agent.get("id", "")
             order_name = order.get("name", "")
+            order_id = order.get("id", "")
 
             # Менеджер (владелец заказа)
             owner = order.get("owner", {})
@@ -1827,6 +1833,7 @@ async def check_order_prices(order_href: str) -> list:
                 assortment = pos.get("assortment", {})
                 product_name = assortment.get("name", "")
                 product_id = assortment.get("id", "")
+                product_code = assortment.get("code", "")
                 order_price = pos.get("price", 0) / 100  # цена в копейках
 
                 if not product_id or order_price <= 0:
@@ -1854,13 +1861,28 @@ async def check_order_prices(order_href: str) -> list:
                 # 5. Сравниваем
                 if order_price < min_price:
                     diff = min_price - order_price
-                    alerts.append(
+                    text = (
                         f"📦 *{agent_name}* | Заказ *{order_name}*\n"
                         f"Менеджер: {manager_name}\n\n"
                         f"*{product_name}*\n"
                         f"Цена в заказе: {order_price:,.0f} руб | Минимальная ({client_type}): {min_price:,.0f} руб\n"
                         f"*Занижена на: {diff:,.0f} руб*"
                     )
+                    alerts.append({
+                        "order_id": order_id,
+                        "order_name": order_name,
+                        "agent_id": agent_id,
+                        "agent_name": agent_name,
+                        "client_type": client_type,
+                        "manager_name": manager_name,
+                        "product_id": product_id,
+                        "product_code": product_code,
+                        "product_name": product_name,
+                        "order_price": order_price,
+                        "min_price": min_price,
+                        "delta": diff,
+                        "text": text,
+                    })
 
     except Exception as e:
         logger.error(f"check_order_prices: {e}")
