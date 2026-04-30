@@ -1010,7 +1010,8 @@ async def cmd_wazzup_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     import aiohttp
-    webhook_url = "https://f2b-production.up.railway.app/webhook/wazzup"
+    _public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "f2b-production.up.railway.app")
+    webhook_url = f"https://{_public_domain}/webhook/wazzup"
 
     async with aiohttp.ClientSession() as session:
         # Устанавливаем вебхук
@@ -1117,7 +1118,8 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            async with session.get("https://f2b-production.up.railway.app/health") as resp:
+            _public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "f2b-production.up.railway.app")
+            async with session.get(f"https://{_public_domain}/health") as resp:
                 if resp.status == 200:
                     results.append("✅ Webhook сервер")
                 else:
@@ -3018,7 +3020,8 @@ async def cmd_add_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     import aiohttp
     token = os.getenv("MOYSKLAD_TOKEN")
-    webhook_url = "https://f2b-production.up.railway.app/webhook/moysklad"
+    _public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "f2b-production.up.railway.app")
+    webhook_url = f"https://{_public_domain}/webhook/moysklad"
     api_url = "https://api.moysklad.ru/api/remap/1.2/entity/webhook"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 

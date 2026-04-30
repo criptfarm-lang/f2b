@@ -725,7 +725,8 @@ async def cmd_amo_setup(update, context):
     # 3. Проверяем webhooks
     webhooks_data = await _amo_get("/webhooks")
     webhooks = webhooks_data.get("_embedded", {}).get("webhooks", []) if webhooks_data else []
-    webhook_url = "https://f2b-production.up.railway.app/webhook/amocrm"
+    _public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "f2b-production.up.railway.app")
+    webhook_url = f"https://{_public_domain}/webhook/amocrm"
     webhook_ok = any(w.get("destination", "") == webhook_url for w in webhooks)
 
     lines = [
