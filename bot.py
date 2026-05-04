@@ -4859,13 +4859,22 @@ async def _build_report_data() -> dict:
                     continue
                 lost_client_names.setdefault(mgr, []).append(cp.get("name", aid))
 
-    PLANS = {
-        "Инесса Скляр":     {"shipments": 250, "revenue": 26_500_000, "clients": 30, "new_clients": 5, "attracted": 1_000_000},
-        "Карина Баласанян": {"shipments": 170, "revenue": 6_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
-        "Елена Мерзлякова": {"shipments": 80,  "revenue": 6_700_000,  "clients": 30, "new_clients": 5, "attracted": 300_000},
-        "Ирина Дьяченко":   {"shipments": 1,   "revenue": 50_000,     "clients": 1,  "new_clients": 1, "attracted": 12_500},
-        "Денис Коликов":    {"shipments": 1,   "revenue": 200_000,    "clients": 1,  "new_clients": 5, "attracted": 50_000},
+    MONTHLY_PLANS = {
+        "2026-05": {
+            "Инесса Скляр":     {"shipments": 210, "revenue": 22_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
+            "Карина Баласанян": {"shipments": 180, "revenue": 6_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
+            "Елена Мерзлякова": {"shipments": 67,  "revenue": 6_500_000,  "clients": 23, "new_clients": 5, "attracted": 300_000},
+            "Ирина Дьяченко":   {"shipments": 4,   "revenue": 500_000,    "clients": 2,  "new_clients": 1, "attracted": 12_500},
+            "Денис Коликов":    {"shipments": 15,  "revenue": 1_000_000,  "clients": 12, "new_clients": 5, "attracted": 50_000},
+        },
     }
+    current_month_key = today.strftime("%Y-%m")
+    if current_month_key in MONTHLY_PLANS:
+        PLANS = MONTHLY_PLANS[current_month_key]
+    else:
+        latest_month = max(MONTHLY_PLANS.keys())
+        logger.warning(f"План на {current_month_key} не задан в MONTHLY_PLANS, использую {latest_month}")
+        PLANS = MONTHLY_PLANS[latest_month]
     WEEKLY_PLANS = {
         "Инесса Скляр":     {"shipments": 25,  "revenue": 2_000_000,  "clients": 10, "new_clients": 1, "attracted": 250_000},
         "Карина Баласанян": {"shipments": 40,  "revenue": 1_200_000,  "clients": 16, "new_clients": 1, "attracted": 275_000},
