@@ -17,6 +17,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     TypeHandler,
     ContextTypes,
+    BusinessConnectionHandler,
     filters,
 )
 
@@ -5740,6 +5741,61 @@ async def _task_handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         _task_creating.discard(msg_id)
 
 
+# ─── Telegram Business: приём BusinessConnection (для TG Stories Publisher) ───
+async def handle_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Ловит подключение/отключение бота в Telegram Business → Chatbots.
+    Сохраняет business_connection_id в bot_settings и шлёт алерт собственнику.
+    План: plans/2026-05-14-tg-stories-publisher-mvp.md (Фаза 0/1).
+    """
+    bc = update.business_connection
+    if bc is None:
+        return
+
+    rights_repr = None
+    try:
+        if getattr(bc, "rights", None) is not None:
+            rights_repr = str(bc.rights.to_dict()) if hasattr(bc.rights, "to_dict") else str(bc.rights)
+    except Exception:
+        rights_repr = "<unparseable>"
+
+    payload = {
+        "id": bc.id,
+        "user_chat_id": bc.user_chat_id,
+        "user_id": bc.user.id if bc.user else None,
+        "is_enabled": bc.is_enabled,
+        "rights": rights_repr,
+        "date": bc.date.isoformat() if bc.date else None,
+    }
+    logger.info(f"📣 BusinessConnection update: {payload}")
+
+    try:
+        db._execute(
+            """INSERT INTO bot_settings (key, value) VALUES (%s, %s)
+               ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
+            ("business_connection_id_ftb_mob", bc.id if bc.is_enabled else "")
+        )
+        db._execute(
+            """INSERT INTO bot_settings (key, value) VALUES (%s, %s)
+               ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
+            ("business_connection_payload_ftb_mob", str(payload))
+        )
+    except Exception as e:
+        logger.error(f"Не удалось сохранить business_connection в bot_settings: {e}")
+
+    try:
+        status_emoji = "🟢" if bc.is_enabled else "🔴"
+        text = (
+            f"{status_emoji} Business Connection {'подключён' if bc.is_enabled else 'отключён'}\n"
+            f"business_connection_id: `{bc.id}`\n"
+            f"От user_id: {payload['user_id']}\n"
+            f"Права: {rights_repr}"
+        )
+        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Не удалось отправить алерт собственнику: {e}")
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -5763,6 +5819,9 @@ def main():
             logger.info(f"Восстановлено {len(pending_rows)} ожидающих идентификаций из БД")
     except Exception as e:
         logger.warning(f"Не удалось восстановить pending_idents: {e}")
+
+    # Telegram Business: подключение бота к бизнес-аккаунту (Stories Publisher)
+    app.add_handler(BusinessConnectionHandler(handle_business_connection))
 
     # Команды
     app.add_handler(CommandHandler("op_report", cmd_op_report))
@@ -6206,7 +6265,7 @@ def main():
 
         await app.updater.start_polling(
             drop_pending_updates=True,
-            allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post", "callback_query"]
+            allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post", "callback_query", "business_connection"]
         )
         logger.info("🤖 Бот запущен!")
         # Загружаем менеджеров Wazzup
