@@ -2864,6 +2864,80 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await smart_answer(query, user.full_name, context_data)
         await message.reply_text(response)
 
+# ─── Канал «Мониторинг» — закупочные прайсы поставщиков ────────────────────
+# План фичи: F2B второй мозг/plans/2026-05-15-tg-канал-мониторинг-цен-поставщиков.md
+# Обработка vision'ом — на стороне Claude Code (скилл update-market-intel),
+# бот только сохраняет сырьё в БД и медиа на persistent volume Amvera.
+MARKET_INTEL_CHAT_ID = int(os.getenv("MARKET_INTEL_CHAT_ID", "-1002964644525"))
+MARKET_INTEL_DIR = os.getenv("MARKET_INTEL_DIR", "/data/market-intel")
+
+
+async def handle_market_intel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняет channel_post из канала «Мониторинг»: текст + медиа."""
+    msg = update.channel_post or update.edited_channel_post
+    if not msg or msg.chat_id != MARKET_INTEL_CHAT_ID:
+        return  # whitelist по chat_id
+
+    # Тип сообщения и file_id (если есть)
+    file_id = None
+    file_ext = None
+    if msg.photo:
+        file_id = msg.photo[-1].file_id  # наибольшее разрешение
+        file_ext = "jpg"
+        msg_type = "photo"
+    elif msg.document:
+        file_id = msg.document.file_id
+        # выбираем расширение по mime/имени
+        fname = msg.document.file_name or ""
+        if "." in fname:
+            file_ext = fname.rsplit(".", 1)[-1].lower()[:8]
+        else:
+            mime = (msg.document.mime_type or "").lower()
+            file_ext = "pdf" if "pdf" in mime else "bin"
+        msg_type = "document"
+    else:
+        msg_type = "text"
+
+    text_raw = msg.text or msg.caption or ""
+    forward_from = None
+    if msg.forward_from_chat:
+        forward_from = msg.forward_from_chat.title or msg.forward_from_chat.username or ""
+    elif getattr(msg, "forward_sender_name", None):
+        forward_from = msg.forward_sender_name
+
+    # Скачиваем медиа на persistent volume (если есть)
+    file_path = None
+    if file_id:
+        try:
+            ym = msg.date.strftime("%Y-%m") if msg.date else datetime.utcnow().strftime("%Y-%m")
+            month_dir = os.path.join(MARKET_INTEL_DIR, ym)
+            os.makedirs(month_dir, exist_ok=True)
+            file_path = os.path.join(month_dir, f"{msg.message_id}.{file_ext}")
+            tg_file = await context.bot.get_file(file_id)
+            await tg_file.download_to_drive(file_path)
+        except Exception as e:
+            logger.error(f"market_intel: download failed for msg {msg.message_id}: {e}")
+            file_path = None  # запись в БД всё равно создаём, но без файла
+
+    saved_id = db.save_market_intel_message(
+        tg_msg_id=msg.message_id,
+        chat_id=msg.chat_id,
+        posted_at=msg.date or datetime.utcnow(),
+        msg_type=msg_type,
+        text_raw=text_raw,
+        file_path=file_path,
+        file_ext=file_ext,
+        forward_from=forward_from,
+    )
+    if saved_id:
+        logger.info(
+            f"market_intel: saved id={saved_id} tg_msg={msg.message_id} type={msg_type} "
+            f"file={'yes' if file_path else 'no'} fwd={forward_from or '-'}"
+        )
+    else:
+        logger.info(f"market_intel: duplicate tg_msg={msg.message_id} skipped")
+
+
 async def save_media(message: Message, media_type: str):
     """Сохраняет фото/документ в базу с тегами из подписи."""
     caption = message.caption or ""
@@ -5823,6 +5897,14 @@ def main():
     # Telegram Business: подключение бота к бизнес-аккаунту (Stories Publisher)
     app.add_handler(BusinessConnectionHandler(handle_business_connection))
 
+    # ─── Канал «Мониторинг» — закупочные прайсы поставщиков ─────────────────
+    # Регистрируем ДО любых других handler'ов на channel_post, чтобы whitelist
+    # по chat_id отработал первым. В функции стоит ранний return, если чат не наш.
+    app.add_handler(MessageHandler(
+        filters.UpdateType.CHANNEL_POST | filters.UpdateType.EDITED_CHANNEL_POST,
+        handle_market_intel_post,
+    ))
+
     # Команды
     app.add_handler(CommandHandler("op_report", cmd_op_report))
     app.add_handler(CommandHandler("test_group", cmd_test_group))
@@ -6241,6 +6323,45 @@ def main():
             await handle_amo_webhook(request, app, db)
             return web.Response(text="ok")
         web_app.router.add_post("/webhook/amocrm", handle_amo_webhook_route)
+
+        # ─── Market Intel: эндпоинты для скилла update-market-intel ──────────
+        market_intel_token = os.getenv("MARKET_INTEL_TOKEN", "")
+
+        def _check_market_intel_auth(request) -> bool:
+            if not market_intel_token:
+                return False
+            auth = request.headers.get("Authorization", "")
+            return auth == f"Bearer {market_intel_token}"
+
+        async def handle_market_intel_file(request):
+            if not _check_market_intel_auth(request):
+                return web.Response(text="forbidden", status=403)
+            try:
+                msg_id = int(request.match_info["id"])
+            except (KeyError, ValueError):
+                return web.Response(text="bad id", status=400)
+            row = db.get_market_intel_message(msg_id)
+            if not row or not row.get("file_path"):
+                return web.Response(text="not found", status=404)
+            path = row["file_path"]
+            if not os.path.exists(path):
+                return web.Response(text="file missing on disk", status=410)
+            return web.FileResponse(path)
+
+        async def handle_market_intel_processed(request):
+            if not _check_market_intel_auth(request):
+                return web.Response(text="forbidden", status=403)
+            try:
+                data = await request.json()
+                msg_id = int(data["id"])
+            except Exception:
+                return web.Response(text="bad body", status=400)
+            db.mark_market_intel_processed(msg_id)
+            return web.json_response({"ok": True, "id": msg_id})
+
+        web_app.router.add_get("/market-intel/files/{id}", handle_market_intel_file)
+        web_app.router.add_post("/market-intel/processed", handle_market_intel_processed)
+
         port = int(os.getenv("PORT", "8080"))
         runner = web.AppRunner(web_app)
         await runner.setup()

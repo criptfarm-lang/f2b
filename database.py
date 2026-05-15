@@ -332,6 +332,21 @@ class Database:
                 work_date DATE DEFAULT CURRENT_DATE,
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
+            """CREATE TABLE IF NOT EXISTS market_intel_messages (
+                id SERIAL PRIMARY KEY,
+                tg_msg_id BIGINT NOT NULL,
+                chat_id BIGINT NOT NULL,
+                posted_at TIMESTAMPTZ NOT NULL,
+                msg_type TEXT NOT NULL,
+                text_raw TEXT,
+                file_path TEXT,
+                file_ext TEXT,
+                forward_from TEXT,
+                processed_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (chat_id, tg_msg_id)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_market_intel_unprocessed ON market_intel_messages (processed_at) WHERE processed_at IS NULL",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:
@@ -346,6 +361,71 @@ class Database:
             "INSERT INTO pdz_results (manager_name, manager_user_id, result_text) VALUES (%s,%s,%s)",
             (manager_name, manager_user_id, result_text)
         )
+
+    # ─── Market Intel (канал «Мониторинг» — закупочные прайсы) ──────────────
+    def save_market_intel_message(
+        self,
+        tg_msg_id: int,
+        chat_id: int,
+        posted_at,
+        msg_type: str,
+        text_raw: Optional[str] = None,
+        file_path: Optional[str] = None,
+        file_ext: Optional[str] = None,
+        forward_from: Optional[str] = None,
+    ) -> Optional[int]:
+        """Сохраняет сообщение из канала «Мониторинг». Возвращает id или None если уже есть (UNIQUE chat_id, tg_msg_id)."""
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO market_intel_messages
+                   (tg_msg_id, chat_id, posted_at, msg_type, text_raw, file_path, file_ext, forward_from)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (chat_id, tg_msg_id) DO NOTHING
+                   RETURNING id""",
+                (tg_msg_id, chat_id, posted_at, msg_type, text_raw, file_path, file_ext, forward_from),
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row["id"] if row else None
+
+    def get_unprocessed_market_intel(self, limit: int = 100) -> List[Dict]:
+        return self._fetchall(
+            """SELECT id, tg_msg_id, chat_id, posted_at, msg_type, text_raw,
+                      file_path, file_ext, forward_from, created_at
+               FROM market_intel_messages
+               WHERE processed_at IS NULL
+               ORDER BY posted_at ASC
+               LIMIT %s""",
+            (limit,),
+        )
+
+    def mark_market_intel_processed(self, msg_id: int):
+        self._execute(
+            "UPDATE market_intel_messages SET processed_at = NOW() WHERE id = %s",
+            (msg_id,),
+        )
+
+    def get_market_intel_message(self, msg_id: int) -> Optional[Dict]:
+        return self._fetchone(
+            """SELECT id, tg_msg_id, chat_id, posted_at, msg_type, text_raw,
+                      file_path, file_ext, forward_from, processed_at, created_at
+               FROM market_intel_messages
+               WHERE id = %s""",
+            (msg_id,),
+        )
+
+    def get_market_intel_count(self) -> Dict[str, int]:
+        row = self._fetchone(
+            """SELECT
+                 COUNT(*) AS total,
+                 COUNT(*) FILTER (WHERE processed_at IS NULL) AS unprocessed
+               FROM market_intel_messages"""
+        )
+        return {
+            "total": int(row["total"]) if row else 0,
+            "unprocessed": int(row["unprocessed"]) if row else 0,
+        }
 
     def get_activity_by_day(self, days: int = 7) -> list:
         """Активность менеджеров по дням: звонки + сообщения."""
