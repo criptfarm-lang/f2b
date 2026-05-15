@@ -2899,11 +2899,22 @@ async def handle_market_intel_post(update: Update, context: ContextTypes.DEFAULT
         msg_type = "text"
 
     text_raw = msg.text or msg.caption or ""
+    # python-telegram-bot 21+: forward_from_chat / forward_sender_name удалены,
+    # вместо них единое поле forward_origin (MessageOrigin*).
     forward_from = None
-    if msg.forward_from_chat:
-        forward_from = msg.forward_from_chat.title or msg.forward_from_chat.username or ""
-    elif getattr(msg, "forward_sender_name", None):
-        forward_from = msg.forward_sender_name
+    origin = getattr(msg, "forward_origin", None)
+    if origin is not None:
+        chat = getattr(origin, "chat", None)
+        if chat is not None:
+            forward_from = chat.title or chat.username or ""
+        else:
+            sender_user = getattr(origin, "sender_user", None)
+            if sender_user is not None:
+                forward_from = sender_user.full_name or sender_user.username or ""
+            else:
+                forward_from = getattr(origin, "sender_user_name", None) or getattr(origin, "sender_chat", None)
+                if hasattr(forward_from, "title"):
+                    forward_from = forward_from.title
 
     # Скачиваем медиа на persistent volume (если есть)
     file_path = None
