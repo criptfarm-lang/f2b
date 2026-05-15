@@ -2875,7 +2875,16 @@ MARKET_INTEL_DIR = os.getenv("MARKET_INTEL_DIR", "/data/market-intel")
 async def handle_market_intel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет channel_post из канала «Мониторинг»: текст + медиа."""
     msg = update.channel_post or update.edited_channel_post
-    if not msg or msg.chat_id != MARKET_INTEL_CHAT_ID:
+    if not msg:
+        return
+    # Diagnostic: всегда логируем chat_id, чтобы видеть, какие каналы вообще достигают handler'а.
+    # При несовпадении с whitelist — выходим, но запись в логе остаётся.
+    logger.info(
+        f"market_intel: channel_post received chat_id={msg.chat_id} "
+        f"chat_title={getattr(msg.chat, 'title', '?')} "
+        f"msg_id={msg.message_id} expected_chat_id={MARKET_INTEL_CHAT_ID}"
+    )
+    if msg.chat_id != MARKET_INTEL_CHAT_ID:
         return  # whitelist по chat_id
 
     # Тип сообщения и file_id (если есть)
