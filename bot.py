@@ -6379,8 +6379,68 @@ def main():
             db.mark_market_intel_processed(msg_id)
             return web.json_response({"ok": True, "id": msg_id})
 
+        async def handle_market_intel_unprocessed(request):
+            """Возвращает список необработанных сообщений из канала «Мониторинг»
+            для скилла update-market-intel и cloud-routine."""
+            if not _check_market_intel_auth(request):
+                return web.Response(text="forbidden", status=403)
+            try:
+                limit = int(request.query.get("limit", "100"))
+            except ValueError:
+                limit = 100
+            rows = db.get_unprocessed_market_intel(limit=limit)
+            # сериализуем datetime в isoformat для JSON
+            for r in rows:
+                for k in ("posted_at", "created_at"):
+                    v = r.get(k)
+                    if v is not None and hasattr(v, "isoformat"):
+                        r[k] = v.isoformat()
+            counts = db.get_market_intel_count()
+            return web.json_response({
+                "ok": True,
+                "limit": limit,
+                "returned": len(rows),
+                "total": counts.get("total", 0),
+                "unprocessed_total": counts.get("unprocessed", 0),
+                "messages": rows,
+            })
+
+        async def handle_market_intel_alert(request):
+            """Принимает {"text": "..."} и шлёт его в OWNER_CHAT_ID (Виктор)
+            от лица бота «Эф» — для алертов «кандидат на замену сырья»."""
+            if not _check_market_intel_auth(request):
+                return web.Response(text="forbidden", status=403)
+            try:
+                data = await request.json()
+                text = (data.get("text") or "").strip()
+            except Exception:
+                return web.Response(text="bad body", status=400)
+            if not text:
+                return web.Response(text="empty text", status=400)
+            try:
+                sent = await app.bot.send_message(
+                    chat_id=OWNER_CHAT_ID,
+                    text=text,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error(f"market_intel_alert send failed: {e}")
+                # fallback без Markdown — в случае ошибки парсинга
+                try:
+                    sent = await app.bot.send_message(
+                        chat_id=OWNER_CHAT_ID,
+                        text=text,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e2:
+                    return web.json_response({"ok": False, "error": str(e2)}, status=500)
+            return web.json_response({"ok": True, "message_id": sent.message_id})
+
         web_app.router.add_get("/market-intel/files/{id}", handle_market_intel_file)
+        web_app.router.add_get("/market-intel/unprocessed", handle_market_intel_unprocessed)
         web_app.router.add_post("/market-intel/processed", handle_market_intel_processed)
+        web_app.router.add_post("/market-intel/alert", handle_market_intel_alert)
 
         port = int(os.getenv("PORT", "8080"))
         runner = web.AppRunner(web_app)
