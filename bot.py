@@ -5787,11 +5787,11 @@ async def handle_business_connection(update: Update, context: ContextTypes.DEFAU
         status_emoji = "🟢" if bc.is_enabled else "🔴"
         text = (
             f"{status_emoji} Business Connection {'подключён' if bc.is_enabled else 'отключён'}\n"
-            f"business_connection_id: `{bc.id}`\n"
-            f"От user_id: {payload['user_id']}\n"
+            f"business_connection_id: {bc.id}\n"
+            f"От user: {payload['user_id']}\n"
             f"Права: {rights_repr}"
         )
-        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=text, parse_mode="Markdown")
+        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=text)
     except Exception as e:
         logger.error(f"Не удалось отправить алерт собственнику: {e}")
 
