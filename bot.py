@@ -5196,6 +5196,129 @@ def get_weekly_targets(mgr_name: str) -> dict:
     return result
 
 
+# ─── Карты менеджеров и метрик для /set_weekly и /set_weekly_bulk ────────────
+_MGR_NAME_MAP = {
+    "инесса": "Инесса Скляр", "скляр": "Инесса Скляр",
+    "карина": "Карина Баласанян", "баласанян": "Карина Баласанян",
+    "елена": "Елена Мерзлякова", "лена": "Елена Мерзлякова", "мерзлякова": "Елена Мерзлякова",
+    "ирина": "Ирина Дьяченко", "дьяченко": "Ирина Дьяченко",
+    "денис": "Денис Коликов", "коликов": "Денис Коликов",
+}
+_WEEKLY_METRIC_MAP = {
+    "выручка": "revenue", "выручки": "revenue", "выручку": "revenue", "revenue": "revenue",
+    "отгрузки": "shipments", "отгрузка": "shipments", "отгрузок": "shipments", "отгрузке": "shipments", "shipments": "shipments",
+    "акб": "clients", "клиенты": "clients", "клиент": "clients", "клиента": "clients", "клиентов": "clients", "clients": "clients",
+    "новые": "new_clients", "новых": "new_clients", "новый": "new_clients", "новых_клиентов": "new_clients", "new_clients": "new_clients",
+    "привл": "attracted", "привлеченные": "attracted", "привлеч": "attracted", "привлеченных": "attracted", "attracted": "attracted",
+}
+_WEEKLY_METRIC_LABELS = {
+    "revenue": "Выручка",
+    "shipments": "Отгрузки",
+    "clients": "АКБ",
+    "new_clients": "Новые",
+    "attracted": "Привл. товары",
+}
+
+
+def _parse_weekly_value(s: str) -> float:
+    """Парсит '12500000', '12 500 000', '12,5 млн', '860 тыс', '500к' → float."""
+    s = s.strip().lower().replace('₽', '').replace('руб', '').replace('р.', '').strip()
+    s = s.replace(' ', '').replace(' ', '').replace(',', '.')
+    m = re.match(r'^([\d.]+)(млн|млрд|тыс|m|k|кк)?$', s)
+    if not m:
+        raise ValueError(f"некорректное число «{s}»")
+    v = float(m.group(1))
+    suffix = m.group(2)
+    if suffix in ('млн', 'm', 'кк'):
+        v *= 1_000_000
+    elif suffix == 'млрд':
+        v *= 1_000_000_000
+    elif suffix in ('тыс', 'k'):
+        v *= 1_000
+    return v
+
+
+def _parse_weekly_chunk(chunk: str) -> tuple[str, float]:
+    """Парсит 'выручка 12,5 млн' либо '12,5 млн выручка' → (metric_key, value)."""
+    tokens = chunk.split()
+    if len(tokens) < 2:
+        raise ValueError(f"ожидается «метрика значение», получено «{chunk}»")
+    metric_idx = None
+    for i, tok in enumerate(tokens):
+        if tok.lower() in _WEEKLY_METRIC_MAP:
+            metric_idx = i
+            break
+    if metric_idx is None:
+        raise ValueError(f"метрика не найдена в «{chunk}»")
+    metric_key = _WEEKLY_METRIC_MAP[tokens[metric_idx].lower()]
+    value_tokens = tokens[:metric_idx] + tokens[metric_idx + 1:]
+    if not value_tokens:
+        raise ValueError(f"нет числа в «{chunk}»")
+    return metric_key, _parse_weekly_value(' '.join(value_tokens))
+
+
+def _parse_weekly_bulk(text: str) -> tuple[list, list]:
+    """Разбирает многострочный ввод. Возвращает (успехи, ошибки).
+
+    Успехи: [(mgr_name, metric_key, value), ...]
+    Ошибки: [(контекст, сообщение), ...]
+
+    Поддерживает:
+    - «Имя:» или просто «Имя» в начале строки — старт блока менеджера.
+    - В блоке: пары «метрика значение» через запятую, точку с запятой или « — ».
+    - Числа: «12500000», «12 500 000», «12,5 млн», «860 тыс», «500к».
+    - Склонения: «отгрузок», «клиентов» и т.п.
+    - Пустые строки и строки с «#» в начале игнорируются.
+    """
+    successes: list = []
+    errors: list = []
+    blocks: list = []
+    current_mgr = None
+    current_data: list = []
+
+    for raw_line in text.split('\n'):
+        line = raw_line.strip()
+        if not line or line.startswith('#'):
+            continue
+        before, sep, after = line.partition(':')
+        if sep and _MGR_NAME_MAP.get(before.strip().lower()):
+            if current_mgr is not None:
+                blocks.append((current_mgr, ' , '.join(current_data)))
+            current_mgr = _MGR_NAME_MAP[before.strip().lower()]
+            current_data = [after.strip()] if after.strip() else []
+            continue
+        if _MGR_NAME_MAP.get(line.lower()):
+            if current_mgr is not None:
+                blocks.append((current_mgr, ' , '.join(current_data)))
+            current_mgr = _MGR_NAME_MAP[line.lower()]
+            current_data = []
+            continue
+        if current_mgr is None:
+            errors.append((line, "ожидался «Имя:» или строка только с именем менеджера"))
+            continue
+        current_data.append(line)
+    if current_mgr is not None:
+        blocks.append((current_mgr, ' , '.join(current_data)))
+
+    for mgr_name, data_str in blocks:
+        if not data_str.strip():
+            errors.append((mgr_name, "нет данных по менеджеру"))
+            continue
+        normalized = re.sub(r'\s+[-—–;]\s+', ' , ', data_str)
+        normalized = re.sub(r'(\d),(\d)', r'\1.\2', normalized)
+        for chunk in normalized.split(','):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
+                metric_key, value = _parse_weekly_chunk(chunk)
+                successes.append((mgr_name, metric_key, value))
+            except ValueError as e:
+                errors.append((f"{mgr_name}: {chunk}", str(e)))
+
+    return successes, errors
+
+
 async def cmd_set_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/set_weekly [имя] [показатель] [значение] — задать накопительный недельный план."""
     if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
@@ -5204,7 +5327,8 @@ async def cmd_set_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Использование: /set_weekly [имя] [показатель] [значение]\n"
             "Показатели: выручка, отгрузки, акб, новые, привл\n"
-            "Пример: /set_weekly Инесса выручка 4000000"
+            "Пример: /set_weekly Инесса выручка 4000000\n\n"
+            "Для нескольких значений сразу — /set_weekly_bulk"
         )
         return
     name_part = context.args[0].lower()
@@ -5214,25 +5338,11 @@ async def cmd_set_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Значение должно быть числом")
         return
-    NAME_MAP = {
-        "инесса": "Инесса Скляр", "скляр": "Инесса Скляр",
-        "карина": "Карина Баласанян", "баласанян": "Карина Баласанян",
-        "елена": "Елена Мерзлякова", "лена": "Елена Мерзлякова", "мерзлякова": "Елена Мерзлякова",
-        "ирина": "Ирина Дьяченко", "дьяченко": "Ирина Дьяченко",
-        "денис": "Денис Коликов", "коликов": "Денис Коликов",
-    }
-    METRIC_MAP = {
-        "выручка": "revenue", "revenue": "revenue",
-        "отгрузки": "shipments", "отгрузка": "shipments", "shipments": "shipments",
-        "акб": "clients", "клиенты": "clients", "clients": "clients",
-        "новые": "new_clients", "новых": "new_clients", "new_clients": "new_clients",
-        "привл": "attracted", "привлеченные": "attracted", "attracted": "attracted",
-    }
-    mgr_name = NAME_MAP.get(name_part)
+    mgr_name = _MGR_NAME_MAP.get(name_part)
     if not mgr_name:
         await update.message.reply_text(f"❌ Менеджер '{context.args[0]}' не найден.")
         return
-    metric_key = METRIC_MAP.get(metric_part)
+    metric_key = _WEEKLY_METRIC_MAP.get(metric_part)
     if not metric_key:
         await update.message.reply_text(f"❌ Показатель '{context.args[1]}' не найден.\nДоступные: выручка, отгрузки, акб, новые, привл")
         return
@@ -5241,9 +5351,82 @@ async def cmd_set_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
         (key, str(value), str(value))
     )
-    METRIC_LABELS = {"revenue": "Выручка", "shipments": "Отгрузки", "clients": "АКБ", "new_clients": "Новые", "attracted": "Привл. товары"}
-    label = METRIC_LABELS.get(metric_key, metric_key)
+    label = _WEEKLY_METRIC_LABELS.get(metric_key, metric_key)
     await update.message.reply_text(f"✅ Недельный план *{label}* для *{mgr_name}*: {value:,.0f}", parse_mode="Markdown")
+
+
+async def cmd_set_weekly_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/set_weekly_bulk — задать накопительные недельные планы списком (многострочно).
+
+    Форматы (можно смешивать):
+        /set_weekly_bulk
+        Инесса: выручка 12,5 млн, отгрузки 110, акб 26
+        Лена: 3 млн выручка, 32 отгрузок, 20 клиентов
+
+    или с именем на отдельной строке:
+        /set_weekly_bulk
+        Инесса
+        12,5 млн выручка — 110 отгрузок — 26 клиентов
+
+    Числа: «12500000», «12 500 000», «12,5 млн», «860 тыс», «500к».
+    Метрики: выручка, отгрузки, акб, новые, привл (склонения распознаются).
+    """
+    if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
+        return
+    raw_text = update.message.text or ''
+    lines = raw_text.split('\n')
+    first_stripped = re.sub(r'^/\S+\s*', '', lines[0]) if lines else ''
+    body = '\n'.join(([first_stripped] if first_stripped.strip() else []) + lines[1:])
+
+    if not body.strip():
+        await update.message.reply_text(
+            "Использование: пришли команду + список менеджеров (одна строка на менеджера).\n\n"
+            "Пример:\n"
+            "/set_weekly_bulk\n"
+            "Инесса: выручка 12,5 млн, отгрузки 110, акб 26\n"
+            "Лена: выручка 3 млн, отгрузки 32, акб 20\n"
+            "Карина: выручка 3,8 млн, отгрузки 100, акб 36\n"
+            "Ирина: выручка 500 тыс, отгрузки 2, акб 2\n"
+            "Денис: выручка 860 тыс, отгрузки 6, акб 6\n\n"
+            "Метрики: выручка, отгрузки, акб, новые, привл.\n"
+            "Числа: 12500000, 12,5 млн, 860 тыс — все ок."
+        )
+        return
+
+    successes, errors = _parse_weekly_bulk(body)
+
+    applied: list = []
+    for mgr_name, metric_key, value in successes:
+        try:
+            db._execute(
+                "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
+                (f"weekly_target_{mgr_name}_{metric_key}", str(value), str(value))
+            )
+            applied.append((mgr_name, metric_key, value))
+        except Exception as e:
+            errors.append((f"{mgr_name} {metric_key}={value}", f"DB-ошибка: {e}"))
+
+    msg_parts: list = []
+    if applied:
+        from collections import OrderedDict
+        by_mgr: "OrderedDict[str, list]" = OrderedDict()
+        for mgr, metric, val in applied:
+            by_mgr.setdefault(mgr, []).append((metric, val))
+        msg_parts.append(f"✅ Обновлено целей: {len(applied)}")
+        for mgr, items in by_mgr.items():
+            parts = []
+            for metric, val in items:
+                label = _WEEKLY_METRIC_LABELS.get(metric, metric)
+                num = f"{val:,.0f}".replace(',', ' ')
+                parts.append(f"{label} {num}")
+            msg_parts.append(f"• {mgr}: {', '.join(parts)}")
+    if errors:
+        msg_parts.append(f"\n❌ Ошибок: {len(errors)}")
+        for ctx_str, err in errors:
+            msg_parts.append(f"• {ctx_str} → {err}")
+    if not msg_parts:
+        msg_parts = ["Нечего обновлять."]
+    await update.message.reply_text('\n'.join(msg_parts))
 
 
 
@@ -5978,6 +6161,7 @@ def main():
     app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
     app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
     app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
+    app.add_handler(CommandHandler("set_weekly_bulk", cmd_set_weekly_bulk))
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
     app.add_handler(CommandHandler("ms_attributes", cmd_ms_attributes))
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
