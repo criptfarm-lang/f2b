@@ -1884,6 +1884,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await message.reply_text("✅ Прайс сохранён в базу!")
 
+    # Видео-форварды от собственника/партнёра → сохраняем как контент
+    if message.video and user and user.id in {OWNER_CHAT_ID, PARTNER_CHAT_ID}:
+        await save_media(message, "video")
+
     if not text:
         return
 
@@ -2972,6 +2976,13 @@ async def save_media(message: Message, media_type: str):
                 "Фото сохранено в базу без подписи.\n"
                 "Чтобы его можно было найти, напиши следующим сообщением название товара — например: форель трим С",
             )
+    elif media_type == "video":
+        file_id = message.video.file_id
+        if not caption:
+            await message.reply_text(
+                "Видео сохранено в базу без подписи.\n"
+                "Чтобы его можно было найти, напиши следующим сообщением название товара.",
+            )
     else:
         file_id = message.document.file_id
         caption = caption or message.document.file_name or ""
@@ -3077,6 +3088,30 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             date=datetime.now().isoformat()
         )
         logger.info(f"Сохранено фото-документ из канала Контент: '{caption}'")
+
+    elif message.video:
+        file_id = message.video.file_id
+        db.save_media(
+            file_id=file_id,
+            media_type="video",
+            caption=caption,
+            chat_id=message.chat_id,
+            uploader="Контент F2B",
+            date=datetime.now().isoformat()
+        )
+        logger.info(f"Сохранено видео из канала Контент: '{caption}' file_id={file_id}")
+
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith("video/"):
+        file_id = message.document.file_id
+        db.save_media(
+            file_id=file_id,
+            media_type="video",
+            caption=caption or message.document.file_name or "",
+            chat_id=message.chat_id,
+            uploader="Контент F2B",
+            date=datetime.now().isoformat()
+        )
+        logger.info(f"Сохранено видео-документ из канала Контент: '{caption}'")
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
