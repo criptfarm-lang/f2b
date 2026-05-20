@@ -8,7 +8,6 @@ notifier.py — Рассылка клиентам при согласовани�
     from notifier import check_order_agreed
 """
 
-import asyncio
 import logging
 import os
 
@@ -16,11 +15,6 @@ logger = logging.getLogger(__name__)
 
 QUIZ_BASE_URL = os.getenv("QUIZ_BASE_URL", "")
 
-# In-memory кэш отправленных уведомлений — защита от дублей при параллельных вызовах
-_notified_orders: set = set()
-# Узкий lock — только вокруг проверки и записи в _notified_orders,
-# чтобы два параллельных вебхука на один order_id не прошли дедуп одновременно.
-_dedup_lock = asyncio.Lock()
 MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
 WAZZUP_API_URL = "https://api.wazzup24.com/v3/message"
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
@@ -105,6 +99,140 @@ async def _get_agent_tags(agent_id: str, headers: dict) -> list:
     return []
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Синхронизация Wazzup-полей в amoCRM-контакт ПЕРЕД рассылкой.
+#
+# Зачем: при отправке через Wazzup `POST /v3/message` Wazzup-amoCRM-интеграция
+# параллельно пытается найти amoCRM-контакт с тем же chatId/username в кастомных
+# полях TelegramId_WZ / MaxId_WZ / WhatsappUsername_WZ. Если не находит —
+# создаёт новый контакт + новую сделку в воронке Привлечение. Получаем
+# фантом-сделки на каждую рассылку существующим клиентам.
+#
+# Решение: перед `POST /v3/message` найти amoCRM-контакт по phone клиента
+# (из МСК) и обновить ему соответствующее Wazzup-поле тем же значением,
+# которое мы шлём через Wazzup. Тогда Wazzup-интеграция найдёт контакт
+# и положит беседу к нему — без создания фантома.
+#
+# Включается флагом AMOCRM_SYNC_ENABLED=1 (по умолчанию выключен).
+# Любая ошибка → логируется WARN и не блокирует рассылку.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# IDs кастомных полей контакта в amoCRM F2B (`victorfishtobiz`)
+AMO_FIELD_MAX_ID = 2244321          # MaxId_WZ
+AMO_FIELD_TG_ID = 2224427           # TelegramId_WZ
+AMO_FIELD_TG_USERNAME = 2224425     # TelegramUsername_WZ
+AMO_FIELD_WA_USERNAME = 2245217     # WhatsappUsername_WZ
+
+
+async def _get_agent_phone(agent_id: str, headers: dict) -> str | None:
+    """Читает phone контрагента из МойСклад. Возвращает digits-only или None."""
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/counterparty/{agent_id}",
+                headers=headers
+            ) as r:
+                if r.status != 200:
+                    return None
+                cp = await r.json()
+        phone = cp.get("phone") or ""
+        digits = "".join(ch for ch in phone if ch.isdigit())
+        if len(digits) == 10:
+            digits = "7" + digits
+        elif len(digits) == 11 and digits.startswith("8"):
+            digits = "7" + digits[1:]
+        return digits or None
+    except Exception as e:
+        logger.warning(f"_get_agent_phone: {e}")
+        return None
+
+
+async def _sync_amocrm_contact(agent_phone: str | None, contact_data: dict) -> int | None:
+    """Найти amoCRM-контакт по phone и обновить Wazzup-поле под канал отправки.
+
+    Возвращает amocrm contact_id если контакт найден (даже если не пришлось
+    обновлять поля), иначе None. Не падает на ошибках — только логирует.
+    """
+    if not agent_phone:
+        return None
+    if os.getenv("AMOCRM_SYNC_ENABLED", "0").lower() not in ("1", "true", "yes"):
+        return None
+
+    try:
+        from amocrm import find_contact_by_phone, AMO_BASE_URL, get_headers
+    except Exception as e:
+        logger.warning(f"_sync_amocrm_contact: amocrm import failed: {e}")
+        return None
+
+    try:
+        contact = await find_contact_by_phone(agent_phone)
+    except Exception as e:
+        logger.warning(f"_sync_amocrm_contact: search by phone {agent_phone} failed: {e}")
+        return None
+    if not contact:
+        logger.info(f"_sync_amocrm_contact: amoCRM-контакт не найден по phone={agent_phone}")
+        return None
+
+    contact_id = contact["id"]
+    chat_type = contact_data.get("chat_type", "")
+    chat_id = contact_data.get("chat_id", "")
+
+    # Определяем целевое поле и значение
+    if chat_type == "max":
+        field_id, value = AMO_FIELD_MAX_ID, chat_id
+    elif chat_type == "telegram":
+        if chat_id.startswith("@"):
+            field_id, value = AMO_FIELD_TG_USERNAME, chat_id
+        else:
+            field_id, value = AMO_FIELD_TG_ID, chat_id
+    elif chat_type == "whatsapp":
+        field_id, value = AMO_FIELD_WA_USERNAME, chat_id
+    else:
+        return contact_id
+
+    # Не пишем если уже совпадает
+    existing_cf = next(
+        (cf for cf in (contact.get("custom_fields_values") or [])
+         if cf.get("field_id") == field_id),
+        None
+    )
+    if existing_cf:
+        existing_val = existing_cf.get("values", [{}])[0].get("value") if existing_cf.get("values") else None
+        if existing_val == value:
+            logger.info(
+                f"_sync_amocrm_contact: contact={contact_id} field={field_id} уже = {value}, skip"
+            )
+            return contact_id
+
+    # PATCH — добавить/обновить кастомное поле
+    import aiohttp
+    payload = {
+        "custom_fields_values": [
+            {"field_id": field_id, "values": [{"value": value}]}
+        ]
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.patch(
+                f"{AMO_BASE_URL}/contacts/{contact_id}",
+                headers=get_headers(),
+                json=payload,
+            ) as r:
+                if r.status == 200:
+                    logger.info(
+                        f"_sync_amocrm_contact: ✅ contact={contact_id} field={field_id} = {value}"
+                    )
+                else:
+                    body = await r.text()
+                    logger.warning(
+                        f"_sync_amocrm_contact: PATCH {r.status} contact={contact_id}: {body[:200]}"
+                    )
+    except Exception as e:
+        logger.warning(f"_sync_amocrm_contact: PATCH error: {e}")
+    return contact_id
+
+
 async def _get_contact_from_ms(agent_id: str, headers: dict) -> dict | None:
     """Читает контакт для рассылки из дополнительных полей контрагента в МойСклад.
     Возвращает {chat_id, chat_type, channel_id} или None."""
@@ -182,13 +310,11 @@ async def check_order_agreed(order_href: str, bot, db):
 
         order_id = order_href.split("/")[-1].split("?")[0]
 
-        # ── 3. Дедупликация — не отправлять дважды ───────────────────────
-        async with _dedup_lock:
-            if order_id in _notified_orders or db.is_agreed_notified(order_id):
-                logger.info(f"notifier: заказ {order_id} уже уведомлялся, пропускаем")
-                return
-            # Сразу помечаем в памяти чтобы параллельный вызов не прошёл
-            _notified_orders.add(order_id)
+        # ── 3. Быстрая проверка дедупа — оптимизация, чтобы не дёргать API ─
+        # Финальный атомарный claim делается прямо перед POST в Wazzup ниже.
+        if db.is_agreed_notified(order_id):
+            logger.info(f"notifier: заказ {order_id} уже уведомлялся, пропускаем")
+            return
 
         # ── 4. Данные заказа ──────────────────────────────────────────────
         order_name = order.get("name", "")
@@ -276,7 +402,27 @@ async def check_order_agreed(order_href: str, bot, db):
             )
             logger.info(f"notifier: квиз добавлен для {agent_name}")
 
-        # ── 11. Отправляем через Wazzup ───────────────────────────────────
+        # ── 10.5. Синхронизация amoCRM-контакта (защита от дублей сделок) ─
+        # Заполняем у существующего amoCRM-контакта Wazzup-поле тем же значением,
+        # которое отправляем через Wazzup. Это позволяет Wazzup-amoCRM-интеграции
+        # сматчить исходящее с существующим контактом и не создавать новую сделку.
+        # Управляется флагом AMOCRM_SYNC_ENABLED (по умолчанию выключено).
+        try:
+            agent_phone = await _get_agent_phone(agent_id, headers)
+            await _sync_amocrm_contact(agent_phone, contact)
+        except Exception as _e:
+            logger.warning(f"notifier: amocrm sync failed (non-blocking): {_e}")
+
+        # ── 11. Атомарный claim прямо перед отправкой ─────────────────────
+        # INSERT ... ON CONFLICT DO NOTHING RETURNING — один из параллельных
+        # webhook'ов получит True и отправит, остальные получат False и выйдут.
+        # Если флаг стоит — НЕ откатываем даже при ошибке Wazzup: требование
+        # «строго один POST на заказ». Для повторной попытки — /reset_agreed.
+        if not db.try_claim_agreed_notification(order_id):
+            logger.info(f"notifier: заказ {order_id} уже отправлен параллельным вызовом, пропускаем")
+            return
+
+        # ── 12. Отправляем через Wazzup ───────────────────────────────────
         api_key = os.getenv("WAZZUP_API_KEY", "")
         # Определяем chatId или username
         chat_id_value = contact["chat_id"]
@@ -299,7 +445,6 @@ async def check_order_agreed(order_href: str, bot, db):
             ) as r:
                 if r.status in (200, 201):
                     logger.info(f"notifier: ✅ отправлено {agent_name} → {contact['chat_type']}")
-                    db.save_agreed_notification(order_id)
                     # Логируем рассылку в квиз-сервис для статистики
                     logger.info(f"notifier: QUIZ_BASE_URL={QUIZ_BASE_URL!r}")
                     if QUIZ_BASE_URL:

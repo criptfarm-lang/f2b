@@ -6908,9 +6908,11 @@ async def process_ms_webhook(data: dict, bot):
             action = event.get("action", "")
             logger.info(f"Webhook: заказ {order_id} action={action} already_checked={already_checked}")
 
-            # Смена статуса на "Согласовано" — отправляем клиенту
-            # Notifier сам делает дедупликацию через agreed_notifications
-            if action == "UPDATE":
+            # Смена статуса на "Согласовано" (UPDATE) или создание сразу
+            # в этом статусе (CREATE — например, через API/импорт/Salesbot)
+            # → отправляем клиенту. Notifier проверяет state внутри и делает
+            # атомарный claim через agreed_notifications.
+            if action in ("UPDATE", "CREATE"):
                 await check_order_agreed(order_href, bot, db)
 
             # ПДЗ алерт — только для новых заказов, только один раз

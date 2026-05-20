@@ -556,6 +556,23 @@ class Database:
             (order_id,)
         )
 
+    def try_claim_agreed_notification(self, order_id: str) -> bool:
+        """Атомарный claim: пытается отметить заказ как уведомлённый.
+
+        True — запись вставлена этой транзакцией, мы первые → отправляем.
+        False — запись уже была (другой webhook/процесс отметил раньше) → молчим.
+        """
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO agreed_notifications (order_id) VALUES (%s) "
+                "ON CONFLICT DO NOTHING RETURNING order_id",
+                (order_id,)
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row is not None
+
     def get_aging_alerted(self) -> set:
         """Возвращает ID контрагентов которым уже отправлен алерт."""
         rows = self._fetchall("SELECT counterparty_id FROM aging_alerts")
