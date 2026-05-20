@@ -76,6 +76,22 @@ def setup_scheduler(app: Application, db):
         id="sync_managers"
     )
 
+    # 13:55 и 14:00 МСК — снимок состояния заказов для ПДЗ-автоматики
+    # (план 2026-05-20, Фаза 2). Два запуска: до банк-cut-off (13:55) и
+    # после разнесения банка (14:00). Логика срывов сравнивает 14:00-снимки.
+    scheduler.add_job(
+        pdz_take_snapshot_job,
+        CronTrigger(hour=13, minute=55, timezone=MSK),
+        args=[app, db],
+        id="pdz_snapshot_1355"
+    )
+    scheduler.add_job(
+        pdz_take_snapshot_job,
+        CronTrigger(hour=14, minute=0, timezone=MSK),
+        args=[app, db],
+        id="pdz_snapshot_1400"
+    )
+
     scheduler.start()
     logger.info("✅ Планировщик запущен")
     for job in scheduler.get_jobs():
@@ -236,3 +252,22 @@ async def check_aging_clients(app: Application):
 
     except Exception as e:
         logger.error(f"check_aging_clients: {e}", exc_info=True)
+
+
+async def pdz_take_snapshot_job(app: Application, db):
+    """Снимок состояния customerorder для ПДЗ-автоматики.
+
+    Запускается дважды в день — 13:55 и 14:00 МСК. Тянет все заказы с
+    заполненным `Дата планируемой оплаты`, пишет в `pdz_snapshots`.
+    Логика срывов (Фаза 3) будет сравнивать вчерашний 14:00 со сегодняшним.
+    """
+    logger.info(
+        f"pdz_take_snapshot_job стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}"
+    )
+    try:
+        from moysklad import pdz_take_snapshot
+        rows = await pdz_take_snapshot()
+        inserted = db.save_pdz_snapshot(rows)
+        logger.info(f"pdz_take_snapshot_job: вставлено {inserted} строк")
+    except Exception as e:
+        logger.error(f"pdz_take_snapshot_job: {e}", exc_info=True)

@@ -3127,6 +3127,45 @@ async def cmd_pdz_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "регламент будет в группе ОП."
         )
 
+
+async def cmd_pdz_snapshot_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Диагностика Фазы 2 ПДЗ-автоматики: руками запустить снимок и вернуть
+    в ЛС количество записей + 3 примера строк. Доступ — только собственник."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    if not update.message:
+        return
+
+    await update.message.reply_text("⏳ Тяну снимок customerorder из МойСклад...")
+    try:
+        from moysklad import pdz_take_snapshot
+        rows = await pdz_take_snapshot()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка снимка: {e}")
+        return
+
+    try:
+        inserted = db.save_pdz_snapshot(rows)
+    except Exception as e:
+        await update.message.reply_text(
+            f"⚠️ Снимок получен ({len(rows)} строк), но запись в БД упала: {e}"
+        )
+        return
+
+    lines = [f"📸 *Снимок ПДЗ*", f"Получено: {len(rows)} · Записано: {inserted}", ""]
+    if rows:
+        lines.append("*Примеры (первые 3):*")
+        for r in rows[:3]:
+            lines.append(
+                f"• `{r.get('order_name','?')}` · {r.get('agent_name','?')} · "
+                f"тег={r.get('manager_tag') or '—'} · "
+                f"исх={r.get('ppm_initial')} · нов={r.get('ppm_new') or '—'} · "
+                f"reason={r.get('reason_id') or '—'} · "
+                f"{r.get('payed_sum')}/{r.get('total_sum')}"
+            )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_group [название группы] — сумма продаж по группе товаров за текущий месяц по менеджерам."""
     user = update.effective_user
@@ -5659,6 +5698,8 @@ def main():
         filters.Regex(r"^/дебиторка(@\w+)?(\s|$)"),
         cmd_pdz_disabled,
     ))
+    # Диагностика Фазы 2 ПДЗ-автоматики (только собственник).
+    app.add_handler(CommandHandler("pdz_snapshot_test", cmd_pdz_snapshot_test))
     app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
     app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
     app.add_handler(CommandHandler("set_weekly_bulk", cmd_set_weekly_bulk))

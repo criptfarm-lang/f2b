@@ -347,6 +347,43 @@ class Database:
                 UNIQUE (chat_id, tg_msg_id)
             )""",
             "CREATE INDEX IF NOT EXISTS idx_market_intel_unprocessed ON market_intel_messages (processed_at) WHERE processed_at IS NULL",
+            # ── ПДЗ-автоматика (план 2026-05-20, Фаза 2) ───────────────────────
+            # Снимок состояния всех customerorder с заполненным ppm_initial.
+            # Cron 13:55 и 14:00 МСК пишет сюда. Источник правды для сравнения
+            # «вчера vs сегодня» и для logic «срыв обещания».
+            """CREATE TABLE IF NOT EXISTS pdz_snapshots (
+                id SERIAL PRIMARY KEY,
+                snap_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                snap_date DATE NOT NULL,
+                order_id TEXT NOT NULL,
+                order_name TEXT,
+                agent_id TEXT,
+                agent_name TEXT,
+                manager_tag TEXT,
+                ppm_initial DATE,
+                ppm_new DATE,
+                reason_id TEXT,
+                payed_sum NUMERIC(14,2),
+                total_sum NUMERIC(14,2)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_pdz_snapshots_snap_date ON pdz_snapshots (snap_date)",
+            "CREATE INDEX IF NOT EXISTS idx_pdz_snapshots_order_snap ON pdz_snapshots (order_id, snap_date)",
+            # Журнал обещаний оплаты. event_type = 'set' | 'moved' | 'broken'.
+            """CREATE TABLE IF NOT EXISTS promise_log (
+                id SERIAL PRIMARY KEY,
+                occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                order_id TEXT NOT NULL,
+                order_name TEXT,
+                agent_id TEXT,
+                agent_name TEXT,
+                manager_tag TEXT,
+                event_type TEXT NOT NULL,
+                old_ppm_new DATE,
+                new_ppm_new DATE,
+                reason_id TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_promise_log_agent_time ON promise_log (agent_id, occurred_at)",
+            "CREATE INDEX IF NOT EXISTS idx_promise_log_order_time ON promise_log (order_id, occurred_at)",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:
@@ -360,6 +397,56 @@ class Database:
         self._execute(
             "INSERT INTO pdz_results (manager_name, manager_user_id, result_text) VALUES (%s,%s,%s)",
             (manager_name, manager_user_id, result_text)
+        )
+
+    # ─── ПДЗ-автоматика: снимки и журнал обещаний (Фаза 2) ────────────────
+    def save_pdz_snapshot(self, rows: List[Dict]) -> int:
+        """Batch insert строк снимка состояния заказов.
+
+        Каждый row — dict с ключами: snap_date, order_id, order_name,
+        agent_id, agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
+        payed_sum, total_sum. Возвращает число вставленных записей.
+        """
+        if not rows:
+            return 0
+        self._ensure_connection()
+        params = [
+            (
+                r.get("snap_date"),
+                r.get("order_id"),
+                r.get("order_name"),
+                r.get("agent_id"),
+                r.get("agent_name"),
+                r.get("manager_tag"),
+                r.get("ppm_initial"),
+                r.get("ppm_new"),
+                r.get("reason_id"),
+                r.get("payed_sum"),
+                r.get("total_sum"),
+            )
+            for r in rows
+        ]
+        with self.conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO pdz_snapshots
+                   (snap_date, order_id, order_name, agent_id, agent_name,
+                    manager_tag, ppm_initial, ppm_new, reason_id, payed_sum, total_sum)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                params,
+            )
+            self.conn.commit()
+        return len(params)
+
+    def get_pdz_snapshot(self, snap_date) -> List[Dict]:
+        """Возвращает все строки снимка за указанную дату (для отладки)."""
+        return self._fetchall(
+            """SELECT id, snap_at, snap_date, order_id, order_name, agent_id,
+                      agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
+                      payed_sum, total_sum
+               FROM pdz_snapshots
+               WHERE snap_date = %s
+               ORDER BY snap_at DESC, id ASC""",
+            (snap_date,),
         )
 
     # ─── Market Intel (канал «Мониторинг» — закупочные прайсы) ──────────────

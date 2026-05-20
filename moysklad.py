@@ -1337,6 +1337,158 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
         logger.error(f"get_overdue_demands error: {e}", exc_info=True)
         return []
 
+
+# ─── ПДЗ-автоматика (план 2026-05-20, Фаза 2) ─────────────────────────────
+# Маппинг тег контрагента → имя менеджера. Полная версия (5 ОП). Скопировано
+# из удалённого PDZ_MANAGERS в scheduler.py при Фазе 1.
+PDZ_MANAGER_TAG_MAP = {
+    "баласанян": "Карина Баласанян",
+    "скляр": "Инесса Скляр",
+    "мерзлякова": "Елена Мерзлякова",
+    "дьяченко": "Ирина Дьяченко",
+    "коликов": "Денис Коликов",
+}
+
+
+def _parse_ms_date(value):
+    """МС отдаёт даты в виде 'YYYY-MM-DD HH:MM:SS.SSS'. Возвращает date или None."""
+    if not value:
+        return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        # отрезаем время если есть
+        s10 = s[:10]
+        try:
+            from datetime import date as _date
+            y, m, d = s10.split("-")
+            return _date(int(y), int(m), int(d))
+        except Exception:
+            return None
+    return None
+
+
+async def pdz_take_snapshot() -> list:
+    """Снимок состояния всех customerorder с заполненным `ppm_initial`.
+
+    Тянет все заказы (пагинация по 100, expand=agent,attributes), для каждого
+    собирает: исходную дату оплаты (ppm_initial), новую дату оплаты (ppm_new),
+    id причины переноса (reason_id, из customentity), менеджера (по тегу
+    контрагента), payed_sum/total_sum (в рублях, не копейках).
+
+    Заказы без `ppm_initial` (старые до введения поля) пропускаются.
+    Розничный покупатель исключается.
+
+    Возвращает список dict, готовый для `Database.save_pdz_snapshot()`.
+    """
+    from datetime import datetime, timezone
+    snap_at = datetime.now(timezone.utc)
+    # Используем дату МСК для snap_date — снимок логически принадлежит МСК-дню.
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        snap_date = snap_at.astimezone(_ZI("Europe/Moscow")).date()
+    except Exception:
+        snap_date = snap_at.date()
+
+    rows: list = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/entity/customerorder"
+            all_orders = []
+            offset = 0
+            while True:
+                params = {
+                    "limit": 100,
+                    "offset": offset,
+                    "expand": "agent,attributes",
+                    "order": "moment,asc",
+                }
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error(f"pdz_take_snapshot customerorder {resp.status}: {body[:200]}")
+                        break
+                    data = await resp.json()
+                    batch = data.get("rows", [])
+                    all_orders.extend(batch)
+                    if len(batch) < 100:
+                        break
+                    offset += 100
+
+            logger.info(f"pdz_take_snapshot: {len(all_orders)} заказов загружено из МС")
+
+            for order in all_orders:
+                # Атрибуты — список с {name, value, ...}. customentity-значение
+                # = вложенный объект с meta.href и id.
+                ppm_initial_raw = None
+                ppm_new_raw = None
+                reason_id = None
+                for attr in order.get("attributes", []) or []:
+                    name = attr.get("name")
+                    if name == "Дата планируемой оплаты":
+                        ppm_initial_raw = attr.get("value")
+                    elif name == "НОВАЯ дата оплаты":
+                        ppm_new_raw = attr.get("value")
+                    elif name == "Причина переноса":
+                        v = attr.get("value")
+                        if isinstance(v, dict):
+                            # customentity: бери id напрямую, иначе вытаскивай
+                            # из meta.href последний сегмент
+                            reason_id = v.get("id")
+                            if not reason_id:
+                                href = (v.get("meta") or {}).get("href") or ""
+                                if href:
+                                    reason_id = href.rstrip("/").split("/")[-1] or None
+
+                ppm_initial = _parse_ms_date(ppm_initial_raw)
+                if not ppm_initial:
+                    # Пустые ppm_initial не пишем — старые заказы до введения поля.
+                    continue
+                ppm_new = _parse_ms_date(ppm_new_raw)
+
+                agent = order.get("agent", {}) or {}
+                agent_id = agent.get("id") or ""
+                agent_name = agent.get("name") or "неизвестно"
+                agent_tags = agent.get("tags", []) or []
+
+                if not agent_id:
+                    continue
+
+                # Розничного покупателя исключаем.
+                if "розничный покупатель" in agent_name.lower():
+                    continue
+
+                manager_tag = None
+                for t in agent_tags:
+                    if isinstance(t, str) and t.lower() in PDZ_MANAGER_TAG_MAP:
+                        manager_tag = t.lower()
+                        break
+
+                total_sum = round((order.get("sum", 0) or 0) / 100, 2)
+                payed_sum = round((order.get("payedSum", 0) or 0) / 100, 2)
+
+                rows.append({
+                    "snap_date": snap_date,
+                    "order_id": order.get("id") or "",
+                    "order_name": order.get("name") or "",
+                    "agent_id": agent_id,
+                    "agent_name": agent_name,
+                    "manager_tag": manager_tag,
+                    "ppm_initial": ppm_initial,
+                    "ppm_new": ppm_new,
+                    "reason_id": reason_id,
+                    "payed_sum": payed_sum,
+                    "total_sum": total_sum,
+                })
+
+            logger.info(f"pdz_take_snapshot: {len(rows)} строк готово к записи (с ppm_initial, не розница)")
+            return rows
+    except Exception as e:
+        logger.error(f"pdz_take_snapshot error: {e}", exc_info=True)
+        return rows
+
+
 def format_overdue_summary(items: list) -> str:
     """Краткий формат ПДЗ: итог + по менеджерам со списком клиентов."""
     if not items:
