@@ -1489,6 +1489,268 @@ async def pdz_take_snapshot() -> list:
         return rows
 
 
+# ─── ПДЗ Фаза 3: логика событий обещаний + аудит ppm_initial ───────────────
+
+# Защита от шторма: если в одном проходе изменения ppm_initial оказались
+# массовыми (например, кто-то «починил» поле через импорт) — обрезаем список,
+# чтобы не запросить /audit на сотни заказов и не залить TG-чат.
+PDZ_AUDIT_PPM_INITIAL_LIMIT = 200
+
+
+def _to_date(value):
+    """Принимает date | datetime | None | str — возвращает date или None."""
+    if value is None:
+        return None
+    # date / datetime
+    try:
+        from datetime import date as _date, datetime as _dt
+        if isinstance(value, _dt):
+            return value.date()
+        if isinstance(value, _date):
+            return value
+    except Exception:
+        pass
+    # строка
+    if isinstance(value, str):
+        return _parse_ms_date(value)
+    return None
+
+
+def compute_promise_events(today_rows: list, yesterday_rows: list) -> list:
+    """Сравнивает текущий снимок (today_rows) со вчерашним (yesterday_rows)
+    и возвращает список событий обещаний для записи в promise_log.
+
+    Логика по каждому заказу из today_rows:
+      - `event_type='set'`     — у заказа `old.ppm_new IS NULL`, `new.ppm_new IS NOT NULL`
+        → обещание поставлено впервые.
+      - `event_type='moved'`   — `old.ppm_new IS NOT NULL`, `new.ppm_new IS NOT NULL`
+        и они РАЗНЫЕ даты → обещание перенесено.
+      - `event_type='broken'`  — `new.ppm_new IS NOT NULL`, `new.ppm_new < today`,
+        `new.payed_sum < new.total_sum`, `old.ppm_new == new.ppm_new` (т.е. за день
+        ничего не пересогласовали и дата прошла без оплаты).
+
+    Возвращаемые dict'ы готовы к Database.save_promise_events().
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo as _ZI
+    today = datetime.now(_ZI("Europe/Moscow")).date()
+
+    yesterday_by_id = {r.get("order_id"): r for r in (yesterday_rows or []) if r.get("order_id")}
+
+    events: list = []
+    for new_row in today_rows or []:
+        order_id = new_row.get("order_id")
+        if not order_id:
+            continue
+        old_row = yesterday_by_id.get(order_id)
+
+        new_ppm = _to_date(new_row.get("ppm_new"))
+        old_ppm = _to_date(old_row.get("ppm_new")) if old_row else None
+
+        new_payed = new_row.get("payed_sum") or 0
+        new_total = new_row.get("total_sum") or 0
+
+        event_type = None
+        # set: было пусто (или строки вчера не было), сейчас стоит
+        if new_ppm is not None and old_ppm is None:
+            event_type = "set"
+        # moved: было непусто, сейчас непусто, и они РАЗНЫЕ
+        elif new_ppm is not None and old_ppm is not None and new_ppm != old_ppm:
+            event_type = "moved"
+        # broken: за день ничего не пересогласовали (даты одинаковые),
+        # дата уже в прошлом, и не оплачено
+        elif (
+            new_ppm is not None
+            and old_ppm is not None
+            and new_ppm == old_ppm
+            and new_ppm < today
+            and float(new_payed) < float(new_total)
+        ):
+            event_type = "broken"
+
+        if not event_type:
+            continue
+
+        events.append({
+            "order_id": order_id,
+            "order_name": new_row.get("order_name"),
+            "agent_id": new_row.get("agent_id"),
+            "agent_name": new_row.get("agent_name"),
+            "manager_tag": new_row.get("manager_tag"),
+            "event_type": event_type,
+            "old_ppm_new": old_ppm,
+            "new_ppm_new": new_ppm,
+            "reason_id": new_row.get("reason_id"),
+        })
+
+    return events
+
+
+async def _audit_who_changed_order(order_id: str) -> Optional[str]:
+    """GET `/audit?filter=entity=customerorder;hrefId={order_id}&limit=10`.
+
+    Возвращает имя сотрудника из последней записи, где это можно определить,
+    либо None если МС не отдал данные/ничего не найдено. Сетевые ошибки —
+    тихо проглатываем (логируем), чтобы не ронять весь job.
+    """
+    if not order_id:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{MS_BASE}/audit"
+            params = {
+                # МС audit-фильтр: entity=customerorder;hrefId=<uuid>.
+                "filter": f"entity=customerorder;hrefId={order_id}",
+                "limit": 10,
+            }
+            async with session.get(
+                url,
+                headers=get_headers(),
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(
+                        f"_audit_who_changed_order {order_id} {resp.status}: {body[:200]}"
+                    )
+                    return None
+                data = await resp.json()
+        # rows — список audit-событий; у каждого есть employee {name, ...}.
+        # Берём ПОСЛЕДНЕЕ событие (события возвращаются от свежих к старым).
+        rows = data.get("rows") or []
+        for ev in rows:
+            emp = ev.get("employee") or {}
+            name = emp.get("name")
+            if name:
+                return name
+        return None
+    except Exception as e:
+        logger.warning(f"_audit_who_changed_order {order_id}: {e}")
+        return None
+
+
+async def audit_ppm_initial_changes(today_rows: list, yesterday_rows: list) -> list:
+    """Сравнивает ppm_initial вчера vs сегодня. Любое изменение поля
+    «Дата планируемой оплаты» (которая по регламенту менять НЕЛЬЗЯ) — алерт.
+
+    Для каждого изменения, по возможности, через `/audit` определяет, кто менял
+    (employee.name). Лимит на ОДИН проход — PDZ_AUDIT_PPM_INITIAL_LIMIT заказов
+    (защита от шторма). Если в одном дне массовое изменение — берём первые N
+    по сортировке order_name + флаг в логе.
+
+    Возвращает список:
+      {order_id, order_name, agent_name, manager_tag,
+       old_ppm_initial, new_ppm_initial, changed_by (Optional[str])}
+    """
+    yesterday_by_id = {r.get("order_id"): r for r in (yesterday_rows or []) if r.get("order_id")}
+
+    # Сначала собираем кандидатов без сетевых запросов
+    candidates: list = []
+    for new_row in today_rows or []:
+        order_id = new_row.get("order_id")
+        if not order_id:
+            continue
+        old_row = yesterday_by_id.get(order_id)
+        if not old_row:
+            # Новый заказ — это не «изменение исходной даты», пропускаем.
+            continue
+        old_ppm = _to_date(old_row.get("ppm_initial"))
+        new_ppm = _to_date(new_row.get("ppm_initial"))
+        if not old_ppm or not new_ppm:
+            continue
+        if old_ppm == new_ppm:
+            continue
+
+        candidates.append({
+            "order_id": order_id,
+            "order_name": new_row.get("order_name"),
+            "agent_name": new_row.get("agent_name"),
+            "manager_tag": new_row.get("manager_tag"),
+            "old_ppm_initial": old_ppm,
+            "new_ppm_initial": new_ppm,
+            "changed_by": None,
+        })
+
+    if not candidates:
+        return []
+
+    if len(candidates) > PDZ_AUDIT_PPM_INITIAL_LIMIT:
+        logger.warning(
+            "audit_ppm_initial_changes: получено %d изменений, обрезаем до %d (защита от шторма)",
+            len(candidates), PDZ_AUDIT_PPM_INITIAL_LIMIT,
+        )
+        candidates.sort(key=lambda c: c.get("order_name") or "")
+        candidates = candidates[:PDZ_AUDIT_PPM_INITIAL_LIMIT]
+
+    # Теперь к каждому — точечный GET /audit. Сетевые ошибки уже подавлены внутри
+    # _audit_who_changed_order, она вернёт None.
+    for c in candidates:
+        changed_by = await _audit_who_changed_order(c["order_id"])
+        c["changed_by"] = changed_by
+
+    return candidates
+
+
+async def pdz_overdue_for_manager(manager_tag: str) -> list:
+    """Список просроченных заказов конкретного менеджера для TG-дайджеста.
+
+    Источник данных — свежий `pdz_take_snapshot()` (для простоты MVP; вызывается
+    из cron 14:10, после двух снимков, поэтому время «промахнуться по полю» минимально).
+
+    Критерий «просрочен»:
+      - effective_due_date = ppm_new if ppm_new is not None else ppm_initial
+      - effective_due_date < сегодня (МСК)
+      - payed_sum < total_sum
+      - manager_tag совпадает (case-insensitive)
+
+    Сортировка: по days_overdue убыванию (старые сверху).
+
+    Возвращает список dict:
+      {order_id, order_name, agent_id, agent_name, effective_due_date,
+       days_overdue, unpaid_sum, ms_url}
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo as _ZI
+    today = datetime.now(_ZI("Europe/Moscow")).date()
+
+    if not manager_tag:
+        return []
+    tag_lower = manager_tag.lower()
+
+    rows = await pdz_take_snapshot()
+    result: list = []
+    for r in rows:
+        row_tag = (r.get("manager_tag") or "").lower()
+        if row_tag != tag_lower:
+            continue
+        ppm_new = _to_date(r.get("ppm_new"))
+        ppm_initial = _to_date(r.get("ppm_initial"))
+        effective = ppm_new if ppm_new is not None else ppm_initial
+        if not effective or effective >= today:
+            continue
+        payed = float(r.get("payed_sum") or 0)
+        total = float(r.get("total_sum") or 0)
+        if payed >= total:
+            continue
+        days_overdue = (today - effective).days
+        unpaid = round(total - payed, 2)
+        order_id = r.get("order_id") or ""
+        result.append({
+            "order_id": order_id,
+            "order_name": r.get("order_name"),
+            "agent_id": r.get("agent_id"),
+            "agent_name": r.get("agent_name"),
+            "effective_due_date": effective,
+            "days_overdue": days_overdue,
+            "unpaid_sum": unpaid,
+            "ms_url": f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}",
+        })
+
+    result.sort(key=lambda x: x["days_overdue"], reverse=True)
+    return result
+
+
 def format_overdue_summary(items: list) -> str:
     """Краткий формат ПДЗ: итог + по менеджерам со списком клиентов."""
     if not items:

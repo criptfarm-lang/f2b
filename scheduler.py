@@ -92,6 +92,17 @@ def setup_scheduler(app: Application, db):
         id="pdz_snapshot_1400"
     )
 
+    # 14:02 МСК — обработка событий обещаний (Фаза 3). Между snapshot 14:00
+    # и дайджестом менеджерам 14:10. Сравнивает сегодняшний и вчерашний
+    # snapshot, пишет события в promise_log и шлёт TG-алерт собственнику
+    # при изменении ppm_initial («Дата планируемой оплаты», менять нельзя).
+    scheduler.add_job(
+        pdz_process_events_job,
+        CronTrigger(hour=14, minute=2, timezone=MSK),
+        args=[app, db],
+        id="pdz_process_events_1402"
+    )
+
     scheduler.start()
     logger.info("✅ Планировщик запущен")
     for job in scheduler.get_jobs():
@@ -271,3 +282,136 @@ async def pdz_take_snapshot_job(app: Application, db):
         logger.info(f"pdz_take_snapshot_job: вставлено {inserted} строк")
     except Exception as e:
         logger.error(f"pdz_take_snapshot_job: {e}", exc_info=True)
+
+
+# ─── ПДЗ Фаза 3: обработка событий + аудит исходной даты ─────────────────
+
+def _md_escape(s) -> str:
+    """Markdown-экранирование специальных символов в TG-сообщениях.
+
+    parse_mode=Markdown в PTB: спецсимволы для нашего use-case — `*`, `_`,
+    `` ` ``, `[`, `]`. Имена клиентов часто содержат `_`/`-`/кавычки — это ок,
+    защищаем именно от ломающей разметки.
+    """
+    if s is None:
+        return ""
+    text = str(s)
+    for ch in ("\\", "*", "_", "`", "[", "]"):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def _fmt_date(d) -> str:
+    """Дата → DD.MM.YYYY. Принимает date/datetime/None/str."""
+    if not d:
+        return "—"
+    try:
+        return d.strftime("%d.%m.%Y")
+    except Exception:
+        return str(d)
+
+
+async def pdz_process_events_job(app: Application, db):
+    """Cron 14:02 МСК — основная обработка событий обещаний (Фаза 3).
+
+    Шаги:
+      a. today  = pdz_take_snapshot()  (свежий API-запрос; мы сразу после 14:00
+         и хотим максимально актуальное состояние для сравнения).
+      b. yesterday = db.get_last_snapshot_before(today_date).
+      c. events = compute_promise_events(today, yesterday) → save_promise_events.
+      d. initial_changes = await audit_ppm_initial_changes(today, yesterday).
+      e. Для каждого initial_change — TG-сообщение собственнику OWNER_CHAT_ID.
+
+    Сообщения группируются по 10 на одно TG-message (защита от rate-limit).
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+
+    logger.info(
+        f"pdz_process_events_job стартовала в {_dt.now(MSK):%Y-%m-%d %H:%M %Z}"
+    )
+    try:
+        from moysklad import (
+            pdz_take_snapshot,
+            compute_promise_events,
+            audit_ppm_initial_changes,
+        )
+
+        today_rows = await pdz_take_snapshot()
+        today_date = _dt.now(_ZI("Europe/Moscow")).date()
+        yesterday_rows = db.get_last_snapshot_before(today_date)
+
+        # Сохраняем сегодняшний срез сюда же — чтобы /pdz_events_test был
+        # самодостаточным (даже если 14:00-cron почему-то не отработал).
+        # Если cron 14:00 уже отписал тот же snap_date — будет дубль, и это
+        # нормально (для compute_promise_events используется именно `today_rows`,
+        # а get_last_snapshot_before берёт ПРОШЛЫЕ даты). На текущий день
+        # дублирующая запись не мешает.
+        try:
+            inserted_now = db.save_pdz_snapshot(today_rows)
+            logger.info(f"pdz_process_events_job: snapshot up-sert {inserted_now} строк")
+        except Exception as e:
+            logger.warning(f"pdz_process_events_job: повторный save_pdz_snapshot: {e}")
+
+        events = compute_promise_events(today_rows, yesterday_rows)
+        saved = db.save_promise_events(events)
+        sets = sum(1 for e in events if e["event_type"] == "set")
+        moved = sum(1 for e in events if e["event_type"] == "moved")
+        broken = sum(1 for e in events if e["event_type"] == "broken")
+        logger.info(
+            f"pdz_process_events_job: events={len(events)} (set={sets}, moved={moved}, broken={broken}); saved={saved}"
+        )
+
+        # Аудит исходной даты
+        initial_changes = await audit_ppm_initial_changes(today_rows, yesterday_rows)
+        logger.info(f"pdz_process_events_job: ppm_initial изменений: {len(initial_changes)}")
+
+        if initial_changes:
+            owner_raw = os.getenv("OWNER_CHAT_ID")
+            if not owner_raw:
+                logger.warning("pdz_process_events_job: OWNER_CHAT_ID не задан, алерты не отправлены")
+            else:
+                owner_id = int(owner_raw)
+                BATCH = 10
+                for i in range(0, len(initial_changes), BATCH):
+                    chunk = initial_changes[i : i + BATCH]
+                    lines = []
+                    for c in chunk:
+                        order_id = c.get("order_id") or ""
+                        order_name = _md_escape(c.get("order_name") or "—")
+                        agent_name = _md_escape(c.get("agent_name") or "—")
+                        manager_tag = _md_escape(c.get("manager_tag") or "—")
+                        changed_by = _md_escape(c.get("changed_by") or "не определено")
+                        old_d = _md_escape(_fmt_date(c.get("old_ppm_initial")))
+                        new_d = _md_escape(_fmt_date(c.get("new_ppm_initial")))
+                        ms_url = (
+                            f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}"
+                        )
+                        lines.append(
+                            f"⚠️ *Изменена ИСХОДНАЯ дата оплаты*\n"
+                            f"[{agent_name}]({ms_url}) · {order_name}\n"
+                            f"Было: {old_d} → Стало: {new_d}\n"
+                            f"Менеджер: {manager_tag}\n"
+                            f"Кто менял: {changed_by}"
+                        )
+                    text = "\n\n".join(lines)
+                    try:
+                        await app.bot.send_message(
+                            chat_id=owner_id,
+                            text=text,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as e:
+                        logger.error(f"pdz_process_events_job: TG-алерт собственнику: {e}")
+
+        return {
+            "events_total": len(events),
+            "set": sets,
+            "moved": moved,
+            "broken": broken,
+            "initial_changes": len(initial_changes),
+        }
+    except Exception as e:
+        logger.error(f"pdz_process_events_job: {e}", exc_info=True)
+        return {"events_total": 0, "set": 0, "moved": 0, "broken": 0, "initial_changes": 0, "error": str(e)}

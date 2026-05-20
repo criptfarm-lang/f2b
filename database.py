@@ -449,6 +449,75 @@ class Database:
             (snap_date,),
         )
 
+    def get_last_snapshot_before(self, snap_date) -> List[Dict]:
+        """Возвращает последний снимок ПЕРЕД snap_date (для сравнения «вчера vs сегодня»).
+
+        Логика:
+          1) Берём MAX(snap_date) с условием snap_date < %s.
+          2) Если такой даты нет — возвращаем [].
+          3) Иначе тянем все строки этого дня — берём ПОСЛЕДНИЙ snap_at
+             (на случай нескольких запусков cron в один день — 13:55 и 14:00).
+        """
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT MAX(snap_date) AS d FROM pdz_snapshots WHERE snap_date < %s",
+                (snap_date,),
+            )
+            row = cur.fetchone()
+            prev_date = row.get("d") if row else None
+        if not prev_date:
+            return []
+        # Берём строки последнего snap_at в этом дне (на каждый order_id — самая поздняя
+        # запись). На случай редких дублей по (order_id, snap_at) — DISTINCT ON.
+        return self._fetchall(
+            """
+            SELECT DISTINCT ON (order_id)
+                   id, snap_at, snap_date, order_id, order_name, agent_id,
+                   agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
+                   payed_sum, total_sum
+            FROM pdz_snapshots
+            WHERE snap_date = %s
+            ORDER BY order_id, snap_at DESC, id DESC
+            """,
+            (prev_date,),
+        )
+
+    def save_promise_events(self, events: List[Dict]) -> int:
+        """Batch insert событий в promise_log.
+
+        Каждый event — dict с ключами: order_id, order_name, agent_id, agent_name,
+        manager_tag, event_type ('set'|'moved'|'broken'), old_ppm_new, new_ppm_new,
+        reason_id. Возвращает число вставленных записей.
+        """
+        if not events:
+            return 0
+        self._ensure_connection()
+        params = [
+            (
+                e.get("order_id"),
+                e.get("order_name"),
+                e.get("agent_id"),
+                e.get("agent_name"),
+                e.get("manager_tag"),
+                e.get("event_type"),
+                e.get("old_ppm_new"),
+                e.get("new_ppm_new"),
+                e.get("reason_id"),
+            )
+            for e in events
+        ]
+        with self.conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO promise_log
+                   (order_id, order_name, agent_id, agent_name, manager_tag,
+                    event_type, old_ppm_new, new_ppm_new, reason_id)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                params,
+            )
+            self.conn.commit()
+        return len(params)
+
     # ─── Market Intel (канал «Мониторинг» — закупочные прайсы) ──────────────
     def save_market_intel_message(
         self,

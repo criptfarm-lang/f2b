@@ -3166,6 +3166,91 @@ async def cmd_pdz_snapshot_test(update: Update, context: ContextTypes.DEFAULT_TY
             )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+async def cmd_pdz_events_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Диагностика Фазы 3 ПДЗ-автоматики: руками запускает pdz_process_events_job.
+    Отвечает короткой сводкой по событиям и аудиту. Доступ — только собственник."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    if not update.message:
+        return
+
+    await update.message.reply_text("⏳ Запускаю обработку событий обещаний...")
+    try:
+        from scheduler import pdz_process_events_job
+        result = await pdz_process_events_job(context.application, db)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    if result is None:
+        await update.message.reply_text("⚠️ pdz_process_events_job вернула None")
+        return
+
+    err = result.get("error")
+    if err:
+        await update.message.reply_text(f"⚠️ Job упала: {err}")
+        return
+
+    text = (
+        f"✅ События: {result.get('events_total', 0)} "
+        f"(set:{result.get('set', 0)}, moved:{result.get('moved', 0)}, broken:{result.get('broken', 0)}). "
+        f"Аудит ppm_initial: {result.get('initial_changes', 0)} алертов"
+    )
+    await update.message.reply_text(text)
+
+
+async def cmd_pdz_overdue_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/pdz_overdue_test <тег>` — печатает первые 5 строк просрочки менеджера.
+    Тег — фамилия в нижнем регистре (скляр, баласанян, мерзлякова, дьяченко, коликов).
+    Доступ — только собственник."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    if not update.message:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Укажи тег менеджера: `/pdz_overdue_test скляр`",
+            parse_mode="Markdown",
+        )
+        return
+    tag = context.args[0].strip().lower()
+
+    await update.message.reply_text(f"⏳ Считаю просрочки для тега «{tag}»...")
+    try:
+        from moysklad import pdz_overdue_for_manager, fmt_money
+        items = await pdz_overdue_for_manager(tag)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    if not items:
+        await update.message.reply_text(f"✅ По тегу «{tag}» просрочек нет.")
+        return
+
+    lines = [f"📋 *Просрочки {tag}* — всего: {len(items)}", ""]
+    for it in items[:5]:
+        name = (it.get("agent_name") or "—").replace("*", "").replace("_", "")
+        url = it.get("ms_url") or "#"
+        due = it.get("effective_due_date")
+        due_str = due.strftime("%d.%m.%Y") if due else "—"
+        lines.append(
+            f"[{name}]({url}) · {it.get('days_overdue', 0)} дн · "
+            f"{fmt_money(it.get('unpaid_sum', 0))} (срок {due_str})"
+        )
+    if len(items) > 5:
+        lines.append("")
+        lines.append(f"_…ещё {len(items) - 5} заказов_")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
+
+
 async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_group [название группы] — сумма продаж по группе товаров за текущий месяц по менеджерам."""
     user = update.effective_user
@@ -5700,6 +5785,9 @@ def main():
     ))
     # Диагностика Фазы 2 ПДЗ-автоматики (только собственник).
     app.add_handler(CommandHandler("pdz_snapshot_test", cmd_pdz_snapshot_test))
+    # Диагностика Фазы 3 (только собственник).
+    app.add_handler(CommandHandler("pdz_events_test", cmd_pdz_events_test))
+    app.add_handler(CommandHandler("pdz_overdue_test", cmd_pdz_overdue_test))
     app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
     app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
     app.add_handler(CommandHandler("set_weekly_bulk", cmd_set_weekly_bulk))
