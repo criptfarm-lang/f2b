@@ -1403,6 +1403,9 @@ async def pdz_take_snapshot() -> list:
                     "offset": offset,
                     "expand": "agent,attributes",
                     "order": "moment,asc",
+                    # Только неоплаченные и не архивные — сокращаем выборку
+                    # с ~2700 до ~100. Заказы без долга не интересуют ПДЗ.
+                    "filter": "payedSum<sum;archived=false",
                 }
                 async with session.get(url, headers=get_headers(), params=params) as resp:
                     if resp.status != 200:
