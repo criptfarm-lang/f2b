@@ -1,6 +1,6 @@
 """
 F2B PRO — Telegram Bot
-Ассистент отдела продаж: фото, прайсы, дебиторка
+Ассистент отдела продаж: фото, прайсы, задачи
 """
 
 import asyncio
@@ -23,7 +23,7 @@ from telegram.ext import (
 
 from database import Database
 from notifier import check_order_agreed  # рассылка при согласовании — не трогать!
-from scheduler import setup_scheduler, record_group_message, PDZ_MANAGERS, get_group_chat_id
+from scheduler import setup_scheduler, get_group_chat_id
 from claude_ai import dispatch, smart_answer, parse_product_query
 from amocrm import check_connection as amo_check  # оставляем для совместимости
 from amo_alarms import (
@@ -179,7 +179,6 @@ def _user_menu_keyboard(include_task_button: bool = False) -> InlineKeyboardMark
     rows = [
         [
             InlineKeyboardButton("📸 Запросить фото товара", callback_data="user_photo"),
-            InlineKeyboardButton("💰 ПДЗ клиента", callback_data="user_pdz_client"),
         ],
         [
             InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
@@ -213,14 +212,6 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
             parse_mode="Markdown"
         )
         _user_awaiting[query.from_user.id] = "photo"
-
-    elif action == "user_pdz_client":
-        await query.message.reply_text(
-            "💰 Напиши название клиента — покажу его дебиторку.\n"
-            "Например: _Атмосфера_ или _ИТФИШ_",
-            parse_mode="Markdown"
-        )
-        _user_awaiting[query.from_user.id] = "pdz_client"
 
     elif action == "user_contract":
         await query.message.reply_text(
@@ -258,11 +249,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *Все команды:*\n\n"
         "*Отчёты:*\n"
-        "/report — недельный отчёт\n"
-        "/дебиторка — срез по дебиторке\n\n"
+        "/report — недельный отчёт\n\n"
         "*Управление:*\n"
         "/menu — панель управления\n"
-        "/pdz — запустить работу с дебиторкой\n"
         "/mychatid — мой chat ID",
         parse_mode="Markdown"
     )
@@ -292,7 +281,6 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("── Общие функции ──", callback_data="menu_noop")],
         [
             InlineKeyboardButton("📸 Фото товара", callback_data="user_photo"),
-            InlineKeyboardButton("💰 ПДЗ клиента", callback_data="user_pdz_client"),
         ],
         [
             InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
@@ -302,10 +290,6 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         # ── Только руководитель ────────────────────────────────────
         [InlineKeyboardButton("── Только для меня ──", callback_data="menu_noop")],
-        [
-            InlineKeyboardButton("🚀 Запустить /pdz", callback_data="menu_pdz_run"),
-            InlineKeyboardButton("📊 Результат ПДЗ", callback_data="menu_pdz_results"),
-        ],
         [
             InlineKeyboardButton("⏳ Стареющие", callback_data="menu_aging"),
         ],
@@ -340,51 +324,6 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown"
         )
         _user_awaiting[query.from_user.id] = "photo"
-
-    elif action == "user_pdz_client":
-        await query.message.reply_text(
-            "💰 Напиши название клиента — покажу его дебиторку.\nНапример: _Атмосфера_",
-            parse_mode="Markdown"
-        )
-        _user_awaiting[query.from_user.id] = "pdz_client"
-
-    elif action == "menu_pdz_all":
-        await query.message.reply_text("⏳ Запрашиваю ПДЗ...")
-        from moysklad import get_overdue_demands
-        items = await get_overdue_demands()
-        if not items:
-            await query.message.reply_text("✅ Просроченных долгов нет.")
-        else:
-            text = format_overdue_demands(items)
-            await query.message.reply_text(text, parse_mode="Markdown")
-
-    elif action == "menu_pdz_run":
-        await query.message.reply_text(
-            "🚀 Запустить ПДЗ?\nЭто разошлёт напоминания по дебиторке всем менеджерам.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Да, запустить", callback_data="menu_pdz_confirm"),
-                InlineKeyboardButton("❌ Отмена", callback_data="menu_cancel"),
-            ]])
-        )
-
-    elif action == "menu_pdz_confirm":
-        import asyncio
-        from scheduler import pdz_morning_task, pdz_launched_today
-        from datetime import date as _date
-        today = _date.today().isoformat()
-        pdz_launched_today.add(today)
-        await query.message.reply_text(f"📋 Запускаю для {len(PDZ_MANAGERS)} менеджеров (2 мин интервал)...")
-        for i, mgr in enumerate(PDZ_MANAGERS):
-            try:
-                await pdz_morning_task(context.application, mgr)
-            except Exception as e:
-                await query.message.reply_text(f"❌ {mgr['name']}: {e}")
-            if i < len(PDZ_MANAGERS) - 1:
-                await asyncio.sleep(120)
-        await query.message.reply_text("✅ Готово. Сводка придёт в 17:00.")
-
-    elif action == "menu_pdz_results":
-        await cmd_pdz_results(update, context)
 
     elif action == "menu_evening":
         await cmd_op_report(update, context)
@@ -473,8 +412,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *Все команды:*\n\n"
         "*Отчёты:*\n"
-        "/report — недельный отчёт\n"
-        "/дебиторка — срез по дебиторке\n\n"
+        "/report — недельный отчёт\n\n"
         "*База знаний:*\n"
         "/фото [товар] — найти фото\n"
         "/прайс — актуальный прайс\n"
@@ -488,7 +426,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _wazzup_notified: set = set()
 
 _pending_links: dict = {}
-_user_awaiting: dict = {}  # user_id → "photo" | "pdz_client"
+_user_awaiting: dict = {}  # user_id → "photo" | "contract" | "reconciliation"
 _pending_price_comments: dict = {}  # manager_user_id → {alert_id, order_id, mgr_name}
 
 async def handle_wazzup_ignore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1239,19 +1177,6 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-async def cmd_debtors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Срез по дебиторке."""
-    debtors = db.get_debtors()
-    if not debtors:
-        await update.message.reply_text("✅ Просроченной дебиторки нет!")
-        return
-
-    lines = ["💰 *Дебиторка — требуют внимания:*\n"]
-    for d in debtors:
-        lines.append(f"• {d['client']} → *{d['manager']}* [{d['days']} дн.]")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
 async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск фото по команде /фото [товар]."""
     query = " ".join(context.args) if context.args else ""
@@ -1623,58 +1548,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _create_and_send_contract(contract_data, user.full_name, message, context)
             return
 
-        elif awaiting == "pdz_client":
-            await message.reply_chat_action("typing")
-            counterparties = await get_counterparty_balance(text)
-            if not counterparties:
-                await message.reply_text(f"❌ Клиент *{text}* не найден.", parse_mode="Markdown")
-                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
-                return
-
-            cp = counterparties[0]
-            cp_name = cp.get("name", text)
-            balance = cp.get("balance", 0)
-            tags = cp.get("tags", [])
-
-            MANAGER_TAG_MAP = {
-                "баласанян": "Карина Баласанян", "мерзлякова": "Елена Мерзлякова",
-                "скляр": "Инесса Скляр", "дьяченко": "Ирина Дьяченко",
-            }
-            manager = "Не назначен"
-            for tag in tags:
-                if tag.lower() in MANAGER_TAG_MAP:
-                    manager = MANAGER_TAG_MAP[tag.lower()]
-                    break
-
-            overdue_items = await get_overdue_demands(query=cp_name)
-            overdue_sum = sum(i.get("overdue_sum", 0) for i in overdue_items) if overdue_items else 0
-            overdue_lines = []
-            if overdue_items:
-                for item in overdue_items:
-                    for d in item.get("demands", []):
-                        overdue_lines.append(
-                            f"   └ {d.get('name','')} · {d.get('due','')} · "
-                            f"{d.get('unpaid',0):,.2f} руб. · {d.get('days',0)} дн."
-                        )
-
-            lines = [
-                f"📊 *{cp_name}*\n",
-                f"👤 Менеджер: *{manager}*",
-                f"🏷 Теги: {', '.join(tags) if tags else '—'}",
-                f"💵 Общий долг: *{abs(balance):,.2f} руб.*",
-            ]
-            if overdue_sum > 0:
-                lines.append(f"🔴 Просрочено: *{overdue_sum:,.2f} руб.*")
-                if overdue_lines:
-                    lines.append("\n*Просроченные заказы:*")
-                    lines.extend(overdue_lines[:5])
-            else:
-                lines.append("✅ Просроченных долгов нет")
-
-            await message.reply_text("\n".join(lines), parse_mode="Markdown",
-                                     reply_markup=_user_menu_keyboard())
-            return
-
     # Ответ менеджера на алерт цены в личке — пересылаем Виктору
     if user and chat_id == user.id and chat_id != OWNER_CHAT_ID and text:
 
@@ -1727,64 +1600,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await message.reply_text("✅ Ответ отправлен руководителю.")
                     return
 
-        # 3. Результат по ПДЗ — менеджер пишет в личку боту
-        from scheduler import pdz_launched_today
-        from datetime import date as _date
-        today_str = _date.today().isoformat()
-        if today_str in pdz_launched_today:
-            text_lower = text.lower()
-
-            # Фильтруем — НЕ сохраняем если это запрос к боту или нерелевантное сообщение
-            is_bot_request = (
-                text_lower.startswith("эф") or
-                text_lower.startswith("пришли фото") or
-                text_lower.startswith("фото ") or
-                "пдз пробка" in text_lower or
-                "/pdz" in text_lower or
-                len(text.strip()) < 5
-            )
-
-            # Признаки ПДЗ ответа — упоминание оплаты/суммы/клиента/даты
-            pdz_keywords = [
-                "оплат", "перевод", "платёж", "платеж", "платежк",
-                "тыс", "руб", "завтра", "пятниц", "понедельник",
-                "вторник", "среда", "четверг", "задолженност",
-                "ип ", "ооо ", "пришлёт", "пришлет", "перечислит",
-                "отсрочк", "просрочк", "долг"
-            ]
-            is_pdz_result = any(kw in text_lower for kw in pdz_keywords)
-
-            if not is_bot_request and is_pdz_result:
-                db.save_pdz_result(
-                    manager_name=user.full_name,
-                    manager_user_id=user.id,
-                    result_text=text
-                )
-                from scheduler import pdz_day_messages
-                if today_str not in pdz_day_messages:
-                    pdz_day_messages[today_str] = {}
-                mgr_tag = "_all"
-                for mgr in PDZ_MANAGERS:
-                    frag = mgr.get("name_fragment", mgr["name"]).lower()
-                    if frag in user.full_name.lower():
-                        mgr_tag = mgr["tag"]
-                        break
-                if mgr_tag not in pdz_day_messages[today_str]:
-                    pdz_day_messages[today_str][mgr_tag] = []
-                pdz_day_messages[today_str][mgr_tag].append(f"{user.full_name}: {text}")
-                await message.reply_text("✅ Принял, записал для отчёта.")
-            elif is_bot_request:
-                # Это запрос к боту — не отвечаем (обработается ниже)
-                pass
-            else:
-                await message.reply_text(
-                    "ℹ️ Не похоже на ответ по дебиторке.\n"
-                    "Напиши например: _«Атмосфера оплатит в пятницу»_",
-                    parse_mode="Markdown"
-                )
-            return
-
-        # 4. Прочие сообщения в личке — бот не реагирует
+        # Прочие сообщения в личке — бот не реагирует
         return
 
     if message.forward_origin and chat_id == (user.id if user else None):
@@ -1880,20 +1696,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=text[:1000],  # обрезаем очень длинные
         )
 
-    # Записываем сообщения группы для анализа ПДЗ (пн/ср)
-    group_chat_id = get_group_chat_id()
-    if text and user and group_chat_id and chat_id == group_chat_id:
-        from datetime import date as _date
-        if _date.today().weekday() in (0, 2):  # 0=пн, 2=ср
-            sender_lower = user.full_name.lower()
-            matched = False
-            for mgr in PDZ_MANAGERS:
-                if mgr["name"].lower() in sender_lower or mgr["tag"] in sender_lower:
-                    record_group_message(user.full_name, mgr["tag"], text)
-                    matched = True
-                    break
-            if not matched:
-                record_group_message(user.full_name, "_all", text)
     # 1. Сохраняем документы в базу (фото берём из МойСклад)
     if message.document:
         fname = message.document.file_name or ""
@@ -2024,13 +1826,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not is_bot_addressed(text):
-        # Автореакция на ПДЗ-запросы без обращения "Эф,"
-        text_lower_pdz = text.lower().strip()
-        PDZ_TRIGGER = ["просрочка", "пдз", "должник", "дебиторка"]
-        if any(kw in text_lower_pdz for kw in PDZ_TRIGGER) and user and user.id in manager_ids:
-            pass  # продолжаем — обработаем как PDZ запрос
-        else:
-            return
+        return
 
     query = clean_query(text)
 
@@ -3192,37 +2988,6 @@ async def cmd_add_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     results.append(f"❌ {action}: {data}")
 
     await update.message.reply_text("Вебхуки МойСклад:\n" + "\n".join(results))
-    """Тестовый запуск утренних задач ПДЗ. /pdz_test [имя|all]"""
-    user = update.message.from_user
-    manager_ids_str = os.getenv("MANAGER_IDS", "")
-    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
-    if user.id not in manager_ids:
-        await update.message.reply_text("⛔ Только для руководителей.")
-        return
-
-    arg = (context.args[0].lower() if context.args else "all")
-
-    from scheduler import pdz_morning_task
-    app = update.get_bot()  # используем контекст
-
-    targets = PDZ_MANAGERS if arg == "all" else [
-        m for m in PDZ_MANAGERS if m["name"].lower() == arg or m["tag"] == arg
-    ]
-
-    if not targets:
-        names = ", ".join(m["name"].lower() for m in PDZ_MANAGERS)
-        await update.message.reply_text(f"Не найдено. Варианты: all, {names}")
-        return
-
-    await update.message.reply_text(
-        f"🧪 Запускаю тест ПДЗ для: {', '.join(m['name'] for m in targets)}..."
-    )
-
-    for mgr in targets:
-        try:
-            await pdz_morning_task(context.application, mgr)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка для {mgr['name']}: {e}")
 
 # Хранилище ожидающих отправки сообщений — message_key → {phone, name, text, chat_type}
 _pending_sends: dict = {}
@@ -3353,46 +3118,14 @@ async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         await query.message.edit_text(f"❌ Ошибка: {e}")
 
-async def cmd_pdz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/pdz — ПДЗ в группу + задача менеджерам в личку."""
-    user = update.message.from_user
-    manager_ids_str = os.getenv("MANAGER_IDS", "")
-    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
-    if user.id not in manager_ids:
-        await update.message.reply_text("⛔ Только для руководителей.")
-        return
-
-    from scheduler import pdz_morning_task, pdz_launched_today
-    import asyncio
-    from datetime import date as _date
-
-    today = _date.today().isoformat()
-    pdz_launched_today.add(today)
-
-    # Подтягиваем chat_id менеджеров из БД
-    managers_with_ids = []
-    for mgr in PDZ_MANAGERS:
-        mgr_copy = dict(mgr)
-        cid = db.get_manager_chat_id(mgr.get("name_fragment", mgr["name"]))
-        mgr_copy["chat_id"] = cid
-        if not cid:
-            logger.warning(f"cmd_pdz: нет chat_id для {mgr['name']}")
-        managers_with_ids.append(mgr_copy)
-
-    await update.message.reply_text(
-        f"📋 Запускаю ПДЗ для {len(managers_with_ids)} менеджеров.\n"
-        f"Интервал: 2 минуты. Результаты — боту в личку."
-    )
-
-    for i, mgr in enumerate(managers_with_ids):
-        try:
-            await pdz_morning_task(context.application, mgr)
-        except Exception as e:
-            logger.error(f"cmd_pdz ошибка для {mgr['name']}: {e}")
-        if i < len(managers_with_ids) - 1:
-            await asyncio.sleep(120)
-
-    await update.message.reply_text("✅ Готово. Сводка результатов придёт в 17:00.")
+async def cmd_pdz_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Заглушка для всех старых команд по дебиторке (/pdz, /pdz_results, /pdz_test,
+    /pdz_evening, /дебиторка, /debtors). Новая механика — без команд, см. объявление в группе ОП."""
+    if update.message:
+        await update.message.reply_text(
+            "Команда временно отключена. Скоро запустим новую механику работы с дебиторкой — "
+            "регламент будет в группе ОП."
+        )
 
 async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_group [название группы] — сумма продаж по группе товаров за текущий месяц по менеджерам."""
@@ -4503,224 +4236,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Был: {last_str}"
         )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    """/pdz_results — результаты ПДЗ в личку по каждому менеджеру."""
-    user = update.effective_user
-    if not user or user.id != OWNER_CHAT_ID:
-        return
-
-    from moysklad import get_overdue_demands
-
-    # Берём сегодняшние результаты, если нет — последние доступные
-    today_results = db.get_pdz_results_today()
-    if today_results:
-        all_results = today_results
-        date_label = "сегодня"
-    else:
-        last_date, all_results = db.get_pdz_results_last()
-        if not all_results:
-            await context.bot.send_message(chat_id=OWNER_CHAT_ID, text="📭 Результатов по ПДЗ пока нет.")
-            return
-        date_label = last_date.strftime("%d.%m.%Y") if hasattr(last_date, "strftime") else str(last_date)
-
-    sent_any = False
-    for mgr in PDZ_MANAGERS:
-        frag = mgr.get("name_fragment", mgr["name"]).lower()
-        mgr_results = [
-            r.get("result_text", "") for r in all_results
-            if frag in r.get("manager_name", "").lower()
-        ]
-
-        # Текущая просрочка
-        items = await get_overdue_demands(tag=mgr["tag"])
-        overdue_clients = [i.get("name", "") for i in items] if items else []
-
-        # Клиенты с ответами
-        answered_clients = []
-        for res_text in mgr_results:
-            res_lower = res_text.lower()
-            for client in overdue_clients:
-                if any(w.lower() in res_lower for w in client.split() if len(w) >= 4):
-                    if client not in answered_clients:
-                        answered_clients.append(client)
-
-        unanswered = [c for c in overdue_clients if c not in answered_clients]
-
-        lines = [f"📊 *{mgr['name']} — ПДЗ* ({date_label})\n"]
-
-        if not overdue_clients:
-            lines.append("✅ Просроченных долгов нет")
-        else:
-            if mgr_results:
-                lines.append("💬 *Ответы менеджера:*")
-                for r in mgr_results:
-                    lines.append(f"   — {r}")
-                lines.append("")
-            if unanswered:
-                lines.append("❓ *Без ответа:*")
-                for c in unanswered:
-                    lines.append(f"   • {c}")
-            else:
-                lines.append("✅ По всем клиентам есть ответы")
-
-        text = "\n".join(lines)
-
-        keyboard = None
-        if unanswered:
-            mgr_chat_id = db.get_manager_chat_id(mgr.get("name_fragment", mgr["name"]))
-            if mgr_chat_id:
-                alert_id = db.save_price_alert(
-                    order_id=f"pdz_{mgr['tag']}",
-                    order_name=", ".join(unanswered[:3]),
-                    client_name=", ".join(unanswered[:3]),
-                    manager_name=mgr["name"],
-                    manager_user_id=mgr_chat_id,
-                    alert_text=text
-                )
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📨 Запросить комментарии",
-                                         callback_data=f"pdz_request|{alert_id}")
-                ]])
-
-        await context.bot.send_message(
-            chat_id=OWNER_CHAT_ID, text=text,
-            parse_mode="Markdown", reply_markup=keyboard
-        )
-        sent_any = True
-
-    if not sent_any:
-        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text="📭 Просроченных долгов нет.")
-
-async def cmd_pdz_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/pdz_results — результаты ПДЗ в личку по каждому менеджеру."""
-    user = update.effective_user
-    if not user or user.id != OWNER_CHAT_ID:
-        return
-
-    from moysklad import get_overdue_demands
-
-    today_results = db.get_pdz_results_today()
-    if today_results:
-        all_results = today_results
-        date_label = "сегодня"
-    else:
-        last_date, all_results = db.get_pdz_results_last()
-        if not all_results:
-            await context.bot.send_message(chat_id=OWNER_CHAT_ID, text="📭 Результатов по ПДЗ пока нет.")
-            return
-        date_label = last_date.strftime("%d.%m.%Y") if hasattr(last_date, "strftime") else str(last_date)
-
-    sent_any = False
-    for mgr in PDZ_MANAGERS:
-        frag = mgr.get("name_fragment", mgr["name"]).lower()
-        mgr_results = [
-            r.get("result_text", "") for r in all_results
-            if frag in r.get("manager_name", "").lower()
-        ]
-
-        items = await get_overdue_demands(tag=mgr["tag"])
-        overdue_clients = [i.get("name", "") for i in items] if items else []
-
-        answered_clients = []
-        for res_text in mgr_results:
-            res_lower = res_text.lower()
-            for client in overdue_clients:
-                if any(w.lower() in res_lower for w in client.split() if len(w) >= 4):
-                    if client not in answered_clients:
-                        answered_clients.append(client)
-
-        unanswered = [c for c in overdue_clients if c not in answered_clients]
-
-        lines = [f"📊 *{mgr['name']} — ПДЗ* ({date_label})\n"]
-        if not overdue_clients:
-            lines.append("✅ Просроченных долгов нет")
-        else:
-            if mgr_results:
-                lines.append("💬 *Ответы менеджера:*")
-                for r in mgr_results:
-                    lines.append(f"   — {r}")
-                lines.append("")
-            if unanswered:
-                lines.append("❓ *Без ответа:*")
-                for c in unanswered:
-                    lines.append(f"   • {c}")
-            else:
-                lines.append("✅ По всем клиентам есть ответы")
-
-        text = "\n".join(lines)
-        keyboard = None
-        if unanswered:
-            mgr_chat_id = db.get_manager_chat_id(mgr.get("name_fragment", mgr["name"]))
-            if mgr_chat_id:
-                alert_id = db.save_price_alert(
-                    order_id=f"pdz_{mgr['tag']}",
-                    order_name=", ".join(unanswered[:3]),
-                    client_name=", ".join(unanswered[:3]),
-                    manager_name=mgr["name"],
-                    manager_user_id=mgr_chat_id,
-                    alert_text=text
-                )
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📨 Запросить комментарии",
-                                         callback_data=f"pdz_request|{alert_id}")
-                ]])
-
-        await context.bot.send_message(
-            chat_id=OWNER_CHAT_ID, text=text,
-            parse_mode="Markdown", reply_markup=keyboard
-        )
-        sent_any = True
-
-    if not sent_any:
-        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text="📭 Просроченных долгов нет.")
-
-async def cmd_pdz_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Тестовый запуск утренних задач ПДЗ. /pdz_test [имя|all]"""
-    user = update.message.from_user
-    manager_ids_str = os.getenv("MANAGER_IDS", "")
-    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
-    if user.id not in manager_ids:
-        await update.message.reply_text("⛔ Только для руководителей.")
-        return
-
-    arg = (context.args[0].lower() if context.args else "all")
-
-    from scheduler import pdz_morning_task
-    app = update.get_bot()
-
-    targets = PDZ_MANAGERS if arg == "all" else [
-        m for m in PDZ_MANAGERS if m["name"].lower() == arg or m["tag"] == arg
-    ]
-
-    if not targets:
-        names = ", ".join(m["name"].lower() for m in PDZ_MANAGERS)
-        await update.message.reply_text(f"Не найдено. Варианты: all, {names}")
-        return
-
-    await update.message.reply_text(
-        f"🧪 Запускаю тест ПДЗ для: {', '.join(m['name'] for m in targets)}..."
-    )
-
-    for mgr in targets:
-        try:
-            await pdz_morning_task(context.application, mgr)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка для {mgr['name']}: {e}")
-
-async def cmd_pdz_evening_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Тестовый запуск вечерней сводки ПДЗ. /pdz_evening"""
-    user = update.message.from_user
-    manager_ids_str = os.getenv("MANAGER_IDS", "")
-    manager_ids = [int(x) for x in manager_ids_str.split(",") if x.strip()]
-    if user.id not in manager_ids:
-        await update.message.reply_text("⛔ Только для руководителей.")
-        return
-
-    await update.message.reply_text("🧪 Запускаю тест вечерней сводки ПДЗ...")
-    from scheduler import pdz_evening_summary
-    try:
-        await pdz_evening_summary(context.application)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает нажатия кнопок на алерте о цене."""
@@ -4808,88 +4323,6 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 )
             await query.edit_message_text(
                 query.message.text + f"\n\n💬 *Запрошен комментарий у {mgr_name}*",
-                parse_mode="Markdown"
-            )
-
-    elif action == "pdz_ok":
-        from moysklad import set_order_state
-        order_id = parts[1] if len(parts) > 1 else ""
-        logger.info(f"pdz_ok: order_id={order_id}")
-        if order_id:
-            success = await set_order_state(order_id, MS_STATE_AGREED)
-            logger.info(f"pdz_ok: set_order_state result={success}")
-        await query.answer("✅ Принято")
-        await query.message.delete()
-
-    elif action == "pdz_request":
-        # Запрашиваем комментарии у менеджера по клиентам без ответа
-        alert_id = int(parts[1]) if len(parts) > 1 else 0
-        alert_data = db.get_price_alert(alert_id) if alert_id else {}
-        if not alert_data:
-            await query.answer("Данные не найдены.", show_alert=True)
-            return
-
-        mgr_chat_id = alert_data.get("manager_user_id")
-        mgr_name = alert_data.get("manager_name", "")
-        clients_str = alert_data.get("client_name", "")
-
-        if not mgr_chat_id:
-            await query.answer("Нет chat_id менеджера — пусть напишет /mychatid боту.", show_alert=True)
-            return
-
-        clients_list = [c.strip() for c in clients_str.split(",") if c.strip()]
-        clients_text = "\n".join(f"• {c}" for c in clients_list)
-
-        try:
-            await context.bot.send_message(
-                chat_id=mgr_chat_id,
-                text=(
-                    f"📋 *{mgr_name}, нужны комментарии по дебиторке*\n\n"
-                    f"По следующим клиентам пока нет информации:\n"
-                    f"{clients_text}\n\n"
-                    f"Напиши боту в личку — кто и когда оплатит."
-                ),
-                parse_mode="Markdown"
-            )
-            await query.edit_message_reply_markup(reply_markup=None)
-            await query.answer("✅ Запрос отправлен менеджеру.")
-            await context.bot.send_message(
-                chat_id=OWNER_CHAT_ID,
-                text=f"✅ Запрос комментариев отправлен *{mgr_name}*.",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            await query.answer(f"Ошибка: {e}", show_alert=True)
-
-    elif action == "pdz_comment":
-        order_id = parts[1] if len(parts) > 1 else ""
-        pdz_data = _pdz_alert_data.get(order_id, {})
-        client = pdz_data.get("client", "")
-        manager_name_pdz = pdz_data.get("manager", manager_name)
-        order_name_pdz = pdz_data.get("order_name", "")
-        debt_amount = pdz_data.get("debt_amount", 0)
-        debt_days = pdz_data.get("debt_days", 0)
-
-        # Сохраняем в БД
-        db.save_pdz_comment(
-            client=client,
-            manager=manager_name_pdz,
-            order_name=order_name_pdz,
-            debt_amount=debt_amount,
-            debt_days=debt_days,
-            comment="Запрошен комментарий руководителем",
-            commented_by=user.first_name,
-        )
-
-        new_text = query.message.text + f"\n\n💬 *{user.first_name} ждёт комментарий менеджера*"
-        await query.edit_message_text(new_text, parse_mode="Markdown")
-
-        if group_chat_id:
-            contact = MANAGERS_CONTACTS.get(manager_name_pdz)
-            mgr_mention = contact if contact else f"*{manager_name_pdz}*" if manager_name_pdz else "Менеджер"
-            await context.bot.send_message(
-                chat_id=group_chat_id,
-                text=f"{mgr_mention}, дай комментарий по заказу *{order_name_pdz}* — у клиента просрочка {debt_days} дней.",
                 parse_mode="Markdown"
             )
 
@@ -6208,17 +5641,24 @@ def main():
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(MessageHandler(filters.StatusUpdate.MESSAGE_AUTO_DELETE_TIMER_CHANGED, handle_message))
     app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("debts", cmd_debtors))
     app.add_handler(CommandHandler("photo", cmd_photo))
     app.add_handler(CommandHandler("price", cmd_price))
     app.add_handler(CommandHandler("contact", cmd_contact))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(CommandHandler("add_webhook", cmd_add_webhook))
-    app.add_handler(CommandHandler("pdz_results", cmd_pdz_results))
-    app.add_handler(CommandHandler("pdz", cmd_pdz))
-    app.add_handler(CommandHandler("pdz_test", cmd_pdz_test))
-    app.add_handler(CommandHandler("pdz_evening", cmd_pdz_evening_test))
+    # ── Заглушки для старых ПДЗ-команд (Фаза 1: чистка старой механики) ──
+    # Команды отключены, новая механика дебиторки описывается в группе ОП.
+    app.add_handler(CommandHandler("pdz", cmd_pdz_disabled))
+    app.add_handler(CommandHandler("pdz_results", cmd_pdz_disabled))
+    app.add_handler(CommandHandler("pdz_test", cmd_pdz_disabled))
+    app.add_handler(CommandHandler("pdz_evening", cmd_pdz_disabled))
+    app.add_handler(CommandHandler("debtors", cmd_pdz_disabled))
+    app.add_handler(CommandHandler("debts", cmd_pdz_disabled))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^/дебиторка(@\w+)?(\s|$)"),
+        cmd_pdz_disabled,
+    ))
     app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
     app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
     app.add_handler(CommandHandler("set_weekly_bulk", cmd_set_weekly_bulk))
@@ -6791,8 +6231,6 @@ async def load_wazzup_managers():
         logger.warning(f"load_wazzup_managers: {e}")
 # Кэш для дедупликации webhook — order_id → timestamp последней проверки
 _price_check_cache: dict = {}
-# Хранилище данных алертов ПДЗ — order_id → {client, manager, debt_amount, debt_days, order_name}
-_pdz_alert_data: dict = {}
 
 
 async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
@@ -6845,13 +6283,6 @@ async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
             return
 
         order_id = order_href.split("/")[-1]
-        _pdz_alert_data[order_id] = {
-            "client": agent_name,
-            "manager": manager_name,
-            "order_name": order_name,
-            "debt_amount": debt_amount,
-            "debt_days": debt_days,
-        }
 
         text = (
             f"🔴 *Новый заказ от клиента с просрочкой!*\n\n"
@@ -6859,17 +6290,10 @@ async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
             f"Менеджер: {manager_name}\n\n"
             f"Просрочка: *{debt_days} дней* | Сумма: *{debt_amount:,.0f} руб*"
         )
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Согласовано", callback_data=f"pdz_ok|{order_id}"),
-                InlineKeyboardButton("💬 Требуется комментарий", callback_data=f"pdz_comment|{order_id}"),
-            ]
-        ])
         await bot.send_message(
             chat_id=group_chat_id,
             text=text,
             parse_mode="Markdown",
-            reply_markup=keyboard
         )
         logger.info(f"ПДЗ алерт: {agent_name}, просрочка {debt_days} дней, заказ {order_name}")
 
