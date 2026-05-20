@@ -1380,6 +1380,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message:
         return
 
+    # Диагностика входящих апдейтов: тип + chat + user
+    _u = message.from_user
+    _mt = ("video" if message.video else "video-doc" if (message.document and (message.document.mime_type or "").startswith("video/")) else "photo" if message.photo else "doc" if message.document else "text" if message.text else "other")
+    logger.info(f"HM-IN: chat={message.chat_id} type={_mt} user={_u.id if _u else None} user_name={_u.full_name if _u else '-'}")
+
+    # Видео от собственника/партнёра в личке → сохраняем в media до всех остальных return'ов
+    if _u and _u.id in {OWNER_CHAT_ID, PARTNER_CHAT_ID}:
+        if message.video:
+            await save_media(message, "video")
+            return
+        if message.document and (message.document.mime_type or "").startswith("video/"):
+            # видео отправленное как файл (большое или несжатое)
+            file_id = message.document.file_id
+            caption = message.caption or message.document.file_name or ""
+            db.save_media(
+                file_id=file_id,
+                media_type="video",
+                caption=caption,
+                chat_id=message.chat_id,
+                uploader=_u.full_name,
+                date=datetime.now().isoformat()
+            )
+            await message.reply_text("Видео-файл сохранён в базу.")
+            return
+
     async def safe_reply(text, **kwargs):
         """Отправляет ответ, при ошибке цитаты — без неё."""
         try:
