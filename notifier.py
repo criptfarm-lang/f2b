@@ -463,3 +463,306 @@ async def check_order_agreed(order_href: str, bot, db):
 
     except Exception as e:
         logger.error(f"notifier.check_order_agreed: {e}", exc_info=True)
+
+
+# ============================================================================
+# Объединённый алерт «На согласовании» / «ЗА ЛИМИТОМ»
+# План: 2026-05-21-объединённый-алерт-на-согласование.md, Фаза 3.
+# Светофор: Лимит → Просрочка → ДДС → Цена → Дата оплаты → Сайт → Контакты.
+# ============================================================================
+
+MS_STATE_ON_APPROVAL = "005f34bf-9a9a-11f0-0a80-03a900027473"
+MS_STATE_OVER_LIMIT  = "462ee41b-b554-11f0-0a80-15a000036d2c"
+
+
+def _parse_approvers_chat_ids() -> list[int]:
+    """
+    APPROVERS_CHAT_IDS — env, список chat_id через запятую.
+    Дефолт: только OWNER_CHAT_ID (если задан).
+    """
+    raw = os.getenv("APPROVERS_CHAT_IDS", "").strip()
+    if not raw:
+        owner = os.getenv("OWNER_CHAT_ID", "").strip()
+        return [int(owner)] if owner.isdigit() else []
+    out = []
+    for x in raw.split(","):
+        x = x.strip()
+        if x.lstrip("-").isdigit():
+            out.append(int(x))
+    return out
+
+
+def _icon(color: str) -> str:
+    return {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(color, "⚪")
+
+
+def _fmt_money(amount: float) -> str:
+    return f"{amount:,.0f}".replace(",", " ")
+
+
+def _build_approval_text(
+    order_name: str, order_sum: float, state_name: str,
+    client_name: str, manager_name: str,
+    credit: dict, overdue: dict, cashflow: dict, price: dict,
+    payment_date: dict, site: dict, contacts: dict,
+) -> str:
+    """
+    Шаблон алерта (план 2026-05-21, раздел «Шаблон сообщения»).
+    all-green → одна сводная строка; иначе — 7 строк по убыванию важности.
+    """
+    from datetime import datetime, timezone, timedelta
+    now_msk = datetime.now(timezone(timedelta(hours=3)))
+    sent_at = now_msk.strftime("%H:%M")
+
+    colors = [credit["color"], overdue["color"], cashflow["color"],
+              price["color"], payment_date["color"], site["color"], contacts["color"]]
+    all_green = all(c == "green" for c in colors)
+
+    header = (
+        f"🔔 *{client_name}* · {_fmt_money(order_sum)} ₽\n"
+        f"Заказ {order_name} · _{state_name}_\n"
+        f"👔 {manager_name} · 🕐 {sent_at}\n"
+    )
+
+    if all_green:
+        limit_pct = 0
+        if credit.get("limit", 0) > 0:
+            limit_pct = int(credit["effective_debt"] / credit["limit"] * 100)
+        body = (
+            f"\n🟢 Все 7 проверок ОК "
+            f"(лимит {limit_pct}% · ДДС {cashflow.get('n_days', 0)}д · "
+            f"долг 0 · цена · дата оплаты · сайт · контакты)\n"
+        )
+        return header + body
+
+    # Не-зелёный вариант — 7 строк по убыванию важности.
+    lines = ["\n"]
+
+    # 1. Лимит
+    if credit["color"] == "yellow":
+        lines.append(f"🟡 *Лимит:* не задан — заполните в карточке МС")
+    else:
+        lines.append(
+            f"{_icon(credit['color'])} *Лимит:* долг {_fmt_money(credit['current_debt'])} "
+            f"+ заказ {_fmt_money(credit['order_sum'])} "
+            f"= {_fmt_money(credit['effective_debt'])} ₽ "
+            f"из {_fmt_money(credit['limit'])} ₽"
+        )
+
+    # 2. Просрочка
+    if overdue["color"] == "red":
+        lines.append(
+            f"🔴 *Просрочка:* {overdue.get('days', 0)} дн "
+            f"/ {_fmt_money(overdue.get('debt', 0))} ₽"
+        )
+    else:
+        lines.append(f"🟢 *Просрочка:* нет")
+
+    # 3. ДДС
+    explain = cashflow.get("explain", "")
+    lines.append(f"{_icon(cashflow['color'])} *ДДС:* {explain}")
+
+    # 4. Цена
+    alerts = price.get("alerts", [])
+    if alerts:
+        n = len(alerts)
+        lines.append(f"🔴 *Цена:* {n} {'позиция' if n == 1 else 'позиций'} ниже минимума")
+        # До 3 строк детализации (первые строки каждого alert содержат суть)
+        for a in alerts[:3]:
+            first_useful = ""
+            for ln in a.split("\n"):
+                ln = ln.strip()
+                if ln and not ln.startswith("📦") and "Менеджер:" not in ln:
+                    first_useful = ln
+                    break
+            if first_useful:
+                lines.append(f"   • {first_useful[:80]}")
+        if n > 3:
+            lines.append(f"   • … и ещё {n - 3} позиций")
+    else:
+        lines.append("🟢 *Цена:* в норме")
+
+    # 5. Дата плановой оплаты
+    if payment_date["color"] == "green":
+        lines.append(f"🟢 *Дата оплаты:* {payment_date['date_str']}")
+    else:
+        if payment_date.get("date_str"):
+            lines.append(f"🔴 *Дата оплаты:* {payment_date['date_str']} (в прошлом)")
+        else:
+            lines.append(f"🔴 *Дата оплаты:* не указана")
+
+    # 6. Сайт
+    if site["color"] == "green":
+        lines.append(f"🟢 *Сайт:* {site['raw_value'][:60]}")
+    else:
+        lines.append(f"🔴 *Сайт:* {site.get('raw_value', '') or 'не заполнен'}")
+
+    # 7. Контакты
+    mx = contacts.get("max", "")
+    tg = contacts.get("telegram", "")
+    if contacts["color"] == "green":
+        parts_c = []
+        if contacts.get("max_valid"):
+            parts_c.append(f"Max {mx}")
+        if contacts.get("tg_valid"):
+            parts_c.append(f"TG {tg}")
+        lines.append(f"🟢 *Контакты:* " + " · ".join(parts_c))
+    else:
+        lines.append(f"🔴 *Контакты:* Max={mx or '—'} / TG={tg or '—'}")
+
+    return header + "\n".join(lines)
+
+
+async def check_approval_needed(order_href: str, bot, db):
+    """
+    Объединённый алерт согласующим (OWNER + Маланчук, env APPROVERS_CHAT_IDS) при
+    попадании заказа в статус «На согласовании» или «ЗА ЛИМИТОМ».
+    Дедуп — атомарный INSERT с UNIQUE(order_id, sum_hash) в pending_approval_alerts.
+    """
+    try:
+        import asyncio
+        import aiohttp
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        from moysklad import (
+            get_headers, MS_BASE,
+            load_counterparty_attrs,
+            compute_credit_color, compute_overdue_color, compute_cashflow_color,
+            compute_price_color, compute_payment_date_color,
+            compute_site_color, compute_contacts_color,
+        )
+
+        # 1. Загружаем заказ с атрибутами и расширениями
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                order_href, headers=get_headers(),
+                params={"expand": "agent,state,owner,attributes"}
+            ) as r:
+                if r.status != 200:
+                    logger.warning(f"check_approval_needed: GET order {r.status}")
+                    return
+                order = await r.json()
+
+        state = order.get("state") or {}
+        state_id = state.get("meta", {}).get("href", "").split("/")[-1]
+        if state_id not in (MS_STATE_ON_APPROVAL, MS_STATE_OVER_LIMIT):
+            return
+
+        state_name = state.get("name", "?")
+        order_id = order_href.split("/")[-1].split("?")[0]
+        order_name = order.get("name", "")
+        order_sum = (order.get("sum", 0) or 0) / 100
+        agent = order.get("agent") or {}
+        agent_name = agent.get("name", "")
+        agent_id = agent.get("id") or agent.get("meta", {}).get("href", "").split("/")[-1]
+        owner = order.get("owner") or {}
+        manager_name = owner.get("name", "не указан")
+
+        if not agent_id:
+            logger.warning(f"check_approval_needed: agent_id пустой для {order_name}")
+            return
+
+        logger.info(
+            f"check_approval_needed: {order_name} ({state_name}) клиент={agent_name} "
+            f"менеджер={manager_name} sum={order_sum:,.0f}"
+        )
+
+        # 2. Атрибуты counterparty (1 GET, передаётся в 3 sync helper'а)
+        cp_attrs = await load_counterparty_attrs(agent_id)
+
+        # 3. Параллельно: cashflow, overdue, price (+ timeout 20с с fallback)
+        try:
+            cashflow, overdue, price = await asyncio.wait_for(
+                asyncio.gather(
+                    compute_cashflow_color(agent_id),
+                    compute_overdue_color(agent_id),
+                    compute_price_color(order_href),
+                    return_exceptions=True,
+                ),
+                timeout=20.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"check_approval_needed: timeout для {order_name}")
+            cashflow = overdue = price = None
+
+        # Нормализуем результаты (Exception/None → yellow с пометкой)
+        def _norm(v, default):
+            if isinstance(v, Exception) or v is None:
+                logger.warning(f"check_approval_needed: helper failed → {v!r}")
+                return default
+            return v
+
+        cashflow = _norm(cashflow, {"color": "yellow", "n_days": None, "explain": "?", "payments_sum": 0})
+        overdue = _norm(overdue, {"color": "yellow", "days": 0, "debt": 0})
+        price = _norm(price, {"color": "yellow", "alerts": []})
+
+        # 4. Sync helper'ы
+        current_debt = overdue.get("debt", 0) or 0
+        credit = compute_credit_color(cp_attrs, current_debt=current_debt, order_sum=order_sum)
+        payment_date = compute_payment_date_color(order)
+        site = compute_site_color(cp_attrs)
+        contacts = compute_contacts_color(cp_attrs)
+
+        # 5. Сборка текста + colors_json для confirmation flow
+        colors_json = {
+            "credit": credit["color"],
+            "overdue": overdue["color"],
+            "cashflow": cashflow["color"],
+            "price": price["color"],
+            "payment_date": payment_date["color"],
+            "site": site["color"],
+            "contacts": contacts["color"],
+        }
+        alert_text = _build_approval_text(
+            order_name=order_name, order_sum=order_sum, state_name=state_name,
+            client_name=agent_name, manager_name=manager_name,
+            credit=credit, overdue=overdue, cashflow=cashflow, price=price,
+            payment_date=payment_date, site=site, contacts=contacts,
+        )
+
+        # 6. Дедуп: sum_hash = округлённая сумма в ₽
+        sum_hash = round(order_sum)
+
+        # Резолвим manager_user_id (для callback `appr_comment`)
+        mgr_user_id = 0
+        if manager_name:
+            for part in manager_name.split():
+                cid = db.get_manager_chat_id(part)
+                if cid:
+                    mgr_user_id = cid
+                    break
+
+        # 7. Атомарная вставка с дедупом
+        alert_id = db.try_insert_approval_alert(
+            order_id=order_id, sum_hash=sum_hash,
+            alert_text=alert_text, colors_json=colors_json,
+            order_name=order_name, client_name=agent_name,
+            manager_name=manager_name, manager_user_id=mgr_user_id,
+        )
+        if alert_id is None:
+            logger.info(f"check_approval_needed: дедуп — {order_name} (sum_hash={sum_hash}) уже алертили")
+            return
+
+        logger.info(f"check_approval_needed: alert_id={alert_id} для {order_name}")
+
+        # 8. Клавиатура + fan-out
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Согласовано", callback_data=f"appr_ok|{alert_id}"),
+            InlineKeyboardButton("💬 Комментарий", callback_data=f"appr_comment|{alert_id}"),
+        ]])
+
+        approvers = _parse_approvers_chat_ids()
+        if not approvers:
+            logger.error("check_approval_needed: APPROVERS_CHAT_IDS / OWNER_CHAT_ID не задан")
+            return
+
+        for chat_id in approvers:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id, text=alert_text,
+                    parse_mode="Markdown", reply_markup=keyboard
+                )
+            except Exception as e:
+                logger.error(f"check_approval_needed: send to {chat_id} failed: {e}")
+
+    except Exception as e:
+        logger.error(f"notifier.check_approval_needed: {e}", exc_info=True)

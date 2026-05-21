@@ -427,7 +427,8 @@ _wazzup_notified: set = set()
 
 _pending_links: dict = {}
 _user_awaiting: dict = {}  # user_id → "photo" | "contract" | "reconciliation"
-_pending_price_comments: dict = {}  # manager_user_id → {alert_id, order_id, mgr_name}
+_pending_price_comments: dict = {}  # manager_user_id → {alert_id, order_id, mgr_name, alert_type?, approver_chat_id?}
+_pending_approver_input: dict = {}  # approver_chat_id → {alert_id, order_name, client_name, manager_name, manager_user_id}
 
 async def handle_wazzup_ignore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Помечает контакт как 'не наш клиент' — больше не присылать уведомления."""
@@ -1551,13 +1552,75 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ответ менеджера на алерт цены в личке — пересылаем Виктору
     if user and chat_id == user.id and chat_id != OWNER_CHAT_ID and text:
 
+        # 1. Approver написал текст комментария для менеджера (approval-алерт)
+        if user.id in _pending_approver_input:
+            pending = _pending_approver_input.pop(user.id)
+            mgr_uid = pending.get("manager_user_id") or 0
+            alert_id = pending["alert_id"]
+            order_name = pending.get("order_name", "")
+            client_name = pending.get("client_name", "")
+            mgr_name = pending.get("manager_name", "?")
 
-        # 2. Ответ на запрос комментария по цене
+            if mgr_uid:
+                try:
+                    await context.bot.send_message(
+                        chat_id=mgr_uid,
+                        text=(
+                            f"💬 *Вопрос по заказу {order_name} ({client_name})*\n\n"
+                            f"{text}\n\n"
+                            f"_Ответь в этот чат — ответ уйдёт обратно._"
+                        ),
+                        parse_mode="Markdown",
+                    )
+                    # Ждём reply менеджера → отправим обратно approver'у через _pending_price_comments
+                    _pending_price_comments[mgr_uid] = {
+                        "alert_id": alert_id,
+                        "alert_type": "approval",
+                        "approver_chat_id": user.id,
+                        "order_id": pending.get("order_name", ""),
+                        "order_name": order_name,
+                        "client_name": client_name,
+                        "mgr_name": mgr_name,
+                    }
+                    await message.reply_text("✅ Уйдёт менеджеру; жду его ответ.")
+                except Exception as e:
+                    logger.error(f"appr_comment forward: {e}")
+                    await message.reply_text(f"❌ Не удалось отправить: {e}")
+            else:
+                await message.reply_text(
+                    f"❌ Chat_id менеджера {mgr_name} не известен боту. "
+                    f"Напишите ему напрямую."
+                )
+            return
+
+        # 2. Ответ на запрос комментария по цене (price_*) ИЛИ от менеджера на approval
         if user.id in _pending_price_comments:
             pending = _pending_price_comments.pop(user.id)
             alert_id = pending.get("alert_id", 0)
             order_id = pending.get("order_id", "")
+            order_name = pending.get("order_name", "")
+            client_name = pending.get("client_name", "")
             mgr_name = pending.get("mgr_name", user.full_name)
+            alert_type = pending.get("alert_type", "price")
+
+            if alert_type == "approval":
+                # Reply менеджера на approval-комментарий → шлём approver'у с шапкой заказа
+                approver_chat_id = pending.get("approver_chat_id", OWNER_CHAT_ID)
+                if alert_id:
+                    db.close_approval_alert(alert_id, closed_by=user.id, comment=text)
+                await context.bot.send_message(
+                    chat_id=approver_chat_id,
+                    text=(
+                        f"💬 *Ответ по заказу {order_name} ({client_name})*\n"
+                        f"👤 Менеджер: *{mgr_name}*\n\n"
+                        f"{text}"
+                    ),
+                    parse_mode="Markdown",
+                )
+                await message.reply_text("✅ Ответ передан.")
+                return
+
+            # Старый flow для price_alerts
             if alert_id:
                 db.close_price_alert(alert_id, text)
             await context.bot.send_message(
@@ -4640,6 +4703,144 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
 
+async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает нажатия на кнопки объединённого алерта «На согласовании / ЗА ЛИМИТОМ».
+    Callbacks: appr_ok | appr_confirm | appr_cancel | appr_comment.
+    План: 2026-05-21-объединённый-алерт-на-согласование.md, Фаза 3.
+    """
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    parts = query.data.split("|")
+    action = parts[0]
+    try:
+        alert_id = int(parts[1]) if len(parts) > 1 else 0
+    except (ValueError, IndexError):
+        alert_id = 0
+    if not alert_id:
+        return
+
+    # Авторизация: пользователь должен быть в APPROVERS_CHAT_IDS (или дефолтный OWNER)
+    raw_approvers = os.getenv("APPROVERS_CHAT_IDS", "").strip()
+    if raw_approvers:
+        approvers = [int(x.strip()) for x in raw_approvers.split(",")
+                     if x.strip().lstrip("-").isdigit()]
+    else:
+        approvers = [OWNER_CHAT_ID]
+    if user.id not in approvers:
+        await query.answer("⛔ Только для согласующих.", show_alert=True)
+        return
+
+    alert_data = db.get_approval_alert(alert_id)
+    if not alert_data:
+        await query.answer("Алерт не найден или закрыт.", show_alert=True)
+        return
+
+    order_id = alert_data["order_id"]
+    colors = alert_data.get("colors_json") or {}
+    if isinstance(colors, str):
+        import json as _json
+        try:
+            colors = _json.loads(colors)
+        except Exception:
+            colors = {}
+
+    MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
+
+    # --- appr_ok ---
+    if action == "appr_ok":
+        # Если уже закрыт — молча подтверждаем
+        if alert_data.get("closed_at"):
+            await query.answer("Уже согласовано ✓", show_alert=False)
+            return
+        has_non_green = any(c != "green" for c in colors.values())
+        if has_non_green:
+            n_red = sum(1 for c in colors.values() if c == "red")
+            n_yellow = sum(1 for c in colors.values() if c == "yellow")
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Да, согласовать", callback_data=f"appr_confirm|{alert_id}"),
+                InlineKeyboardButton("❌ Отмена",          callback_data=f"appr_cancel|{alert_id}"),
+            ]])
+            await query.message.reply_text(
+                f"⚠ Точно согласовать? В светофоре {n_red} красных, {n_yellow} жёлтых.",
+                reply_markup=kb,
+            )
+            return
+        # all-green → действие сразу (fall-through к appr_confirm)
+        action = "appr_confirm"
+
+    # --- appr_confirm ---
+    if action == "appr_confirm":
+        from moysklad import set_order_state, get_headers, MS_BASE
+        import aiohttp
+
+        # Idempotency: GET state перед PATCH
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{MS_BASE}/entity/customerorder/{order_id}",
+                    headers=get_headers(),
+                    params={"expand": "state"},
+                ) as r:
+                    if r.status == 200:
+                        ord_data = await r.json()
+                        cur_state_id = ord_data.get("state", {}).get("meta", {}).get(
+                            "href", "").split("/")[-1]
+                        if cur_state_id == MS_STATE_AGREED:
+                            db.close_approval_alert(alert_id, closed_by=user.id)
+                            await query.answer("Уже согласовано ✓", show_alert=False)
+                            return
+        except Exception as e:
+            logger.warning(f"appr_confirm idempotency check: {e}")
+
+        ok = await set_order_state(order_id, MS_STATE_AGREED)
+        if ok:
+            from datetime import datetime, timezone, timedelta
+            now_msk = datetime.now(timezone(timedelta(hours=3)))
+            db.close_approval_alert(alert_id, closed_by=user.id)
+            try:
+                await query.edit_message_text(
+                    query.message.text + f"\n\n✅ Согласовал: {user.full_name} в {now_msk.strftime('%H:%M')}",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                # Если это confirmation-сообщение (без кнопок ниже) — просто отвечаем
+                await query.message.reply_text("✅ Согласовано")
+        else:
+            await query.answer("❌ Ошибка смены статуса в МС", show_alert=True)
+        return
+
+    # --- appr_cancel ---
+    if action == "appr_cancel":
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
+    # --- appr_comment ---
+    if action == "appr_comment":
+        if alert_data.get("closed_at"):
+            await query.answer("Алерт уже закрыт.", show_alert=True)
+            return
+        _pending_approver_input[user.id] = {
+            "alert_id": alert_id,
+            "order_name": alert_data.get("order_name", ""),
+            "client_name": alert_data.get("client_name", ""),
+            "manager_name": alert_data.get("manager_name", ""),
+            "manager_user_id": alert_data.get("manager_user_id", 0),
+        }
+        mgr_name = alert_data.get("manager_name", "?")
+        await query.message.reply_text(
+            f"💬 Напишите вопрос/инструкцию менеджеру *{mgr_name}* одним сообщением. "
+            f"Уйдёт ему в личку.",
+            parse_mode="Markdown",
+        )
+        return
+
+
 async def _refresh_report_cache():
     """Фоновое обновление кэша отчёта."""
     try:
@@ -5991,6 +6192,7 @@ def main():
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
+    app.add_handler(CallbackQueryHandler(handle_approval_callback, pattern="^appr_"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing|wazzup_later)"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
@@ -6662,6 +6864,13 @@ async def process_ms_webhook(data: dict, bot):
             # атомарный claim через agreed_notifications.
             if action in ("UPDATE", "CREATE"):
                 await check_order_agreed(order_href, bot, db)
+
+            # Объединённый алерт «На согласовании» / «ЗА ЛИМИТОМ» — собственнику
+            # (план 2026-05-21, Фаза 3). Notifier сам проверяет state и делает
+            # атомарный дедуп через pending_approval_alerts (UNIQUE order_id+sum_hash).
+            if action in ("UPDATE", "CREATE"):
+                from notifier import check_approval_needed
+                await check_approval_needed(order_href, bot, db)
 
             # ПДЗ алерт — только для новых заказов, только один раз
             if action == "CREATE" and not already_checked:
