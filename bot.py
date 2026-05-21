@@ -3317,6 +3317,44 @@ async def cmd_pdz_events_test(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(text)
 
 
+async def cmd_pdz_html(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/pdz_html` — ручной запуск регенерации HTML-отчёта «Дебиторка» (Фаза 5).
+
+    Только собственник (OWNER_CHAT_ID). Запускает pdz_generate_html_job —
+    тот рендерит HTML из БД (snapshot + promise_log, без МС API), кладёт в
+    кэш и шлёт собственнику ссылку с токеном TTL 24ч. Команда отвечает
+    краткой сводкой результата."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        if update.message:
+            await update.message.reply_text("Нет доступа")
+        return
+    if not update.message:
+        return
+
+    await update.message.reply_text("⏳ Регенерирую HTML-отчёт «Дебиторка»...")
+    try:
+        from scheduler import pdz_generate_html_job
+        result = await pdz_generate_html_job(context.application, db)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    status = (result or {}).get("status")
+    if status == "ok":
+        url = result.get("url") or "—"
+        size_kb = round(int(result.get("html_size") or 0) / 1024, 1)
+        await update.message.reply_text(
+            f"✅ Отчёт обновлён ({size_kb} KB)\n{url}",
+            disable_web_page_preview=True,
+        )
+    else:
+        err = (result or {}).get("error") or "—"
+        await update.message.reply_text(
+            f"⚠️ Статус: {status}. Ошибка: {err}"
+        )
+
+
 async def cmd_pdz_overdue_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/pdz_overdue_test <тег>` — печатает первые 5 строк просрочки менеджера.
     Тег — фамилия в нижнем регистре (скляр, баласанян, мерзлякова, дьяченко, коликов).
@@ -6290,6 +6328,8 @@ def main():
     app.add_handler(CommandHandler("pdz_send_owner_pending_test", cmd_pdz_send_owner_pending_test))
     # Фаза 4.5: топ-30 клиентов по срывам обещаний за 90 дней (только собственник).
     app.add_handler(CommandHandler("pdz_breaks", cmd_pdz_breaks))
+    # Фаза 5: HTML-отчёт «Дебиторка» — ручной запуск регенерации (только собственник).
+    app.add_handler(CommandHandler("pdz_html", cmd_pdz_html))
     app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
     app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
     app.add_handler(CommandHandler("set_weekly_bulk", cmd_set_weekly_bulk))
@@ -6651,6 +6691,41 @@ def main():
         except Exception as e:
             logger.error(f"handle_web_report: {e}", exc_info=True)
             return web.Response(text=f"Ошибка: {e}", status=500)
+
+    async def handle_pdz_html(request):
+        """HTML-отчёт «Дебиторка» (Фаза 5 плана 2026-05-20-пдз-автоматика).
+
+        Доступ — только по токену из `report_links` с mgr_filter='pdz'.
+        Отдаёт закэшированный HTML (cron 14:15 МСК пишет в bot_settings.pdz_html_cache).
+        Если кэш пуст — рендерит на лету из последнего snapshot + promise_log.
+        НЕ дёргает МойСклад API.
+        """
+        token = request.query.get("token", "")
+        link = db.get_report_link(token)
+        if not link or (link.get("mgr_filter") or "") != "pdz":
+            return web.Response(
+                text="<html><body style='font-family:sans-serif;padding:40px;color:#6b7280'>"
+                     "<h2>Ссылка истекла или недействительна</h2>"
+                     "<p>Запроси новую через /pdz_html в боте.</p></body></html>",
+                content_type="text/html", status=403, charset="utf-8",
+            )
+        try:
+            cached = db.get_pdz_html_cache()
+            if cached:
+                html_text = cached
+                logger.info("handle_pdz_html: отдаём из кэша")
+            else:
+                from pdz_report_html import render_pdz_html_from_db
+                html_text = render_pdz_html_from_db(db)
+                try:
+                    db.set_pdz_html_cache(html_text)
+                except Exception as e:
+                    logger.warning(f"handle_pdz_html: set_pdz_html_cache: {e}")
+            return web.Response(text=html_text, content_type="text/html", charset="utf-8")
+        except Exception as e:
+            logger.error(f"handle_pdz_html: {e}", exc_info=True)
+            return web.Response(text=f"Ошибка: {e}", status=500, charset="utf-8")
+
     async def run_web():
         web_app = web.Application()
         web_app.router.add_post("/webhook/moysklad", handle_ms_webhook)
@@ -6659,6 +6734,7 @@ def main():
         web_app.router.add_post("/webhook/sipuni", handle_sipuni_webhook)
         web_app.router.add_get("/health", handle_health)
         web_app.router.add_get("/report", handle_web_report)
+        web_app.router.add_get("/pdz", handle_pdz_html)
         # ─── amoCRM алармы ───────────────────────────────────────────────────
         async def handle_amo_webhook_route(request):
             await handle_amo_webhook(request, app, db)

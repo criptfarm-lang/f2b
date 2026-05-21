@@ -914,6 +914,27 @@ class Database:
             ("op_new_share_snapshot", payload, payload)
         )
 
+    # ── Кэш HTML-отчёта «Дебиторка» (ПДЗ Фаза 5) ─────────────────────────────
+    # Готовый HTML-документ кладём в bot_settings.pdz_html_cache. Регенерация —
+    # cron 14:15 МСК (после фиксации срывов в 14:02 + дайджестов в 14:10) и
+    # ручной запуск через /pdz_html. Источник данных — pdz_snapshots + promise_log.
+    # Чтение — handle_pdz_html в bot.py, по защищённой ссылке `report_links`.
+
+    def get_pdz_html_cache(self) -> str | None:
+        """Возвращает закэшированный HTML отчёта дебиторки или None."""
+        row = self._fetchone(
+            "SELECT value FROM bot_settings WHERE key='pdz_html_cache'", ()
+        )
+        return row["value"] if row and row.get("value") else None
+
+    def set_pdz_html_cache(self, html_text: str):
+        """Идемпотентно перезаписывает кэш HTML отчёта дебиторки."""
+        self._execute(
+            """INSERT INTO bot_settings (key, value) VALUES (%s, %s)
+               ON CONFLICT (key) DO UPDATE SET value=%s""",
+            ("pdz_html_cache", html_text, html_text)
+        )
+
     def save_manager_chat_id(self, user_id: int, full_name: str):
         self._execute(
             """INSERT INTO manager_chats (user_id, full_name, updated_at)

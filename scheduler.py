@@ -121,6 +121,17 @@ def setup_scheduler(app: Application, db):
         id="pdz_send_owner_pending_16_05"
     )
 
+    # 14:15 МСК — регенерация HTML-отчёта «Дебиторка» (Фаза 5).
+    # Идёт после 14:02 (фиксация срывов в promise_log) и 14:10 (дайджесты
+    # менеджерам). Источник — БД (pdz_snapshots + promise_log), МС API не
+    # дёргается. Шлёт собственнику ссылку с токеном TTL 24ч.
+    scheduler.add_job(
+        pdz_generate_html_job,
+        CronTrigger(hour=14, minute=15, timezone=MSK),
+        args=[app, db],
+        id="pdz_generate_html_14_15"
+    )
+
     # ПТ 08:00 МСК — пересчёт «% работы на новых клиентах» (MTD) и запись
     # снимка в bot_settings.op_new_share_snapshot. Виджет в /op_report читает
     # его независимо от report_cache. План:
@@ -661,6 +672,79 @@ async def pdz_send_owner_pending_job(app: Application, db) -> dict:
         "managers": len(by_tag),
         "messages_sent": sent,
         "messages_total": len(chunks),
+    }
+
+
+async def pdz_generate_html_job(app: Application, db) -> dict:
+    """Cron 14:15 МСК — регенерация HTML-отчёта «Дебиторка» (Фаза 5).
+
+    Шаги:
+      1. render_pdz_html_from_db(db) — собирает HTML из последнего snapshot
+         и promise_log (МС API не дёргается).
+      2. db.set_pdz_html_cache(html) — атомарно перезаписывает кэш.
+      3. db.create_report_link(mgr_filter='pdz', ttl_minutes=24*60) — токен на 24ч.
+      4. Шлёт собственнику в ЛС ссылку `https://<host>/pdz?token=...`.
+
+    Возвращает dict для тестов: {status, html_size, token, url}.
+    """
+    logger.info(
+        f"pdz_generate_html_job стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}"
+    )
+
+    owner_raw = os.getenv("OWNER_CHAT_ID")
+    if not owner_raw:
+        logger.warning("pdz_generate_html_job: OWNER_CHAT_ID не задан")
+        return {"status": "no_owner_chat_id"}
+    owner_id = int(owner_raw)
+
+    try:
+        from pdz_report_html import render_pdz_html_from_db
+        html_text = render_pdz_html_from_db(db)
+    except Exception as e:
+        logger.error(f"pdz_generate_html_job: render: {e}", exc_info=True)
+        try:
+            await app.bot.send_message(
+                chat_id=owner_id,
+                text=f"⚠️ pdz_generate_html_job упал на рендере: {e}",
+            )
+        except Exception:
+            pass
+        return {"status": "error_render", "error": str(e)}
+
+    try:
+        db.set_pdz_html_cache(html_text)
+    except Exception as e:
+        logger.error(f"pdz_generate_html_job: set_pdz_html_cache: {e}", exc_info=True)
+        return {"status": "error_save", "error": str(e)}
+
+    # Токен на 24 часа, mgr_filter='pdz' = маркер для handle_pdz_html.
+    try:
+        token = db.create_report_link(mgr_filter="pdz", ttl_minutes=24 * 60)
+    except Exception as e:
+        logger.error(f"pdz_generate_html_job: create_report_link: {e}", exc_info=True)
+        return {"status": "error_link", "error": str(e)}
+
+    base = os.getenv("RAILWAY_PUBLIC_DOMAIN", "f2b-production.up.railway.app")
+    url = f"https://{base}/pdz?token={token}"
+
+    try:
+        await app.bot.send_message(
+            chat_id=owner_id,
+            text=f"📊 Дебиторка обновлена: {url}",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"pdz_generate_html_job: send_message: {e}")
+        return {"status": "error_send", "error": str(e), "url": url}
+
+    logger.info(
+        f"pdz_generate_html_job: html={len(html_text)} симв, token={token[:8]}…"
+    )
+    return {
+        "status": "ok",
+        "html_size": len(html_text),
+        "token": token,
+        "url": url,
     }
 
 
