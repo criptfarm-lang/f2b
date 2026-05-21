@@ -7078,80 +7078,16 @@ async def load_wazzup_managers():
 _price_check_cache: dict = {}
 
 
-async def check_debtor_alert(order_href: str, bot, group_chat_id: int):
-    """Проверяет есть ли у клиента просрочка > 5 дней при новом заказе."""
-    try:
-        import aiohttp
-        from moysklad import get_headers, MS_BASE
-        from datetime import date
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                order_href, headers=get_headers(),
-                params={"expand": "agent,owner"}
-            ) as resp:
-                if resp.status != 200:
-                    return
-                order = await resp.json()
-
-        agent = order.get("agent", {})
-        agent_meta = agent.get("meta", {})
-        agent_href = agent_meta.get("href", "")
-        agent_id = agent.get("id") or (agent_href.split("/")[-1] if agent_href else "")
-        agent_name = agent.get("name", "")
-        order_name = order.get("name", "")
-        owner = order.get("owner", {})
-        manager_name = owner.get("name", "не указан")
-
-        logger.info(f"check_debtor_alert: agent_id={agent_id} agent_name={agent_name} order={order_name}")
-
-        if not agent_id:
-            logger.warning("check_debtor_alert: agent_id пустой, пропускаем")
-            return
-
-        # Проверяем долг и просрочку через заказы контрагента
-        from moysklad import get_counterparty_debt
-        logger.info(f"check_debtor_alert: запрашиваю долг для {agent_id}")
-        debt_info = await get_counterparty_debt(agent_id)
-        logger.info(f"check_debtor_alert: debt_info={debt_info}")
-
-        if not debt_info:
-            logger.info("check_debtor_alert: debt_info пустой — нет долга или ошибка")
-            return
-
-        debt_amount = debt_info.get("debt", 0)
-        debt_days = debt_info.get("overdue_days", 0)
-        logger.info(f"check_debtor_alert: debt={debt_amount} days={debt_days}")
-
-        if debt_days <= 5 or debt_amount <= 0:
-            logger.info(f"check_debtor_alert: просрочка {debt_days} дней — ниже порога или долга нет")
-            return
-
-        order_id = order_href.split("/")[-1]
-
-        text = (
-            f"🔴 *Новый заказ от клиента с просрочкой!*\n\n"
-            f"*{agent_name}* | Заказ *{order_name}*\n"
-            f"Менеджер: {manager_name}\n\n"
-            f"Просрочка: *{debt_days} дней* | Сумма: *{debt_amount:,.0f} руб*"
-        )
-        await bot.send_message(
-            chat_id=group_chat_id,
-            text=text,
-            parse_mode="Markdown",
-        )
-        logger.info(f"ПДЗ алерт: {agent_name}, просрочка {debt_days} дней, заказ {order_name}")
-
-    except Exception as e:
-        logger.error(f"check_debtor_alert: {e}")
-# Кэш позиций заказа — order_id → frozenset(позиций) для отслеживания изменений цен/номенклатуры
-_order_positions_cache: dict = {}
+# Функция check_debtor_alert удалена в Фазе 5 (план 2026-05-21).
+# Её роль (алертить о новом заказе клиента с просрочкой) перенесена в
+# объединённый approval-алерт через notifier.check_approval_needed,
+# который собирает 6-блочный светофор включая просрочку и шлёт в личку
+# собственнику, а не в групповой чат.
 
 async def process_ms_webhook(data: dict, bot):
-    """Обрабатывает webhook от МойСклад — проверяет цены в заказе."""
+    """Обрабатывает webhook от МойСклад — триггерит approval-алерт и логистику."""
     import time
     try:
-        from moysklad import check_order_prices
         group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
         if not group_chat_id:
             return
@@ -7187,62 +7123,11 @@ async def process_ms_webhook(data: dict, bot):
             # Объединённый алерт «На согласовании» / «ЗА ЛИМИТОМ» — собственнику
             # (план 2026-05-21, Фаза 3). Notifier сам проверяет state и делает
             # атомарный дедуп через pending_approval_alerts (UNIQUE order_id+sum_hash).
+            # Заменил собой старые check_debtor_alert (в группу PRO) и self-standing
+            # check_order_prices alert (в личку) — оба выпилены в Фазе 5.
             if action in ("UPDATE", "CREATE"):
                 from notifier import check_approval_needed
                 await check_approval_needed(order_href, bot, db)
-
-            # ПДЗ алерт — только для новых заказов, только один раз
-            if action == "CREATE" and not already_checked:
-                await check_debtor_alert(order_href, bot, group_chat_id)
-
-            if already_checked:
-                logger.info(f"Webhook: заказ {order_id} уже проверялся, пропускаем цены/логистику")
-                continue
-
-            # Получаем снапшот позиций (товар + цена) и сравниваем с предыдущим
-            from moysklad import get_order_positions_snapshot
-            snapshot = await get_order_positions_snapshot(order_href)
-            prev_snapshot = _order_positions_cache.get(order_id)
-            _order_positions_cache[order_id] = snapshot
-
-            if prev_snapshot is not None and snapshot == prev_snapshot:
-                logger.info(f"Webhook: заказ {order_id} — цены/номенклатура не изменились, пропускаем")
-                continue
-
-            logger.info(f"Webhook: проверяю цены заказа {order_id}")
-            alerts = await check_order_prices(order_href)
-
-            if alerts:
-                text = "⚠️ *Цена ниже минимальной!*\n\n" + "\n\n".join(alerts)
-
-                # Получаем имя менеджера из данных заказа
-                mgr_name = ""
-                for a in alerts:
-                    for line in a.split("\n"):
-                        if "Менеджер:" in line:
-                            mgr_name = line.replace("Менеджер:", "").strip()
-                            break
-
-                # Сохраняем алерт в БД
-                alert_id = db.save_price_alert(
-                    order_id=order_id,
-                    order_name="",
-                    client_name="",
-                    manager_name=mgr_name,
-                    manager_user_id=0,
-                    alert_text=text
-                )
-
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Согласовано", callback_data=f"price_ok|{order_id}"),
-                    InlineKeyboardButton("💬 Комментарий менеджеру", callback_data=f"price_comment|{order_id}|{alert_id}"),
-                ]])
-                await bot.send_message(
-                    chat_id=OWNER_CHAT_ID,
-                    text=text,
-                    parse_mode="Markdown",
-                    reply_markup=keyboard
-                )
 
             # Проверяем логистику — только при создании заказа
             if action == "CREATE":
