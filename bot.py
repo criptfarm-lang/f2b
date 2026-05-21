@@ -3128,6 +3128,57 @@ async def cmd_pdz_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cmd_pdz_token_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Диагностика: проверка какой токен МС в env + жив ли он + есть ли права."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    if not update.message:
+        return
+
+    tok = os.getenv("MOYSKLAD_TOKEN", "")
+    if not tok:
+        await update.message.reply_text("❌ MOYSKLAD_TOKEN в env не задан!")
+        return
+
+    lines = [
+        f"🔑 Токен в env: len={len(tok)}",
+        f"   prefix={tok[:4]}  suffix={tok[-4:]}",
+        "",
+    ]
+
+    import aiohttp
+    from moysklad import MS_BASE, get_headers
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 1) /context/employee — проверка живого токена
+            async with session.get(f"{MS_BASE}/context/employee", headers=get_headers()) as r:
+                lines.append(f"/context/employee → {r.status}")
+                if r.status == 200:
+                    data = await r.json()
+                    lines.append(f"   me: {data.get('name', '?')} ({data.get('email', '?')})")
+
+            # 2) /report/counterparty — берём один agent_id и тестируем
+            async with session.get(f"{MS_BASE}/entity/customerorder?limit=1", headers=get_headers()) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    if d.get("rows"):
+                        href = d["rows"][0]["agent"]["meta"]["href"]
+                        aid = href.split("/")[-1]
+                        async with session.get(f"{MS_BASE}/report/counterparty/{aid}", headers=get_headers()) as r2:
+                            lines.append(f"/report/counterparty/{aid[:8]} → {r2.status}")
+                            if r2.status == 200:
+                                rd = await r2.json()
+                                lines.append(f"   balance: {rd.get('balance')}")
+                            else:
+                                body = await r2.text()
+                                lines.append(f"   body: {body[:200]}")
+    except Exception as e:
+        lines.append(f"❌ {type(e).__name__}: {e}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_pdz_snapshot_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Диагностика Фазы 2 ПДЗ-автоматики: руками запустить снимок и вернуть
     в ЛС количество записей + 3 примера строк. Доступ — только собственник."""
@@ -5806,6 +5857,7 @@ def main():
     ))
     # Диагностика Фазы 2 ПДЗ-автоматики (только собственник).
     app.add_handler(CommandHandler("pdz_snapshot_test", cmd_pdz_snapshot_test))
+    app.add_handler(CommandHandler("pdz_token_check", cmd_pdz_token_check))
     # Диагностика Фазы 3 (только собственник).
     app.add_handler(CommandHandler("pdz_events_test", cmd_pdz_events_test))
     app.add_handler(CommandHandler("pdz_overdue_test", cmd_pdz_overdue_test))

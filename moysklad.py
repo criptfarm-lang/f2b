@@ -1501,21 +1501,26 @@ async def pdz_take_snapshot() -> list:
                 try:
                     report_url = f"{MS_BASE}/report/counterparty/{aid}"
                     async with session.get(report_url, headers=get_headers()) as resp_b:
+                        # Логируем ВСЕ статусы (не только не-200) для диагностики.
                         if resp_b.status != 200:
                             body = await resp_b.text()
                             logger.warning(
-                                f"pdz_take_snapshot balance {aid} {resp_b.status}: {body[:120]}"
+                                f"pdz_take_snapshot balance {aid[:8]} STATUS={resp_b.status} body={body[:200]}"
                             )
                             return aid, None
                         rdata = await resp_b.json()
                         raw_balance = rdata.get("balance", 0) or 0
+                        # Лог раз в ~30 запросов, чтобы видеть что 200 идёт.
+                        logger.debug(f"pdz_take_snapshot balance {aid[:8]} OK = {raw_balance}")
                         return aid, round(raw_balance / 100, 2)
                 except Exception as ex_b:
-                    logger.warning(f"pdz_take_snapshot balance {aid} error: {ex_b}")
+                    logger.warning(f"pdz_take_snapshot balance {aid[:8]} exception: {type(ex_b).__name__}: {ex_b}")
                     return aid, None
 
-            # Батчи по 10 параллельно — МС API лимит RPS ~5-10.
-            BATCH = 10
+            # Батчи по 3 параллельно — защита от rate-limit МС (он бьёт 429
+            # при ~5+ одновременных запросах). Если за раз 3 — пока медленнее,
+            # но стабильно.
+            BATCH = 3
             for i in range(0, len(unique_agents), BATCH):
                 chunk = unique_agents[i:i + BATCH]
                 results = await asyncio.gather(
