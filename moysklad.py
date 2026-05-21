@@ -1869,7 +1869,7 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
         })
 
     grouped.sort(key=lambda x: x["total_unpaid"], reverse=True)
-    return grouped[:30]
+    return grouped
 
 
 def format_overdue_summary(items: list) -> str:

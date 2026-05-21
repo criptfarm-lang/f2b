@@ -3234,33 +3234,42 @@ async def cmd_pdz_overdue_test(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     # items — список dict, сгруппированный по контрагенту (group_by_agent=True
-    # по умолчанию). Лимит топ-30 уже применён внутри pdz_overdue_for_manager.
-    lines = [f"📋 *Просрочки {tag}* — клиентов: {len(items)}", ""]
-    for it in items[:5]:
+    # по умолчанию). Показываем ВСЕХ клиентов, разбивая на несколько TG-сообщений
+    # по лимиту 3500 символов (запас от лимита Telegram 4096).
+    header = f"📋 *Просрочки {tag}* — клиентов: {len(items)}"
+    chunks: list[list[str]] = [[header, ""]]
+    current_len = len(header) + 2
+
+    def order_word(cnt: int) -> str:
+        if cnt % 10 == 1 and cnt % 100 != 11:
+            return "заказ"
+        if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
+            return "заказа"
+        return "заказов"
+
+    for it in items:
         name = (it.get("agent_name") or "—").replace("*", "").replace("_", "")
         url = it.get("ms_url_first_order") or "#"
         cnt = it.get("orders_count", 0)
-        # Простая склейка падежа для «заказ(а/ов)».
-        if cnt % 10 == 1 and cnt % 100 != 11:
-            order_word = "заказ"
-        elif cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
-            order_word = "заказа"
-        else:
-            order_word = "заказов"
-        lines.append(
-            f"[{name}]({url}) · {cnt} {order_word} · "
+        line = (
+            f"[{name}]({url}) · {cnt} {order_word(cnt)} · "
             f"{it.get('max_days_overdue', 0)} дн · "
             f"{fmt_money(it.get('total_unpaid', 0))}"
         )
-    if len(items) > 5:
-        lines.append("")
-        lines.append(f"_…ещё {len(items) - 5} клиентов_")
+        if current_len + len(line) + 1 > 3500:
+            chunks.append([])
+            current_len = 0
+        chunks[-1].append(line)
+        current_len += len(line) + 1
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-    )
+    for chunk in chunks:
+        if not chunk:
+            continue
+        await update.message.reply_text(
+            "\n".join(chunk),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
 
 
 async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
