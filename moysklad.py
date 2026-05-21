@@ -1891,6 +1891,163 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
     return grouped
 
 
+# ─── ПДЗ Фаза 4: TG-дайджесты ────────────────────────────────────────────
+
+def _order_word_ru(cnt: int) -> str:
+    """Русское склонение «заказ/заказа/заказов» по числу."""
+    if cnt % 10 == 1 and cnt % 100 != 11:
+        return "заказ"
+    if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
+        return "заказа"
+    return "заказов"
+
+
+def pdz_send_manager_digest_text(items: list, manager_name: str = None) -> list:
+    """Формирует список TG-сообщений (Markdown) с дайджестом просрочек для одного
+    менеджера. Каждое сообщение ≤3500 символов (запас от лимита TG 4096).
+
+    items — результат pdz_overdue_for_manager(tag, db=db) (grouped, по клиентам,
+    отсортирован по total_unpaid убыванию).
+
+    Формат строки клиента:
+        [Имя клиента](ms_url_first_order) · K заказа · M дн · S руб.
+
+    Заголовок (одно сообщение в начале):
+        📋 Просрочки — клиентов: N
+
+    Возвращает [] если items пуст (тишина = всё хорошо).
+
+    manager_name — оставлен в сигнатуре для совместимости / диагностики; в текст
+    не подмешиваем, потому что сообщение приходит менеджеру в личку и он знает,
+    что это про него (требование плана 2026-05-20 Фазы 4).
+    """
+    if not items:
+        return []
+
+    header = f"📋 *Просрочки* — клиентов: {len(items)}"
+    chunks: list[list[str]] = [[header, ""]]
+    current_len = len(header) + 2
+
+    for it in items:
+        name = (it.get("agent_name") or "—").replace("*", "").replace("_", "")
+        url = it.get("ms_url_first_order") or "#"
+        cnt = int(it.get("orders_count", 0) or 0)
+        line = (
+            f"[{name}]({url}) · {cnt} {_order_word_ru(cnt)} · "
+            f"{it.get('max_days_overdue', 0)} дн · "
+            f"{fmt_money(it.get('total_unpaid', 0))}"
+        )
+        if current_len + len(line) + 1 > 3500:
+            chunks.append([])
+            current_len = 0
+        chunks[-1].append(line)
+        current_len += len(line) + 1
+
+    return ["\n".join(c) for c in chunks if c]
+
+
+def pdz_unprocessed_for_owner(db) -> dict:
+    """Для пинга собственнику в 16:05 МСК. Группирует «необработанных» клиентов
+    по тегу менеджера.
+
+    «Необработанный заказ» (из последнего snapshot):
+      - manager_tag входит в PDZ_MANAGER_TAG_MAP
+      - effective_due_date = ppm_new if ppm_new else ppm_initial; effective < today
+      - payed_sum < total_sum
+      - ppm_new is None ИЛИ ppm_new < today (= менеджер НЕ пересогласовал в будущее)
+      - agent_balance < 0 ИЛИ agent_balance is None (как в pdz_overdue_for_manager)
+
+    Возврат: {manager_tag: [agent_dict, ...]}, где agent_dict — то же поле, что
+    отдаёт pdz_overdue_for_manager(group_by_agent=True), отсортирован по
+    total_unpaid убыванию.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo as _ZI
+    today = datetime.now(_ZI("Europe/Moscow")).date()
+
+    rows = db.get_latest_snapshot() if db is not None else []
+
+    # tag → agent_id → {agent_name, agent_balance, orders: [...]}
+    by_tag: dict = {}
+
+    for r in rows:
+        row_tag = (r.get("manager_tag") or "").lower()
+        if not row_tag or row_tag not in PDZ_MANAGER_TAG_MAP:
+            continue
+
+        ppm_new = _to_date(r.get("ppm_new"))
+        ppm_initial = _to_date(r.get("ppm_initial"))
+        effective = ppm_new if ppm_new is not None else ppm_initial
+        if not effective or effective >= today:
+            continue
+
+        payed = float(r.get("payed_sum") or 0)
+        total = float(r.get("total_sum") or 0)
+        if payed >= total:
+            continue
+
+        # Фильтр против ложных просрочек (см. pdz_overdue_for_manager).
+        bal_raw = r.get("agent_balance")
+        agent_balance = float(bal_raw) if bal_raw is not None else None
+        if agent_balance is not None and agent_balance >= 0:
+            continue
+
+        # «Необработан»: ppm_new пустой ИЛИ ppm_new в прошлом/сегодня
+        # (= не пересогласовал в будущее).
+        if ppm_new is not None and ppm_new >= today:
+            continue
+
+        days_overdue = (today - effective).days
+        unpaid = round(total - payed, 2)
+        order_id = r.get("order_id") or ""
+        order = {
+            "order_id": order_id,
+            "order_name": r.get("order_name"),
+            "agent_id": r.get("agent_id"),
+            "agent_name": r.get("agent_name"),
+            "effective_due_date": effective,
+            "days_overdue": days_overdue,
+            "unpaid_sum": unpaid,
+            "ms_url": f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}",
+            "agent_balance": agent_balance,
+        }
+
+        agent_bucket = by_tag.setdefault(row_tag, {}).setdefault(
+            order["agent_id"] or "",
+            {
+                "agent_id": order["agent_id"],
+                "agent_name": order["agent_name"],
+                "agent_balance": agent_balance,
+                "orders": [],
+            },
+        )
+        agent_bucket["orders"].append(order)
+
+    # Сводим order→agent в формат как у pdz_overdue_for_manager.
+    result: dict = {}
+    for tag, agents in by_tag.items():
+        grouped = []
+        for aid, data in agents.items():
+            orders = data["orders"]
+            oldest = min(orders, key=lambda x: x["effective_due_date"])
+            total_unpaid = round(sum(x["unpaid_sum"] for x in orders), 2)
+            max_days = max(x["days_overdue"] for x in orders)
+            grouped.append({
+                "agent_id": data["agent_id"],
+                "agent_name": data["agent_name"],
+                "agent_balance": data["agent_balance"],
+                "total_unpaid": total_unpaid,
+                "max_days_overdue": max_days,
+                "orders_count": len(orders),
+                "ms_url_first_order": oldest["ms_url"],
+            })
+        grouped.sort(key=lambda x: x["total_unpaid"], reverse=True)
+        if grouped:
+            result[tag] = grouped
+
+    return result
+
+
 def format_overdue_summary(items: list) -> str:
     """Краткий формат ПДЗ: итог + по менеджерам со списком клиентов."""
     if not items:

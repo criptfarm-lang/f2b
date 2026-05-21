@@ -3323,6 +3323,124 @@ async def cmd_pdz_overdue_test(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 
+# ─── ПДЗ Фаза 4: тестовые команды ────────────────────────────────────────
+
+# In-memory токен подтверждения для «боевой» рассылки дайджестов.
+# Проставляется в cmd_pdz_send_digests_test, сбрасывается через 10 минут
+# либо после успешного запуска /pdz_send_digests_test_now.
+_PDZ_DIGESTS_CONFIRM_TS = {"ts": None}
+
+
+async def cmd_pdz_send_digests_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Диагностика Фазы 4: подтверждает намерение разослать боевые дайджесты.
+    Ничего не шлёт — только включает окно подтверждения на 10 минут.
+    Реальная рассылка — /pdz_send_digests_test_now. Доступ — только собственник."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    if not update.message:
+        return
+
+    from datetime import datetime as _dt
+    _PDZ_DIGESTS_CONFIRM_TS["ts"] = _dt.utcnow()
+    await update.message.reply_text(
+        "⚠️ Сейчас разошлю боевые дайджесты 5 менеджерам. "
+        "Подтверди — отправь ещё раз `/pdz_send_digests_test_now`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_pdz_send_digests_test_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Реально запускает pdz_send_digests_job — рассылает боевые дайджесты
+    менеджерам в личку. Требует, чтобы перед этим был вызван
+    /pdz_send_digests_test (окно подтверждения 10 минут).
+    Доступ — только собственник."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    if not update.message:
+        return
+
+    from datetime import datetime as _dt, timedelta as _td
+    ts = _PDZ_DIGESTS_CONFIRM_TS.get("ts")
+    if not ts or (_dt.utcnow() - ts) > _td(minutes=10):
+        await update.message.reply_text(
+            "❌ Нет действующего подтверждения. Сначала отправь `/pdz_send_digests_test`",
+            parse_mode="Markdown",
+        )
+        return
+    # Сбрасываем токен — повторный вызов потребует нового /pdz_send_digests_test.
+    _PDZ_DIGESTS_CONFIRM_TS["ts"] = None
+
+    await update.message.reply_text("⏳ Шлю боевые дайджесты менеджерам...")
+    try:
+        from scheduler import pdz_send_digests_job
+        report = await pdz_send_digests_job(context.application, db)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    if not report:
+        await update.message.reply_text("⚠️ pdz_send_digests_job вернула пусто")
+        return
+
+    lines = ["✅ Дайджесты разосланы. Сводка:"]
+    for tag, info in report.items():
+        status = info.get("status")
+        if status == "ok":
+            lines.append(
+                f"• {tag} ({info.get('manager','?')}) — {info.get('clients',0)} клиентов, "
+                f"{info.get('messages_sent',0)}/{info.get('messages_total',0)} сообщений"
+            )
+        elif status == "no_overdue":
+            lines.append(f"• {tag} — просрочек нет")
+        elif status == "no_chat_id":
+            lines.append(f"• {tag} ({info.get('manager','?')}) — ⚠️ chat_id не найден ({info.get('clients',0)} клиентов)")
+        elif status == "error_fetch":
+            lines.append(f"• {tag} — ❌ ошибка получения: {info.get('error','?')}")
+        else:
+            lines.append(f"• {tag} — {status}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_pdz_send_owner_pending_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Диагностика Фазы 4: руками запускает pdz_send_owner_pending_job.
+    Результат собственник видит у себя же (job шлёт OWNER_CHAT_ID).
+    Доступ — только собственник."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    if not update.message:
+        return
+
+    await update.message.reply_text("⏳ Считаю необработанных для пинга собственнику...")
+    try:
+        from scheduler import pdz_send_owner_pending_job
+        result = await pdz_send_owner_pending_job(context.application, db)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    if not result:
+        await update.message.reply_text("⚠️ pdz_send_owner_pending_job вернула пусто")
+        return
+
+    status = result.get("status")
+    if status == "all_clear":
+        await update.message.reply_text("ℹ️ Сводка: все менеджеры обработали (сообщение пошло собственнику).")
+    elif status == "sent":
+        await update.message.reply_text(
+            f"ℹ️ Сводка: {result.get('managers',0)} менеджеров с необработанными, "
+            f"{result.get('messages_sent',0)}/{result.get('messages_total',0)} сообщений отправлено."
+        )
+    elif status == "no_owner_chat_id":
+        await update.message.reply_text("⚠️ OWNER_CHAT_ID не задан в env.")
+    elif status == "error":
+        await update.message.reply_text(f"❌ Job упал: {result.get('error','?')}")
+    else:
+        await update.message.reply_text(f"ℹ️ status={status}")
+
+
 async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_group [название группы] — сумма продаж по группе товаров за текущий месяц по менеджерам."""
     user = update.effective_user
@@ -5861,6 +5979,10 @@ def main():
     # Диагностика Фазы 3 (только собственник).
     app.add_handler(CommandHandler("pdz_events_test", cmd_pdz_events_test))
     app.add_handler(CommandHandler("pdz_overdue_test", cmd_pdz_overdue_test))
+    # Диагностика Фазы 4: TG-дайджесты менеджерам + пинг собственнику.
+    app.add_handler(CommandHandler("pdz_send_digests_test", cmd_pdz_send_digests_test))
+    app.add_handler(CommandHandler("pdz_send_digests_test_now", cmd_pdz_send_digests_test_now))
+    app.add_handler(CommandHandler("pdz_send_owner_pending_test", cmd_pdz_send_owner_pending_test))
     app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
     app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
     app.add_handler(CommandHandler("set_weekly_bulk", cmd_set_weekly_bulk))

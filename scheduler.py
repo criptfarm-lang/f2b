@@ -5,6 +5,7 @@
 - Стареющие клиенты в 12:00
 """
 
+import asyncio
 import logging
 import os
 from datetime import datetime
@@ -101,6 +102,23 @@ def setup_scheduler(app: Application, db):
         CronTrigger(hour=14, minute=2, timezone=MSK),
         args=[app, db],
         id="pdz_process_events_1402"
+    )
+
+    # 14:10 МСК — TG-дайджест каждому менеджеру с просрочками (Фаза 4).
+    # Если просрочек нет — тишина.
+    scheduler.add_job(
+        pdz_send_digests_job,
+        CronTrigger(hour=14, minute=10, timezone=MSK),
+        args=[app, db],
+        id="pdz_send_digests_14_10"
+    )
+
+    # 16:05 МСК — пинг собственнику по необработанным после дедлайна 16:00 (Фаза 4).
+    scheduler.add_job(
+        pdz_send_owner_pending_job,
+        CronTrigger(hour=16, minute=5, timezone=MSK),
+        args=[app, db],
+        id="pdz_send_owner_pending_16_05"
     )
 
     scheduler.start()
@@ -415,3 +433,211 @@ async def pdz_process_events_job(app: Application, db):
     except Exception as e:
         logger.error(f"pdz_process_events_job: {e}", exc_info=True)
         return {"events_total": 0, "set": 0, "moved": 0, "broken": 0, "initial_changes": 0, "error": str(e)}
+
+
+# ─── ПДЗ Фаза 4: TG-дайджесты ────────────────────────────────────────────
+
+
+async def pdz_send_digests_job(app: Application, db) -> dict:
+    """Cron 14:10 МСК — рассылка дайджестов просрочек менеджерам в личку.
+
+    Для каждого тега из PDZ_MANAGER_TAG_MAP:
+      - получает items через pdz_overdue_for_manager(tag, db=db);
+      - если пусто — пропускает (тишина = всё хорошо);
+      - ищет chat_id менеджера в БД (по первому имени из имени менеджера);
+      - формирует список TG-сообщений (каждое ≤3500 симв.);
+      - отправляет последовательно, sleep 0.3с между сообщениями (TG rate limit).
+
+    Возвращает сводку для теста: {tag: {"status": ..., "messages_sent": N}}.
+    """
+    from moysklad import (
+        PDZ_MANAGER_TAG_MAP,
+        pdz_overdue_for_manager,
+        pdz_send_manager_digest_text,
+    )
+
+    logger.info(
+        f"pdz_send_digests_job стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}"
+    )
+
+    report: dict = {}
+    for tag, manager_name in PDZ_MANAGER_TAG_MAP.items():
+        try:
+            items = await pdz_overdue_for_manager(tag, db=db)
+        except Exception as e:
+            logger.error(f"pdz_send_digests_job: {tag} pdz_overdue_for_manager: {e}", exc_info=True)
+            report[tag] = {"status": "error_fetch", "error": str(e), "messages_sent": 0}
+            continue
+
+        if not items:
+            logger.info(f"pdz_send_digests_job: {tag} — просрочек нет, пропуск")
+            report[tag] = {"status": "no_overdue", "messages_sent": 0, "clients": 0}
+            continue
+
+        # chat_id ищется по первому имени менеджера (как в check_aging_clients).
+        first_name = manager_name.split()[0] if manager_name else ""
+        chat_id = db.get_manager_chat_id(first_name) if first_name else None
+        if not chat_id:
+            logger.warning(
+                f"pdz_send_digests_job: {tag} ({manager_name}) — chat_id не найден в manager_chats"
+            )
+            report[tag] = {
+                "status": "no_chat_id",
+                "manager": manager_name,
+                "messages_sent": 0,
+                "clients": len(items),
+            }
+            continue
+
+        messages = pdz_send_manager_digest_text(items, manager_name)
+        sent = 0
+        for i, msg in enumerate(messages):
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=msg,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+                sent += 1
+                if i < len(messages) - 1:
+                    await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error(
+                    f"pdz_send_digests_job: {tag} send_message → {chat_id}: {e}"
+                )
+                break
+
+        logger.info(
+            f"pdz_send_digests_job: {tag} ({manager_name}) — {len(items)} клиентов, "
+            f"{sent}/{len(messages)} сообщений отправлено"
+        )
+        report[tag] = {
+            "status": "ok",
+            "manager": manager_name,
+            "chat_id": chat_id,
+            "clients": len(items),
+            "messages_sent": sent,
+            "messages_total": len(messages),
+        }
+
+    return report
+
+
+async def pdz_send_owner_pending_job(app: Application, db) -> dict:
+    """Cron 16:05 МСК — пинг собственнику по необработанным после 16:00.
+
+    Собирает по менеджерам клиентов, где менеджер не пересогласовал
+    `ppm_new` в будущее (см. pdz_unprocessed_for_owner).
+
+    Если у всех всё проставлено — отправляет «✅ Все менеджеры обработали
+    просрочки до 16:00».
+    """
+    from moysklad import (
+        PDZ_MANAGER_TAG_MAP,
+        pdz_unprocessed_for_owner,
+        fmt_money,
+    )
+
+    logger.info(
+        f"pdz_send_owner_pending_job стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}"
+    )
+
+    owner_raw = os.getenv("OWNER_CHAT_ID")
+    if not owner_raw:
+        logger.warning("pdz_send_owner_pending_job: OWNER_CHAT_ID не задан, пропуск")
+        return {"status": "no_owner_chat_id"}
+    owner_id = int(owner_raw)
+
+    try:
+        by_tag = pdz_unprocessed_for_owner(db)
+    except Exception as e:
+        logger.error(f"pdz_send_owner_pending_job: {e}", exc_info=True)
+        try:
+            await app.bot.send_message(
+                chat_id=owner_id,
+                text=f"⚠️ pdz_send_owner_pending_job упал: {e}",
+            )
+        except Exception:
+            pass
+        return {"status": "error", "error": str(e)}
+
+    if not by_tag:
+        text = "✅ Все менеджеры обработали просрочки до 16:00"
+        try:
+            await app.bot.send_message(chat_id=owner_id, text=text)
+        except Exception as e:
+            logger.error(f"pdz_send_owner_pending_job: send_message OK: {e}")
+        return {"status": "all_clear", "managers": 0}
+
+    # Формируем сводку. Группировка по менеджеру, внутри — клиенты по
+    # total_unpaid убыванию (уже отсортированы pdz_unprocessed_for_owner).
+    lines: list[str] = ["⚠️ *16:00 — не проставлены новые даты:*", ""]
+
+    # Сортируем менеджеров по сумме просрочки (убывание).
+    tag_totals = [
+        (tag, sum(a["total_unpaid"] for a in agents), agents)
+        for tag, agents in by_tag.items()
+    ]
+    tag_totals.sort(key=lambda x: x[1], reverse=True)
+
+    for tag, total, agents in tag_totals:
+        manager_name = PDZ_MANAGER_TAG_MAP.get(tag, tag)
+        # Берём фамилию (первое слово после имени) для заголовка — в плане
+        # пример "Скляр — 3 клиента · 280 000 ₽".
+        surname = manager_name.split()[-1] if manager_name else tag
+        cnt = len(agents)
+        word = "клиент" if cnt % 10 == 1 and cnt % 100 != 11 else (
+            "клиента" if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14) else "клиентов"
+        )
+        lines.append(f"*{surname}* — {cnt} {word} · {fmt_money(total)}")
+        for a in agents:
+            name = (a.get("agent_name") or "—").replace("*", "").replace("_", "")
+            url = a.get("ms_url_first_order") or "#"
+            lines.append(
+                f"• [{name}]({url}) · {a.get('max_days_overdue', 0)} дн · "
+                f"{fmt_money(a.get('total_unpaid', 0))}"
+            )
+        lines.append("")
+
+    text = "\n".join(lines).rstrip()
+    # Разбиваем на чанки ≤3500 символов (как в дайджесте).
+    chunks: list[str] = []
+    buf: list[str] = []
+    cur_len = 0
+    for ln in text.split("\n"):
+        if cur_len + len(ln) + 1 > 3500 and buf:
+            chunks.append("\n".join(buf))
+            buf = []
+            cur_len = 0
+        buf.append(ln)
+        cur_len += len(ln) + 1
+    if buf:
+        chunks.append("\n".join(buf))
+
+    sent = 0
+    for i, chunk in enumerate(chunks):
+        try:
+            await app.bot.send_message(
+                chat_id=owner_id,
+                text=chunk,
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+            sent += 1
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.error(f"pdz_send_owner_pending_job: send_message → {owner_id}: {e}")
+            break
+
+    logger.info(
+        f"pdz_send_owner_pending_job: {len(by_tag)} менеджеров с необработанными, "
+        f"{sent}/{len(chunks)} сообщений отправлено"
+    )
+    return {
+        "status": "sent",
+        "managers": len(by_tag),
+        "messages_sent": sent,
+        "messages_total": len(chunks),
+    }
