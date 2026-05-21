@@ -1497,11 +1497,15 @@ async def pdz_take_snapshot() -> list:
 
             balance_map: dict = {}
 
-            async def _fetch_balance(aid: str):
+            async def _fetch_balance(aid: str, attempt: int = 1):
+                report_url = f"{MS_BASE}/report/counterparty/{aid}"
                 try:
-                    report_url = f"{MS_BASE}/report/counterparty/{aid}"
-                    async with session.get(report_url, headers=get_headers()) as resp_b:
-                        # Логируем ВСЕ статусы (не только не-200) для диагностики.
+                    timeout = aiohttp.ClientTimeout(total=30)
+                    async with session.get(report_url, headers=get_headers(), timeout=timeout) as resp_b:
+                        if resp_b.status == 429 and attempt == 1:
+                            # Rate-limit — подождать секунду и попробовать ещё раз.
+                            await asyncio.sleep(1.0)
+                            return await _fetch_balance(aid, attempt=2)
                         if resp_b.status != 200:
                             body = await resp_b.text()
                             logger.warning(
@@ -1510,17 +1514,24 @@ async def pdz_take_snapshot() -> list:
                             return aid, None
                         rdata = await resp_b.json()
                         raw_balance = rdata.get("balance", 0) or 0
-                        # Лог раз в ~30 запросов, чтобы видеть что 200 идёт.
-                        logger.debug(f"pdz_take_snapshot balance {aid[:8]} OK = {raw_balance}")
                         return aid, round(raw_balance / 100, 2)
+                except (asyncio.TimeoutError, aiohttp.ClientError) as ex_b:
+                    if attempt == 1:
+                        await asyncio.sleep(0.5)
+                        return await _fetch_balance(aid, attempt=2)
+                    logger.warning(
+                        f"pdz_take_snapshot balance {aid[:8]} {type(ex_b).__name__}: {ex_b}"
+                    )
+                    return aid, None
                 except Exception as ex_b:
-                    logger.warning(f"pdz_take_snapshot balance {aid[:8]} exception: {type(ex_b).__name__}: {ex_b}")
+                    logger.warning(
+                        f"pdz_take_snapshot balance {aid[:8]} unexpected: {type(ex_b).__name__}: {ex_b}"
+                    )
                     return aid, None
 
-            # Батчи по 3 параллельно — защита от rate-limit МС (он бьёт 429
-            # при ~5+ одновременных запросах). Если за раз 3 — пока медленнее,
-            # но стабильно.
-            BATCH = 3
+            # Батчи по 2 параллельно + 200ms пауза между батчами — защита от
+            # rate-limit МС. Для ~700 контрагентов ~70 сек, приемлемо для cron.
+            BATCH = 2
             for i in range(0, len(unique_agents), BATCH):
                 chunk = unique_agents[i:i + BATCH]
                 results = await asyncio.gather(
@@ -1529,6 +1540,9 @@ async def pdz_take_snapshot() -> list:
                 )
                 for aid, bal in results:
                     balance_map[aid] = bal
+                # Тротлинг для МС — иначе на больших объёмах бот ловит 429/timeout.
+                if i + BATCH < len(unique_agents):
+                    await asyncio.sleep(0.2)
 
             # Раскладываем balance по строкам.
             for r in rows:
