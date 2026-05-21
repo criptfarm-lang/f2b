@@ -1480,7 +1480,64 @@ async def pdz_take_snapshot() -> list:
                     "reason_id": reason_id,
                     "payed_sum": payed_sum,
                     "total_sum": total_sum,
+                    "agent_balance": None,  # обогащается ниже
                 })
+
+            # ── Обогащение balance контрагента (отсекаем false-positive PDZ) ──
+            # Логика: МойСклад в customerorder.payedSum хранит только разнесённые
+            # на этот заказ оплаты. Если бухгалтерия закрыла долг общей платёжкой
+            # без разноски — payedSum < sum, но реальный долг = 0. Фильтр по
+            # /report/counterparty/{id}.balance (в копейках, делим на 100):
+            #   balance < 0 = клиент должен НАМ (есть реальный долг)
+            #   balance >= 0 = клиент НЕ должен (нам должны ему / в ноль)
+            unique_agents = list({r["agent_id"] for r in rows if r.get("agent_id")})
+            logger.info(
+                f"pdz_take_snapshot: тяну balance для {len(unique_agents)} уникальных контрагентов"
+            )
+
+            balance_map: dict = {}
+
+            async def _fetch_balance(aid: str):
+                try:
+                    report_url = f"{MS_BASE}/report/counterparty/{aid}"
+                    async with session.get(report_url, headers=get_headers()) as resp_b:
+                        if resp_b.status != 200:
+                            body = await resp_b.text()
+                            logger.warning(
+                                f"pdz_take_snapshot balance {aid} {resp_b.status}: {body[:120]}"
+                            )
+                            return aid, None
+                        rdata = await resp_b.json()
+                        raw_balance = rdata.get("balance", 0) or 0
+                        return aid, round(raw_balance / 100, 2)
+                except Exception as ex_b:
+                    logger.warning(f"pdz_take_snapshot balance {aid} error: {ex_b}")
+                    return aid, None
+
+            # Батчи по 10 параллельно — МС API лимит RPS ~5-10.
+            BATCH = 10
+            for i in range(0, len(unique_agents), BATCH):
+                chunk = unique_agents[i:i + BATCH]
+                results = await asyncio.gather(
+                    *(_fetch_balance(aid) for aid in chunk),
+                    return_exceptions=False,
+                )
+                for aid, bal in results:
+                    balance_map[aid] = bal
+
+            # Раскладываем balance по строкам.
+            for r in rows:
+                r["agent_balance"] = balance_map.get(r.get("agent_id"))
+
+            # Статистика для логов: сколько agents с balance>=0 (= не должны).
+            non_debtors = sum(
+                1 for aid, b in balance_map.items() if b is not None and b >= 0
+            )
+            failed = sum(1 for b in balance_map.values() if b is None)
+            logger.info(
+                f"pdz_take_snapshot: balance получен для {len(balance_map) - failed}/{len(balance_map)} "
+                f"контрагентов; balance>=0 (не должны): {non_debtors}; запросы упали: {failed}"
+            )
 
             logger.info(f"pdz_take_snapshot: {len(rows)} строк готово к записи (с ppm_initial, не розница)")
             return rows
@@ -1692,7 +1749,7 @@ async def audit_ppm_initial_changes(today_rows: list, yesterday_rows: list) -> l
     return candidates
 
 
-async def pdz_overdue_for_manager(manager_tag: str, db=None) -> list:
+async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: bool = True) -> list:
     """Список просроченных заказов конкретного менеджера для TG-дайджеста.
 
     Источник данных:
@@ -1706,12 +1763,18 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None) -> list:
       - effective_due_date < сегодня (МСК)
       - payed_sum < total_sum
       - manager_tag совпадает (case-insensitive)
+      - agent_balance < 0 ИЛИ agent_balance is None (фильтр против ложных
+        срабатываний: balance≥0 = клиент не должен → пропускаем; None = запрос
+        упал → оставляем как подозрительного).
 
-    Сортировка: по days_overdue убыванию (старые сверху).
-
-    Возвращает список dict:
-      {order_id, order_name, agent_id, agent_name, effective_due_date,
-       days_overdue, unpaid_sum, ms_url}
+    Возврат:
+      - group_by_agent=True (default): список dict по контрагентам, отсортирован
+        по total_unpaid убыванию, лимит топ-30. Поля:
+          {agent_id, agent_name, total_unpaid, max_days_overdue, orders_count,
+           ms_url_first_order, agent_balance}
+      - group_by_agent=False: плоский список заказов, сортировка по days_overdue.
+        Поля: {order_id, order_name, agent_id, agent_name, effective_due_date,
+        days_overdue, unpaid_sum, ms_url, agent_balance}
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo as _ZI
@@ -1725,7 +1788,9 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None) -> list:
         rows = db.get_latest_snapshot()
     else:
         rows = await pdz_take_snapshot()
-    result: list = []
+
+    orders: list = []
+    skipped_balance_ok = 0
     for r in rows:
         row_tag = (r.get("manager_tag") or "").lower()
         if row_tag != tag_lower:
@@ -1739,10 +1804,19 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None) -> list:
         total = float(r.get("total_sum") or 0)
         if payed >= total:
             continue
+        # Фильтр по реальному балансу контрагента.
+        bal_raw = r.get("agent_balance")
+        agent_balance = float(bal_raw) if bal_raw is not None else None
+        if agent_balance is not None and agent_balance >= 0:
+            # Клиент не должен — заказ выглядит как просрочка только из-за
+            # неразнесённой оплаты в бухгалтерии. Пропускаем.
+            skipped_balance_ok += 1
+            continue
+
         days_overdue = (today - effective).days
         unpaid = round(total - payed, 2)
         order_id = r.get("order_id") or ""
-        result.append({
+        orders.append({
             "order_id": order_id,
             "order_name": r.get("order_name"),
             "agent_id": r.get("agent_id"),
@@ -1751,10 +1825,51 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None) -> list:
             "days_overdue": days_overdue,
             "unpaid_sum": unpaid,
             "ms_url": f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}",
+            "agent_balance": agent_balance,
         })
 
-    result.sort(key=lambda x: x["days_overdue"], reverse=True)
-    return result
+    if skipped_balance_ok:
+        logger.info(
+            f"pdz_overdue_for_manager({manager_tag}): пропущено {skipped_balance_ok} "
+            f"заказов с balance>=0 (клиент не должен)"
+        )
+
+    if not group_by_agent:
+        orders.sort(key=lambda x: x["days_overdue"], reverse=True)
+        return orders
+
+    # ── Группировка по контрагенту ────────────────────────────────────────
+    by_agent: dict = {}
+    for o in orders:
+        aid = o.get("agent_id") or ""
+        if aid not in by_agent:
+            by_agent[aid] = {
+                "agent_id": aid,
+                "agent_name": o.get("agent_name"),
+                "agent_balance": o.get("agent_balance"),
+                "orders": [],
+            }
+        by_agent[aid]["orders"].append(o)
+
+    grouped: list = []
+    for aid, data in by_agent.items():
+        agent_orders = data["orders"]
+        # Самый старый просроченный заказ — по возрастанию effective_due_date.
+        oldest = min(agent_orders, key=lambda x: x["effective_due_date"])
+        total_unpaid = round(sum(x["unpaid_sum"] for x in agent_orders), 2)
+        max_days = max(x["days_overdue"] for x in agent_orders)
+        grouped.append({
+            "agent_id": aid,
+            "agent_name": data["agent_name"],
+            "agent_balance": data["agent_balance"],
+            "total_unpaid": total_unpaid,
+            "max_days_overdue": max_days,
+            "orders_count": len(agent_orders),
+            "ms_url_first_order": oldest["ms_url"],
+        })
+
+    grouped.sort(key=lambda x: x["total_unpaid"], reverse=True)
+    return grouped[:30]
 
 
 def format_overdue_summary(items: list) -> str:

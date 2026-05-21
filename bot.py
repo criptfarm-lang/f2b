@@ -3157,12 +3157,15 @@ async def cmd_pdz_snapshot_test(update: Update, context: ContextTypes.DEFAULT_TY
     if rows:
         lines.append("*Примеры (первые 3):*")
         for r in rows[:3]:
+            bal_raw = r.get("agent_balance")
+            bal_str = "—" if bal_raw is None else f"{bal_raw}"
             lines.append(
                 f"• `{r.get('order_name','?')}` · {r.get('agent_name','?')} · "
                 f"тег={r.get('manager_tag') or '—'} · "
                 f"исх={r.get('ppm_initial')} · нов={r.get('ppm_new') or '—'} · "
                 f"reason={r.get('reason_id') or '—'} · "
-                f"{r.get('payed_sum')}/{r.get('total_sum')}"
+                f"{r.get('payed_sum')}/{r.get('total_sum')} · "
+                f"balance={bal_str}"
             )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -3230,19 +3233,28 @@ async def cmd_pdz_overdue_test(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"✅ По тегу «{tag}» просрочек нет.")
         return
 
-    lines = [f"📋 *Просрочки {tag}* — всего: {len(items)}", ""]
+    # items — список dict, сгруппированный по контрагенту (group_by_agent=True
+    # по умолчанию). Лимит топ-30 уже применён внутри pdz_overdue_for_manager.
+    lines = [f"📋 *Просрочки {tag}* — клиентов: {len(items)}", ""]
     for it in items[:5]:
         name = (it.get("agent_name") or "—").replace("*", "").replace("_", "")
-        url = it.get("ms_url") or "#"
-        due = it.get("effective_due_date")
-        due_str = due.strftime("%d.%m.%Y") if due else "—"
+        url = it.get("ms_url_first_order") or "#"
+        cnt = it.get("orders_count", 0)
+        # Простая склейка падежа для «заказ(а/ов)».
+        if cnt % 10 == 1 and cnt % 100 != 11:
+            order_word = "заказ"
+        elif cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
+            order_word = "заказа"
+        else:
+            order_word = "заказов"
         lines.append(
-            f"[{name}]({url}) · {it.get('days_overdue', 0)} дн · "
-            f"{fmt_money(it.get('unpaid_sum', 0))} (срок {due_str})"
+            f"[{name}]({url}) · {cnt} {order_word} · "
+            f"{it.get('max_days_overdue', 0)} дн · "
+            f"{fmt_money(it.get('total_unpaid', 0))}"
         )
     if len(items) > 5:
         lines.append("")
-        lines.append(f"_…ещё {len(items) - 5} заказов_")
+        lines.append(f"_…ещё {len(items) - 5} клиентов_")
 
     await update.message.reply_text(
         "\n".join(lines),

@@ -368,6 +368,10 @@ class Database:
             )""",
             "CREATE INDEX IF NOT EXISTS idx_pdz_snapshots_snap_date ON pdz_snapshots (snap_date)",
             "CREATE INDEX IF NOT EXISTS idx_pdz_snapshots_order_snap ON pdz_snapshots (order_id, snap_date)",
+            # 2026-05-20: balance контрагента — фильтр против ложных PDZ
+            # (payed_sum<total_sum, но клиент по факту ничего не должен — оплата
+            # не разнесена бухгалтерией). См. moysklad.pdz_overdue_for_manager.
+            "ALTER TABLE pdz_snapshots ADD COLUMN IF NOT EXISTS agent_balance NUMERIC(14,2)",
             # Журнал обещаний оплаты. event_type = 'set' | 'moved' | 'broken'.
             """CREATE TABLE IF NOT EXISTS promise_log (
                 id SERIAL PRIMARY KEY,
@@ -405,7 +409,8 @@ class Database:
 
         Каждый row — dict с ключами: snap_date, order_id, order_name,
         agent_id, agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
-        payed_sum, total_sum. Возвращает число вставленных записей.
+        payed_sum, total_sum, agent_balance (опционально, может быть None).
+        Возвращает число вставленных записей.
         """
         if not rows:
             return 0
@@ -423,6 +428,7 @@ class Database:
                 r.get("reason_id"),
                 r.get("payed_sum"),
                 r.get("total_sum"),
+                r.get("agent_balance"),
             )
             for r in rows
         ]
@@ -430,8 +436,9 @@ class Database:
             cur.executemany(
                 """INSERT INTO pdz_snapshots
                    (snap_date, order_id, order_name, agent_id, agent_name,
-                    manager_tag, ppm_initial, ppm_new, reason_id, payed_sum, total_sum)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    manager_tag, ppm_initial, ppm_new, reason_id, payed_sum,
+                    total_sum, agent_balance)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 params,
             )
             self.conn.commit()
@@ -442,7 +449,7 @@ class Database:
         return self._fetchall(
             """SELECT id, snap_at, snap_date, order_id, order_name, agent_id,
                       agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
-                      payed_sum, total_sum
+                      payed_sum, total_sum, agent_balance
                FROM pdz_snapshots
                WHERE snap_date = %s
                ORDER BY snap_at DESC, id ASC""",
@@ -464,7 +471,7 @@ class Database:
             """SELECT DISTINCT ON (order_id)
                       id, snap_at, snap_date, order_id, order_name, agent_id,
                       agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
-                      payed_sum, total_sum
+                      payed_sum, total_sum, agent_balance
                FROM pdz_snapshots
                WHERE snap_date = %s
                ORDER BY order_id, snap_at DESC""",
@@ -497,7 +504,7 @@ class Database:
             SELECT DISTINCT ON (order_id)
                    id, snap_at, snap_date, order_id, order_name, agent_id,
                    agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
-                   payed_sum, total_sum
+                   payed_sum, total_sum, agent_balance
             FROM pdz_snapshots
             WHERE snap_date = %s
             ORDER BY order_id, snap_at DESC, id DESC
