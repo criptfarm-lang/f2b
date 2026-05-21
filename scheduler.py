@@ -662,3 +662,51 @@ async def pdz_send_owner_pending_job(app: Application, db) -> dict:
         "messages_sent": sent,
         "messages_total": len(chunks),
     }
+
+
+async def op_new_share_snapshot_job(app: Application, db):
+    """Пересчитывает «% работы на новых клиентах» за MTD и пишет снимок в БД.
+
+    Cron: ПТ 08:00 МСК. План:
+    2026-05-21-виджет-процент-новых-в-отчете-оп.md, Фаза 5.
+
+    Виджет в /op_report читает снимок через db.get_new_share_snapshot()
+    ОТДЕЛЬНО от report_cache (TTL 5 ч), поэтому свежий снимок виден сразу.
+
+    При исключении в расчёте — TG-алерт собственнику; старый снимок не
+    перезаписывается, в UI он покажется как «устарело · DD.MM» через >9 дней.
+    """
+    logger.info(
+        f"op_new_share_snapshot_job стартовала в "
+        f"{datetime.now(MSK):%Y-%m-%d %H:%M %Z}"
+    )
+
+    try:
+        from op_new_share import compute_new_client_share
+        from datetime import date
+        today = datetime.now(MSK).date()
+        start = today.replace(day=1)
+        result = await compute_new_client_share(start, today)
+        db.set_new_share_snapshot(result)
+        logger.info(
+            f"op_new_share_snapshot_job OK: "
+            f"company={result['company_pct']}% "
+            f"by_manager={result['by_manager']}"
+        )
+        return {"status": "ok", "company_pct": result["company_pct"]}
+    except Exception as e:
+        logger.error(f"op_new_share_snapshot_job: {e}", exc_info=True)
+        owner_raw = os.getenv("OWNER_CHAT_ID")
+        if owner_raw:
+            try:
+                await app.bot.send_message(
+                    chat_id=int(owner_raw),
+                    text=f"⚠️ op_new_share_snapshot_job упал: {e}\n"
+                         f"Снимок не обновлён. Старая цифра остаётся в /op_report; "
+                         f"если она старше 9 дней — в UI появится «устарело».",
+                )
+            except Exception as send_err:
+                logger.error(
+                    f"op_new_share_snapshot_job: TG-алерт не доставлен: {send_err}"
+                )
+        return {"status": "error", "error": str(e)}
