@@ -504,18 +504,19 @@ def _build_approval_text(
     order_name: str, order_sum: float, state_name: str,
     client_name: str, manager_name: str,
     credit: dict, overdue: dict, cashflow: dict, price: dict,
-    payment_date: dict, site: dict, contacts: dict,
+    site: dict, contacts: dict,
 ) -> str:
     """
-    Шаблон алерта (план 2026-05-21, раздел «Шаблон сообщения»).
-    all-green → одна сводная строка; иначе — 7 строк по убыванию важности.
+    Шаблон алерта. Порядок строк (по убыванию важности):
+      Лимит → Просрочка → ДДС → Сайт → Контакты → Цена (внизу — длинный список).
+    all-green → одна сводная строка; иначе — 6 строк светофора.
     """
     from datetime import datetime, timezone, timedelta
     now_msk = datetime.now(timezone(timedelta(hours=3)))
     sent_at = now_msk.strftime("%H:%M")
 
     colors = [credit["color"], overdue["color"], cashflow["color"],
-              price["color"], payment_date["color"], site["color"], contacts["color"]]
+              price["color"], site["color"], contacts["color"]]
     all_green = all(c == "green" for c in colors)
 
     header = (
@@ -529,13 +530,13 @@ def _build_approval_text(
         if credit.get("limit", 0) > 0:
             limit_pct = int(credit["effective_debt"] / credit["limit"] * 100)
         body = (
-            f"\n🟢 Все 7 проверок ОК "
+            f"\n🟢 Все 6 проверок ОК "
             f"(лимит {limit_pct}% · ДДС {cashflow.get('n_days', 0)}д · "
-            f"долг 0 · цена · дата оплаты · сайт · контакты)\n"
+            f"долг {_fmt_money(credit.get('current_debt', 0))} · "
+            f"сайт · контакты · цена)\n"
         )
         return header + body
 
-    # Не-зелёный вариант — 7 строк по убыванию важности.
     lines = ["\n"]
 
     # 1. Лимит
@@ -562,42 +563,13 @@ def _build_approval_text(
     explain = cashflow.get("explain", "")
     lines.append(f"{_icon(cashflow['color'])} *ДДС:* {explain}")
 
-    # 4. Цена
-    alerts = price.get("alerts", [])
-    if alerts:
-        n = len(alerts)
-        lines.append(f"🔴 *Цена:* {n} {'позиция' if n == 1 else 'позиций'} ниже минимума")
-        # До 3 строк детализации (первые строки каждого alert содержат суть)
-        for a in alerts[:3]:
-            first_useful = ""
-            for ln in a.split("\n"):
-                ln = ln.strip()
-                if ln and not ln.startswith("📦") and "Менеджер:" not in ln:
-                    first_useful = ln
-                    break
-            if first_useful:
-                lines.append(f"   • {first_useful[:80]}")
-        if n > 3:
-            lines.append(f"   • … и ещё {n - 3} позиций")
-    else:
-        lines.append("🟢 *Цена:* в норме")
-
-    # 5. Дата плановой оплаты
-    if payment_date["color"] == "green":
-        lines.append(f"🟢 *Дата оплаты:* {payment_date['date_str']}")
-    else:
-        if payment_date.get("date_str"):
-            lines.append(f"🔴 *Дата оплаты:* {payment_date['date_str']} (в прошлом)")
-        else:
-            lines.append(f"🔴 *Дата оплаты:* не указана")
-
-    # 6. Сайт
+    # 4. Сайт
     if site["color"] == "green":
         lines.append(f"🟢 *Сайт:* {site['raw_value'][:60]}")
     else:
         lines.append(f"🔴 *Сайт:* {site.get('raw_value', '') or 'не заполнен'}")
 
-    # 7. Контакты
+    # 5. Контакты
     mx = contacts.get("max", "")
     tg = contacts.get("telegram", "")
     if contacts["color"] == "green":
@@ -609,6 +581,23 @@ def _build_approval_text(
         lines.append(f"🟢 *Контакты:* " + " · ".join(parts_c))
     else:
         lines.append(f"🔴 *Контакты:* Max={mx or '—'} / TG={tg or '—'}")
+
+    # 6. Цена — внизу, длинный список не мешает читать остальные строки
+    items = price.get("items", [])
+    if items:
+        n = len(items)
+        lines.append(f"🔴 *Цена ниже минимальной* — {n} {'позиция' if n == 1 else 'позиций'}:")
+        for it in items[:5]:
+            name = (it.get("name") or "")[:48]
+            lines.append(
+                f"   • {name}: {_fmt_money(it['order_price'])} ₽ "
+                f"при минимуме {_fmt_money(it['min_price'])} ₽ "
+                f"(−{it['diff_pct']:.1f}%, −{_fmt_money(it['diff_rub'])} ₽)"
+            )
+        if n > 5:
+            lines.append(f"   • … и ещё {n - 5} {'позиция' if n - 5 == 1 else 'позиций'}")
+    else:
+        lines.append("🟢 *Цена:* в норме")
 
     return header + "\n".join(lines)
 
@@ -627,7 +616,7 @@ async def check_approval_needed(order_href: str, bot, db):
             get_headers, MS_BASE,
             load_counterparty_attrs,
             compute_credit_color, compute_overdue_color, compute_cashflow_color,
-            compute_price_color, compute_payment_date_color,
+            compute_price_color,
             compute_site_color, compute_contacts_color,
         )
 
@@ -691,14 +680,16 @@ async def check_approval_needed(order_href: str, bot, db):
                 return default
             return v
 
-        cashflow = _norm(cashflow, {"color": "yellow", "n_days": None, "explain": "?", "payments_sum": 0})
+        cashflow = _norm(cashflow, {"color": "yellow", "n_days": None, "explain": "?",
+                                    "payments_sum": 0, "current_debt": 0.0})
         overdue = _norm(overdue, {"color": "yellow", "days": 0, "debt": 0})
-        price = _norm(price, {"color": "yellow", "alerts": []})
+        price = _norm(price, {"color": "yellow", "items": []})
 
-        # 4. Sync helper'ы
-        current_debt = overdue.get("debt", 0) or 0
+        # 4. Sync helper'ы.
+        # current_debt берём из /report (cashflow), а НЕ из overdue.debt — overdue
+        # отдаёт только просроченную часть, а для лимита нужна вся текущая дебиторка.
+        current_debt = cashflow.get("current_debt", 0) or 0
         credit = compute_credit_color(cp_attrs, current_debt=current_debt, order_sum=order_sum)
-        payment_date = compute_payment_date_color(order)
         site = compute_site_color(cp_attrs)
         contacts = compute_contacts_color(cp_attrs)
 
@@ -708,7 +699,6 @@ async def check_approval_needed(order_href: str, bot, db):
             "overdue": overdue["color"],
             "cashflow": cashflow["color"],
             "price": price["color"],
-            "payment_date": payment_date["color"],
             "site": site["color"],
             "contacts": contacts["color"],
         }
@@ -716,7 +706,7 @@ async def check_approval_needed(order_href: str, bot, db):
             order_name=order_name, order_sum=order_sum, state_name=state_name,
             client_name=agent_name, manager_name=manager_name,
             credit=credit, overdue=overdue, cashflow=cashflow, price=price,
-            payment_date=payment_date, site=site, contacts=contacts,
+            site=site, contacts=contacts,
         )
 
         # 6. Дедуп: sum_hash = округлённая сумма в ₽

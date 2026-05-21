@@ -4115,7 +4115,7 @@ async def compute_cashflow_color(agent_id: str, today=None, window_days: int = 3
     report = await _fetch_counterparty_report(agent_id)
     if not report:
         return {"color": "yellow", "n_days": None, "opening_balance": 0,
-                "payments_sum": 0, "explain": "отчёт МС недоступен"}
+                "payments_sum": 0, "current_debt": 0.0, "explain": "отчёт МС недоступен"}
     balance = (report.get("balance", 0) or 0) / 100
     debt_today = -balance if balance < 0 else 0.0
 
@@ -4153,7 +4153,8 @@ async def compute_cashflow_color(agent_id: str, today=None, window_days: int = 3
     # Клиент был в авансе или без долга 30 дней назад — точно 🟢
     if opening <= 0:
         return {"color": "green", "n_days": 0, "opening_balance": opening,
-                "payments_sum": payments_sum, "explain": "клиент в авансе"}
+                "payments_sum": payments_sum, "current_debt": debt_today,
+                "explain": "клиент в авансе"}
 
     # 4. Подбираем N: сортируем платежи по дате убыв., копим кумулятив
     today_dt = datetime.combine(today, datetime.min.time())
@@ -4206,6 +4207,7 @@ async def compute_cashflow_color(agent_id: str, today=None, window_days: int = 3
         "opening_balance": opening,
         "payments_sum": payments_sum,
         "demands_sum": demands_sum_30d,
+        "current_debt": debt_today,
         "explain": explain,
         "bank_pending": bank_pending,
     }
@@ -4213,15 +4215,82 @@ async def compute_cashflow_color(agent_id: str, today=None, window_days: int = 3
 
 async def compute_price_color(order_href: str) -> dict:
     """
-    Блок 4 светофора. Тонкая обёртка над check_order_prices.
-    Зелёный, если занижений нет; красный, если есть.
-    Возвращает {color, alerts}.
+    Блок цены в светофоре. Возвращает структурированный список заниженных позиций,
+    а не строки (для красивого форматирования в шаблоне алерта).
+    Возвращает {color, items: [{name, order_price, min_price, diff_rub, diff_pct, client_type}]}.
     """
-    alerts = await check_order_prices(order_href)
-    return {
-        "color": "red" if alerts else "green",
-        "alerts": alerts,
+    SKIP_STATES = {
+        "005f3651-9a9a-11f0-0a80-03a900027474",  # Согласован
+        "267fdfbc-a2a7-11f0-0a80-0f640047fcaa",  # Собирается
+        "70999fb0-a2b6-11f0-0a80-1c830049f367",  # Собран без охл
+        "005f376a-9a9a-11f0-0a80-03a900027475",  # Собран
+        "ee088f23-df45-11f0-0a80-1670003a954a",  # ИЗМЕНЕН
+        "6edbfa00-dfdb-11f0-0a80-104e0008a4d4",  # Документы готовы
+        "005f383a-9a9a-11f0-0a80-03a900027476",  # Отгружен
+        "005f3938-9a9a-11f0-0a80-03a900027478",  # Возврат
+        "005f398e-9a9a-11f0-0a80-03a900027479",  # Отменен
     }
+    items: list[dict] = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                order_href, headers=get_headers(),
+                params={"expand": "agent,positions.assortment,state"},
+            ) as resp:
+                if resp.status != 200:
+                    return {"color": "green", "items": []}
+                order = await resp.json()
+
+            state_id = (order.get("state") or {}).get("id")
+            if state_id in SKIP_STATES:
+                return {"color": "green", "items": []}
+
+            agent = order.get("agent") or {}
+            tags_lower = [t.lower() for t in (agent.get("tags") or [])]
+            if "хорека" in tags_lower:
+                price_type_name = "Цена продажи"
+                client_type = "хорека"
+            elif "опт" in tags_lower:
+                price_type_name = "Цена опт"
+                client_type = "опт"
+            else:
+                return {"color": "green", "items": []}
+
+            positions = order.get("positions", {}) or {}
+            for pos in (positions.get("rows", []) if isinstance(positions, dict) else []):
+                assortment = pos.get("assortment", {}) or {}
+                product_id = assortment.get("id", "")
+                product_name = assortment.get("name", "")
+                order_price = (pos.get("price", 0) or 0) / 100
+                if not product_id or order_price <= 0:
+                    continue
+                async with session.get(
+                    f"{MS_BASE}/entity/product/{product_id}", headers=get_headers(),
+                ) as r2:
+                    if r2.status != 200:
+                        continue
+                    product_data = await r2.json()
+                min_price = None
+                for sp in (product_data.get("salePrices", []) or []):
+                    if (sp.get("priceType") or {}).get("name", "") == price_type_name:
+                        min_price = (sp.get("value", 0) or 0) / 100
+                        break
+                if not min_price or min_price <= 0:
+                    continue
+                if order_price < min_price:
+                    diff_rub = min_price - order_price
+                    diff_pct = diff_rub / min_price * 100
+                    items.append({
+                        "name": product_name,
+                        "order_price": order_price,
+                        "min_price": min_price,
+                        "diff_rub": diff_rub,
+                        "diff_pct": diff_pct,
+                        "client_type": client_type,
+                    })
+    except Exception as e:
+        logger.error(f"compute_price_color: {e}")
+    return {"color": "red" if items else "green", "items": items}
 
 
 def compute_payment_date_color(order: dict) -> dict:
