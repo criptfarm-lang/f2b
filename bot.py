@@ -3221,7 +3221,7 @@ async def cmd_pdz_overdue_test(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"⏳ Считаю просрочки для тега «{tag}»...")
     try:
         from moysklad import pdz_overdue_for_manager, fmt_money
-        items = await pdz_overdue_for_manager(tag)
+        items = await pdz_overdue_for_manager(tag, db=db)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
         return

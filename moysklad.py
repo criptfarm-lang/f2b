@@ -1692,11 +1692,14 @@ async def audit_ppm_initial_changes(today_rows: list, yesterday_rows: list) -> l
     return candidates
 
 
-async def pdz_overdue_for_manager(manager_tag: str) -> list:
+async def pdz_overdue_for_manager(manager_tag: str, db=None) -> list:
     """Список просроченных заказов конкретного менеджера для TG-дайджеста.
 
-    Источник данных — свежий `pdz_take_snapshot()` (для простоты MVP; вызывается
-    из cron 14:10, после двух снимков, поэтому время «промахнуться по полю» минимально).
+    Источник данных:
+      - Если передан `db` — читает последний снимок из БД (`db.get_latest_snapshot()`).
+        Мгновенно. Это основной путь для cron 14:10 и тестов.
+      - Если `db=None` — fallback на свежий `pdz_take_snapshot()` (~30 сек,
+        для совместимости и ручных вызовов).
 
     Критерий «просрочен»:
       - effective_due_date = ppm_new if ppm_new is not None else ppm_initial
@@ -1718,7 +1721,10 @@ async def pdz_overdue_for_manager(manager_tag: str) -> list:
         return []
     tag_lower = manager_tag.lower()
 
-    rows = await pdz_take_snapshot()
+    if db is not None:
+        rows = db.get_latest_snapshot()
+    else:
+        rows = await pdz_take_snapshot()
     result: list = []
     for r in rows:
         row_tag = (r.get("manager_tag") or "").lower()

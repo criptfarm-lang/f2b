@@ -449,6 +449,28 @@ class Database:
             (snap_date,),
         )
 
+    def get_latest_snapshot(self) -> List[Dict]:
+        """Возвращает последний snapshot — DISTINCT ON (order_id) за MAX(snap_date)
+        с самым свежим snap_at. Используется TG-дайджестом, чтобы не дёргать МС API
+        каждый раз."""
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT MAX(snap_date) AS d FROM pdz_snapshots")
+            row = cur.fetchone()
+            latest_date = row.get("d") if row else None
+        if not latest_date:
+            return []
+        return self._fetchall(
+            """SELECT DISTINCT ON (order_id)
+                      id, snap_at, snap_date, order_id, order_name, agent_id,
+                      agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
+                      payed_sum, total_sum
+               FROM pdz_snapshots
+               WHERE snap_date = %s
+               ORDER BY order_id, snap_at DESC""",
+            (latest_date,),
+        )
+
     def get_last_snapshot_before(self, snap_date) -> List[Dict]:
         """Возвращает последний снимок ПЕРЕД snap_date (для сравнения «вчера vs сегодня»).
 
