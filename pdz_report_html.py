@@ -178,8 +178,18 @@ def build_pdz_payload(db) -> dict:
             breaks_map = db.get_promise_breaks_count(ids, days_window=90) or {}
     except Exception:
         breaks_map = {}
+    # Фаза 6: обогащение стоп-флагами для колонки «Статус».
+    stop_map: dict[str, str] = {}
+    try:
+        ids = [g["agent_id"] for g in debtors if g.get("agent_id")]
+        if ids and hasattr(db, "get_stop_flag_map"):
+            stop_map = db.get_stop_flag_map(ids) or {}
+    except Exception:
+        stop_map = {}
     for g in debtors:
-        g["breaks_count"] = int(breaks_map.get(g.get("agent_id") or "", 0))
+        aid = g.get("agent_id") or ""
+        g["breaks_count"] = int(breaks_map.get(aid, 0))
+        g["stop_status"] = stop_map.get(aid)
 
     debtors.sort(key=lambda x: x["total_unpaid"], reverse=True)
     debtors_top = debtors[:50]
@@ -296,6 +306,13 @@ td a:hover { text-decoration: underline; }
 .num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .bad-break { color: #c00; font-weight: bold; }
 tr.row-old-overdue td { background: #fef2f2; }
+/* Фаза 6: фон строк со стоп-флагом. ПРЕДОПЛАТА жёстче — красный, СТОП — жёлтый. */
+tr.row-stop-shipments td { background: #fff3cd; }
+tr.row-prepayment-only td { background: #fee2e2; }
+.stop-badge { display: inline-block; padding: 2px 6px; border-radius: 4px;
+              font-size: 11px; font-weight: 600; }
+.stop-badge.stop { background: #fde68a; color: #7c2d12; }
+.stop-badge.prepay { background: #fecaca; color: #7f1d1d; }
 .muted { color: #9ca3af; }
 .empty { color: #6b7280; font-size: 13px; padding: 20px; text-align: center; }
 """
@@ -326,11 +343,21 @@ def _render_debtors(debtors: list) -> str:
     for d in debtors:
         breaks = int(d.get("breaks_count") or 0)
         days = int(d.get("days_overdue") or 0)
+        stop_status = d.get("stop_status")
         breaks_cell = (
             f'<span class="bad-break">{breaks}</span>' if breaks > 0
             else f'<span class="muted">0</span>'
         )
-        row_cls = ' class="row-old-overdue"' if days > 90 else ''
+        # Фаза 6: класс строки и значок статуса. Приоритет — стоп-флаг.
+        if stop_status == "prepayment_only":
+            row_cls = ' class="row-prepayment-only"'
+            status_cell = '<span class="stop-badge prepay">🚫 ПРЕДОПЛАТА</span>'
+        elif stop_status == "stop_shipments":
+            row_cls = ' class="row-stop-shipments"'
+            status_cell = '<span class="stop-badge stop">🚫 СТОП</span>'
+        else:
+            row_cls = ' class="row-old-overdue"' if days > 90 else ''
+            status_cell = '<span class="muted">—</span>'
         rows.append(
             f'<tr{row_cls}>'
             f'<td><a href="{_esc(d.get("ms_url"))}" target="_blank" rel="noopener">'
@@ -339,6 +366,7 @@ def _render_debtors(debtors: list) -> str:
             f'<td class="num">{int(d.get("orders_count") or 0)}</td>'
             f'<td class="num">{days}</td>'
             f'<td class="num">{breaks_cell}</td>'
+            f'<td>{status_cell}</td>'
             f'<td class="num">{_esc(_fmt_money(d.get("total_unpaid")))}</td>'
             f'</tr>'
         )
@@ -347,7 +375,7 @@ def _render_debtors(debtors: list) -> str:
         '<thead><tr>'
         '<th>Клиент</th><th>Менеджер</th>'
         '<th class="num">Заказов</th><th class="num">Дней просрочки</th>'
-        '<th class="num">Срывов 90д</th><th class="num">Долг</th>'
+        '<th class="num">Срывов 90д</th><th>Статус</th><th class="num">Долг</th>'
         '</tr></thead>'
         f'<tbody>{"".join(rows)}</tbody>'
         '</table>'

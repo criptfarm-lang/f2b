@@ -410,6 +410,25 @@ class Database:
             )""",
             "CREATE INDEX IF NOT EXISTS idx_promise_log_agent_time ON promise_log (agent_id, occurred_at)",
             "CREATE INDEX IF NOT EXISTS idx_promise_log_order_time ON promise_log (order_id, occurred_at)",
+            # ── ПДЗ Фаза 6: эскалация переносов и стоп-флаги ────────────────────
+            # Один контрагент — одна активная запись (PK agent_id + removed_at IS NULL).
+            # Чтобы пересоздать с новым статусом — сначала remove_client_stop_flag,
+            # потом set_client_stop_flag (методы делают это атомарно).
+            #   status: 'stop_shipments' (3-й перенос) | 'prepayment_only' (4+).
+            #   set_by: 'auto' или TG username собственника.
+            """CREATE TABLE IF NOT EXISTS client_stop_flags (
+                id SERIAL PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                agent_name TEXT,
+                status TEXT NOT NULL,
+                reason TEXT,
+                set_by TEXT,
+                set_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                removed_at TIMESTAMPTZ,
+                removed_by TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_client_stop_flags_agent ON client_stop_flags (agent_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_client_stop_flags_active ON client_stop_flags (agent_id) WHERE removed_at IS NULL",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:
@@ -637,6 +656,173 @@ class Database:
                 "last_break_at": r.get("last_break_at"),
             })
         return out
+
+    # ─── ПДЗ Фаза 6: client_stop_flags (эскалация) ─────────────────────────
+    # status: 'stop_shipments' (3 срыва) | 'prepayment_only' (4+ срывов).
+    # «Активный» = removed_at IS NULL. Уникальный индекс гарантирует, что в
+    # один момент времени у agent_id максимум одна активная запись.
+    def set_client_stop_flag(
+        self,
+        agent_id: str,
+        agent_name: Optional[str],
+        status: str,
+        reason: Optional[str] = None,
+        set_by: str = "auto",
+    ) -> bool:
+        """Атомарно гасит старый активный флаг и ставит новый.
+
+        Если status совпадает с уже активным — ничего не делает, возвращает False
+        (флаг уже выставлен на этот уровень). Возвращает True если флаг был
+        изменён (создан или ужесточён/смягчён).
+        """
+        if not agent_id or not status:
+            return False
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, status FROM client_stop_flags "
+                "WHERE agent_id=%s AND removed_at IS NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (agent_id,),
+            )
+            row = cur.fetchone()
+            if row and row.get("status") == status:
+                # Тот же уровень уже стоит — дублировать не нужно.
+                return False
+            if row:
+                cur.execute(
+                    "UPDATE client_stop_flags SET removed_at=NOW(), removed_by=%s "
+                    "WHERE id=%s",
+                    (f"auto:upgrade→{status}", row["id"]),
+                )
+            cur.execute(
+                "INSERT INTO client_stop_flags "
+                "(agent_id, agent_name, status, reason, set_by) "
+                "VALUES (%s,%s,%s,%s,%s)",
+                (agent_id, agent_name, status, reason, set_by),
+            )
+            self.conn.commit()
+        return True
+
+    def remove_client_stop_flag(self, agent_id: str, removed_by: str = "manual") -> bool:
+        """Помечает активный флаг как снятый. True если что-то снято."""
+        if not agent_id:
+            return False
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "UPDATE client_stop_flags SET removed_at=NOW(), removed_by=%s "
+                "WHERE agent_id=%s AND removed_at IS NULL",
+                (removed_by, agent_id),
+            )
+            affected = cur.rowcount
+            self.conn.commit()
+        return affected > 0
+
+    def get_client_stop_flag(self, agent_id: str) -> Optional[Dict]:
+        """Возвращает активный флаг (removed_at IS NULL) или None."""
+        if not agent_id:
+            return None
+        return self._fetchone(
+            "SELECT id, agent_id, agent_name, status, reason, set_by, set_at "
+            "FROM client_stop_flags WHERE agent_id=%s AND removed_at IS NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (agent_id,),
+        )
+
+    def get_active_stop_flags(self) -> List[Dict]:
+        """Все активные стоп-флаги (для /list_stops)."""
+        return self._fetchall(
+            "SELECT id, agent_id, agent_name, status, reason, set_by, set_at "
+            "FROM client_stop_flags WHERE removed_at IS NULL "
+            "ORDER BY set_at DESC",
+            (),
+        )
+
+    def get_stop_flag_map(self, agent_ids: List[str]) -> Dict[str, str]:
+        """Batch: agent_id → status (только активные) для дайджестов/отчётов."""
+        if not agent_ids:
+            return {}
+        unique_ids = [a for a in {x for x in agent_ids if x}]
+        if not unique_ids:
+            return {}
+        rows = self._fetchall(
+            "SELECT agent_id, status FROM client_stop_flags "
+            "WHERE agent_id = ANY(%s) AND removed_at IS NULL",
+            (unique_ids,),
+        )
+        return {r["agent_id"]: r["status"] for r in rows if r.get("agent_id")}
+
+    def find_stop_flag_by_name(self, name_substring: str) -> List[Dict]:
+        """Поиск активных стоп-флагов по подстроке имени контрагента.
+
+        Используется в /snimi_stop <часть_имени>. Регистронезависимо. Возвращает
+        список (может быть несколько кандидатов → потребуется уточнить).
+        """
+        if not name_substring:
+            return []
+        return self._fetchall(
+            "SELECT id, agent_id, agent_name, status, reason, set_by, set_at "
+            "FROM client_stop_flags "
+            "WHERE removed_at IS NULL AND agent_name ILIKE %s "
+            "ORDER BY set_at DESC",
+            (f"%{name_substring}%",),
+        )
+
+    # ─── ПДЗ Фаза 6: учёт уже выполненных эскалаций ────────────────────────
+    # Чтобы не дублировать постановку задачи менеджеру / алерт собственнику
+    # при каждом запуске cron 14:02, храним в bot_settings.pdz_escalation_done
+    # JSON вида {"<agent_id>": [2, 3, 4]}. Уровень = число срывов, при котором
+    # эскалация уже сработала.
+    def _get_pdz_escalation_done(self) -> dict:
+        row = self._fetchone(
+            "SELECT value FROM bot_settings WHERE key='pdz_escalation_done'", ()
+        )
+        if not row or not row.get("value"):
+            return {}
+        import json
+        try:
+            data = json.loads(row["value"])
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_pdz_escalation_done(self, data: dict):
+        import json
+        payload = json.dumps(data, ensure_ascii=False)
+        self._execute(
+            "INSERT INTO bot_settings (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value=%s",
+            ("pdz_escalation_done", payload, payload),
+        )
+
+    def is_pdz_escalation_done(self, agent_id: str, level: int) -> bool:
+        """True если эскалация уровня level (число срывов) уже выполнена."""
+        if not agent_id:
+            return False
+        data = self._get_pdz_escalation_done()
+        levels = data.get(agent_id) or []
+        try:
+            return int(level) in {int(x) for x in levels}
+        except Exception:
+            return False
+
+    def mark_pdz_escalation_done(self, agent_id: str, level: int) -> bool:
+        """Помечает эскалацию как выполненную. True если был обновлён уровень."""
+        if not agent_id:
+            return False
+        data = self._get_pdz_escalation_done()
+        levels = set()
+        try:
+            levels = {int(x) for x in (data.get(agent_id) or [])}
+        except Exception:
+            levels = set()
+        if int(level) in levels:
+            return False
+        levels.add(int(level))
+        data[agent_id] = sorted(levels)
+        self._save_pdz_escalation_done(data)
+        return True
 
     # ─── Market Intel (канал «Мониторинг» — закупочные прайсы) ──────────────
     def save_market_intel_message(

@@ -3646,6 +3646,135 @@ async def cmd_pdz_breaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cmd_snimi_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/snimi_stop <agent_id | часть_имени>` — снять стоп-флаг (Фаза 6).
+
+    Принимает либо UUID контрагента, либо подстроку имени. Если по подстроке
+    найдено несколько активных флагов — список выводится и просим уточнить.
+    Доступ — только собственник (OWNER_CHAT_ID).
+    """
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        if update.message:
+            await update.message.reply_text("Нет доступа")
+        return
+    if not update.message:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Укажи agent\\_id или часть имени:\n`/snimi_stop <id|имя>`",
+            parse_mode="Markdown",
+        )
+        return
+
+    arg = " ".join(context.args).strip()
+    # UUID-эвристика: 4 дефиса, длина 36.
+    is_uuid_like = arg.count("-") >= 4 and len(arg) >= 30 and " " not in arg
+
+    target_agent_id = None
+    target_name = None
+    if is_uuid_like:
+        flag = db.get_client_stop_flag(arg)
+        if not flag:
+            await update.message.reply_text(
+                f"❌ Активного стоп-флага по `{arg}` не найдено",
+                parse_mode="Markdown",
+            )
+            return
+        target_agent_id = arg
+        target_name = flag.get("agent_name") or "—"
+    else:
+        candidates = db.find_stop_flag_by_name(arg)
+        if not candidates:
+            await update.message.reply_text(
+                f"❌ Активных стоп-флагов по подстроке «{arg}» не найдено"
+            )
+            return
+        if len(candidates) > 1:
+            lines = [f"⚠️ Найдено {len(candidates)} активных флагов — уточни:"]
+            for c in candidates:
+                lines.append(
+                    f"• `{c.get('agent_id')}` — {c.get('agent_name') or '—'}"
+                    f" [{c.get('status')}]"
+                )
+            lines.append("\nПовтори с agent\\_id или более точным именем.")
+            await update.message.reply_text(
+                "\n".join(lines), parse_mode="Markdown"
+            )
+            return
+        target_agent_id = candidates[0].get("agent_id")
+        target_name = candidates[0].get("agent_name") or "—"
+
+    username = user.username or str(user.id)
+    ok = db.remove_client_stop_flag(target_agent_id, removed_by=f"tg:{username}")
+    if not ok:
+        await update.message.reply_text(
+            f"⚠️ Не удалось снять флаг по `{target_agent_id}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    safe_name = (target_name or "—").replace("*", "").replace("_", "")
+    await update.message.reply_text(
+        f"✅ Стоп-флаг снят: {safe_name}",
+    )
+
+
+async def cmd_list_stops(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/list_stops` — список активных стоп-флагов (Фаза 6).
+
+    Доступ — только собственник.
+    """
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        if update.message:
+            await update.message.reply_text("Нет доступа")
+        return
+    if not update.message:
+        return
+
+    try:
+        flags = db.get_active_stop_flags()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    if not flags:
+        await update.message.reply_text("✅ Активных стоп-флагов нет")
+        return
+
+    def _status_label(s: str) -> str:
+        if s == "stop_shipments":
+            return "🚫 СТОП"
+        if s == "prepayment_only":
+            return "🚫 ПРЕДОПЛАТА"
+        return s or "—"
+
+    lines = [f"📋 *Активные стоп-флаги* — {len(flags)}", ""]
+    for f in flags:
+        name = (f.get("agent_name") or "—").replace("*", "").replace("_", "")
+        aid = f.get("agent_id") or "—"
+        status = _status_label(f.get("status") or "")
+        reason = (f.get("reason") or "—").replace("*", "").replace("_", "")
+        set_by = (f.get("set_by") or "—").replace("*", "").replace("_", "")
+        set_at = f.get("set_at")
+        try:
+            set_at_str = set_at.strftime("%Y-%m-%d %H:%M") if set_at else "—"
+        except Exception:
+            set_at_str = str(set_at) if set_at else "—"
+        lines.append(f"• {status} *{name}*")
+        lines.append(f"   `{aid}`")
+        lines.append(f"   причина: {reason}")
+        lines.append(f"   поставил: {set_by} · {set_at_str}")
+        lines.append("")
+
+    text = "\n".join(lines).rstrip()
+    await update.message.reply_text(
+        text, parse_mode="Markdown", disable_web_page_preview=True
+    )
+
+
 async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_group [название группы] — сумма продаж по группе товаров за текущий месяц по менеджерам."""
     user = update.effective_user
@@ -6328,6 +6457,9 @@ def main():
     app.add_handler(CommandHandler("pdz_send_owner_pending_test", cmd_pdz_send_owner_pending_test))
     # Фаза 4.5: топ-30 клиентов по срывам обещаний за 90 дней (только собственник).
     app.add_handler(CommandHandler("pdz_breaks", cmd_pdz_breaks))
+    # ПДЗ Фаза 6 — управление стоп-флагами (только OWNER_CHAT_ID).
+    app.add_handler(CommandHandler("snimi_stop", cmd_snimi_stop))
+    app.add_handler(CommandHandler("list_stops", cmd_list_stops))
     # Фаза 5: HTML-отчёт «Дебиторка» — ручной запуск регенерации (только собственник).
     app.add_handler(CommandHandler("pdz_html", cmd_pdz_html))
     app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))

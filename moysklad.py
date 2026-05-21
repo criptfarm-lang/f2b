@@ -1895,11 +1895,22 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
         except Exception as e:
             logger.warning(f"pdz_overdue_for_manager({manager_tag}): breaks_count failed: {e}")
             breaks_map = {}
+        # Обогащение стоп-флагами (Фаза 6).
+        stop_map: dict = {}
+        if hasattr(db, "get_stop_flag_map"):
+            try:
+                stop_map = db.get_stop_flag_map(ids) or {}
+            except Exception as e:
+                logger.warning(f"pdz_overdue_for_manager({manager_tag}): stop_flag_map failed: {e}")
+                stop_map = {}
         for g in grouped:
-            g["breaks_count"] = int(breaks_map.get(g.get("agent_id") or "", 0))
+            aid = g.get("agent_id") or ""
+            g["breaks_count"] = int(breaks_map.get(aid, 0))
+            g["stop_status"] = stop_map.get(aid)
     else:
         for g in grouped:
             g.setdefault("breaks_count", 0)
+            g.setdefault("stop_status", None)
 
     grouped.sort(key=lambda x: x["total_unpaid"], reverse=True)
     return grouped
@@ -1956,7 +1967,15 @@ def pdz_send_manager_digest_text(items: list, manager_name: str = None) -> list:
         url = it.get("ms_url_first_order") or "#"
         cnt = int(it.get("orders_count", 0) or 0)
         breaks = int(it.get("breaks_count", 0) or 0)
-        prefix = "🔴 " if breaks > 0 else ""
+        # Фаза 6: префикс стоп-флага (🚫 СТОП / 🚫 ПРЕДОПЛАТА). Может идти
+        # вместе с 🔴 (срывами). Пример: «🚫 СТОП 🔴 [Клиент] ...».
+        stop_status = it.get("stop_status")
+        stop_prefix = ""
+        if stop_status == "stop_shipments":
+            stop_prefix = "🚫 СТОП "
+        elif stop_status == "prepayment_only":
+            stop_prefix = "🚫 ПРЕДОПЛАТА "
+        prefix = stop_prefix + ("🔴 " if breaks > 0 else "")
         suffix = f" ({breaks} {_breaks_word_ru(breaks)} за 90д)" if breaks > 0 else ""
         line = (
             f"{prefix}[{name}]({url}) · {cnt} {_order_word_ru(cnt)} · "
@@ -2082,9 +2101,19 @@ def pdz_unprocessed_for_owner(db) -> dict:
         except Exception as e:
             logger.warning(f"pdz_unprocessed_for_owner: breaks_count failed: {e}")
             breaks_map = {}
+    # Обогащение стоп-флагами (Фаза 6).
+    stop_map: dict = {}
+    if db is not None and all_ids and hasattr(db, "get_stop_flag_map"):
+        try:
+            stop_map = db.get_stop_flag_map(all_ids) or {}
+        except Exception as e:
+            logger.warning(f"pdz_unprocessed_for_owner: stop_flag_map failed: {e}")
+            stop_map = {}
     for tag, grouped in result.items():
         for g in grouped:
-            g["breaks_count"] = int(breaks_map.get(g.get("agent_id") or "", 0))
+            aid = g.get("agent_id") or ""
+            g["breaks_count"] = int(breaks_map.get(aid, 0))
+            g["stop_status"] = stop_map.get(aid)
 
     return result
 
@@ -3779,6 +3808,54 @@ async def create_task(assignee_id: str, description: str, due_msk) -> dict:
     task_url = MS_TASK_EDIT_URL.format(task_id=task_id)
     logger.info(f"create_task: создана задача {task_id} для assignee={assignee_id}")
     return {"id": task_id, "url": task_url}
+
+
+# ─── ПДЗ Фаза 6: поиск сотрудника МС по тегу-фамилии ──────────────────────
+async def find_employee_id_by_tag(tag: str) -> Optional[str]:
+    """Возвращает UUID сотрудника МойСклада по фамилии-тегу контрагента.
+
+    Использует кеш list_employees(). Сопоставляет:
+      1) PDZ_MANAGER_TAG_MAP[tag] → полное ФИО сотрудника F2B → match по shortFio.
+      2) Если в карте нет — пробует найти сотрудника, в имени которого есть тег.
+
+    Сравнение case-insensitive. Возвращает None, если не нашли.
+    """
+    if not tag:
+        return None
+    t = tag.strip().lower()
+    target_full = PDZ_MANAGER_TAG_MAP.get(t)
+    target_full_l = target_full.lower() if target_full else None
+
+    try:
+        employees = await list_employees()
+    except Exception as e:
+        logger.warning(f"find_employee_id_by_tag: list_employees failed: {e}")
+        return None
+
+    # 1) Прямой match по полному ФИО.
+    if target_full_l:
+        for emp in employees:
+            name = (emp.get("name") or "").lower()
+            if not name:
+                continue
+            if name == target_full_l:
+                return emp.get("id")
+        # 2) Match по фамилии (последнее слово ФИО).
+        for emp in employees:
+            name = (emp.get("name") or "").lower()
+            if not name:
+                continue
+            words = [w for w in name.split() if w]
+            if words and words[-1] == t:
+                return emp.get("id")
+
+    # 3) Substring-fallback: tag входит в name (например, «коликов» → «Коликов Д. Н.»).
+    for emp in employees:
+        name = (emp.get("name") or "").lower()
+        if name and t in name:
+            return emp.get("id")
+
+    return None
 
 
 # ============================================================================

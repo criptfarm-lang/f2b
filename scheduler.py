@@ -402,6 +402,32 @@ async def pdz_process_events_job(app: Application, db):
             f"pdz_process_events_job: events={len(events)} (set={sets}, moved={moved}, broken={broken}); saved={saved}"
         )
 
+        # ── Фаза 6: эскалация по числу срывов ───────────────────────────
+        # Для каждого broken-события считаем число срывов за 90д у этого
+        # контрагента и реагируем:
+        #   2 → задача менеджеру в МС (через create_task).
+        #   3 → set_client_stop_flag(stop_shipments) + TG-алерт собственнику.
+        #   4+ → set_client_stop_flag(prepayment_only) + TG-алерт.
+        # Дедуп: db.is_pdz_escalation_done(agent_id, level) → не повторять.
+        try:
+            escalation_summary = await _pdz_escalate_broken_events(app, db, events)
+            logger.info(
+                f"pdz_process_events_job: escalations="
+                f"tasks_created={escalation_summary['tasks_created']}, "
+                f"stop_shipments={escalation_summary['stop_shipments']}, "
+                f"prepayment_only={escalation_summary['prepayment_only']}, "
+                f"skipped_done={escalation_summary['skipped_done']}"
+            )
+        except Exception as e:
+            logger.error(f"pdz_process_events_job: escalation step failed: {e}", exc_info=True)
+            escalation_summary = {
+                "tasks_created": 0,
+                "stop_shipments": 0,
+                "prepayment_only": 0,
+                "skipped_done": 0,
+                "errors": [str(e)],
+            }
+
         # Аудит исходной даты
         initial_changes = await audit_ppm_initial_changes(today_rows, yesterday_rows)
         logger.info(f"pdz_process_events_job: ppm_initial изменений: {len(initial_changes)}")
@@ -451,10 +477,210 @@ async def pdz_process_events_job(app: Application, db):
             "moved": moved,
             "broken": broken,
             "initial_changes": len(initial_changes),
+            "escalation": escalation_summary,
         }
     except Exception as e:
         logger.error(f"pdz_process_events_job: {e}", exc_info=True)
         return {"events_total": 0, "set": 0, "moved": 0, "broken": 0, "initial_changes": 0, "error": str(e)}
+
+
+async def _pdz_escalate_broken_events(app: Application, db, events: list) -> dict:
+    """Реакция на broken-события (Фаза 6).
+
+    Для каждого уникального agent_id, по которому в `events` есть >=1 broken:
+      - получаем breaks_count = db.get_promise_breaks_count за 90д;
+      - выбираем максимальный уровень эскалации (2/3/4+), который ещё не
+        выполнен (db.is_pdz_escalation_done);
+      - выполняем соответствующее действие и помечаем его как done.
+
+    Возвращает сводку (для логирования и теста).
+    """
+    summary = {
+        "tasks_created": 0,
+        "stop_shipments": 0,
+        "prepayment_only": 0,
+        "skipped_done": 0,
+        "errors": [],
+    }
+
+    # Собираем уникальные клиенты, которые ИМЕННО СЕГОДНЯ сорвали обещание.
+    broken_agents: dict = {}  # agent_id → {agent_name, manager_tag, order_id, order_name}
+    for ev in events or []:
+        if ev.get("event_type") != "broken":
+            continue
+        aid = ev.get("agent_id")
+        if not aid or aid in broken_agents:
+            continue
+        broken_agents[aid] = {
+            "agent_name": ev.get("agent_name"),
+            "manager_tag": ev.get("manager_tag"),
+            "order_id": ev.get("order_id"),
+            "order_name": ev.get("order_name"),
+        }
+
+    if not broken_agents:
+        return summary
+
+    # breaks_count за 90д батчем для всех затронутых клиентов.
+    try:
+        breaks_map = db.get_promise_breaks_count(list(broken_agents.keys()), days_window=90)
+    except Exception as e:
+        logger.error(f"_pdz_escalate_broken_events: get_promise_breaks_count failed: {e}")
+        breaks_map = {}
+
+    owner_raw = os.getenv("OWNER_CHAT_ID")
+    owner_id = int(owner_raw) if owner_raw else None
+
+    # Импортируем тут, чтобы не плодить циклические импорты при загрузке модуля.
+    from moysklad import (
+        find_employee_id_by_tag,
+        create_task as ms_create_task,
+        fmt_money,
+        PDZ_MANAGER_TAG_MAP,
+    )
+    from datetime import timedelta
+
+    for aid, info in broken_agents.items():
+        count = int(breaks_map.get(aid, 0))
+        if count < 2:
+            # 1 срыв = молча по плану.
+            continue
+        agent_name = info.get("agent_name") or "—"
+        manager_tag = (info.get("manager_tag") or "").lower()
+        order_id = info.get("order_id")
+        order_name = info.get("order_name")
+
+        # Считаем общий долг клиента по последнему снимку — для алерта собственнику.
+        total_unpaid = 0.0
+        try:
+            latest = db.get_latest_snapshot() or []
+            for r in latest:
+                if (r.get("agent_id") or "") != aid:
+                    continue
+                bal_raw = r.get("agent_balance")
+                try:
+                    balance = float(bal_raw) if bal_raw is not None else None
+                except Exception:
+                    balance = None
+                if balance is not None and balance >= 0:
+                    continue
+                try:
+                    t = float(r.get("total_sum") or 0)
+                    p = float(r.get("payed_sum") or 0)
+                except Exception:
+                    t, p = 0.0, 0.0
+                if p < t:
+                    total_unpaid += (t - p)
+        except Exception as e:
+            logger.warning(f"_pdz_escalate_broken_events: total_unpaid for {aid} failed: {e}")
+
+        # ── Уровень 2: задача менеджеру в МС ───────────────────────────
+        if count >= 2 and not db.is_pdz_escalation_done(aid, 2):
+            try:
+                assignee_id = await find_employee_id_by_tag(manager_tag)
+                if not assignee_id:
+                    logger.warning(
+                        f"_pdz_escalate_broken_events: не нашли сотрудника МС по тегу '{manager_tag}'"
+                        f" (клиент {agent_name}); задача не поставлена"
+                    )
+                else:
+                    due_msk = datetime.now(MSK) + timedelta(days=2)
+                    desc = (
+                        f"2-й перенос обещания у клиента {agent_name}. "
+                        f"Согласовать с собственником при необходимости."
+                    )
+                    await ms_create_task(assignee_id, desc, due_msk)
+                    summary["tasks_created"] += 1
+                db.mark_pdz_escalation_done(aid, 2)
+            except Exception as e:
+                logger.error(
+                    f"_pdz_escalate_broken_events: create_task для {agent_name} ({manager_tag}): {e}"
+                )
+                summary["errors"].append(f"task:{aid}:{e}")
+        elif count >= 2 and db.is_pdz_escalation_done(aid, 2):
+            summary["skipped_done"] += 1
+
+        # ── Уровень 3: stop_shipments + TG-алерт собственнику ──────────
+        if count >= 3 and not db.is_pdz_escalation_done(aid, 3):
+            try:
+                changed = db.set_client_stop_flag(
+                    agent_id=aid,
+                    agent_name=agent_name,
+                    status="stop_shipments",
+                    reason="3-й перенос обещания",
+                    set_by="auto",
+                )
+                if changed:
+                    summary["stop_shipments"] += 1
+                db.mark_pdz_escalation_done(aid, 3)
+                if owner_id:
+                    tag_display = PDZ_MANAGER_TAG_MAP.get(manager_tag, manager_tag or "—")
+                    safe_name = (agent_name or "—").replace("*", "").replace("_", "")
+                    safe_tag = (tag_display or "—").replace("*", "").replace("_", "")
+                    safe_aid = (aid or "—").replace("*", "").replace("_", "")
+                    text = (
+                        f"🚫 *СТОП ОТГРУЗОК:* {safe_name}\n"
+                        f"Причина: 3-й перенос обещания\n"
+                        f"Менеджер: {safe_tag}\n"
+                        f"Долг: {fmt_money(total_unpaid)}\n\n"
+                        f"Для снятия: `/snimi_stop {safe_aid}`"
+                    )
+                    try:
+                        await app.bot.send_message(
+                            chat_id=owner_id,
+                            text=text,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"_pdz_escalate_broken_events: TG-алерт собственнику (stop): {e}"
+                        )
+            except Exception as e:
+                logger.error(f"_pdz_escalate_broken_events: set_stop_shipments для {agent_name}: {e}")
+                summary["errors"].append(f"stop3:{aid}:{e}")
+
+        # ── Уровень 4+: prepayment_only + TG-алерт собственнику ────────
+        if count >= 4 and not db.is_pdz_escalation_done(aid, 4):
+            try:
+                changed = db.set_client_stop_flag(
+                    agent_id=aid,
+                    agent_name=agent_name,
+                    status="prepayment_only",
+                    reason=f"{count}-й перенос обещания (4+)",
+                    set_by="auto",
+                )
+                if changed:
+                    summary["prepayment_only"] += 1
+                db.mark_pdz_escalation_done(aid, 4)
+                if owner_id:
+                    tag_display = PDZ_MANAGER_TAG_MAP.get(manager_tag, manager_tag or "—")
+                    safe_name = (agent_name or "—").replace("*", "").replace("_", "")
+                    safe_tag = (tag_display or "—").replace("*", "").replace("_", "")
+                    safe_aid = (aid or "—").replace("*", "").replace("_", "")
+                    text = (
+                        f"🚫 *ТОЛЬКО ПРЕДОПЛАТА:* {safe_name}\n"
+                        f"Причина: {count}-й перенос обещания\n"
+                        f"Менеджер: {safe_tag}\n"
+                        f"Долг: {fmt_money(total_unpaid)}\n\n"
+                        f"Для снятия: `/snimi_stop {safe_aid}`"
+                    )
+                    try:
+                        await app.bot.send_message(
+                            chat_id=owner_id,
+                            text=text,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"_pdz_escalate_broken_events: TG-алерт собственнику (prepay): {e}"
+                        )
+            except Exception as e:
+                logger.error(f"_pdz_escalate_broken_events: set_prepayment_only для {agent_name}: {e}")
+                summary["errors"].append(f"prepay:{aid}:{e}")
+
+    return summary
 
 
 # ─── ПДЗ Фаза 4: TG-дайджесты ────────────────────────────────────────────
@@ -624,7 +850,15 @@ async def pdz_send_owner_pending_job(app: Application, db) -> dict:
             name = (a.get("agent_name") or "—").replace("*", "").replace("_", "")
             url = a.get("ms_url_first_order") or "#"
             breaks = int(a.get("breaks_count", 0) or 0)
-            prefix = "🔴 " if breaks > 0 else ""
+            # Фаза 6: префикс стоп-флага.
+            stop_status = a.get("stop_status")
+            if stop_status == "stop_shipments":
+                stop_prefix = "🚫 СТОП "
+            elif stop_status == "prepayment_only":
+                stop_prefix = "🚫 ПРЕДОПЛАТА "
+            else:
+                stop_prefix = ""
+            prefix = stop_prefix + ("🔴 " if breaks > 0 else "")
             suffix = f" ({breaks} {_breaks_word(breaks)} за 90д)" if breaks > 0 else ""
             lines.append(
                 f"• {prefix}[{name}]({url}) · {a.get('max_days_overdue', 0)} дн · "
