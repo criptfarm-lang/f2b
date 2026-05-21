@@ -3581,3 +3581,444 @@ async def create_task(assignee_id: str, description: str, due_msk) -> dict:
     task_url = MS_TASK_EDIT_URL.format(task_id=task_id)
     logger.info(f"create_task: создана задача {task_id} для assignee={assignee_id}")
     return {"id": task_id, "url": task_url}
+
+
+# ============================================================================
+# Helper'ы для объединённого алерта «На согласовании» / «ЗА ЛИМИТОМ»
+# План: 2026-05-21-объединённый-алерт-на-согласование.md, Фаза 2.
+# Семипунктовый светофор: Лимит → Просрочка → ДДС → Цена → Дата оплаты → Сайт → Контакты.
+# ============================================================================
+
+# UUID статусов customerorder (триггеры алерта; fallback на случай недоступности metadata)
+APPROVAL_STATE_ON_APPROVAL = "005f34bf-9a9a-11f0-0a80-03a900027473"  # «На согласовании»
+APPROVAL_STATE_OVER_LIMIT  = "462ee41b-b554-11f0-0a80-15a000036d2c"  # «ЗА ЛИМИТОМ»
+APPROVAL_STATE_AGREED      = "005f3651-9a9a-11f0-0a80-03a900027474"  # «Согласован»
+
+# UUID кастомных атрибутов counterparty
+ATTR_CP_CREDIT_LIMIT = "fd6e0220-b553-11f0-0a80-114f000373a7"  # long, required (₽)
+ATTR_CP_SITE         = "9e4fb8db-b55f-11f0-0a80-196e000604d3"  # link, required
+ATTR_CP_MAX          = "1505236e-34d7-11f1-0a80-1489000ec449"  # string
+ATTR_CP_TELEGRAM     = "15052610-34d7-11f1-0a80-1489000ec44a"  # string
+
+# UUID кастомного атрибута customerorder (Дата плановой оплаты)
+ATTR_CO_PAYMENT_PLANNED = "327940fd-b54e-11f0-0a80-0066000d5578"  # time
+
+# Регулярки валидации
+_RE_SITE_HAS_LATIN = re.compile(r"[a-zA-Z]{3,}")
+_RE_PHONE_RU       = re.compile(r"^[78]\d{10}$")
+_RE_TG_USERNAME    = re.compile(r"^@\S{5,}$")
+_RE_TG_CHAT_ID     = re.compile(r"^\d+$")
+
+# Москва — фиксированный UTC+3
+_MSK_TZ = None  # lazy init в _now_msk()
+
+# Кеш статусов customerorder (single-process, перетягиваем раз в час)
+_co_states_cache: dict = {"data": None, "fetched_at": 0.0}
+_CO_STATES_TTL_SEC = 3600
+
+
+def _now_msk():
+    """Возвращает текущее время в МСК (UTC+3)."""
+    from datetime import datetime, timezone, timedelta
+    global _MSK_TZ
+    if _MSK_TZ is None:
+        _MSK_TZ = timezone(timedelta(hours=3))
+    return datetime.now(_MSK_TZ)
+
+
+async def get_customerorder_state_uuid(name: str) -> Optional[str]:
+    """
+    Возвращает UUID статуса customerorder по имени (как в МС UI).
+    Тянет /entity/customerorder/metadata раз в час (кеш в _co_states_cache).
+    При недоступности metadata — fallback на захардкоженные UUID известных статусов.
+    """
+    import time as _time
+    now = _time.time()
+    cached = _co_states_cache.get("data")
+    if cached is None or (now - _co_states_cache.get("fetched_at", 0)) > _CO_STATES_TTL_SEC:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{MS_BASE}/entity/customerorder/metadata",
+                    headers=get_headers(),
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        states = data.get("states", []) or []
+                        cached = {s.get("name", "").strip().lower(): s.get("id") for s in states}
+                        _co_states_cache["data"] = cached
+                        _co_states_cache["fetched_at"] = now
+        except Exception as e:
+            logger.warning(f"get_customerorder_state_uuid: metadata недоступна ({e}), fallback")
+    if cached:
+        sid = cached.get(name.strip().lower())
+        if sid:
+            return sid
+    # Fallback
+    fallback = {
+        "на согласовании": APPROVAL_STATE_ON_APPROVAL,
+        "за лимитом":      APPROVAL_STATE_OVER_LIMIT,
+        "согласован":      APPROVAL_STATE_AGREED,
+    }
+    return fallback.get(name.strip().lower())
+
+
+def _extract_attr_value(attrs: list, attr_id: str):
+    """attrs = order['attributes'] или counterparty['attributes']."""
+    for a in attrs or []:
+        if a.get("id") == attr_id:
+            return a.get("value")
+    return None
+
+
+async def load_counterparty_attrs(agent_id: str) -> dict:
+    """
+    Один GET counterparty с expand=attributes. Возвращает dict с готовыми ключами:
+      {site, max, telegram, credit_limit, _raw_attrs}
+    _raw_attrs нужен на случай, если потом понадобится прочитать ещё атрибут (например,
+    из Wazzup-блока) без второго GET.
+    """
+    url = f"{MS_BASE}/entity/counterparty/{agent_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                headers=get_headers(),
+                params={"expand": "attributes"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"load_counterparty_attrs: {resp.status} для {agent_id}")
+                    return {"site": "", "max": "", "telegram": "", "credit_limit": 0, "_raw_attrs": []}
+                cp = await resp.json()
+    except Exception as e:
+        logger.error(f"load_counterparty_attrs: {e}")
+        return {"site": "", "max": "", "telegram": "", "credit_limit": 0, "_raw_attrs": []}
+
+    attrs = cp.get("attributes", []) or []
+    return {
+        "site":         (_extract_attr_value(attrs, ATTR_CP_SITE) or "").strip(),
+        "max":          (_extract_attr_value(attrs, ATTR_CP_MAX) or "").strip(),
+        "telegram":     (_extract_attr_value(attrs, ATTR_CP_TELEGRAM) or "").strip(),
+        "credit_limit": _extract_attr_value(attrs, ATTR_CP_CREDIT_LIMIT) or 0,
+        "_raw_attrs":   attrs,
+    }
+
+
+def compute_credit_color(cp_attrs: dict, current_debt: float, order_sum: float) -> dict:
+    """
+    Блок 1 светофора. cp_attrs = результат load_counterparty_attrs().
+    current_debt — текущая дебиторка клиента (₽), order_sum — сумма согласовываемого заказа (₽).
+    Возвращает {color, limit, current_debt, order_sum, effective_debt}.
+    Цвет:
+      🟡 если limit = 0/null («лимит не задан»);
+      🟢 если effective_debt ≤ limit;
+      🔴 если effective_debt > limit.
+    """
+    limit_raw = cp_attrs.get("credit_limit") or 0
+    try:
+        limit = float(limit_raw)
+    except (TypeError, ValueError):
+        limit = 0.0
+    effective_debt = (current_debt or 0.0) + (order_sum or 0.0)
+    if limit <= 0:
+        color = "yellow"
+    elif effective_debt <= limit:
+        color = "green"
+    else:
+        color = "red"
+    return {
+        "color": color,
+        "limit": limit,
+        "current_debt": current_debt or 0.0,
+        "order_sum": order_sum or 0.0,
+        "effective_debt": effective_debt,
+    }
+
+
+async def compute_overdue_color(agent_id: str) -> dict:
+    """
+    Блок 2 светофора. Просрочка >3 дн → красный.
+    Обёртка над существующей get_counterparty_debt: переиспользуем её алгоритм
+    (vычитание текущего долга из свежих заказов с datepayplanned).
+    Возвращает {color, days, debt}.
+    """
+    OVERDUE_THRESHOLD_DAYS = 3
+    info = await get_counterparty_debt(agent_id)
+    debt = info.get("debt", 0) if info else 0
+    days = info.get("overdue_days", 0) if info else 0
+    if debt > 0 and days > OVERDUE_THRESHOLD_DAYS:
+        color = "red"
+    else:
+        color = "green"
+    return {"color": color, "days": days, "debt": debt}
+
+
+# Кеш текущего сальдо контрагента (используется внутри compute_cashflow_color
+# и может пригодиться вызывающей стороне для пересчёта).
+async def _fetch_counterparty_report(agent_id: str) -> dict:
+    """GET /report/counterparty/{id}. Возвращает сырой JSON ({} при ошибке)."""
+    url = f"{MS_BASE}/report/counterparty/{agent_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=get_headers(),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return {}
+                return await resp.json()
+    except Exception as e:
+        logger.error(f"_fetch_counterparty_report: {e}")
+        return {}
+
+
+async def _fetch_incoming_payments(agent_id: str, since_iso: str) -> list[dict]:
+    """
+    Тянет paymentin + cashin контрагента, фильтрует по moment >= since_iso в Python.
+    Пагинация — через meta.nextHref (МС-рекомендуемый способ).
+    """
+    agent_href = f"{MS_BASE}/entity/counterparty/{agent_id}"
+    results: list[dict] = []
+    for entity in ("paymentin", "cashin"):
+        next_url = (
+            f"{MS_BASE}/entity/{entity}?filter=agent={agent_href}"
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                for _ in range(20):  # safety bound
+                    async with session.get(
+                        next_url, headers=get_headers(),
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        if resp.status != 200:
+                            logger.warning(
+                                f"_fetch_incoming_payments[{entity}]: {resp.status}"
+                            )
+                            break
+                        data = await resp.json()
+                    for row in data.get("rows", []) or []:
+                        m = row.get("moment", "")
+                        if m and m >= since_iso:
+                            results.append({
+                                "moment": m,
+                                "sum": (row.get("sum", 0) or 0) / 100,
+                                "type": entity,
+                            })
+                    next_url = data.get("meta", {}).get("nextHref")
+                    if not next_url:
+                        break
+        except Exception as e:
+            logger.error(f"_fetch_incoming_payments[{entity}]: {e}")
+    return results
+
+
+async def compute_cashflow_color(agent_id: str, today=None, window_days: int = 30) -> dict:
+    """
+    Блок 3 светофора (ДДС). Полная формула — в плане 2026-05-21, раздел Фазы 1.
+
+    Логика:
+      1. debt_today = -balance / 100 (если balance < 0); иначе клиент в авансе → 🟢.
+      2. demands_30d, payments_30d, returns_30d (последние — из агрегата отчёта).
+      3. opening_balance(T-30) ≈ debt_today − net_movement, где net = demands − returns − payments.
+      4. Сортируем платежи по убыв. даты, копим кумулятив; первое N (дн назад), при котором
+         cumulative ≥ opening_balance, — искомое.
+      5. Цвет: <20 🟢, 20–29 🟡, ≥30 (или платежи не покрывают) 🔴.
+      6. Доп. правило банк-cutoff: если сейчас в МСК до 14:00 — поднимаем красный в жёлтый
+         с пометкой bank_pending=True (банк ещё разносится).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    if today is None:
+        today = _now_msk().date()
+
+    since_dt = datetime.combine(today, datetime.min.time()) - timedelta(days=window_days)
+    since_iso = since_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. Сальдо и агрегаты
+    report = await _fetch_counterparty_report(agent_id)
+    if not report:
+        return {"color": "yellow", "n_days": None, "opening_balance": 0,
+                "payments_sum": 0, "explain": "отчёт МС недоступен"}
+    balance = (report.get("balance", 0) or 0) / 100
+    debt_today = -balance if balance < 0 else 0.0
+
+    # 2. Платежи + отгрузки за окно
+    payments = await _fetch_incoming_payments(agent_id, since_iso)
+    payments_sum = sum(p["sum"] for p in payments)
+
+    demands_sum_30d = 0.0
+    try:
+        agent_href = f"{MS_BASE}/entity/counterparty/{agent_id}"
+        next_url = f"{MS_BASE}/entity/demand?filter=agent={agent_href}"
+        async with aiohttp.ClientSession() as session:
+            for _ in range(20):
+                async with session.get(
+                    next_url, headers=get_headers(),
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+                for row in data.get("rows", []) or []:
+                    m = row.get("moment", "")
+                    if m and m >= since_iso:
+                        demands_sum_30d += (row.get("sum", 0) or 0) / 100
+                next_url = data.get("meta", {}).get("nextHref")
+                if not next_url:
+                    break
+    except Exception as e:
+        logger.warning(f"compute_cashflow_color: demands {e}")
+
+    # 3. Opening balance (T-window): debt_today − net_movement
+    net_movement = demands_sum_30d - payments_sum
+    opening = debt_today - net_movement
+
+    # Клиент был в авансе или без долга 30 дней назад — точно 🟢
+    if opening <= 0:
+        return {"color": "green", "n_days": 0, "opening_balance": opening,
+                "payments_sum": payments_sum, "explain": "клиент в авансе"}
+
+    # 4. Подбираем N: сортируем платежи по дате убыв., копим кумулятив
+    today_dt = datetime.combine(today, datetime.min.time())
+    by_day: dict[int, float] = {}
+    for p in payments:
+        m = p["moment"]
+        try:
+            pdt = datetime.fromisoformat(m.replace(" ", "T").replace(".000", "").replace("Z", ""))
+        except Exception:
+            continue
+        n = (today_dt.date() - pdt.date()).days
+        if n < 0:
+            n = 0
+        by_day[n] = by_day.get(n, 0.0) + p["sum"]
+
+    cum = 0.0
+    n_match = None
+    for n in sorted(by_day.keys()):
+        cum += by_day[n]
+        if cum >= opening:
+            n_match = n
+            break
+
+    # Bank-cutoff: до 14:00 МСК банк ещё может довезти платежи дня
+    now_msk = _now_msk()
+    bank_pending = now_msk.hour < 14
+
+    if n_match is None:
+        color = "yellow" if bank_pending else "red"
+        explain = (
+            f"платежи за {window_days}д ({payments_sum:,.0f}) не покрывают долг "
+            f"({opening:,.0f})"
+        )
+    elif n_match < 20:
+        color = "green"
+        explain = f"закрывает долг за {n_match} дн"
+    elif n_match < 30:
+        color = "yellow"
+        explain = f"закрывает долг за {n_match} дн — медленно"
+    else:
+        color = "yellow" if bank_pending else "red"
+        explain = f"закрывает долг за {n_match} дн"
+
+    if bank_pending and color == "yellow" and "медленно" not in explain:
+        explain += " (⏳ банк ещё разносится)"
+
+    return {
+        "color": color,
+        "n_days": n_match,
+        "opening_balance": opening,
+        "payments_sum": payments_sum,
+        "demands_sum": demands_sum_30d,
+        "explain": explain,
+        "bank_pending": bank_pending,
+    }
+
+
+async def compute_price_color(order_href: str) -> dict:
+    """
+    Блок 4 светофора. Тонкая обёртка над check_order_prices.
+    Зелёный, если занижений нет; красный, если есть.
+    Возвращает {color, alerts}.
+    """
+    alerts = await check_order_prices(order_href)
+    return {
+        "color": "red" if alerts else "green",
+        "alerts": alerts,
+    }
+
+
+def compute_payment_date_color(order: dict) -> dict:
+    """
+    Блок 5 светофора. Дата планируемой оплаты — атрибут на customerorder (НЕ counterparty).
+    order — JSON загруженного заказа с expand=attributes.
+    Возвращает {color, date_str}.
+    """
+    from datetime import datetime
+
+    attrs = order.get("attributes", []) or []
+    raw = _extract_attr_value(attrs, ATTR_CO_PAYMENT_PLANNED)
+    if not raw:
+        return {"color": "red", "date_str": ""}
+    try:
+        # МС отдаёт формат "2026-05-25 00:00:00.000"
+        dt = datetime.fromisoformat(str(raw).replace(" ", "T").replace(".000", "").replace("Z", ""))
+    except Exception:
+        return {"color": "red", "date_str": str(raw)}
+    today = _now_msk().date()
+    return {
+        "color": "green" if dt.date() >= today else "red",
+        "date_str": dt.date().strftime("%d.%m.%Y"),
+    }
+
+
+def compute_site_color(cp_attrs: dict) -> dict:
+    """
+    Блок 6 светофора. Сайт валиден, если содержит ≥3 латинских букв подряд
+    (отсекает «нет», «—», «н/д» в кириллице).
+    Возвращает {color, raw_value}.
+    """
+    raw = (cp_attrs.get("site") or "").strip()
+    if raw and _RE_SITE_HAS_LATIN.search(raw):
+        return {"color": "green", "raw_value": raw}
+    return {"color": "red", "raw_value": raw}
+
+
+def _normalize_phone(raw: str) -> str:
+    """+7 (926) 583-10-26 → 79265831026. Превращает префикс +7 в 7."""
+    digits = re.sub(r"[^\d]", "", raw or "")
+    if digits.startswith("8") and len(digits) == 11:
+        return digits
+    if digits.startswith("7") and len(digits) == 11:
+        return digits
+    # +7XXXXXXXXXX → 7XXXXXXXXXX уже сохранён (regex срезал +)
+    return digits
+
+
+def compute_contacts_color(cp_attrs: dict) -> dict:
+    """
+    Блок 7 светофора. Контакт валиден, если ХОТЯ БЫ ОДНО из двух:
+      Max:      11 цифр, начинается с 7 или 8 (формат +7... тоже принимаем — нормализуем).
+      Telegram: ^@\\S{5,}$  ИЛИ  ^\\d+$ (но НЕ совпадает с шаблоном телефона)
+    Wazzup-сгенерированные атрибуты НЕ учитываем (решение Виктора 2026-05-21).
+    Возвращает {color, max, telegram, max_valid, tg_valid}.
+    """
+    mx_raw = (cp_attrs.get("max") or "").strip()
+    tg = (cp_attrs.get("telegram") or "").strip()
+
+    mx_normalized = _normalize_phone(mx_raw)
+    max_valid = bool(_RE_PHONE_RU.match(mx_normalized))
+
+    tg_valid = False
+    if tg:
+        if _RE_TG_USERNAME.match(tg):
+            tg_valid = True
+        elif _RE_TG_CHAT_ID.match(tg) and not _RE_PHONE_RU.match(tg):
+            tg_valid = True
+
+    return {
+        "color": "green" if (max_valid or tg_valid) else "red",
+        "max": mx_raw, "telegram": tg,
+        "max_valid": max_valid, "tg_valid": tg_valid,
+    }
