@@ -121,6 +121,17 @@ def setup_scheduler(app: Application, db):
         id="pdz_send_owner_pending_16_05"
     )
 
+    # ПТ 08:00 МСК — пересчёт «% работы на новых клиентах» (MTD) и запись
+    # снимка в bot_settings.op_new_share_snapshot. Виджет в /op_report читает
+    # его независимо от report_cache. План:
+    # 2026-05-21-виджет-процент-новых-в-отчете-оп.md, Фаза 5.
+    scheduler.add_job(
+        op_new_share_snapshot_job,
+        CronTrigger(day_of_week='fri', hour=8, minute=0, timezone=MSK),
+        args=[app, db],
+        id="op_new_share_snapshot_fri_08"
+    )
+
     scheduler.start()
     logger.info("✅ Планировщик запущен")
     for job in scheduler.get_jobs():
@@ -581,6 +592,13 @@ async def pdz_send_owner_pending_job(app: Application, db) -> dict:
     ]
     tag_totals.sort(key=lambda x: x[1], reverse=True)
 
+    def _breaks_word(cnt: int) -> str:
+        if cnt % 10 == 1 and cnt % 100 != 11:
+            return "срыв"
+        if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
+            return "срыва"
+        return "срывов"
+
     for tag, total, agents in tag_totals:
         manager_name = PDZ_MANAGER_TAG_MAP.get(tag, tag)
         # Берём фамилию (первое слово после имени) для заголовка — в плане
@@ -594,9 +612,12 @@ async def pdz_send_owner_pending_job(app: Application, db) -> dict:
         for a in agents:
             name = (a.get("agent_name") or "—").replace("*", "").replace("_", "")
             url = a.get("ms_url_first_order") or "#"
+            breaks = int(a.get("breaks_count", 0) or 0)
+            prefix = "🔴 " if breaks > 0 else ""
+            suffix = f" ({breaks} {_breaks_word(breaks)} за 90д)" if breaks > 0 else ""
             lines.append(
-                f"• [{name}]({url}) · {a.get('max_days_overdue', 0)} дн · "
-                f"{fmt_money(a.get('total_unpaid', 0))}"
+                f"• {prefix}[{name}]({url}) · {a.get('max_days_overdue', 0)} дн · "
+                f"{fmt_money(a.get('total_unpaid', 0))}{suffix}"
             )
         lines.append("")
 

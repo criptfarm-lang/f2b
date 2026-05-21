@@ -1887,6 +1887,20 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
             "ms_url_first_order": oldest["ms_url"],
         })
 
+    # Обогащение счётчиком срывов за 90 дней (Фаза 4.5).
+    if db is not None and grouped:
+        try:
+            ids = [g.get("agent_id") for g in grouped if g.get("agent_id")]
+            breaks_map = db.get_promise_breaks_count(ids, days_window=90)
+        except Exception as e:
+            logger.warning(f"pdz_overdue_for_manager({manager_tag}): breaks_count failed: {e}")
+            breaks_map = {}
+        for g in grouped:
+            g["breaks_count"] = int(breaks_map.get(g.get("agent_id") or "", 0))
+    else:
+        for g in grouped:
+            g.setdefault("breaks_count", 0)
+
     grouped.sort(key=lambda x: x["total_unpaid"], reverse=True)
     return grouped
 
@@ -1900,6 +1914,15 @@ def _order_word_ru(cnt: int) -> str:
     if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
         return "заказа"
     return "заказов"
+
+
+def _breaks_word_ru(cnt: int) -> str:
+    """Русское склонение «срыв/срыва/срывов» по числу."""
+    if cnt % 10 == 1 and cnt % 100 != 11:
+        return "срыв"
+    if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
+        return "срыва"
+    return "срывов"
 
 
 def pdz_send_manager_digest_text(items: list, manager_name: str = None) -> list:
@@ -1932,10 +1955,13 @@ def pdz_send_manager_digest_text(items: list, manager_name: str = None) -> list:
         name = (it.get("agent_name") or "—").replace("*", "").replace("_", "")
         url = it.get("ms_url_first_order") or "#"
         cnt = int(it.get("orders_count", 0) or 0)
+        breaks = int(it.get("breaks_count", 0) or 0)
+        prefix = "🔴 " if breaks > 0 else ""
+        suffix = f" ({breaks} {_breaks_word_ru(breaks)} за 90д)" if breaks > 0 else ""
         line = (
-            f"[{name}]({url}) · {cnt} {_order_word_ru(cnt)} · "
+            f"{prefix}[{name}]({url}) · {cnt} {_order_word_ru(cnt)} · "
             f"{it.get('max_days_overdue', 0)} дн · "
-            f"{fmt_money(it.get('total_unpaid', 0))}"
+            f"{fmt_money(it.get('total_unpaid', 0))}{suffix}"
         )
         if current_len + len(line) + 1 > 3500:
             chunks.append([])
@@ -2025,6 +2051,7 @@ def pdz_unprocessed_for_owner(db) -> dict:
 
     # Сводим order→agent в формат как у pdz_overdue_for_manager.
     result: dict = {}
+    all_ids: list = []
     for tag, agents in by_tag.items():
         grouped = []
         for aid, data in agents.items():
@@ -2041,9 +2068,23 @@ def pdz_unprocessed_for_owner(db) -> dict:
                 "orders_count": len(orders),
                 "ms_url_first_order": oldest["ms_url"],
             })
+            if data.get("agent_id"):
+                all_ids.append(data["agent_id"])
         grouped.sort(key=lambda x: x["total_unpaid"], reverse=True)
         if grouped:
             result[tag] = grouped
+
+    # Обогащение счётчиком срывов за 90 дней (Фаза 4.5).
+    breaks_map: dict = {}
+    if db is not None and all_ids:
+        try:
+            breaks_map = db.get_promise_breaks_count(all_ids, days_window=90)
+        except Exception as e:
+            logger.warning(f"pdz_unprocessed_for_owner: breaks_count failed: {e}")
+            breaks_map = {}
+    for tag, grouped in result.items():
+        for g in grouped:
+            g["breaks_count"] = int(breaks_map.get(g.get("agent_id") or "", 0))
 
     return result
 

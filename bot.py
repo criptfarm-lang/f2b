@@ -3361,14 +3361,24 @@ async def cmd_pdz_overdue_test(update: Update, context: ContextTypes.DEFAULT_TYP
             return "заказа"
         return "заказов"
 
+    def breaks_word(cnt: int) -> str:
+        if cnt % 10 == 1 and cnt % 100 != 11:
+            return "срыв"
+        if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
+            return "срыва"
+        return "срывов"
+
     for it in items:
         name = (it.get("agent_name") or "—").replace("*", "").replace("_", "")
         url = it.get("ms_url_first_order") or "#"
         cnt = it.get("orders_count", 0)
+        breaks = int(it.get("breaks_count", 0) or 0)
+        prefix = "🔴 " if breaks > 0 else ""
+        suffix = f" ({breaks} {breaks_word(breaks)} за 90д)" if breaks > 0 else ""
         line = (
-            f"[{name}]({url}) · {cnt} {order_word(cnt)} · "
+            f"{prefix}[{name}]({url}) · {cnt} {order_word(cnt)} · "
             f"{it.get('max_days_overdue', 0)} дн · "
-            f"{fmt_money(it.get('total_unpaid', 0))}"
+            f"{fmt_money(it.get('total_unpaid', 0))}{suffix}"
         )
         if current_len + len(line) + 1 > 3500:
             chunks.append([])
@@ -3502,6 +3512,100 @@ async def cmd_pdz_send_owner_pending_test(update: Update, context: ContextTypes.
         await update.message.reply_text(f"❌ Job упал: {result.get('error','?')}")
     else:
         await update.message.reply_text(f"ℹ️ status={status}")
+
+
+async def cmd_pdz_breaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/pdz_breaks` — топ-30 клиентов по числу срывов обещаний за 90 дней.
+
+    Источник — таблица `promise_log` (event_type='broken'). Если в окне нет
+    зафиксированных срывов (а так будет в первые дни после старта Фазы 4) —
+    выводим «📭 За 90 дней нет зафиксированных срывов». Доступ — только
+    собственник (OWNER_CHAT_ID).
+    """
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    if not update.message:
+        return
+
+    try:
+        rows = db.get_promise_breaks_top(limit=30, days_window=90)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    if not rows:
+        await update.message.reply_text("📭 За 90 дней нет зафиксированных срывов")
+        return
+
+    def breaks_word(cnt: int) -> str:
+        if cnt % 10 == 1 and cnt % 100 != 11:
+            return "срыв"
+        if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
+            return "срыва"
+        return "срывов"
+
+    # URL первого заказа клиента — берём любой свежий заказ из последнего
+    # snapshot по этому agent_id (используем уже хранящийся в БД ms_url).
+    try:
+        latest_snap = db.get_latest_snapshot() or []
+    except Exception as e:
+        latest_snap = []
+        logger.warning(f"cmd_pdz_breaks: get_latest_snapshot failed: {e}")
+    agent_url_map: dict = {}
+    for r in latest_snap:
+        aid = r.get("agent_id") or ""
+        if not aid or aid in agent_url_map:
+            continue
+        order_id = r.get("order_id") or ""
+        if order_id:
+            agent_url_map[aid] = f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}"
+
+    from datetime import datetime as _dt, timezone as _tz
+    now_utc = _dt.now(_tz.utc)
+
+    header = "🔴 *Срывы обещаний за 90 дней — топ-30*"
+    chunks: list[list[str]] = [[header, ""]]
+    cur_len = len(header) + 2
+
+    for r in rows:
+        aid = r.get("agent_id") or ""
+        name = (r.get("agent_name") or "—").replace("*", "").replace("_", "")
+        cnt = int(r.get("breaks_count", 0) or 0)
+        tag = r.get("manager_tag") or "—"
+        url = agent_url_map.get(aid)
+
+        last_at = r.get("last_break_at")
+        days_ago_str = "?"
+        if last_at is not None:
+            try:
+                if isinstance(last_at, _dt):
+                    if last_at.tzinfo is None:
+                        last_at = last_at.replace(tzinfo=_tz.utc)
+                    delta_days = (now_utc - last_at).days
+                    days_ago_str = str(max(0, delta_days))
+            except Exception:
+                days_ago_str = "?"
+
+        client_label = f"[{name}]({url})" if url else name
+        line = (
+            f"{client_label} · {cnt} {breaks_word(cnt)} · "
+            f"последний {days_ago_str} дн назад · менеджер: {tag}"
+        )
+        if cur_len + len(line) + 1 > 3500:
+            chunks.append([])
+            cur_len = 0
+        chunks[-1].append(line)
+        cur_len += len(line) + 1
+
+    for chunk in chunks:
+        if not chunk:
+            continue
+        await update.message.reply_text(
+            "\n".join(chunk),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
 
 
 async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6184,6 +6288,8 @@ def main():
     app.add_handler(CommandHandler("pdz_send_digests_test", cmd_pdz_send_digests_test))
     app.add_handler(CommandHandler("pdz_send_digests_test_now", cmd_pdz_send_digests_test_now))
     app.add_handler(CommandHandler("pdz_send_owner_pending_test", cmd_pdz_send_owner_pending_test))
+    # Фаза 4.5: топ-30 клиентов по срывам обещаний за 90 дней (только собственник).
+    app.add_handler(CommandHandler("pdz_breaks", cmd_pdz_breaks))
     app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
     app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
     app.add_handler(CommandHandler("set_weekly_bulk", cmd_set_weekly_bulk))
@@ -6527,6 +6633,11 @@ def main():
             else:
                 report_data = await _build_report_data()
                 db.set_report_cache(report_data)
+
+            # Снимок «% работы на новых» (op_new_share) читается ОТДЕЛЬНО,
+            # вне report_cache (TTL 5 ч). План: 2026-05-21-виджет-..., Фаза 3.
+            # Пишется cron-job пятница 08:00 МСК + CLI --backfill.
+            report_data["new_share"] = db.get_new_share_snapshot()
 
             tpl_path = pathlib.Path(__file__).parent / "report_template.html"
             if tpl_path.exists():

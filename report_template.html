@@ -17,6 +17,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .s-card .label { font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 5px; }
 .s-card .value { font-size: 20px; font-weight: 600; }
 .s-card .pct { font-size: 12px; margin-top: 3px; }
+.s-card .sub { font-size: 11px; color: #6b7280; margin-top: 3px; font-weight: 500; }
+.s-card .sub.stale { color: #ea580c; font-weight: 600; }
+.s-card .value.ns-low { color: #d4564a; }
+.s-card .value.ns-null { color: #9ca3af; }
 .good { color: #059669; } .warn { color: #d97706; } .bad { color: #dc2626; }
 .mgr-tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
 .tab { padding: 7px 14px; border-radius: 18px; border: 1.5px solid #e8e5f5; background: #fff; cursor: pointer; font-size: 13px; font-weight: 500; color: #6b7280; transition: all 0.15s; }
@@ -133,17 +137,55 @@ function fmtMonth(ym){
   return names[parseInt(m)-1]+' '+y.slice(2);
 }
 
+/* ── New-share helpers (% работы на новых клиентах, MTD) ── */
+function nsSubLine(computedAt){
+  if(!computedAt) return '<div class="sub">расчёт по пт 08:00</div>';
+  const dt = new Date(computedAt);
+  if(isNaN(dt.getTime())) return '<div class="sub">расчёт по пт 08:00</div>';
+  const days = (Date.now() - dt.getTime()) / 86400000;
+  const dd = String(dt.getDate()).padStart(2,'0');
+  const mm = String(dt.getMonth()+1).padStart(2,'0');
+  const hh = String(dt.getHours()).padStart(2,'0');
+  const mi = String(dt.getMinutes()).padStart(2,'0');
+  if(days > 9) return '<div class="sub stale">устарело · '+dd+'.'+mm+'</div>';
+  return '<div class="sub">обн. '+dd+'.'+mm+' '+hh+':'+mi+'</div>';
+}
+function nsValueHtml(value){
+  if(value === null || value === undefined){
+    return '<div class="value ns-null">—</div>';
+  }
+  const v = Number(value);
+  const cls = v < 30 ? 'ns-low' : '';
+  return '<div class="value '+cls+'">'+v.toFixed(1)+'%</div>';
+}
+function nsCardHtml(label, value, computedAt){
+  return '<div class="s-card"><div class="label">'+label+'</div>'
+       + nsValueHtml(value)
+       + nsSubLine(computedAt)
+       + '</div>';
+}
+
 /* ── Summary cards ── */
 function renderSummary(){
   const allMgrs=Object.keys(DATA.plans);
-  document.getElementById('summary').innerHTML = METRICS.map(m=>{
+  const cards = METRICS.map(m=>{
     const tf=allMgrs.reduce((s,mg)=>s+(DATA.facts[mg]?.[m.key]||0),0);
     const tp=allMgrs.reduce((s,mg)=>s+(DATA.plans[mg]?.[m.key]||0),0);
     const p=pct(tf,tp);
     return '<div class="s-card"><div class="label">'+m.label+'</div>'
           +'<div class="value">'+m.fmt(tf/m.divisor)+'</div>'
           +'<div class="pct '+pClass(p)+'">'+p+'% из '+m.fmt(tp/m.divisor)+'</div></div>';
-  }).join('');
+  });
+  // % работы на новых — вторая плитка (после Выручки), чтобы быть видимой
+  // на mobile-сетке (TG WebView) без скролла. План: 2026-05-21-виджет-...
+  const ns = DATA.new_share || null;
+  const nsCard = nsCardHtml(
+    '% работы на новых · за месяц, по компании',
+    ns ? ns.company_pct : null,
+    ns ? ns.computed_at : null
+  );
+  cards.splice(1, 0, nsCard);
+  document.getElementById('summary').innerHTML = cards.join('');
 }
 
 /* ── Tabs ── */
@@ -331,37 +373,35 @@ function renderMgrDetail(mg){
   const badges=(newCl>0?'<span class="badge badge-new">+ новых: '+newCl+'<span class="tooltip">'+newTip+'</span></span>':'')
               +(lost>0?'<span class="badge badge-lost">▼ выбыли: '+lost+'<span class="tooltip">'+lostTip+'</span></span>':'');
 
-  // Attestation bars (plan always 100%)
+  // Общая аттестация → badge рядом с именем. План: 2026-05-21-виджет-..., Фаза 4.
+  // Полоски «Аттестация общая/АКБ» удалены: их заменяет badge + плитка % работы на новых.
   const a=(DATA.attestation||{})[mg]||{};
-  let attBarsHtml='';
-  if(a.general!==undefined || a.akb!==undefined){
-    attBarsHtml='<div style="margin-top:12px;padding-top:10px;border-top:1px solid #e8e5f5;">';
-    const attItems=[
-      {label:'Аттестация общая', val:a.general},
-      {label:'Аттестация АКБ',   val:a.akb},
-    ];
-    attItems.forEach(item=>{
-      if(item.val===undefined) return;
-      const pc=Math.min(item.val,100);
-      const bc=pc>=80?'#059669':pc>=50?'#d97706':'#dc2626';
-      attBarsHtml+=
-        '<div class="dc-row" style="margin-top:4px;"><span class="dl">'+item.label+'</span>'
-       +'<span class="dv" style="color:'+bc+';font-weight:700;">'+item.val+'%</span></div>'
-       +'<div class="bar-mini" style="margin-bottom:8px;">'
-       +  '<div class="bar-fill" style="width:'+pc+'%;background:'+bc+'80;"></div>'
-       +'</div>';
-    });
-    attBarsHtml+='</div>';
+  let attBadge='';
+  if(a.general!==undefined){
+    const v=a.general;
+    const cls = v>=80 ? 'att-ok' : v>=50 ? 'att-warn' : 'att-bad';
+    attBadge = '<span class="att-badge '+cls+'" title="общая аттестация">атт. '+v+'%</span>';
   }
+
+  // Плитка «% работы на новых» — за месяц, по этому менеджеру.
+  const nsByMgr = (DATA.new_share && DATA.new_share.by_manager) ? DATA.new_share.by_manager[mg] : undefined;
+  const nsComputedAt = DATA.new_share ? DATA.new_share.computed_at : null;
+  const nsCard = nsCardHtml(
+    '% работы на новых · за месяц',
+    (nsByMgr === undefined ? null : nsByMgr),
+    nsComputedAt
+  );
+  const nsWrap = '<div style="margin-top:12px;padding-top:10px;border-top:1px solid #e8e5f5;">'
+               + nsCard + '</div>';
 
   document.getElementById('mgr-detail').innerHTML=
     '<div class="detail-card" style="border:2px solid '+color+'">'
    +'<div class="dc-header">'
-   +  '<span class="dc-name" style="color:'+color+'">'+short+'</span>'
+   +  '<span class="dc-name" style="color:'+color+'">'+short+attBadge+'</span>'
    +  '<span class="dc-avg '+pClass(avg)+'">'+avg+'%</span>'
    +'</div>'
    +rows
-   +attBarsHtml
+   +nsWrap
    +(badges?'<div style="margin-top:8px">'+badges+'</div>':'')
    +'</div>';
 }

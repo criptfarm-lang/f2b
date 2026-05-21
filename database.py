@@ -569,6 +569,75 @@ class Database:
             self.conn.commit()
         return len(params)
 
+    # ─── ПДЗ Фаза 4.5: счётчики срывов обещаний по клиентам ───────────────
+    def get_promise_breaks_count(self, agent_ids: list, days_window: int = 90) -> dict:
+        """Возвращает {agent_id: count} — число срывов (event_type='broken')
+        по каждому agent_id за последние `days_window` дней.
+
+        Batch SQL — один запрос на всех agent_ids. Если список пустой —
+        возвращает {}. Если у agent_id нет срывов, его в результате не будет
+        (вызывающий код может .get(aid, 0)).
+        """
+        if not agent_ids:
+            return {}
+        # Уникальный список (на случай дублей), фильтруем пустые.
+        unique_ids = [a for a in {x for x in agent_ids if x}]
+        if not unique_ids:
+            return {}
+        days = int(days_window)
+        sql = (
+            "SELECT agent_id, COUNT(*) AS cnt FROM promise_log "
+            "WHERE agent_id = ANY(%s) AND event_type='broken' "
+            f"AND occurred_at >= NOW() - INTERVAL '{days} days' "
+            "GROUP BY agent_id"
+        )
+        rows = self._fetchall(sql, (unique_ids,))
+        return {r["agent_id"]: int(r["cnt"]) for r in rows}
+
+    def get_promise_breaks_top(self, limit: int = 30, days_window: int = 90) -> list:
+        """Топ контрагентов по числу broken-событий за `days_window` дней.
+
+        Возвращает список dict с полями:
+            {agent_id, agent_name, manager_tag, breaks_count, last_break_at}
+
+        Группировка по agent_id; agent_name и manager_tag берутся из
+        последнего broken-события. Сортировка breaks_count DESC, далее
+        last_break_at DESC. Лимит — `limit`.
+        """
+        days = int(days_window)
+        lim = int(limit)
+        sql = (
+            "SELECT agent_id, "
+            "       (SELECT agent_name FROM promise_log p2 "
+            "          WHERE p2.agent_id = p.agent_id AND p2.event_type='broken' "
+            f"          AND p2.occurred_at >= NOW() - INTERVAL '{days} days' "
+            "          ORDER BY p2.occurred_at DESC LIMIT 1) AS agent_name, "
+            "       (SELECT manager_tag FROM promise_log p3 "
+            "          WHERE p3.agent_id = p.agent_id AND p3.event_type='broken' "
+            f"          AND p3.occurred_at >= NOW() - INTERVAL '{days} days' "
+            "          ORDER BY p3.occurred_at DESC LIMIT 1) AS manager_tag, "
+            "       COUNT(*) AS breaks_count, "
+            "       MAX(occurred_at) AS last_break_at "
+            "FROM promise_log p "
+            "WHERE event_type='broken' "
+            f"  AND occurred_at >= NOW() - INTERVAL '{days} days' "
+            "  AND agent_id IS NOT NULL AND agent_id <> '' "
+            "GROUP BY agent_id "
+            "ORDER BY breaks_count DESC, last_break_at DESC "
+            f"LIMIT {lim}"
+        )
+        rows = self._fetchall(sql)
+        out = []
+        for r in rows:
+            out.append({
+                "agent_id": r.get("agent_id"),
+                "agent_name": r.get("agent_name"),
+                "manager_tag": r.get("manager_tag"),
+                "breaks_count": int(r.get("breaks_count") or 0),
+                "last_break_at": r.get("last_break_at"),
+            })
+        return out
+
     # ─── Market Intel (канал «Мониторинг» — закупочные прайсы) ──────────────
     def save_market_intel_message(
         self,
@@ -815,6 +884,34 @@ class Database:
             """INSERT INTO bot_settings (key, value) VALUES (%s, %s)
                ON CONFLICT (key) DO UPDATE SET value=%s""",
             (key, text, text)
+        )
+
+    # ── Снимок «% работы на новых» (op_new_share) ────────────────────────────
+    # План: 2026-05-21-виджет-процент-новых-в-отчете-оп.md, Фаза 2.
+    # Пишется cron-job в scheduler.py (пятница 08:00 МСК) и CLI --backfill.
+    # Читается отдельно в handle_web_report, ВНЕ report_cache.
+
+    def get_new_share_snapshot(self):
+        """Возвращает dict снимка или None если ключ отсутствует."""
+        import json
+        row = self._fetchone(
+            "SELECT value FROM bot_settings WHERE key='op_new_share_snapshot'", ()
+        )
+        if not row or not row.get("value"):
+            return None
+        try:
+            return json.loads(row["value"])
+        except Exception:
+            return None
+
+    def set_new_share_snapshot(self, snapshot: dict):
+        """Идемпотентно перезаписывает снимок (JSON в text-value)."""
+        import json
+        payload = json.dumps(snapshot, ensure_ascii=False)
+        self._execute(
+            """INSERT INTO bot_settings (key, value) VALUES (%s, %s)
+               ON CONFLICT (key) DO UPDATE SET value=%s""",
+            ("op_new_share_snapshot", payload, payload)
         )
 
     def save_manager_chat_id(self, user_id: int, full_name: str):
