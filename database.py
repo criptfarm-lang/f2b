@@ -324,6 +324,28 @@ class Database:
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
+            # Объединённый алерт «На согласовании» / «ЗА ЛИМИТОМ»
+            # (план 2026-05-21-объединённый-алерт-на-согласование.md, Фаза 4).
+            # Дедуп: UNIQUE(order_id, sum_hash). Новый алерт триггерится только при
+            # изменении суммы заказа > 5% от уже зафиксированной.
+            """CREATE TABLE IF NOT EXISTS pending_approval_alerts (
+                id BIGSERIAL PRIMARY KEY,
+                order_id TEXT NOT NULL,
+                sum_hash BIGINT NOT NULL,
+                order_name TEXT,
+                client_name TEXT,
+                manager_name TEXT,
+                manager_user_id BIGINT,
+                alert_text TEXT,
+                colors_json JSONB,
+                sent_at TIMESTAMPTZ DEFAULT NOW(),
+                closed_at TIMESTAMPTZ,
+                closed_by BIGINT,
+                comment TEXT,
+                UNIQUE (order_id, sum_hash)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_approval_alerts_order ON pending_approval_alerts (order_id)",
+            "CREATE INDEX IF NOT EXISTS idx_approval_alerts_open ON pending_approval_alerts (closed_at) WHERE closed_at IS NULL",
             """CREATE TABLE IF NOT EXISTS pdz_results (
                 id SERIAL PRIMARY KEY,
                 manager_name TEXT,
@@ -875,6 +897,76 @@ class Database:
             "UPDATE price_alerts SET status='answered', alert_text=alert_text||%s WHERE id=%s",
             (f"\n💬 Ответ: {comment}", alert_id)
         )
+
+    # ─── ОБЪЕДИНЁННЫЙ АЛЕРТ «НА СОГЛАСОВАНИИ / ЗА ЛИМИТОМ» ──────────────────────
+    # План: 2026-05-21-объединённый-алерт-на-согласование.md (Фаза 4).
+
+    def try_insert_approval_alert(
+        self,
+        order_id: str,
+        sum_hash: int,
+        alert_text: str,
+        colors_json: dict,
+        order_name: str = "",
+        client_name: str = "",
+        manager_name: str = "",
+        manager_user_id: int = None,
+    ) -> Optional[int]:
+        """
+        Атомарная вставка с дедупом по (order_id, sum_hash).
+        Возвращает id если алерт реально вставлен; None если запись уже была
+        (значит, алерт уже отправлен в прошлый webhook).
+        """
+        import json
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO pending_approval_alerts
+                       (order_id, sum_hash, order_name, client_name,
+                        manager_name, manager_user_id, alert_text, colors_json)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (order_id, sum_hash) DO NOTHING
+                   RETURNING id""",
+                (order_id, sum_hash, order_name, client_name,
+                 manager_name, manager_user_id, alert_text, json.dumps(colors_json))
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row["id"] if row else None
+
+    def get_approval_alert(self, alert_id: int) -> Optional[dict]:
+        return self._fetchone(
+            "SELECT * FROM pending_approval_alerts WHERE id=%s", (alert_id,)
+        )
+
+    def get_approval_alert_by_order(self, order_id: str) -> Optional[dict]:
+        """
+        Fallback lookup: если callback пришёл с alert_id, которого нет в БД
+        (например, БД упала между отправкой и кликом), ищем самый свежий
+        открытый алерт по order_id.
+        """
+        return self._fetchone(
+            """SELECT * FROM pending_approval_alerts
+               WHERE order_id=%s AND closed_at IS NULL
+               ORDER BY id DESC LIMIT 1""",
+            (order_id,)
+        )
+
+    def close_approval_alert(self, alert_id: int, closed_by: int, comment: str = None):
+        if comment:
+            self._execute(
+                """UPDATE pending_approval_alerts
+                   SET closed_at = NOW(), closed_by = %s, comment = %s
+                   WHERE id = %s""",
+                (closed_by, comment, alert_id)
+            )
+        else:
+            self._execute(
+                """UPDATE pending_approval_alerts
+                   SET closed_at = NOW(), closed_by = %s
+                   WHERE id = %s""",
+                (closed_by, alert_id)
+            )
 
     # ─── ЗАДАЧИ ─────────────────────────────────────────────────────────────────
 
