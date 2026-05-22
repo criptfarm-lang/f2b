@@ -80,17 +80,22 @@ def setup_scheduler(app: Application, db):
     # 13:55 и 14:00 МСК — снимок состояния заказов для ПДЗ-автоматики
     # (план 2026-05-20, Фаза 2). Два запуска: до банк-cut-off (13:55) и
     # после разнесения банка (14:00). Логика срывов сравнивает 14:00-снимки.
+    # misfire_grace_time=3600 + coalesce=True: если контейнер пересобирался
+    # в момент cron-tick (Amvera иногда так делает), job догонится при первом
+    # tick после старта, а не пропадёт молча (как было 2026-05-22).
     scheduler.add_job(
         pdz_take_snapshot_job,
         CronTrigger(hour=13, minute=55, timezone=MSK),
         args=[app, db],
-        id="pdz_snapshot_1355"
+        id="pdz_snapshot_1355",
+        misfire_grace_time=3600, coalesce=True,
     )
     scheduler.add_job(
         pdz_take_snapshot_job,
         CronTrigger(hour=14, minute=0, timezone=MSK),
         args=[app, db],
-        id="pdz_snapshot_1400"
+        id="pdz_snapshot_1400",
+        misfire_grace_time=3600, coalesce=True,
     )
 
     # 14:02 МСК — обработка событий обещаний (Фаза 3). Между snapshot 14:00
@@ -101,7 +106,8 @@ def setup_scheduler(app: Application, db):
         pdz_process_events_job,
         CronTrigger(hour=14, minute=2, timezone=MSK),
         args=[app, db],
-        id="pdz_process_events_1402"
+        id="pdz_process_events_1402",
+        misfire_grace_time=3600, coalesce=True,
     )
 
     # 14:10 МСК — TG-дайджест каждому менеджеру с просрочками (Фаза 4).
@@ -110,7 +116,8 @@ def setup_scheduler(app: Application, db):
         pdz_send_digests_job,
         CronTrigger(hour=14, minute=10, timezone=MSK),
         args=[app, db],
-        id="pdz_send_digests_14_10"
+        id="pdz_send_digests_14_10",
+        misfire_grace_time=3600, coalesce=True,
     )
 
     # 16:05 МСК — пинг собственнику по необработанным после дедлайна 16:00 (Фаза 4).
@@ -118,7 +125,8 @@ def setup_scheduler(app: Application, db):
         pdz_send_owner_pending_job,
         CronTrigger(hour=16, minute=5, timezone=MSK),
         args=[app, db],
-        id="pdz_send_owner_pending_16_05"
+        id="pdz_send_owner_pending_16_05",
+        misfire_grace_time=3600, coalesce=True,
     )
 
     # 14:15 МСК — регенерация HTML-отчёта «Дебиторка» (Фаза 5).
@@ -129,7 +137,8 @@ def setup_scheduler(app: Application, db):
         pdz_generate_html_job,
         CronTrigger(hour=14, minute=15, timezone=MSK),
         args=[app, db],
-        id="pdz_generate_html_14_15"
+        id="pdz_generate_html_14_15",
+        misfire_grace_time=3600, coalesce=True,
     )
 
     # ПТ 08:00 МСК — пересчёт «% работы на новых клиентах» (MTD) и запись
@@ -700,6 +709,7 @@ async def pdz_send_digests_job(app: Application, db) -> dict:
     """
     from moysklad import (
         PDZ_MANAGER_TAG_MAP,
+        PDZ_MANAGER_TG_IDS,
         pdz_overdue_for_manager,
         pdz_send_manager_digest_text,
     )
@@ -722,9 +732,10 @@ async def pdz_send_digests_job(app: Application, db) -> dict:
             report[tag] = {"status": "no_overdue", "messages_sent": 0, "clients": 0}
             continue
 
-        # chat_id ищется по первому имени менеджера (как в check_aging_clients).
-        first_name = manager_name.split()[0] if manager_name else ""
-        chat_id = db.get_manager_chat_id(first_name) if first_name else None
+        chat_id = PDZ_MANAGER_TG_IDS.get(tag)
+        if not chat_id:
+            first_name = manager_name.split()[0] if manager_name else ""
+            chat_id = db.get_manager_chat_id(first_name) if first_name else None
         if not chat_id:
             logger.warning(
                 f"pdz_send_digests_job: {tag} ({manager_name}) — chat_id не найден в manager_chats"
