@@ -1819,7 +1819,9 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
     else:
         rows = await pdz_take_snapshot()
 
-    orders: list = []
+    # Собираем все неоплаченные заказы менеджера, разбивая на «просрочка»
+    # и «в сроке» — нужно для per-contractor FIFO-фильтра ниже.
+    by_agent_unpaid: dict = {}  # aid → {balance, agent_name, overdue: [...], in_сroк_unpaid_total}
     skipped_balance_ok = 0
     for r in rows:
         row_tag = (r.get("manager_tag") or "").lower()
@@ -1828,28 +1830,34 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
         ppm_new = _to_date(r.get("ppm_new"))
         ppm_initial = _to_date(r.get("ppm_initial"))
         effective = ppm_new if ppm_new is not None else ppm_initial
-        if not effective or effective >= today:
+        if not effective:
             continue
         payed = float(r.get("payed_sum") or 0)
         total = float(r.get("total_sum") or 0)
         if payed >= total:
             continue
-        # Фильтр по реальному балансу контрагента.
         bal_raw = r.get("agent_balance")
         agent_balance = float(bal_raw) if bal_raw is not None else None
-        if agent_balance is not None and agent_balance >= 0:
-            # Клиент не должен — заказ выглядит как просрочка только из-за
-            # неразнесённой оплаты в бухгалтерии. Пропускаем.
-            skipped_balance_ok += 1
+        aid = r.get("agent_id") or ""
+
+        bucket = by_agent_unpaid.setdefault(aid, {
+            "agent_id": aid,
+            "agent_name": r.get("agent_name"),
+            "balance": agent_balance,
+            "overdue": [],
+            "in_сroк_unpaid_total": 0.0,
+        })
+        unpaid = round(total - payed, 2)
+        if effective >= today:
+            bucket["in_сroк_unpaid_total"] = round(bucket["in_сroк_unpaid_total"] + unpaid, 2)
             continue
 
         days_overdue = (today - effective).days
-        unpaid = round(total - payed, 2)
         order_id = r.get("order_id") or ""
-        orders.append({
+        bucket["overdue"].append({
             "order_id": order_id,
             "order_name": r.get("order_name"),
-            "agent_id": r.get("agent_id"),
+            "agent_id": aid,
             "agent_name": r.get("agent_name"),
             "effective_due_date": effective,
             "days_overdue": days_overdue,
@@ -1858,10 +1866,40 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
             "agent_balance": agent_balance,
         })
 
-    if skipped_balance_ok:
+    # Per-contractor FIFO: бухгалтерия часто не разносит paymentin на конкретные
+    # customerorder, и старые «хвосты» в payedSum остаются висеть, хотя приходами
+    # уже погашены. Логика: real_overdue = max(0, |balance| − unpaid_в_сроке).
+    # Если 0 — все «хвосты» этого контрагента перекрыты приходами, скрываем.
+    orders: list = []
+    skipped_fifo_covered = 0
+    for aid, data in by_agent_unpaid.items():
+        if not data["overdue"]:
+            continue
+        bal = data["balance"]
+        if bal is not None and bal >= 0:
+            # Контрагент вообще ничего не должен — старый фильтр (заказы как
+            # просрочка только из-за неразнесённой оплаты).
+            skipped_balance_ok += 1
+            continue
+        if bal is not None:
+            bal_abs = abs(bal)
+            in_сroк = data["in_сroк_unpaid_total"]
+            real_overdue = max(0.0, round(bal_abs - in_сroк, 2))
+            if real_overdue < 0.01:
+                # Все хвосты перекрыты приходами + новыми в-срок отгрузками.
+                skipped_fifo_covered += 1
+                logger.info(
+                    f"pdz_overdue_for_manager({manager_tag}): {data['agent_name']!r} "
+                    f"скрыт по FIFO — |balance|={bal_abs:.2f}, in_сroк={in_сroк:.2f}"
+                )
+                continue
+        orders.extend(data["overdue"])
+
+    if skipped_balance_ok or skipped_fifo_covered:
         logger.info(
-            f"pdz_overdue_for_manager({manager_tag}): пропущено {skipped_balance_ok} "
-            f"заказов с balance>=0 (клиент не должен)"
+            f"pdz_overdue_for_manager({manager_tag}): пропущено "
+            f"{skipped_balance_ok} контрагентов с balance>=0, "
+            f"{skipped_fifo_covered} с FIFO-перекрытием хвостов"
         )
 
     if not group_by_agent:
