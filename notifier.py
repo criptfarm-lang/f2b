@@ -532,7 +532,7 @@ def _build_approval_text(
         body = (
             f"\n🟢 Все 6 проверок ОК "
             f"(лимит {limit_pct}% · ДДС {cashflow.get('n_days', 0)}д · "
-            f"долг {_fmt_money(credit.get('current_debt', 0))} · "
+            f"долг {_fmt_money(credit.get('current_debt', 0))} _на {sent_at}_ · "
             f"сайт · контакты · цена)\n"
         )
         return header + body
@@ -540,6 +540,9 @@ def _build_approval_text(
     lines = ["\n"]
 
     # 1. Лимит
+    # snapshot-маркер: долг = balance на момент webhook'а. К моменту, когда
+    # согласующий откроет UI «Взаиморасчёты», цифра уже может вырасти из-за
+    # новых отгрузок — это не баг, см. plans/2026-05-21, Фаза 6.
     if credit["color"] == "yellow":
         lines.append(f"🟡 *Лимит:* не задан — заполните в карточке МС")
     else:
@@ -547,7 +550,8 @@ def _build_approval_text(
             f"{_icon(credit['color'])} *Лимит:* долг {_fmt_money(credit['current_debt'])} "
             f"+ заказ {_fmt_money(credit['order_sum'])} "
             f"= {_fmt_money(credit['effective_debt'])} ₽ "
-            f"из {_fmt_money(credit['limit'])} ₽"
+            f"из {_fmt_money(credit['limit'])} ₽ "
+            f"_(на {sent_at})_"
         )
 
     # 2. Просрочка
