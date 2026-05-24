@@ -521,7 +521,7 @@ def _build_approval_text(
 
     header = (
         f"🔔 *{client_name}* · {_fmt_money(order_sum)} ₽\n"
-        f"Заказ {order_name} · _{state_name}_\n"
+        f"Заказ {order_name}\n"
         f"👔 {manager_name} · 🕐 {sent_at}\n"
     )
 
@@ -544,7 +544,11 @@ def _build_approval_text(
     # согласующий откроет UI «Взаиморасчёты», цифра уже может вырасти из-за
     # новых отгрузок — это не баг, см. plans/2026-05-21, Фаза 6.
     if credit["color"] == "yellow":
-        lines.append(f"🟡 *Лимит:* не задан — заполните в карточке МС")
+        cd = credit.get("current_debt", 0) or 0
+        lines.append(
+            f"🟡 *Лимит:* не задан — заполните в карточке МС "
+            f"· текущий долг {_fmt_money(cd)} ₽ _(на {sent_at})_"
+        )
     else:
         lines.append(
             f"{_icon(credit['color'])} *Лимит:* долг {_fmt_money(credit['current_debt'])} "
