@@ -5018,20 +5018,9 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         if alert_data.get("closed_at"):
             await query.answer("Уже согласовано ✓", show_alert=False)
             return
-        has_non_green = any(c != "green" for c in colors.values())
-        if has_non_green:
-            n_red = sum(1 for c in colors.values() if c == "red")
-            n_yellow = sum(1 for c in colors.values() if c == "yellow")
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Да, согласовать", callback_data=f"appr_confirm|{alert_id}"),
-                InlineKeyboardButton("❌ Отмена",          callback_data=f"appr_cancel|{alert_id}"),
-            ]])
-            await query.message.reply_text(
-                f"⚠ Точно согласовать? В светофоре {n_red} красных, {n_yellow} жёлтых.",
-                reply_markup=kb,
-            )
-            return
-        # all-green → действие сразу (fall-through к appr_confirm)
+        # Confirmation-step убран по запросу Виктора 2026-05-25 — раз нажал
+        # «✅ Согласовано», значит решение принял; цвета светофора уже в самом
+        # сообщении, лишний шаг «Точно?» только тормозит.
         action = "appr_confirm"
 
     # --- appr_confirm ---
