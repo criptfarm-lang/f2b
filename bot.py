@@ -5184,16 +5184,37 @@ async def _build_report_data() -> dict:
             if len(rows)<200: break
             off+=200
 
+        # «Новые» клиенты — есть demand в окне (aid in curr_ids), нет demand до month_start.
+        # КРИТИЧНО: МС API при limit=1 нестабильно возвращает meta.size — иногда 0
+        # даже когда demand реально есть (ловили на Инессе: 12 из 13 «новых» оказались
+        # старыми клиентами с 8–116 demand до месяца). Надёжно — len(rows)+retry.
         new_client_names = {}
         for mgr, ids in tag_to_ids.items():
             for aid in ids:
                 if aid not in curr_ids: continue
-                async with session.get(f"{MS_BASE}/entity/demand", headers=get_headers(), params={"filter":f"agent={MS_BASE}/entity/counterparty/{aid};moment<{month_start} 00:00:00","limit":1}) as r:
-                    prev = await r.json()
-                if prev.get("meta",{}).get("size",0)==0:
+                has_before = False
+                for attempt in range(3):
+                    async with session.get(f"{MS_BASE}/entity/demand", headers=get_headers(), params={"filter":f"agent={MS_BASE}/entity/counterparty/{aid};moment<{month_start} 00:00:00","limit":1}) as r:
+                        prev = await r.json()
+                    if prev.get("rows"):
+                        has_before = True
+                        break
+                    if attempt < 2:
+                        await asyncio.sleep(0.4 * (attempt + 1))
+                if has_before:
+                    continue
+                # Получаем имя контрагента (тоже с retry — ответ counterparty
+                # иногда приходит без name, тогда тултип показывает UUID).
+                name = None
+                for attempt in range(3):
                     async with session.get(f"{MS_BASE}/entity/counterparty/{aid}", headers=get_headers()) as r2:
                         cp = await r2.json()
-                    new_client_names.setdefault(mgr,[]).append(cp.get("name",aid))
+                    name = cp.get("name")
+                    if name:
+                        break
+                    if attempt < 2:
+                        await asyncio.sleep(0.4 * (attempt + 1))
+                new_client_names.setdefault(mgr,[]).append(name or f"?({aid[:8]}…)")
 
         if today.month==1:
             prev_start = f"{today.year-1}-12-01"

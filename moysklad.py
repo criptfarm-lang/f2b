@@ -3365,21 +3365,30 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
                     break
                 offset += 200
 
-            # 3. Новые клиенты — у кого не было отгрузок до date_from
+            # 3. Новые клиенты — у кого не было отгрузок до date_from.
+            # ВАЖНО: meta.size при limit=1 у МС API нестабилен (даёт 0 даже когда
+            # demand есть). Надёжная проверка — len(rows) и retry на пустой ответ.
+            import asyncio as _asyncio
             for mgr_name, data_mgr in result.items():
                 new_clients = set()
                 for agent_id in data_mgr["clients"]:
-                    # Проверяем есть ли отгрузки до начала периода
-                    async with session.get(
-                        f"{MS_BASE}/entity/demand",
-                        headers=get_headers(),
-                        params={
-                            "filter": f"agent={MS_BASE}/entity/counterparty/{agent_id};moment<{date_from} 00:00:00",
-                            "limit": 1,
-                        }
-                    ) as r:
-                        prev = await r.json()
-                    if prev.get("meta", {}).get("size", 0) == 0:
+                    has_before = False
+                    for attempt in range(3):
+                        async with session.get(
+                            f"{MS_BASE}/entity/demand",
+                            headers=get_headers(),
+                            params={
+                                "filter": f"agent={MS_BASE}/entity/counterparty/{agent_id};moment<{date_from} 00:00:00",
+                                "limit": 1,
+                            }
+                        ) as r:
+                            prev = await r.json()
+                        if prev.get("rows"):
+                            has_before = True
+                            break
+                        if attempt < 2:
+                            await _asyncio.sleep(0.4 * (attempt + 1))
+                    if not has_before:
                         new_clients.add(agent_id)
                 result[mgr_name]["new_clients"] = len(new_clients)
                 logger.info(f"get_manager_shipments {mgr_name}: new_clients={len(new_clients)}")
