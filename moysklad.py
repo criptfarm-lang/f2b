@@ -1872,6 +1872,12 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
     # Если 0 — все «хвосты» этого контрагента перекрыты приходами, скрываем.
     orders: list = []
     skipped_fifo_covered = 0
+    # Параллельно с orders храним per-agent real_overdue, чтобы в grouped
+    # показывать сумму = «реальная просрочка» (после вычета новых в-срок отгрузок
+    # из общего долга контрагента), а не «сумма по всем неоплаченным заказам».
+    # Иначе у крупных клиентов сумма раздувается в 3-4 раза за счёт хвостов
+    # по `payedSum`, по которым приходы есть, но бухгалтерия не разнесла.
+    agent_real_overdue: dict = {}
     for aid, data in by_agent_unpaid.items():
         if not data["overdue"]:
             continue
@@ -1893,6 +1899,11 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
                     f"скрыт по FIFO — |balance|={bal_abs:.2f}, in_сroк={in_сroк:.2f}"
                 )
                 continue
+            agent_real_overdue[aid] = real_overdue
+        else:
+            # balance запрос упал — fallback: показываем полную сумму
+            # по неоплаченным заказам (поведение до FIFO-патча).
+            agent_real_overdue[aid] = round(sum(o["unpaid_sum"] for o in data["overdue"]), 2)
         orders.extend(data["overdue"])
 
     if skipped_balance_ok or skipped_fifo_covered:
@@ -1924,7 +1935,12 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
         agent_orders = data["orders"]
         # Самый старый просроченный заказ — по возрастанию effective_due_date.
         oldest = min(agent_orders, key=lambda x: x["effective_due_date"])
-        total_unpaid = round(sum(x["unpaid_sum"] for x in agent_orders), 2)
+        # total_unpaid = real_overdue по FIFO (|balance| − in_сроке), а не
+        # сумма по всем неоплаченным заказам. Fallback на сумму по заказам —
+        # только если balance запроса упал (см. agent_real_overdue выше).
+        total_unpaid = agent_real_overdue.get(
+            aid, round(sum(x["unpaid_sum"] for x in agent_orders), 2)
+        )
         max_days = max(x["days_overdue"] for x in agent_orders)
         grouped.append({
             "agent_id": aid,
