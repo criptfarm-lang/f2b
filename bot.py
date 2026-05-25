@@ -23,7 +23,7 @@ from telegram.ext import (
 
 from database import Database
 from notifier import check_order_agreed  # рассылка при согласовании — не трогать!
-from scheduler import setup_scheduler, get_group_chat_id
+from scheduler import setup_scheduler, get_group_chat_id, pdz_catch_up_missed_jobs
 from claude_ai import dispatch, smart_answer, parse_product_query
 from amocrm import check_connection as amo_check  # оставляем для совместимости
 from amo_alarms import (
@@ -6984,6 +6984,15 @@ def main():
         await run_web()
         await app.initialize()
         await app.start()
+
+        # Catch-up пропущенных PDZ-cron'ов: если контейнер пересобирался
+        # Amvera ПОСЛЕ cron-tick'а — AsyncIOScheduler без persistent jobstore
+        # этого не знает. Catch-up догоняет, иначе дайджест 14:10 теряется
+        # (как было 2026-05-22 и 2026-05-25).
+        try:
+            await pdz_catch_up_missed_jobs(app, db)
+        except Exception as e:
+            logger.error(f"pdz_catch_up_missed_jobs failed: {e}", exc_info=True)
 
         # Ждём завершения старого инстанса и принудительно сбрасываем webhook
         import asyncio as _asyncio

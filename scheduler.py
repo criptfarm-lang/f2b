@@ -80,20 +80,22 @@ def setup_scheduler(app: Application, db):
     # 13:55 и 14:00 МСК — снимок состояния заказов для ПДЗ-автоматики
     # (план 2026-05-20, Фаза 2). Два запуска: до банк-cut-off (13:55) и
     # после разнесения банка (14:00). Логика срывов сравнивает 14:00-снимки.
-    # misfire_grace_time=3600 + coalesce=True: если контейнер пересобирался
-    # в момент cron-tick (Amvera иногда так делает), job догонится при первом
-    # tick после старта, а не пропадёт молча (как было 2026-05-22).
+    # misfire_grace_time=3600 + coalesce=True: если scheduler работал, но не
+    # успел дёрнуть job (тяжёлая очередь и т.п.), tick догонится в течение часа.
+    # Если же контейнер был перезапущен ПОСЛЕ tick'а — misfire не помогает
+    # (AsyncIOScheduler без persistent jobstore не знает о пропуске). Этот
+    # сценарий покрыт pdz_catch_up_missed_jobs(), вызывается из bot.py при старте.
     scheduler.add_job(
-        pdz_take_snapshot_job,
+        _pdz_run_and_record,
         CronTrigger(hour=13, minute=55, timezone=MSK),
-        args=[app, db],
+        args=["pdz_snapshot_1355", pdz_take_snapshot_job, app, db],
         id="pdz_snapshot_1355",
         misfire_grace_time=3600, coalesce=True,
     )
     scheduler.add_job(
-        pdz_take_snapshot_job,
+        _pdz_run_and_record,
         CronTrigger(hour=14, minute=0, timezone=MSK),
-        args=[app, db],
+        args=["pdz_snapshot_1400", pdz_take_snapshot_job, app, db],
         id="pdz_snapshot_1400",
         misfire_grace_time=3600, coalesce=True,
     )
@@ -103,9 +105,9 @@ def setup_scheduler(app: Application, db):
     # snapshot, пишет события в promise_log и шлёт TG-алерт собственнику
     # при изменении ppm_initial («Дата планируемой оплаты», менять нельзя).
     scheduler.add_job(
-        pdz_process_events_job,
+        _pdz_run_and_record,
         CronTrigger(hour=14, minute=2, timezone=MSK),
-        args=[app, db],
+        args=["pdz_process_events_1402", pdz_process_events_job, app, db],
         id="pdz_process_events_1402",
         misfire_grace_time=3600, coalesce=True,
     )
@@ -113,18 +115,18 @@ def setup_scheduler(app: Application, db):
     # 14:10 МСК — TG-дайджест каждому менеджеру с просрочками (Фаза 4).
     # Если просрочек нет — тишина.
     scheduler.add_job(
-        pdz_send_digests_job,
+        _pdz_run_and_record,
         CronTrigger(hour=14, minute=10, timezone=MSK),
-        args=[app, db],
+        args=["pdz_send_digests_14_10", pdz_send_digests_job, app, db],
         id="pdz_send_digests_14_10",
         misfire_grace_time=3600, coalesce=True,
     )
 
     # 16:05 МСК — пинг собственнику по необработанным после дедлайна 16:00 (Фаза 4).
     scheduler.add_job(
-        pdz_send_owner_pending_job,
+        _pdz_run_and_record,
         CronTrigger(hour=16, minute=5, timezone=MSK),
-        args=[app, db],
+        args=["pdz_send_owner_pending_16_05", pdz_send_owner_pending_job, app, db],
         id="pdz_send_owner_pending_16_05",
         misfire_grace_time=3600, coalesce=True,
     )
@@ -134,9 +136,9 @@ def setup_scheduler(app: Application, db):
     # менеджерам). Источник — БД (pdz_snapshots + promise_log), МС API не
     # дёргается. Шлёт собственнику ссылку с токеном TTL 24ч.
     scheduler.add_job(
-        pdz_generate_html_job,
+        _pdz_run_and_record,
         CronTrigger(hour=14, minute=15, timezone=MSK),
-        args=[app, db],
+        args=["pdz_generate_html_14_15", pdz_generate_html_job, app, db],
         id="pdz_generate_html_14_15",
         misfire_grace_time=3600, coalesce=True,
     )
@@ -312,6 +314,76 @@ async def check_aging_clients(app: Application):
 
     except Exception as e:
         logger.error(f"check_aging_clients: {e}", exc_info=True)
+
+
+async def _pdz_run_and_record(job_id: str, func, app: Application, db):
+    """Обёртка для всех PDZ-cron-job'ов: вызывает func(app, db) и при успехе
+    записывает дату последнего выполнения в bot_settings.pdz_job_last_run_{id}.
+
+    Нужно для pdz_catch_up_missed_jobs() — он смотрит last_run при старте
+    бота, чтобы понять, был ли job сегодня запущен. Если упал — last_run
+    не пишем, тогда catch-up попробует ещё раз при следующем старте.
+    """
+    try:
+        result = await func(app, db)
+        try:
+            db.set_pdz_job_last_run(job_id, datetime.now(MSK).date())
+        except Exception as ee:
+            logger.warning(f"_pdz_run_and_record({job_id}): set last_run failed: {ee}")
+        return result
+    except Exception:
+        logger.error(f"_pdz_run_and_record({job_id}): job упал", exc_info=True)
+        raise
+
+
+async def pdz_catch_up_missed_jobs(app: Application, db):
+    """Вызывается ОДИН раз при старте бота, после setup_scheduler.
+
+    Для каждого PDZ-cron-job: если сегодняшнее cron-время уже прошло
+    И job сегодня ещё не выполнялся (last_run != today) → запускаем сейчас.
+
+    Закрывает сценарий: контейнер Amvera пересобирался ПОСЛЕ cron-tick'а,
+    AsyncIOScheduler без persistent jobstore не знает о пропуске. Без catch-up
+    дайджесты пропадают, как было 2026-05-22 (14:10) и 2026-05-25 (14:10).
+    """
+    import asyncio as _asyncio
+    now = datetime.now(MSK)
+    today = now.date()
+
+    pdz_jobs = [
+        ("pdz_snapshot_1355",            13, 55, pdz_take_snapshot_job),
+        ("pdz_snapshot_1400",            14,  0, pdz_take_snapshot_job),
+        ("pdz_process_events_1402",      14,  2, pdz_process_events_job),
+        ("pdz_send_digests_14_10",       14, 10, pdz_send_digests_job),
+        ("pdz_generate_html_14_15",      14, 15, pdz_generate_html_job),
+        ("pdz_send_owner_pending_16_05", 16,  5, pdz_send_owner_pending_job),
+    ]
+
+    caught = 0
+    for job_id, h, m, func in pdz_jobs:
+        cron_time_today = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if now < cron_time_today:
+            continue  # cron-время ещё впереди — scheduler сам дёрнет
+        try:
+            last_run = db.get_pdz_job_last_run(job_id)
+        except Exception as e:
+            logger.warning(f"pdz_catch_up: get_pdz_job_last_run({job_id}) failed: {e}")
+            last_run = None
+        if last_run == today:
+            continue  # уже отрабатывал сегодня — не дублировать
+
+        logger.warning(
+            f"pdz_catch_up: {job_id} был пропущен (cron {h:02d}:{m:02d} МСК, "
+            f"last_run={last_run}, today={today}). Запускаю сейчас."
+        )
+        try:
+            await _pdz_run_and_record(job_id, func, app, db)
+            caught += 1
+        except Exception:
+            pass  # уже залогировано внутри обёртки
+        await _asyncio.sleep(2)  # не нагружать МС API подряд
+
+    logger.info(f"pdz_catch_up: догнано {caught} job'ов")
 
 
 async def pdz_take_snapshot_job(app: Application, db):

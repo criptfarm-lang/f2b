@@ -1121,6 +1121,31 @@ class Database:
             ("pdz_html_cache", html_text, html_text)
         )
 
+    # ── Учёт последнего успешного запуска каждого PDZ-cron-job ───────────────
+    # Нужно для catch-up на старте бота: если контейнер пересобирался Amvera
+    # после cron-tick'а — AsyncIOScheduler без persistent jobstore этого
+    # не заметит. Catch-up при старте проверит last_run и догонит пропуски.
+    def get_pdz_job_last_run(self, job_id: str):
+        import datetime as _dt
+        row = self._fetchone(
+            "SELECT value FROM bot_settings WHERE key=%s",
+            (f"pdz_job_last_run_{job_id}",)
+        )
+        if not row or not row.get("value"):
+            return None
+        try:
+            return _dt.date.fromisoformat(row["value"])
+        except Exception:
+            return None
+
+    def set_pdz_job_last_run(self, job_id: str, when):
+        s = when.isoformat() if hasattr(when, "isoformat") else str(when)
+        self._execute(
+            """INSERT INTO bot_settings (key, value) VALUES (%s, %s)
+               ON CONFLICT (key) DO UPDATE SET value=%s""",
+            (f"pdz_job_last_run_{job_id}", s, s)
+        )
+
     def save_manager_chat_id(self, user_id: int, full_name: str):
         self._execute(
             """INSERT INTO manager_chats (user_id, full_name, updated_at)
