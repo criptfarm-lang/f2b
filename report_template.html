@@ -326,12 +326,12 @@ function renderAllDetail(){
     }).join('');
     const newTip=newNames.length?newNames.join('<br>'):'нет данных';
     const lostTip=lostNames.length?lostNames.join('<br>'):'нет данных';
-    const badges=(newCl>0?'<span class="badge badge-new">+ новых: '+newCl+'<span class="tooltip">'+newTip+'</span></span>':'')
-                +(lost>0?'<span class="badge badge-lost">▼ выбыли: '+lost+'<span class="tooltip">'+lostTip+'</span></span>':'');
+    const badges='<span class="badge badge-new">+ новых: '+newCl+'<span class="tooltip">'+newTip+'</span></span>'
+                +'<span class="badge badge-lost">▼ выбыли: '+lost+'<span class="tooltip">'+lostTip+'</span></span>';
     return '<div class="detail-card"><div class="dc-header">'
           +'<span class="dc-name" style="color:'+color+'">'+short+'</span>'
           +'<span class="dc-avg '+pClass(avg)+'">'+avg+'%</span></div>'
-          +rows+(badges?'<div style="margin-top:8px">'+badges+'</div>':'')+'</div>';
+          +rows+'<div style="margin-top:8px">'+badges+'</div></div>';
   }).join('');
 }
 
@@ -370,8 +370,8 @@ function renderMgrDetail(mg){
 
   const newTip=newNames.length?newNames.join('<br>'):'нет данных';
   const lostTip=lostNames.length?lostNames.join('<br>'):'нет данных';
-  const badges=(newCl>0?'<span class="badge badge-new">+ новых: '+newCl+'<span class="tooltip">'+newTip+'</span></span>':'')
-              +(lost>0?'<span class="badge badge-lost">▼ выбыли: '+lost+'<span class="tooltip">'+lostTip+'</span></span>':'');
+  const badges='<span class="badge badge-new">+ новых: '+newCl+'<span class="tooltip">'+newTip+'</span></span>'
+              +'<span class="badge badge-lost">▼ выбыли: '+lost+'<span class="tooltip">'+lostTip+'</span></span>';
 
   // Общая аттестация → badge рядом с именем. План: 2026-05-21-виджет-..., Фаза 4.
   // Полоски «Аттестация общая/АКБ» удалены: их заменяет badge + плитка % работы на новых.
@@ -402,7 +402,7 @@ function renderMgrDetail(mg){
    +'</div>'
    +rows
    +nsWrap
-   +(badges?'<div style="margin-top:8px">'+badges+'</div>':'')
+   +'<div style="margin-top:8px">'+badges+'</div>'
    +'</div>';
 }
 
