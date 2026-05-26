@@ -1872,6 +1872,7 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
     # Если 0 — все «хвосты» этого контрагента перекрыты приходами, скрываем.
     orders: list = []
     skipped_fifo_covered = 0
+    skipped_balance_unknown = 0
     # Параллельно с orders храним per-agent real_overdue, чтобы в grouped
     # показывать сумму = «реальная просрочка» (после вычета новых в-срок отгрузок
     # из общего долга контрагента), а не «сумма по всем неоплаченным заказам».
@@ -1882,35 +1883,43 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
         if not data["overdue"]:
             continue
         bal = data["balance"]
-        if bal is not None and bal >= 0:
+        if bal is None:
+            # balance не подтянулся при snapshot (rate-limit/timeout МС API).
+            # Без balance FIFO не применим. Пропускаем, чтобы не показать
+            # клиента с раздутыми «хвостами» по payedSum (кейс КОСМОС/СПЕКТР
+            # 2026-05-26). Лучше скрыть, чем дать ложный сигнал — менеджер
+            # перестанет доверять дайджесту.
+            skipped_balance_unknown += 1
+            logger.info(
+                f"pdz_overdue_for_manager({manager_tag}): {data['agent_name']!r} "
+                f"скрыт — balance=None в snapshot"
+            )
+            continue
+        if bal >= 0:
             # Контрагент вообще ничего не должен — старый фильтр (заказы как
             # просрочка только из-за неразнесённой оплаты).
             skipped_balance_ok += 1
             continue
-        if bal is not None:
-            bal_abs = abs(bal)
-            in_сroк = data["in_сroк_unpaid_total"]
-            real_overdue = max(0.0, round(bal_abs - in_сroк, 2))
-            if real_overdue < 0.01:
-                # Все хвосты перекрыты приходами + новыми в-срок отгрузками.
-                skipped_fifo_covered += 1
-                logger.info(
-                    f"pdz_overdue_for_manager({manager_tag}): {data['agent_name']!r} "
-                    f"скрыт по FIFO — |balance|={bal_abs:.2f}, in_сroк={in_сroк:.2f}"
-                )
-                continue
-            agent_real_overdue[aid] = real_overdue
-        else:
-            # balance запрос упал — fallback: показываем полную сумму
-            # по неоплаченным заказам (поведение до FIFO-патча).
-            agent_real_overdue[aid] = round(sum(o["unpaid_sum"] for o in data["overdue"]), 2)
+        bal_abs = abs(bal)
+        in_сroк = data["in_сroк_unpaid_total"]
+        real_overdue = max(0.0, round(bal_abs - in_сroк, 2))
+        if real_overdue < 0.01:
+            # Все хвосты перекрыты приходами + новыми в-срок отгрузками.
+            skipped_fifo_covered += 1
+            logger.info(
+                f"pdz_overdue_for_manager({manager_tag}): {data['agent_name']!r} "
+                f"скрыт по FIFO — |balance|={bal_abs:.2f}, in_сroк={in_сroк:.2f}"
+            )
+            continue
+        agent_real_overdue[aid] = real_overdue
         orders.extend(data["overdue"])
 
-    if skipped_balance_ok or skipped_fifo_covered:
+    if skipped_balance_ok or skipped_fifo_covered or skipped_balance_unknown:
         logger.info(
             f"pdz_overdue_for_manager({manager_tag}): пропущено "
-            f"{skipped_balance_ok} контрагентов с balance>=0, "
-            f"{skipped_fifo_covered} с FIFO-перекрытием хвостов"
+            f"{skipped_balance_ok} с balance>=0, "
+            f"{skipped_fifo_covered} с FIFO-перекрытием, "
+            f"{skipped_balance_unknown} с balance=None"
         )
 
     if not group_by_agent:
