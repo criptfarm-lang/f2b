@@ -5377,6 +5377,88 @@ async def cmd_reset_agreed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+async def cmd_fishki_remind_dry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Собрать preview FISHки-reminder в таблицу fishki_reminders."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    await update.message.reply_text("🔍 Собираю превью FISHки-reminder…")
+    try:
+        from fishki_reminder import build_preview
+        result = await build_preview(db)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка превью: {e}")
+        return
+
+    ready = result["ready"]
+    skipped = result["skipped"]
+    header = f"📋 Превью готово: {len(ready)} к отправке, {len(skipped)} пропущено.\n"
+    lines = [
+        f"• {x['company']} — № {x['order_name']} ({x['days_left']} дн.) → {x['chat_type']}"
+        for x in ready
+    ]
+    body = "\n".join(lines)
+    skipped_txt = ""
+    if skipped:
+        skipped_txt = "\n\n⏭ Пропущены:\n" + "\n".join(
+            f"• {x['company']} — {x['reason']}" for x in skipped
+        )
+    footer = "\n\nОдобрить → /fishki_remind_send\nОтменить/прервать → /fishki_remind_stop"
+    full = header + "\n" + body + skipped_txt + footer
+
+    for start in range(0, len(full), 3500):
+        await update.message.reply_text(full[start:start + 3500])
+
+    if ready:
+        await update.message.reply_text(
+            f"Пример полного сообщения ({ready[0]['company']}):\n\n{ready[0]['msg']}"
+        )
+
+
+async def cmd_fishki_remind_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запустить отправку preview-сообщений через Wazzup, плавно."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    await update.message.reply_text("🚀 Запускаю плавную рассылку (90–120 сек/сообщение).")
+    from fishki_reminder import send_burst
+
+    owner_id = user.id
+    tg_bot = context.bot
+
+    async def progress_cb(idx, total, ok, failed):
+        try:
+            await tg_bot.send_message(
+                owner_id, f"📤 {idx}/{total} (✅ {ok} / ❌ {failed})"
+            )
+        except Exception:
+            pass
+
+    try:
+        result = await send_burst(db, progress_cb=progress_cb)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Сбой рассылки: {e}")
+        return
+
+    if "error" in result:
+        await update.message.reply_text(f"❌ {result['error']}")
+        return
+    await update.message.reply_text(
+        f"🏁 Готово. Всего {result['total']} | ✅ {result['sent']} | ❌ {result['failed']}"
+        + (" | прервано" if result.get("stopped") else "")
+    )
+
+
+async def cmd_fishki_remind_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Прервать текущую рассылку (после очередного сообщения)."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    from fishki_reminder import STOP_EVENT
+    STOP_EVENT.set()
+    await update.message.reply_text("🛑 Stop-флаг выставлен. Текущая рассылка завершится.")
+
+
 async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/notifier_status — заказы за сегодня которым не ушла рассылка."""
     user = update.effective_user
@@ -6485,6 +6567,9 @@ def main():
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
     app.add_handler(CommandHandler("ms_attributes", cmd_ms_attributes))
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
+    app.add_handler(CommandHandler("fishki_remind_dry", cmd_fishki_remind_dry))
+    app.add_handler(CommandHandler("fishki_remind_send", cmd_fishki_remind_send))
+    app.add_handler(CommandHandler("fishki_remind_stop", cmd_fishki_remind_stop))
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_approval_callback, pattern="^appr_"))
