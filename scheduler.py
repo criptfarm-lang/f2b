@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from telegram.ext import Application
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from claude_ai import generate_morning_summary
 
@@ -158,21 +159,24 @@ def setup_scheduler(app: Application, db):
         id="op_new_share_snapshot_fri_08"
     )
 
-    # Каждые 30 мин в рабочие часы 9-19 МСК — обработка прайс-листов из канала «Мониторинг».
+    # Каждые 30 мин — обработка прайс-листов из канала «Мониторинг».
     # Скилл update-market-intel остаётся для PDF и сложных кейсов (manual fallback);
     # cron автоматически разбирает text/photo. План: 2026-05-22, Фаза 1.4.
     #
-    # misfire_grace_time=3600 + coalesce=True: без них APScheduler с дефолтом
-    # misfire_grace_time=1 пропускает каждый tick (потому что scheduler.start()
-    # вызывается асинхронно через await, и первый tick может задержаться > 1 сек).
-    # Зафиксировано 2026-05-26: cron 12:00-16:00 не отработал ни разу из-за этого.
+    # Заменено CronTrigger(hour='9-19', minute='*/30') → IntervalTrigger(minutes=30).
+    # Зафиксировано 2026-05-26: CronTrigger с двумя ограничителями (hour+minute)
+    # не дёргал job ни разу 12:00-16:30 МСК, даже с misfire_grace_time=3600.
+    # IntervalTrigger надёжнее: первый tick через 30 сек после старта, дальше каждые 30 мин.
+    # Окно 9-19 МСК потеряли (теперь 24/7), но это OK для MVP — обработка прайсов
+    # имеет low cost и нет вреда от ночного запуска.
     from market_intel_processor import market_intel_cron_job
     scheduler.add_job(
         market_intel_cron_job,
-        CronTrigger(hour='9-19', minute='*/30', timezone=MSK),
+        IntervalTrigger(minutes=30, timezone=MSK),
         args=[app, db],
         id="market_intel_process",
         misfire_grace_time=3600, coalesce=True,
+        next_run_time=datetime.now(MSK) + timedelta(seconds=30),
     )
 
     scheduler.start()
