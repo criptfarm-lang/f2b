@@ -154,6 +154,17 @@ def setup_scheduler(app: Application, db):
         id="op_new_share_snapshot_fri_08"
     )
 
+    # Каждые 30 мин в рабочие часы 9-19 МСК — обработка прайс-листов из канала «Мониторинг».
+    # Скилл update-market-intel остаётся для PDF и сложных кейсов (manual fallback);
+    # cron автоматически разбирает text/photo. План: 2026-05-22, Фаза 1.4.
+    from market_intel_processor import market_intel_cron_job
+    scheduler.add_job(
+        market_intel_cron_job,
+        CronTrigger(hour='9-19', minute='*/30', timezone=MSK),
+        args=[app, db],
+        id="market_intel_process"
+    )
+
     scheduler.start()
     logger.info("✅ Планировщик запущен")
     for job in scheduler.get_jobs():
