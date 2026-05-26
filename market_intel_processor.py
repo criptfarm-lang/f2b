@@ -269,8 +269,10 @@ def _insert_lots(db, lots: list[dict], supplier_id: str, msg_id: int,
                             received_at, valid_until, msg_id, source_file, raw_text,
                             confidence, notes
                         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (supplier_id, COALESCE(msg_id, 0), species, weight_class,
-                                     processing, state, price_rub_kg, COALESCE(volume_tier, ''))
+                        ON CONFLICT (supplier_id, COALESCE(msg_id, 0), species,
+                                     COALESCE(region, 'прочее'::procurement.region_enum),
+                                     weight_class, processing, state, price_rub_kg,
+                                     COALESCE(volume_tier, ''), COALESCE(conditions, ''))
                         WHERE superseded_by_lot_id IS NULL DO NOTHING""",
                         (
                             species, lot.get("subspecies"), region,
