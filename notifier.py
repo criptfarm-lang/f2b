@@ -720,14 +720,33 @@ async def check_approval_needed(order_href: str, bot, db):
         # 6. Дедуп: sum_hash = округлённая сумма в ₽
         sum_hash = round(order_sum)
 
-        # Резолвим manager_user_id (для callback `appr_comment`)
+        # Резолвим manager_user_id (для callback `appr_comment`).
+        # 1) Primary — захардкоженный маппинг PDZ_MANAGER_TG_IDS (lowercased
+        #    фамилия → tg user_id). Тот же фикс, что в PDZ-flow (коммит 49bb318):
+        #    db.get_manager_chat_id спотыкается о невидимые символы и
+        #    регистр в /managers.
+        # 2) Fallback — db.get_manager_chat_id (вдруг новый менеджер не
+        #    проставлен в PDZ_MANAGER_TG_IDS, но засинкан в managers).
+        from moysklad import PDZ_MANAGER_TG_IDS
         mgr_user_id = 0
         if manager_name:
             for part in manager_name.split():
-                cid = db.get_manager_chat_id(part)
-                if cid:
-                    mgr_user_id = cid
+                key = part.lower().strip(".,").rstrip()
+                if key in PDZ_MANAGER_TG_IDS:
+                    mgr_user_id = PDZ_MANAGER_TG_IDS[key]
                     break
+            if not mgr_user_id:
+                for part in manager_name.split():
+                    cid = db.get_manager_chat_id(part)
+                    if cid:
+                        mgr_user_id = cid
+                        break
+        if not mgr_user_id and manager_name:
+            logger.warning(
+                f"check_approval_needed: не нашёл tg_id для менеджера "
+                f"'{manager_name}' (ни в PDZ_MANAGER_TG_IDS, ни в /managers). "
+                f"Reply-flow по этому заказу работать не будет."
+            )
 
         # 7. Атомарная вставка с дедупом
         alert_id = db.try_insert_approval_alert(

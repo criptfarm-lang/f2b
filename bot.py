@@ -1561,6 +1561,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             client_name = pending.get("client_name", "")
             mgr_name = pending.get("manager_name", "?")
 
+            # Fallback: если в БД остался mgr_user_id=0 (из-за старого бага
+            # db.get_manager_chat_id), пробуем дорезолвить через
+            # PDZ_MANAGER_TG_IDS на лету.
+            if not mgr_uid and mgr_name and mgr_name != "?":
+                from moysklad import PDZ_MANAGER_TG_IDS
+                for part in mgr_name.split():
+                    key = part.lower().strip(".,").rstrip()
+                    if key in PDZ_MANAGER_TG_IDS:
+                        mgr_uid = PDZ_MANAGER_TG_IDS[key]
+                        logger.info(
+                            f"appr_comment fallback: {mgr_name} → {mgr_uid} "
+                            f"через PDZ_MANAGER_TG_IDS"
+                        )
+                        break
+
             if mgr_uid:
                 try:
                     await context.bot.send_message(
