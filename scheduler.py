@@ -1049,15 +1049,12 @@ async def pdz_generate_html_job(app: Application, db) -> dict:
         logger.error(f"pdz_generate_html_job: set_pdz_html_cache: {e}", exc_info=True)
         return {"status": "error_save", "error": str(e)}
 
-    # Токен на 24 часа, mgr_filter='pdz' = маркер для handle_pdz_html.
-    try:
-        token = db.create_report_link(mgr_filter="pdz", ttl_minutes=24 * 60)
-    except Exception as e:
-        logger.error(f"pdz_generate_html_job: create_report_link: {e}", exc_info=True)
-        return {"status": "error_link", "error": str(e)}
-
-    base = os.getenv("RAILWAY_PUBLIC_DOMAIN", "f2b-production.up.railway.app")
-    url = f"https://{base}/pdz?token={token}"
+    # Шаг 4 плана plans/2026-05-21-единый-дашборд-f2b.md: вместо одноразового
+    # /pdz?token=… ссылаемся на единый дашборд, вкладку «Дебиторка». Дашборд
+    # тянет HTML server-side через /pdz/embed?secret=… (постоянный), TTL-токен
+    # для отчёта больше не нужен. Basic Auth на /dashboard — admin / Archor973.
+    dashboard_base = os.getenv("DASHBOARD_URL", "https://f2b-fishki-victor03.amvera.io").rstrip("/")
+    url = f"{dashboard_base}/dashboard?tab=pdz"
 
     try:
         await app.bot.send_message(
@@ -1070,12 +1067,11 @@ async def pdz_generate_html_job(app: Application, db) -> dict:
         return {"status": "error_send", "error": str(e), "url": url}
 
     logger.info(
-        f"pdz_generate_html_job: html={len(html_text)} симв, token={token[:8]}…"
+        f"pdz_generate_html_job: html={len(html_text)} симв, url={url}"
     )
     return {
         "status": "ok",
         "html_size": len(html_text),
-        "token": token,
         "url": url,
     }
 
