@@ -1,0 +1,388 @@
+"""Заявки на закупку — handler для бота «Эф» (Phase 3.2).
+
+План: plans/2026-05-26-procurement-requests.md в репо f2b-second-brain.
+
+Менеджер жмёт «📝 Новая заявка» → вставляет текст → LLM парсит → preview →
+подтверждение → INSERT в procurement.requests + TG-нотификация закупщику.
+
+Зеркало parser/router из procurement_app/lib — копия sync с dictionaries.md.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass, asdict
+from datetime import date, datetime, timedelta
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# ─── ENUM (sync с .business/raw-materials/dictionaries.md) ─────────────────
+
+SPECIES_ENUM = {
+    "лосось", "форель", "кета", "горбуша", "нерка", "кижуч", "чавыча",
+    "треска", "пикша", "минтай", "судак", "сибас", "дорадо", "палтус",
+    "зубатка", "масляная", "тилапия", "пангасиус",
+    "угорь", "тунец", "скумбрия", "сельдь",
+    "креветка", "кальмар", "осьминог", "гребешок", "мидия", "устрица",
+    "краб", "омар", "лангустин",
+    "икра", "прочее",
+}
+PROCESSING_ENUM = {
+    "НПСГ", "ПСГ", "ПБГ", "Б/Г",
+    "Trim PR", "Trim A", "Trim B", "Trim C", "Trim D",
+    "стейк", "кусок", "тушка", "хвост", "unspecified",
+}
+STATE_ENUM = {"охл", "IQF", "блок", "глубокая-заморозка", "сушёный", "unspecified"}
+PRODUCT_FORM_ENUM = {
+    "сырьё", "слабосоль", "сильносоль", "х/к", "г/к",
+    "сухой-засол", "вяленое", "консервы",
+}
+REGION_ENUM = {
+    "Чёрное море РФ", "Мурманск", "Карелия", "Северная Осетия",
+    "Северо-Запад РФ", "Дальний Восток РФ", "Каспий",
+    "Армения", "Беларусь", "Казахстан",
+    "Иран", "Турция-озеро", "Турция-море", "Грузия", "Норвегия",
+    "Фарерские о-ва", "Чили", "Аргентина", "Эквадор", "Перу",
+    "Китай", "Вьетнам", "Таиланд", "Индия", "Индонезия", "Бангладеш",
+}
+
+# ─── Маппинг закупщиков (sync с dictionaries.md::species_to_owner) ─────────
+
+BELYAKOVA_SPECIES = {"лосось", "форель", "масляная"}
+KRISTINA_GO_LIVE = date(2026, 6, 2)
+
+# TG chat_id закупщиков (sync с manager_chats в БД, см. memory). При смене
+# состава — править здесь + в dictionaries.md.
+ASSIGNEE_TG = {
+    "belyakova": 8267564735,
+    "kristina":  8185545246,
+    "victor":    360092495,
+}
+
+# Виктор как fallback при species_unclassified (получает все 3 одновременно).
+UNCLASSIFIED_NOTIFY_TG = [
+    ASSIGNEE_TG["belyakova"],
+    ASSIGNEE_TG["kristina"],
+    ASSIGNEE_TG["victor"],
+]
+
+
+def route_request(species: Optional[str], today: Optional[date] = None) -> Optional[str]:
+    today = today or date.today()
+    if species is None:
+        return None
+    species = species.strip().lower()
+    if species in BELYAKOVA_SPECIES:
+        return "belyakova"
+    if today < KRISTINA_GO_LIVE:
+        return "victor"
+    return "kristina"
+
+
+# ─── LLM-парсер ────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """Ты — парсер заявок на закупку рыбы и морепродуктов для компании F2B.
+Менеджер вставляет свободный текст запроса от клиента. Твоя задача — извлечь
+структурированные поля и вернуть JSON. Никаких комментариев, никакого markdown.
+
+ENUM-значения (используй ТОЛЬКО эти, если не совпадает — возвращай null):
+
+species: лосось, форель, кета, горбуша, нерка, кижуч, чавыча, треска, пикша,
+минтай, судак, сибас, дорадо, палтус, зубатка, масляная, тилапия, пангасиус,
+угорь, тунец, скумбрия, сельдь, креветка, кальмар, осьминог, гребешок, мидия,
+устрица, краб, омар, лангустин, икра.
+
+processing: НПСГ, ПСГ, ПБГ, Б/Г, Trim PR, Trim A, Trim B, Trim C, Trim D,
+стейк, кусок, тушка, хвост, unspecified.
+
+state: охл (охлаждённое), IQF, блок, глубокая-заморозка, сушёный, unspecified.
+«с/м», «свежемороженое», «зам», «замороженное», «з/м» → глубокая-заморозка.
+ВАЖНО: «х/к», «г/к», «слабосоль», «копчёное» — это НЕ state, а product_form.
+
+product_form: сырьё, слабосоль, сильносоль, х/к (холодного копчения),
+г/к (горячего копчения), сухой-засол, вяленое, консервы. По умолчанию «сырьё».
+
+weight_class: свободный текст («5-6», «4+», «1.5-2.0», «2-3», «3.5+»).
+
+volume_kg: число в килограммах. «200 кг» → 200. «1 тонна» → 1000.
+
+target_price_rub_kg: число (рубли за кг).
+
+target_date: ISO дата СТРОГО ПОСЛЕ сегодня (`{today}`, день недели: `{today_dow}`).
+ПРАВИЛО для «к {{dow}}»: ближайший будущий {{dow}}, СТРОГО позднее today.
+Сегодня == целевой dow → +7 дней.
+Примеры (today=2026-05-26 вторник): «к понедельнику» → 2026-06-01;
+«к четвергу» → 2026-05-28; «к вторнику» → 2026-06-02; «завтра» → 2026-05-27;
+«на следующей неделе» → 2026-06-01.
+
+subspecies: ваннамеи/тигровая/северная/гребенчатая для креветки;
+лососёвая/кетовая/щучья/форелевая для икры. Регион — отдельное поле.
+
+region: «чёрноморская» → Чёрное море РФ; «карельская» → Карелия;
+«мурманский/-ая» → Мурманск; «осетинская» → Северная Осетия;
+«армянская» → Армения; «иранская» → Иран; «чилийский» → Чили;
+«норвежский» → Норвегия. ENUM (используй ТОЛЬКО эти):
+Чёрное море РФ, Мурманск, Карелия, Северная Осетия, Северо-Запад РФ,
+Дальний Восток РФ, Каспий, Армения, Беларусь, Казахстан, Иран,
+Турция-озеро, Турция-море, Грузия, Норвегия, Фарерские о-ва, Чили,
+Аргентина, Эквадор, Перу, Китай, Вьетнам, Таиланд, Индия, Индонезия, Бангладеш.
+
+client_hint: имя клиента / ИНН / название ресторана. Иначе null.
+
+confidence: 0.00-1.00. < 0.50 если основные поля (species + processing) не извлекаются.
+
+Возвращай СТРОГО JSON со всеми полями.
+
+Пример: «Лосось ПБГ 5-6 охл 200 кг к четвергу до 720 ₽» →
+{{"species": "лосось", "subspecies": null, "region": null,
+ "weight_class": "5-6", "processing": "ПБГ", "state": "охл",
+ "product_form": "сырьё", "volume_kg": 200, "target_price_rub_kg": 720,
+ "target_date": "2026-05-28", "client_hint": null, "confidence": 0.95}}
+"""
+
+
+@dataclass
+class ParsedRequest:
+    species: Optional[str]
+    subspecies: Optional[str]
+    region: Optional[str]
+    weight_class: Optional[str]
+    processing: Optional[str]
+    state: Optional[str]
+    product_form: Optional[str]
+    volume_kg: Optional[float]
+    target_price_rub_kg: Optional[float]
+    target_date: Optional[str]    # ISO string для JSON-сериализации в draft
+    client_hint: Optional[str]
+    confidence: float
+    raw_text: str = ""
+
+
+def _validate_enum(v: Optional[str], allowed: set) -> Optional[str]:
+    if v is None:
+        return None
+    return v if v in allowed else None
+
+
+async def parse_request_text(text: str, today: Optional[date] = None) -> ParsedRequest:
+    """Дёргает Claude Haiku 4.5 + валидирует ENUM."""
+    from anthropic import AsyncAnthropic
+
+    today = today or date.today()
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY не задан")
+    client = AsyncAnthropic(api_key=api_key)
+
+    dows = ["понедельник", "вторник", "среда", "четверг",
+            "пятница", "суббота", "воскресенье"]
+    system = SYSTEM_PROMPT.format(
+        today=today.isoformat(), today_dow=dows[today.weekday()]
+    )
+
+    msg = await client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=512,
+        system=[{"type": "text", "text": system,
+                 "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": text.strip()}],
+    )
+    raw = msg.content[0].text.strip()
+    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not json_match:
+        return ParsedRequest(
+            species=None, subspecies=None, region=None, weight_class=None,
+            processing=None, state=None, product_form=None, volume_kg=None,
+            target_price_rub_kg=None, target_date=None, client_hint=None,
+            confidence=0.0, raw_text=text,
+        )
+    try:
+        data = json.loads(json_match.group(0))
+    except json.JSONDecodeError:
+        return ParsedRequest(
+            species=None, subspecies=None, region=None, weight_class=None,
+            processing=None, state=None, product_form=None, volume_kg=None,
+            target_price_rub_kg=None, target_date=None, client_hint=None,
+            confidence=0.0, raw_text=text,
+        )
+
+    species = _validate_enum(data.get("species"), SPECIES_ENUM)
+    processing = _validate_enum(data.get("processing"), PROCESSING_ENUM)
+    state = _validate_enum(data.get("state"), STATE_ENUM)
+    product_form = _validate_enum(data.get("product_form"), PRODUCT_FORM_ENUM)
+    region = _validate_enum(data.get("region"), REGION_ENUM)
+
+    td_raw = data.get("target_date")
+    td = None
+    if td_raw:
+        try:
+            d = datetime.strptime(td_raw, "%Y-%m-%d").date()
+            if today <= d <= today + timedelta(days=90):
+                td = d.isoformat()
+        except ValueError:
+            pass
+
+    def _num(v):
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    return ParsedRequest(
+        species=species,
+        subspecies=data.get("subspecies"),
+        region=region,
+        weight_class=data.get("weight_class"),
+        processing=processing,
+        state=state,
+        product_form=product_form,
+        volume_kg=_num(data.get("volume_kg")),
+        target_price_rub_kg=_num(data.get("target_price_rub_kg")),
+        target_date=td,
+        client_hint=data.get("client_hint"),
+        confidence=float(data.get("confidence") or 0.0),
+        raw_text=text,
+    )
+
+
+# ─── DB ────────────────────────────────────────────────────────────────────
+
+def insert_request(db, parsed: ParsedRequest, created_by_tg: int,
+                   created_by_name: str, assigned_to: Optional[str]) -> int:
+    """INSERT в procurement.requests + event 'created'. Возвращает request_id."""
+    with db.conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO procurement.requests(
+                created_by_tg, created_by_name, raw_text,
+                species, subspecies, region, weight_class,
+                processing, state, product_form,
+                volume_kg, target_price_rub_kg, target_date,
+                client_name, assigned_to, llm_confidence
+            ) VALUES (
+                %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s
+            )
+            RETURNING request_id
+            """,
+            (
+                created_by_tg, created_by_name, parsed.raw_text,
+                parsed.species, parsed.subspecies, parsed.region,
+                parsed.weight_class, parsed.processing, parsed.state,
+                parsed.product_form,
+                parsed.volume_kg, parsed.target_price_rub_kg,
+                parsed.target_date,
+                parsed.client_hint, assigned_to, parsed.confidence,
+            ),
+        )
+        request_id = cur.fetchone()["request_id"]
+        cur.execute(
+            """
+            INSERT INTO procurement.request_events(request_id, actor, event_type, payload)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (request_id, f"manager:{created_by_tg}", "created",
+             json.dumps(asdict(parsed), ensure_ascii=False)),
+        )
+        db.conn.commit()
+    return request_id
+
+
+# ─── Форматирование preview / нотификации ─────────────────────────────────
+
+def _fmt_field(label: str, value, suffix: str = "") -> str:
+    if value is None or value == "" or value == "unspecified":
+        return f"  • {label}: —"
+    return f"  • {label}: *{value}*{suffix}"
+
+
+def format_preview(parsed: ParsedRequest, assigned_to: Optional[str]) -> str:
+    target_str = parsed.target_date or "—"
+    if parsed.target_date:
+        try:
+            d = datetime.strptime(parsed.target_date, "%Y-%m-%d").date()
+            dows = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+            target_str = f"{d.strftime('%d.%m')} ({dows[d.weekday()]})"
+        except ValueError:
+            pass
+
+    confidence_warn = ""
+    if parsed.confidence < 0.8:
+        confidence_warn = f"\n⚠️ Уверенность парсера: *{parsed.confidence:.0%}* — проверь поля"
+
+    assignee_disp = {
+        "belyakova": "Александре Беляковой",
+        "kristina":  "Кристине Павленко",
+        "victor":    "Виктору",
+        None:        "общая очередь (species не определён)",
+    }.get(assigned_to, f"`{assigned_to}`")
+
+    return (
+        f"📋 *Понял заявку так:*\n\n"
+        + _fmt_field("Вид", parsed.species) + "\n"
+        + (_fmt_field("Подвид", parsed.subspecies) + "\n" if parsed.subspecies else "")
+        + (_fmt_field("Регион", parsed.region) + "\n" if parsed.region else "")
+        + _fmt_field("Навеска", parsed.weight_class) + "\n"
+        + _fmt_field("Разделка", parsed.processing) + "\n"
+        + _fmt_field("Состояние", parsed.state) + "\n"
+        + (_fmt_field("Форма", parsed.product_form) + "\n"
+           if parsed.product_form and parsed.product_form != "сырьё" else "")
+        + _fmt_field("Объём", parsed.volume_kg, " кг") + "\n"
+        + _fmt_field("Бюджет", parsed.target_price_rub_kg, " ₽/кг") + "\n"
+        + _fmt_field("Дедлайн", target_str) + "\n"
+        + (_fmt_field("Клиент", parsed.client_hint) + "\n" if parsed.client_hint else "")
+        + f"\n🛒 Закупщик: *{assignee_disp}*"
+        + confidence_warn
+    )
+
+
+def format_assignee_notification(request_id: int, parsed: ParsedRequest,
+                                 created_by_name: str) -> str:
+    parts = []
+    if parsed.species:
+        parts.append(parsed.species)
+    if parsed.subspecies:
+        parts.append(parsed.subspecies)
+    if parsed.region:
+        parts.append(parsed.region)
+    if parsed.processing and parsed.processing != "unspecified":
+        parts.append(parsed.processing)
+    if parsed.weight_class:
+        parts.append(parsed.weight_class)
+    if parsed.state and parsed.state != "unspecified":
+        parts.append(parsed.state)
+    if parsed.product_form and parsed.product_form != "сырьё":
+        parts.append(parsed.product_form)
+    if parsed.volume_kg:
+        parts.append(f"{parsed.volume_kg:g} кг")
+    summary = " · ".join(parts) if parts else "(детали в карточке)"
+
+    target = ""
+    if parsed.target_date:
+        try:
+            d = datetime.strptime(parsed.target_date, "%Y-%m-%d").date()
+            target = f"\nК {d.strftime('%d.%m')}"
+        except ValueError:
+            pass
+    if parsed.target_price_rub_kg:
+        target += f"\nБюджет до {parsed.target_price_rub_kg:g} ₽/кг"
+
+    base = os.getenv("PROCUREMENT_APP_URL", "https://f2b-procurement-victor03.amvera.io")
+    url = f"{base}/requests/{request_id}"
+
+    return (
+        f"🆕 *Новая заявка №{request_id}*\n"
+        f"От: {created_by_name}\n\n"
+        f"{summary}"
+        f"{target}\n\n"
+        f"[Открыть карточку]({url})"
+    )

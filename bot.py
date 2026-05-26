@@ -186,6 +186,9 @@ def _user_menu_keyboard(include_task_button: bool = False) -> InlineKeyboardMark
         [
             InlineKeyboardButton("📊 Отчёт ОП", callback_data="user_op_report"),
         ],
+        [
+            InlineKeyboardButton("📝 Новая заявка на закупку", callback_data="user_req_new"),
+        ],
     ]
     if include_task_button:
         rows.append([InlineKeyboardButton("📋 Поставить задачу", callback_data="menu_task")])
@@ -224,6 +227,14 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
     elif action == "user_op_report":
         await cmd_op_report(update, context)
 
+    elif action == "user_req_new":
+        await query.message.reply_text(
+            "📝 Вставь запрос клиента *как есть* — я распарсу и покажу превью.\n\n"
+            "Например: _Лосось ПБГ 5-6 охл 200 кг к четвергу до 720 ₽_",
+            parse_mode="Markdown"
+        )
+        _user_awaiting[query.from_user.id] = "request_text"
+
     elif action == "user_reconciliation":
         await query.message.reply_text(
             "📊 Напиши название компании — сформирую акт сверки.\n"
@@ -231,6 +242,75 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
             parse_mode="Markdown"
         )
         _user_awaiting[query.from_user.id] = "reconciliation"
+
+
+async def handle_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение/отмена черновика заявки на закупку (Phase 3.2)."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    action = query.data
+
+    draft = _draft_requests.pop(user.id, None)
+    if draft is None:
+        await query.message.reply_text(
+            "⚠️ Черновик заявки не найден (возможно, бот перезапускался). "
+            "Создай заявку заново через меню.",
+        )
+        return
+
+    parsed, assigned_to = draft
+
+    if action == "req_cancel":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            "❌ Заявка отменена.",
+            reply_markup=_user_menu_keyboard()
+        )
+        return
+
+    if action == "req_confirm":
+        from request_handler import (
+            insert_request, format_assignee_notification,
+            ASSIGNEE_TG, UNCLASSIFIED_NOTIFY_TG,
+        )
+        try:
+            request_id = insert_request(
+                db, parsed, user.id, user.full_name or "", assigned_to,
+            )
+        except Exception as e:
+            logger.exception(f"insert_request failed: {e}")
+            await query.message.reply_text(f"⚠️ Не удалось сохранить заявку: {e}")
+            return
+
+        # Кому слать TG: если assigned_to=None — обоим закупщикам + Виктору.
+        if assigned_to is None:
+            recipients = list(UNCLASSIFIED_NOTIFY_TG)
+        else:
+            recipients = [ASSIGNEE_TG.get(assigned_to)]
+        recipients = [r for r in recipients if r]
+
+        notif = format_assignee_notification(request_id, parsed, user.full_name or "")
+        for chat_id in recipients:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=notif,
+                    parse_mode="Markdown", disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error(f"send to assignee {chat_id} failed: {e}")
+
+        assignee_disp = {
+            "belyakova": "Александре Беляковой",
+            "kristina":  "Кристине Павленко",
+            "victor":    "Виктору",
+            None:        "обоим закупщикам + Виктору (не определён вид)",
+        }.get(assigned_to)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            f"✅ Заявка №{request_id} создана и ушла {assignee_disp}.",
+            reply_markup=_user_menu_keyboard()
+        )
 
 
 async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -426,7 +506,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _wazzup_notified: set = set()
 
 _pending_links: dict = {}
-_user_awaiting: dict = {}  # user_id → "photo" | "contract" | "reconciliation"
+_user_awaiting: dict = {}  # user_id → "photo" | "contract" | "reconciliation" | "request_text"
+_draft_requests: dict = {}  # user_id → (ParsedRequest, assigned_to). Phase 3.2.
 _pending_price_comments: dict = {}  # manager_user_id → {alert_id, order_id, mgr_name, alert_type?, approver_chat_id?}
 _pending_approver_input: dict = {}  # approver_chat_id → {alert_id, order_name, client_name, manager_name, manager_user_id}
 
@@ -1371,6 +1452,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_chat_action("upload_photo")
             await search_and_send_photo(update, context, text)
             await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+            return
+
+        elif awaiting == "request_text":
+            await message.reply_chat_action("typing")
+            try:
+                from request_handler import parse_request_text, route_request, format_preview
+                parsed = await parse_request_text(text)
+            except Exception as e:
+                logger.exception(f"request_text parse failed: {e}")
+                await message.reply_text(
+                    f"⚠️ Не удалось разобрать заявку: {e}\n\nПопробуй ещё раз через меню.",
+                )
+                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+                return
+            assigned_to = route_request(parsed.species)
+            _draft_requests[user.id] = (parsed, assigned_to)
+            preview = format_preview(parsed, assigned_to)
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Подтвердить", callback_data="req_confirm"),
+                InlineKeyboardButton("❌ Отменить",   callback_data="req_cancel"),
+            ]])
+            await message.reply_text(preview, parse_mode="Markdown", reply_markup=kb)
             return
 
 
@@ -6510,6 +6613,7 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("usermenu", cmd_user_menu))
     app.add_handler(CallbackQueryHandler(handle_user_menu_callback, pattern="^user_"))
+    app.add_handler(CallbackQueryHandler(handle_request_callback, pattern="^req_"))
     app.add_handler(CommandHandler("menu", cmd_menu))
     # Кнопка «📋 Поставить задачу» в /menu — whitelist-гейт внутри; регистрируется ДО общего handle_menu_callback
     app.add_handler(CallbackQueryHandler(handle_menu_task_button, pattern=r"^menu_task$"))
