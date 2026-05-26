@@ -85,61 +85,65 @@ def setup_scheduler(app: Application, db):
     # Если же контейнер был перезапущен ПОСЛЕ tick'а — misfire не помогает
     # (AsyncIOScheduler без persistent jobstore не знает о пропуске). Этот
     # сценарий покрыт pdz_catch_up_missed_jobs(), вызывается из bot.py при старте.
+    # Сдвиг всей цепочки на час раньше (решение собственника 2026-05-26):
+    # digest менеджерам в 13:00 МСК (вместо 14:10), дедлайн менеджерам 15:00
+    # (вместо 16:00), пинг собственнику 15:05 (вместо 16:05). Регламент банка
+    # — разноска до 12:45 МСК (переподтвердить с Малышкиным).
     scheduler.add_job(
         _pdz_run_and_record,
-        CronTrigger(hour=13, minute=55, timezone=MSK),
-        args=["pdz_snapshot_1355", pdz_take_snapshot_job, app, db],
-        id="pdz_snapshot_1355",
+        CronTrigger(hour=12, minute=45, timezone=MSK),
+        args=["pdz_snapshot_1245", pdz_take_snapshot_job, app, db],
+        id="pdz_snapshot_1245",
         misfire_grace_time=3600, coalesce=True,
     )
     scheduler.add_job(
         _pdz_run_and_record,
-        CronTrigger(hour=14, minute=0, timezone=MSK),
-        args=["pdz_snapshot_1400", pdz_take_snapshot_job, app, db],
-        id="pdz_snapshot_1400",
+        CronTrigger(hour=12, minute=50, timezone=MSK),
+        args=["pdz_snapshot_1250", pdz_take_snapshot_job, app, db],
+        id="pdz_snapshot_1250",
         misfire_grace_time=3600, coalesce=True,
     )
 
-    # 14:02 МСК — обработка событий обещаний (Фаза 3). Между snapshot 14:00
-    # и дайджестом менеджерам 14:10. Сравнивает сегодняшний и вчерашний
+    # 12:52 МСК — обработка событий обещаний (Фаза 3). Между snapshot 12:50
+    # и дайджестом менеджерам 13:00. Сравнивает сегодняшний и вчерашний
     # snapshot, пишет события в promise_log и шлёт TG-алерт собственнику
     # при изменении ppm_initial («Дата планируемой оплаты», менять нельзя).
     scheduler.add_job(
         _pdz_run_and_record,
-        CronTrigger(hour=14, minute=2, timezone=MSK),
-        args=["pdz_process_events_1402", pdz_process_events_job, app, db],
-        id="pdz_process_events_1402",
+        CronTrigger(hour=12, minute=52, timezone=MSK),
+        args=["pdz_process_events_1252", pdz_process_events_job, app, db],
+        id="pdz_process_events_1252",
         misfire_grace_time=3600, coalesce=True,
     )
 
-    # 14:10 МСК — TG-дайджест каждому менеджеру с просрочками (Фаза 4).
+    # 13:00 МСК — TG-дайджест каждому менеджеру с просрочками (Фаза 4).
     # Если просрочек нет — тишина.
     scheduler.add_job(
         _pdz_run_and_record,
-        CronTrigger(hour=14, minute=10, timezone=MSK),
-        args=["pdz_send_digests_14_10", pdz_send_digests_job, app, db],
-        id="pdz_send_digests_14_10",
+        CronTrigger(hour=13, minute=0, timezone=MSK),
+        args=["pdz_send_digests_1300", pdz_send_digests_job, app, db],
+        id="pdz_send_digests_1300",
         misfire_grace_time=3600, coalesce=True,
     )
 
-    # 16:05 МСК — пинг собственнику по необработанным после дедлайна 16:00 (Фаза 4).
+    # 15:05 МСК — пинг собственнику по необработанным после дедлайна 15:00 (Фаза 4).
     scheduler.add_job(
         _pdz_run_and_record,
-        CronTrigger(hour=16, minute=5, timezone=MSK),
-        args=["pdz_send_owner_pending_16_05", pdz_send_owner_pending_job, app, db],
-        id="pdz_send_owner_pending_16_05",
+        CronTrigger(hour=15, minute=5, timezone=MSK),
+        args=["pdz_send_owner_pending_1505", pdz_send_owner_pending_job, app, db],
+        id="pdz_send_owner_pending_1505",
         misfire_grace_time=3600, coalesce=True,
     )
 
-    # 14:15 МСК — регенерация HTML-отчёта «Дебиторка» (Фаза 5).
-    # Идёт после 14:02 (фиксация срывов в promise_log) и 14:10 (дайджесты
+    # 13:05 МСК — регенерация HTML-отчёта «Дебиторка» (Фаза 5).
+    # Идёт после 12:52 (фиксация срывов в promise_log) и 13:00 (дайджесты
     # менеджерам). Источник — БД (pdz_snapshots + promise_log), МС API не
     # дёргается. Шлёт собственнику ссылку с токеном TTL 24ч.
     scheduler.add_job(
         _pdz_run_and_record,
-        CronTrigger(hour=14, minute=15, timezone=MSK),
-        args=["pdz_generate_html_14_15", pdz_generate_html_job, app, db],
-        id="pdz_generate_html_14_15",
+        CronTrigger(hour=13, minute=5, timezone=MSK),
+        args=["pdz_generate_html_1305", pdz_generate_html_job, app, db],
+        id="pdz_generate_html_1305",
         misfire_grace_time=3600, coalesce=True,
     )
 
@@ -362,12 +366,12 @@ async def pdz_catch_up_missed_jobs(app: Application, db):
     today = now.date()
 
     pdz_jobs = [
-        ("pdz_snapshot_1355",            13, 55, pdz_take_snapshot_job),
-        ("pdz_snapshot_1400",            14,  0, pdz_take_snapshot_job),
-        ("pdz_process_events_1402",      14,  2, pdz_process_events_job),
-        ("pdz_send_digests_14_10",       14, 10, pdz_send_digests_job),
-        ("pdz_generate_html_14_15",      14, 15, pdz_generate_html_job),
-        ("pdz_send_owner_pending_16_05", 16,  5, pdz_send_owner_pending_job),
+        ("pdz_snapshot_1245",            12, 45, pdz_take_snapshot_job),
+        ("pdz_snapshot_1250",            12, 50, pdz_take_snapshot_job),
+        ("pdz_process_events_1252",      12, 52, pdz_process_events_job),
+        ("pdz_send_digests_1300",        13,  0, pdz_send_digests_job),
+        ("pdz_generate_html_1305",       13,  5, pdz_generate_html_job),
+        ("pdz_send_owner_pending_1505",  15,  5, pdz_send_owner_pending_job),
     ]
 
     caught = 0
