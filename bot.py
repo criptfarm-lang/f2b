@@ -6870,9 +6870,9 @@ def main():
           - возвращает «голый» HTML-фрагмент (то же содержимое), который
             quiz-game встроит в свою вкладку «Дебиторка».
         """
-        embed_secret = os.getenv("DASHBOARD_PDZ_SECRET", "")
-        if not embed_secret:
-            return web.Response(text="DASHBOARD_PDZ_SECRET не задан", status=500, charset="utf-8")
+        # Захардкоженный default — синхронизирован с quiz-game main.py (там тот же
+        # default). Env DASHBOARD_PDZ_SECRET переопределяет, если нужно ротировать.
+        embed_secret = os.getenv("DASHBOARD_PDZ_SECRET", "UY-2J7VujDgbFVEg26WJvqCpS1qY_5pm8x56qZ-O_uE")
         if request.query.get("secret", "") != embed_secret:
             return web.Response(text="forbidden", status=403, charset="utf-8")
         try:
