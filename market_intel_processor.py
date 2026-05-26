@@ -358,9 +358,9 @@ async def process_pending(db, limit: int = 20) -> dict:
 
 async def market_intel_cron_job(app, db):
     """APScheduler entry-point. Вызывается каждые 30 мин в окне 9-19 МСК."""
+    logger.info("market_intel cron tick started")
     try:
         stats = await process_pending(db)
-        if stats["processed"] > 0 or stats["failed"] > 0 or stats["skipped_pdf"] > 0:
-            logger.info(f"market_intel cron: {stats}")
+        logger.info(f"market_intel cron: {stats}")
     except Exception:
         logger.exception("market_intel cron crashed")

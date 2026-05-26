@@ -161,12 +161,18 @@ def setup_scheduler(app: Application, db):
     # Каждые 30 мин в рабочие часы 9-19 МСК — обработка прайс-листов из канала «Мониторинг».
     # Скилл update-market-intel остаётся для PDF и сложных кейсов (manual fallback);
     # cron автоматически разбирает text/photo. План: 2026-05-22, Фаза 1.4.
+    #
+    # misfire_grace_time=3600 + coalesce=True: без них APScheduler с дефолтом
+    # misfire_grace_time=1 пропускает каждый tick (потому что scheduler.start()
+    # вызывается асинхронно через await, и первый tick может задержаться > 1 сек).
+    # Зафиксировано 2026-05-26: cron 12:00-16:00 не отработал ни разу из-за этого.
     from market_intel_processor import market_intel_cron_job
     scheduler.add_job(
         market_intel_cron_job,
         CronTrigger(hour='9-19', minute='*/30', timezone=MSK),
         args=[app, db],
-        id="market_intel_process"
+        id="market_intel_process",
+        misfire_grace_time=3600, coalesce=True,
     )
 
     scheduler.start()
