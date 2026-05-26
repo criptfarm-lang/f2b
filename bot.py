@@ -6860,6 +6860,37 @@ def main():
             logger.error(f"handle_pdz_html: {e}", exc_info=True)
             return web.Response(text=f"Ошибка: {e}", status=500, charset="utf-8")
 
+    async def handle_pdz_embed(request):
+        """Embed-версия PDZ HTML для единого дашборда F2B (plans/2026-05-21-…).
+
+        Отличия от handle_pdz_html:
+          - аутентификация через постоянный shared-secret из env DASHBOARD_PDZ_SECRET
+            (не через report_links с TTL — иначе дашборд должен бы каждые 24ч
+            получать новый токен от собственника);
+          - возвращает «голый» HTML-фрагмент (то же содержимое), который
+            quiz-game встроит в свою вкладку «Дебиторка».
+        """
+        embed_secret = os.getenv("DASHBOARD_PDZ_SECRET", "")
+        if not embed_secret:
+            return web.Response(text="DASHBOARD_PDZ_SECRET не задан", status=500, charset="utf-8")
+        if request.query.get("secret", "") != embed_secret:
+            return web.Response(text="forbidden", status=403, charset="utf-8")
+        try:
+            cached = db.get_pdz_html_cache()
+            if cached:
+                html_text = cached
+            else:
+                from pdz_report_html import render_pdz_html_from_db
+                html_text = render_pdz_html_from_db(db)
+                try:
+                    db.set_pdz_html_cache(html_text)
+                except Exception as e:
+                    logger.warning(f"handle_pdz_embed: set_pdz_html_cache: {e}")
+            return web.Response(text=html_text, content_type="text/html", charset="utf-8")
+        except Exception as e:
+            logger.error(f"handle_pdz_embed: {e}", exc_info=True)
+            return web.Response(text=f"Ошибка: {e}", status=500, charset="utf-8")
+
     async def run_web():
         web_app = web.Application()
         web_app.router.add_post("/webhook/moysklad", handle_ms_webhook)
@@ -6869,6 +6900,7 @@ def main():
         web_app.router.add_get("/health", handle_health)
         web_app.router.add_get("/report", handle_web_report)
         web_app.router.add_get("/pdz", handle_pdz_html)
+        web_app.router.add_get("/pdz/embed", handle_pdz_embed)
         # ─── amoCRM алармы ───────────────────────────────────────────────────
         async def handle_amo_webhook_route(request):
             await handle_amo_webhook(request, app, db)
