@@ -392,6 +392,9 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("📊 Отчёт ОП", callback_data="menu_evening"),
         ],
+        [
+            InlineKeyboardButton("📝 Новая заявка на закупку", callback_data="user_req_new"),
+        ],
         # ── Только руководитель ────────────────────────────────────
         [InlineKeyboardButton("── Только для меня ──", callback_data="menu_noop")],
         [
