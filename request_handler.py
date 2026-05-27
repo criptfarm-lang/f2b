@@ -147,12 +147,12 @@ product_form: сырьё, слабосоль, сильносоль, х/к (хо�
 
 weight_class: свободный текст («5-6», «4+», «1.5-2.0», «2-3», «3.5+»).
 
-volume_kg: ПОТРЕБНОСТЬ клиента в килограммах — сколько ему нужно товара.
-«200 кг» → 200. «1 тонна» → 1000.
-ВАЖНО: если в тексте число рядом с упаковкой («бочка 100 кг», «канистра 5л»,
-«пакет 1 кг», «лоток 250 г») — это размер тары, идёт в package, а НЕ в volume_kg.
-В volume_kg идёт ОТДЕЛЬНОЕ число, обозначающее общий вес заказа.
-Если непонятно — оставь volume_kg=null и проставь package.
+volume_kg: МЕСЯЧНАЯ потребность клиента в килограммах — сколько ему нужно
+товара за месяц. «200 кг» → 200. «1 тонна» → 1000. «1 т в месяц» → 1000.
+ВАЖНО: если число рядом с упаковкой («бочка 100 кг», «канистра 5л», «пакет 1 кг»)
+— это размер тары, идёт в package, а НЕ в volume_kg.
+В volume_kg идёт ОТДЕЛЬНОЕ число общего месячного потребления.
+Если непонятно (одиночное число без контекста) — оставь volume_kg=null.
 
 package: вид упаковки / тара (свободный текст). Примеры:
 «бочка 100 кг», «канистра 5 л», «лоток 250 г», «пакет 1 кг»,
@@ -384,7 +384,7 @@ def insert_request(db, parsed: ParsedRequest, created_by_tg: int,
 # 2026-05-26: «не пропускаем без цены как минимум» + species + объём как фундамент.
 REQUIRED_FIELDS = [
     ("species",              "вид/категория"),
-    ("volume_kg",             "потребность (кг)"),
+    ("volume_kg",             "месячная потребность (кг)"),
     ("target_price_rub_kg",   "цена для клиента (₽/кг)"),
 ]
 
@@ -486,7 +486,7 @@ def format_preview(parsed: ParsedRequest, assigned_to: Optional[str],
         lines.append(_fmt_field("Состояние", parsed.state))
     if parsed.product_form and parsed.product_form != "сырьё":
         lines.append(_fmt_field("Форма", parsed.product_form))
-    lines.append(_fmt_field("Потребность", parsed.volume_kg, " кг"))
+    lines.append(_fmt_field("Месячная потребность", parsed.volume_kg, " кг"))
     if parsed.package:
         lines.append(_fmt_field("Упаковка", parsed.package))
     lines.append(_fmt_field("Цена для клиента", parsed.target_price_rub_kg, " ₽/кг"))
