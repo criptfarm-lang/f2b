@@ -278,6 +278,183 @@ async def _get_contact_from_ms(agent_id: str, headers: dict) -> dict | None:
     return None
 
 
+async def _load_order(order_href: str, headers: dict) -> dict | None:
+    """Загружает заказ из МойСклад с раскрытием agent/state/owner. None при ошибке."""
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                order_href,
+                headers=headers,
+                params={"expand": "agent,state,owner"}
+            ) as r:
+                if r.status != 200:
+                    return None
+                return await r.json()
+    except Exception as e:
+        logger.warning(f"_load_order: {e}")
+        return None
+
+
+async def _send_fishki_mailing(order: dict, db) -> tuple[bool, str]:
+    """Строит и шлёт FISHки-рассылку клиенту по уже загруженному заказу.
+
+    Не проверяет статус — это ответственность вызывающего (webhook-путь проверяет
+    «Согласовано», ручной cron-путь шлёт по любому статусу ≥ «Согласовано»).
+
+    Возвращает (sent_to_client, reason):
+        (True,  "sent")            — отправлено в Wazzup, запись в agreed_notifications
+        (False, "retail")          — Розничный покупатель, флаг сохранён, рассылка не нужна
+        (False, "excluded")        — в exclusions, флаг сохранён, рассылка не нужна
+        (False, "no_contact")      — нет Telegram/WhatsApp/Max в карточке МС
+        (False, "already_claimed") — кто-то уже отправил параллельно
+        (False, f"wazzup_err:...") — POST в Wazzup упал; флаг ОСТАЁТСЯ (один POST на заказ)
+        (False, "load_failed")     — не удалось дотянуть данные заказа
+    """
+    import aiohttp
+    from moysklad import get_headers
+
+    headers = get_headers()
+    order_id   = order.get("id", "")
+    order_name = order.get("name", "")
+    order_sum  = (order.get("sum", 0) or 0) / 100
+    agent      = order.get("agent", {})
+    agent_name = agent.get("name", "")
+    agent_id   = agent.get("meta", {}).get("href", "").split("/")[-1]
+
+    if not order_id or not agent_id:
+        return (False, "load_failed")
+
+    # Розничный покупатель — флаг ставим, рассылку не делаем
+    if agent_name.lower().strip() == "розничный покупатель":
+        db.save_agreed_notification(order_id)
+        return (False, "retail")
+
+    logger.info(f"notifier: заказ {order_name} клиент={agent_name}")
+
+    # Исключения — флаг ставим, рассылку не делаем
+    excluded = await _is_company_excluded(agent_name) if QUIZ_BASE_URL else False
+    if excluded:
+        logger.info(f"notifier: {agent_name} в исключениях, рассылка не отправляется")
+        db.save_agreed_notification(order_id)
+        return (False, "excluded")
+
+    # Контакт в МойСклад
+    contact = await _get_contact_from_ms(agent_id, headers)
+    if contact:
+        logger.info(f"notifier: контакт {agent_name} найден в МойСклад → {contact['chat_type']}")
+    else:
+        logger.info(f"notifier: контакт {agent_name} не найден в МойСклад, пропускаем")
+        # НЕ сохраняем флаг — заполни поля Telegram/Max/WhatsApp в карточке контрагента
+        return (False, "no_contact")
+
+    # Позиции заказа
+    positions_text = await _load_order_positions(order_id, headers)
+
+    # Дата отгрузки
+    delivery_raw = order.get("deliveryPlannedMoment", "")
+    delivery_fmt = ""
+    if delivery_raw:
+        try:
+            from datetime import date as _d
+            d = _d.fromisoformat(delivery_raw[:10])
+            delivery_fmt = f"{d.day} {MONTHS_RU[d.month - 1]}"
+        except Exception:
+            delivery_fmt = delivery_raw[:10]
+
+    # Формируем сообщение
+    msg = f"📋 Пожалуйста, проверьте заказ {order_name}\n\n"
+    if positions_text:
+        msg += f"📦 Состав:\n{positions_text}\n\n"
+    msg += f"💰 Итого: {order_sum:,.0f} руб.\n"
+    if delivery_fmt:
+        msg += f"📅 Плановая дата отгрузки: {delivery_fmt}\n"
+
+    # Квиз
+    if QUIZ_BASE_URL:
+        import urllib.parse, hashlib, aiohttp as _ah
+        short_code = hashlib.md5(f"{order_id}{agent_id}".encode()).hexdigest()[:8]
+        quiz_url = f"{QUIZ_BASE_URL}/q/{short_code}"
+        try:
+            async with _ah.ClientSession() as _qs:
+                await _qs.post(
+                    f"{QUIZ_BASE_URL}/api/short-link",
+                    params={
+                        "order_id": order_id,
+                        "client_id": agent_id,
+                        "amount": int(order_sum),
+                        "company_name": agent_name,
+                    },
+                    timeout=_ah.ClientTimeout(total=5)
+                )
+        except Exception as _e:
+            quiz_url = (
+                f"{QUIZ_BASE_URL}"
+                f"/?order={order_id}"
+                f"&client_id={agent_id}"
+                f"&amount={int(order_sum)}"
+                f"&company={urllib.parse.quote(agent_name)}"
+            )
+            logger.warning(f"notifier: short-link failed ({_e}), используем длинную")
+        msg += (
+            f"\n\n🎣 Дарим 300 кг филе форели! Играйте в викторину, копите FISHки и обменивайте на филе!\n"
+            f"{quiz_url}"
+        )
+        logger.info(f"notifier: квиз добавлен для {agent_name}")
+
+    # Синхронизация amoCRM-контакта (защита от дублей сделок)
+    try:
+        agent_phone = await _get_agent_phone(agent_id, headers)
+        await _sync_amocrm_contact(agent_phone, contact)
+    except Exception as _e:
+        logger.warning(f"notifier: amocrm sync failed (non-blocking): {_e}")
+
+    # Атомарный claim прямо перед отправкой.
+    # INSERT ... ON CONFLICT DO NOTHING RETURNING — победитель шлёт, остальные выходят.
+    # Если флаг стоит — НЕ откатываем даже при ошибке Wazzup (один POST на заказ).
+    if not db.try_claim_agreed_notification(order_id):
+        logger.info(f"notifier: заказ {order_id} уже отправлен параллельным вызовом, пропускаем")
+        return (False, "already_claimed")
+
+    # POST в Wazzup
+    api_key = os.getenv("WAZZUP_API_KEY", "")
+    chat_id_value = contact["chat_id"]
+    wazzup_payload = {
+        "channelId": contact["channel_id"],
+        "chatType":  contact["chat_type"],
+        "text":      msg,
+    }
+    if chat_id_value.startswith("@"):
+        wazzup_payload["username"] = chat_id_value.lstrip("@")
+    else:
+        wazzup_payload["chatId"] = chat_id_value
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            WAZZUP_API_URL,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=wazzup_payload,
+        ) as r:
+            if r.status in (200, 201):
+                logger.info(f"notifier: ✅ отправлено {agent_name} → {contact['chat_type']}")
+                logger.info(f"notifier: QUIZ_BASE_URL={QUIZ_BASE_URL!r}")
+                if QUIZ_BASE_URL:
+                    try:
+                        async with aiohttp.ClientSession() as _s:
+                            await _s.post(
+                                f"{QUIZ_BASE_URL}/api/log-mailing",
+                                json={"order_id": order_id, "client_id": agent_id, "company_name": agent_name},
+                                timeout=aiohttp.ClientTimeout(total=5)
+                            )
+                    except Exception as _e:
+                        logger.warning(f"notifier: log-mailing failed ({_e})")
+                return (True, "sent")
+            else:
+                body = await r.text()
+                logger.error(f"notifier: ❌ ошибка {r.status} для {agent_name}: {body[:200]}")
+                return (False, f"wazzup_err:{r.status}:{body[:200]}")
+
+
 async def check_order_agreed(order_href: str, bot, db):
     """При смене статуса заказа на Согласовано — отправляем клиенту в мессенджер.
 
@@ -287,182 +464,52 @@ async def check_order_agreed(order_href: str, bot, db):
         db         — экземпляр Database
     """
     try:
-        import aiohttp
         from moysklad import get_headers
-
         headers = get_headers()
 
-        # ── 1. Загружаем заказ ────────────────────────────────────────────
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                order_href,
-                headers=headers,
-                params={"expand": "agent,state,owner"}
-            ) as r:
-                if r.status != 200:
-                    return
-                order = await r.json()
+        order = await _load_order(order_href, headers)
+        if not order:
+            return
 
-        # ── 2. Проверяем статус "Согласовано" ─────────────────────────────
+        # Триггер только на статус «Согласован»
         state_id = order.get("state", {}).get("meta", {}).get("href", "").split("/")[-1]
         if state_id != MS_STATE_AGREED:
             return
 
-        order_id = order_href.split("/")[-1].split("?")[0]
+        order_id = order.get("id") or order_href.split("/")[-1].split("?")[0]
 
-        # ── 3. Быстрая проверка дедупа — оптимизация, чтобы не дёргать API ─
-        # Финальный атомарный claim делается прямо перед POST в Wazzup ниже.
+        # Быстрая проверка дедупа — оптимизация. Финальный атомарный claim внутри _send_fishki_mailing.
         if db.is_agreed_notified(order_id):
             logger.info(f"notifier: заказ {order_id} уже уведомлялся, пропускаем")
             return
 
-        # ── 4. Данные заказа ──────────────────────────────────────────────
-        order_name = order.get("name", "")
-        order_sum  = (order.get("sum", 0) or 0) / 100
-        agent      = order.get("agent", {})
-        agent_name = agent.get("name", "")
-        agent_id   = agent.get("meta", {}).get("href", "").split("/")[-1]
-
-        # Пропускаем розничного покупателя
-        if agent_name.lower().strip() == "розничный покупатель":
-            db.save_agreed_notification(order_id)
-            return
-
-        logger.info(f"notifier: заказ {order_name} клиент={agent_name}")
-
-        # ── 5. Проверка исключений — исключённые не получают ничего ──────
-        excluded = await _is_company_excluded(agent_name) if QUIZ_BASE_URL else False
-        if excluded:
-            logger.info(f"notifier: {agent_name} в исключениях, рассылка не отправляется")
-            db.save_agreed_notification(order_id)
-            return
-
-        # ── 6. Ищем контакт в МойСклад ──────────────────────────────────
-        contact = await _get_contact_from_ms(agent_id, headers)
-        if contact:
-            logger.info(f"notifier: контакт {agent_name} найден в МойСклад → {contact['chat_type']}")
-        else:
-            logger.info(f"notifier: контакт {agent_name} не найден в МойСклад, пропускаем")
-            # НЕ сохраняем флаг — заполни поля Telegram/Max/WhatsApp в карточке контрагента
-            return
-
-        # ── 7. Позиции заказа ─────────────────────────────────────────────
-        positions_text = await _load_order_positions(order_id, headers)
-
-        # ── 8. Дата отгрузки ──────────────────────────────────────────────
-        delivery_raw = order.get("deliveryPlannedMoment", "")
-        delivery_fmt = ""
-        if delivery_raw:
-            try:
-                from datetime import date as _d
-                d = _d.fromisoformat(delivery_raw[:10])
-                delivery_fmt = f"{d.day} {MONTHS_RU[d.month - 1]}"
-            except Exception:
-                delivery_fmt = delivery_raw[:10]
-
-        # ── 9. Формируем сообщение ────────────────────────────────────────
-        msg = f"📋 Пожалуйста, проверьте заказ {order_name}\n\n"
-        if positions_text:
-            msg += f"📦 Состав:\n{positions_text}\n\n"
-        msg += f"💰 Итого: {order_sum:,.0f} руб.\n"
-        if delivery_fmt:
-            msg += f"📅 Плановая дата отгрузки: {delivery_fmt}\n"
-
-        # ── 10. Квиз (всем кроме исключённых, исключённые уже отфильтрованы) ──
-        if QUIZ_BASE_URL:
-            import urllib.parse, hashlib, aiohttp as _ah
-            # Создаём короткую ссылку через квиз-сервер
-            short_code = hashlib.md5(f"{order_id}{agent_id}".encode()).hexdigest()[:8]
-            quiz_url = f"{QUIZ_BASE_URL}/q/{short_code}"
-            try:
-                async with _ah.ClientSession() as _qs:
-                    await _qs.post(
-                        f"{QUIZ_BASE_URL}/api/short-link",
-                        params={
-                            "order_id": order_id,
-                            "client_id": agent_id,
-                            "amount": int(order_sum),
-                            "company_name": agent_name,
-                        },
-                        timeout=_ah.ClientTimeout(total=5)
-                    )
-            except Exception as _e:
-                # Если не удалось создать короткую ссылку — используем длинную
-                quiz_url = (
-                    f"{QUIZ_BASE_URL}"
-                    f"/?order={order_id}"
-                    f"&client_id={agent_id}"
-                    f"&amount={int(order_sum)}"
-                    f"&company={urllib.parse.quote(agent_name)}"
-                )
-                logger.warning(f"notifier: short-link failed ({_e}), используем длинную")
-            msg += (
-                f"\n\n🎣 Дарим 300 кг филе форели! Играйте в викторину, копите FISHки и обменивайте на филе!\n"
-                f"{quiz_url}"
-            )
-            logger.info(f"notifier: квиз добавлен для {agent_name}")
-
-        # ── 10.5. Синхронизация amoCRM-контакта (защита от дублей сделок) ─
-        # Заполняем у существующего amoCRM-контакта Wazzup-поле тем же значением,
-        # которое отправляем через Wazzup. Это позволяет Wazzup-amoCRM-интеграции
-        # сматчить исходящее с существующим контактом и не создавать новую сделку.
-        # Управляется флагом AMOCRM_SYNC_ENABLED (по умолчанию выключено).
-        try:
-            agent_phone = await _get_agent_phone(agent_id, headers)
-            await _sync_amocrm_contact(agent_phone, contact)
-        except Exception as _e:
-            logger.warning(f"notifier: amocrm sync failed (non-blocking): {_e}")
-
-        # ── 11. Атомарный claim прямо перед отправкой ─────────────────────
-        # INSERT ... ON CONFLICT DO NOTHING RETURNING — один из параллельных
-        # webhook'ов получит True и отправит, остальные получат False и выйдут.
-        # Если флаг стоит — НЕ откатываем даже при ошибке Wazzup: требование
-        # «строго один POST на заказ». Для повторной попытки — /reset_agreed.
-        if not db.try_claim_agreed_notification(order_id):
-            logger.info(f"notifier: заказ {order_id} уже отправлен параллельным вызовом, пропускаем")
-            return
-
-        # ── 12. Отправляем через Wazzup ───────────────────────────────────
-        api_key = os.getenv("WAZZUP_API_KEY", "")
-        # Определяем chatId или username
-        chat_id_value = contact["chat_id"]
-        wazzup_payload = {
-            "channelId": contact["channel_id"],
-            "chatType":  contact["chat_type"],
-            "text":      msg,
-        }
-        if chat_id_value.startswith("@"):
-            # Username — передаём без @
-            wazzup_payload["username"] = chat_id_value.lstrip("@")
-        else:
-            wazzup_payload["chatId"] = chat_id_value
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                WAZZUP_API_URL,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=wazzup_payload,
-            ) as r:
-                if r.status in (200, 201):
-                    logger.info(f"notifier: ✅ отправлено {agent_name} → {contact['chat_type']}")
-                    # Логируем рассылку в квиз-сервис для статистики
-                    logger.info(f"notifier: QUIZ_BASE_URL={QUIZ_BASE_URL!r}")
-                    if QUIZ_BASE_URL:
-                        try:
-                            async with aiohttp.ClientSession() as _s:
-                                await _s.post(
-                                    f"{QUIZ_BASE_URL}/api/log-mailing",
-                                    json={"order_id": order_id, "client_id": agent_id, "company_name": agent_name},
-                                    timeout=aiohttp.ClientTimeout(total=5)
-                                )
-                        except Exception as _e:
-                            logger.warning(f"notifier: log-mailing failed ({_e})")
-                else:
-                    body = await r.text()
-                    logger.error(f"notifier: ❌ ошибка {r.status} для {agent_name}: {body[:200]}")
+        await _send_fishki_mailing(order, db)
 
     except Exception as e:
         logger.error(f"notifier.check_order_agreed: {e}", exc_info=True)
+
+
+async def manual_send_fishki(order_id: str, db) -> tuple[bool, str]:
+    """Ручная отправка FISHки-рассылки по order_id (cron-fallback кнопка в TG).
+
+    В отличие от check_order_agreed не проверяет статус заказа — вызывается
+    по найденному cron'ом пропуску (state ≥ «Согласован», нет в agreed_notifications).
+    """
+    try:
+        from moysklad import get_headers
+        headers = get_headers()
+        order_href = f"{MS_BASE}/entity/customerorder/{order_id}"
+        order = await _load_order(order_href, headers)
+        if not order:
+            return (False, "load_failed")
+
+        if db.is_agreed_notified(order_id):
+            return (False, "already_claimed")
+
+        return await _send_fishki_mailing(order, db)
+    except Exception as e:
+        logger.error(f"notifier.manual_send_fishki: {e}", exc_info=True)
+        return (False, f"exception:{e}")
 
 
 # ============================================================================
