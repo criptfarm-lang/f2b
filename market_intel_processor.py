@@ -237,7 +237,7 @@ async def parse_pdf_message(pdf_path: str, caption: str = "") -> dict:
             f"Caption из TG: {caption or '(нет)'}\n\n"
             f"Содержимое:\n{text}"
         )},
-    ], max_tokens=16384)
+    ], max_tokens=32768)
 
 
 def _supplier_slug_from_hint(hint: str) -> tuple[Optional[str], bool]:
