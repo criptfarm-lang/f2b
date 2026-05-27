@@ -230,7 +230,9 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
     elif action == "user_req_new":
         await query.message.reply_text(
             "📝 Вставь запрос клиента *как есть* — я распарсу и покажу превью.\n\n"
-            "Например: _Лосось ПБГ 5-6 охл 200 кг к четвергу до 720 ₽_",
+            "*Минимум для заявки:* вид/категория, объём, цена для клиента.\n\n"
+            "_Пример (рыба): «Лосось ПБГ 5-6 охл 200 кг, клиенту по 720 ₽, к четвергу»._\n"
+            "_Пример (сопутка): «Сыр творожный 30 кг, клиенту по 410 ₽, к субботе. Филадельфия»._",
             parse_mode="Markdown"
         )
         _user_awaiting[query.from_user.id] = "request_text"
@@ -273,10 +275,20 @@ async def handle_request_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if action == "req_amend":
         _user_awaiting[user.id] = "request_text_amend"
+        # Считаем что не хватает — покажем менеджеру конкретно.
+        from request_handler import validate_request
+        missing_req, missing_rec = validate_request(parsed)
+        gaps_line = ""
+        if missing_req:
+            gaps_line = f"\n\n*Не хватает обязательного:* {', '.join(missing_req)}."
+        elif missing_rec:
+            gaps_line = f"\n\n*Желательно добавить:* {', '.join(missing_rec)}."
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(
-            "➕ Допиши недостающее одним сообщением — я перепарсу всё вместе.\n\n"
-            "_Пример: «по 720 ₽/кг, 200 кг, к четвергу»_",
+            "➕ Пришли ещё одно сообщение с недостающими данными — я склею с тем, "
+            "что уже прислал, и покажу превью заново."
+            f"{gaps_line}"
+            "\n\n_Пример: «200 кг, продаём клиенту по 720 ₽/кг, к четвергу»_",
             parse_mode="Markdown",
         )
         return
