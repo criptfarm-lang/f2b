@@ -159,7 +159,16 @@ region: «чёрноморская» → Чёрное море РФ; «каре�
 Турция-озеро, Турция-море, Грузия, Норвегия, Фарерские о-ва, Чили,
 Аргентина, Эквадор, Перу, Китай, Вьетнам, Таиланд, Индия, Индонезия, Бангладеш.
 
-client_hint: имя клиента / ИНН / название ресторана. Иначе null.
+client_hint: имя клиента — ресторан / сеть / ООО / ИП / название заведения.
+ВАЖНО: фамилия или название рядом с продуктом — это обычно БРЕНД, не клиент.
+Примеры: «майонез Печагин» → brand=Печагин, client_hint=null.
+«хлеб Riga Pekarnia» → brand=Riga Pekarnia, client_hint=null.
+«Лосось 5-6 для ресторана Сахалин» → client_hint=Сахалин, brand=null.
+Клиент почти всегда явно упомянут как «для X», «клиент Y», «ресторан Z», «ООО».
+
+brand: бренд / производитель продукта (не магазин-клиент). Пример:
+«майонез Печагин» → brand=Печагин. «Сыр Hochland» → brand=Hochland.
+Иначе null.
 
 confidence: 0.00-1.00. < 0.50 если основные поля (species + processing) не извлекаются.
 
@@ -177,6 +186,7 @@ confidence: 0.00-1.00. < 0.50 если основные поля (species + proc
 class ParsedRequest:
     species: Optional[str]
     subspecies: Optional[str]
+    brand: Optional[str]
     region: Optional[str]
     weight_class: Optional[str]
     processing: Optional[str]
@@ -223,7 +233,7 @@ async def parse_request_text(text: str, today: Optional[date] = None) -> ParsedR
     json_match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not json_match:
         return ParsedRequest(
-            species=None, subspecies=None, region=None, weight_class=None,
+            species=None, subspecies=None, brand=None, region=None, weight_class=None,
             processing=None, state=None, product_form=None, volume_kg=None,
             target_price_rub_kg=None, target_date=None, client_hint=None,
             confidence=0.0, raw_text=text,
@@ -232,13 +242,16 @@ async def parse_request_text(text: str, today: Optional[date] = None) -> ParsedR
         data = json.loads(json_match.group(0))
     except json.JSONDecodeError:
         return ParsedRequest(
-            species=None, subspecies=None, region=None, weight_class=None,
+            species=None, subspecies=None, brand=None, region=None, weight_class=None,
             processing=None, state=None, product_form=None, volume_kg=None,
             target_price_rub_kg=None, target_date=None, client_hint=None,
             confidence=0.0, raw_text=text,
         )
 
-    species = _validate_enum(data.get("species"), SPECIES_ENUM)
+    # species: enum-валидацию НЕ применяем — для HoReCa-сопутки LLM может вернуть
+    # «майонез», «кетчуп», «зелёный лук» и др., которых в enum нет. Принимаем как есть.
+    species_raw = data.get("species")
+    species = species_raw.strip().lower() if species_raw else None
     processing = _validate_enum(data.get("processing"), PROCESSING_ENUM)
     state = _validate_enum(data.get("state"), STATE_ENUM)
     product_form = _validate_enum(data.get("product_form"), PRODUCT_FORM_ENUM)
@@ -265,6 +278,7 @@ async def parse_request_text(text: str, today: Optional[date] = None) -> ParsedR
     return ParsedRequest(
         species=species,
         subspecies=data.get("subspecies"),
+        brand=data.get("brand"),
         region=region,
         weight_class=data.get("weight_class"),
         processing=processing,
@@ -289,13 +303,13 @@ def insert_request(db, parsed: ParsedRequest, created_by_tg: int,
             """
             INSERT INTO procurement.requests(
                 created_by_tg, created_by_name, raw_text,
-                species, subspecies, region, weight_class,
+                species, subspecies, brand, region, weight_class,
                 processing, state, product_form,
                 volume_kg, target_price_rub_kg, target_date,
                 client_name, assigned_to, llm_confidence
             ) VALUES (
                 %s, %s, %s,
-                %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
                 %s, %s, %s,
                 %s, %s, %s,
                 %s, %s, %s
@@ -304,7 +318,7 @@ def insert_request(db, parsed: ParsedRequest, created_by_tg: int,
             """,
             (
                 created_by_tg, created_by_name, parsed.raw_text,
-                parsed.species, parsed.subspecies, parsed.region,
+                parsed.species, parsed.subspecies, parsed.brand, parsed.region,
                 parsed.weight_class, parsed.processing, parsed.state,
                 parsed.product_form,
                 parsed.volume_kg, parsed.target_price_rub_kg,
@@ -363,20 +377,33 @@ def _fmt_field(label: str, value, suffix: str = "") -> str:
     return f"  • {label}: *{value}*{suffix}"
 
 
+# Категории species, относящиеся к РЫБЕ/МОРЕПРОДУКТАМ. Для них preview
+# показывает «рыбные» поля (processing, state, region, weight_class).
+# Для сопутки эти поля скрываются как нерелевантные.
+FISH_SPECIES = SPECIES_ENUM - {
+    "сыр", "молочка", "масло-сливочное", "масло-растительное",
+    "овощи", "фрукты", "зелень", "специи", "соусы",
+    "рис", "крупы", "мука", "тесто",
+    "мясо", "птица", "яйцо", "водоросли", "упаковка", "прочее",
+}
+
+
 def format_preview(parsed: ParsedRequest, assigned_to: Optional[str],
                    missing_req: list[str] = None,
                    missing_rec: list[str] = None) -> str:
     missing_req = missing_req or []
     missing_rec = missing_rec or []
 
-    target_str = parsed.target_date or "—"
+    is_fish = (parsed.species or "").lower() in FISH_SPECIES
+
+    target_str = None
     if parsed.target_date:
         try:
             d = datetime.strptime(parsed.target_date, "%Y-%m-%d").date()
             dows = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
             target_str = f"{d.strftime('%d.%m')} ({dows[d.weekday()]})"
         except ValueError:
-            pass
+            target_str = parsed.target_date
 
     confidence_warn = ""
     if parsed.confidence < 0.8:
@@ -386,7 +413,7 @@ def format_preview(parsed: ParsedRequest, assigned_to: Optional[str],
         "belyakova": "Александре Беляковой",
         "kristina":  "Кристине Павленко",
         "victor":    "Виктору",
-        None:        "общая очередь (species не определён)",
+        None:        "общая очередь (вид не определён)",
     }.get(assigned_to, f"`{assigned_to}`")
 
     # Блок «не хватает» сверху — менеджер сразу видит, чего не хватает.
@@ -394,48 +421,64 @@ def format_preview(parsed: ParsedRequest, assigned_to: Optional[str],
     if missing_req:
         header += (
             f"❌ *Не хватает обязательного:* {', '.join(missing_req)}\n"
-            f"_Жми «➕ Дополнить» и допиши недостающее._\n\n"
+            f"_Жми «➕ Дополнить» и пришли это в одном сообщении._\n\n"
         )
     elif missing_rec:
         header += (
             f"💡 *Желательно добавить:* {', '.join(missing_rec)}\n"
-            f"_Можно подтвердить без, но закупщику будет полезно._\n\n"
+            f"_Можно подтвердить и без — но закупщику пригодится._\n\n"
         )
+
+    # Динамическая сборка — показываем только заполненные поля.
+    # Для сопутки скрываем «рыбные» поля (разделка/состояние/регион/подвид).
+    lines = ["📋 *Понял заявку так:*", ""]
+    lines.append(_fmt_field("Вид", parsed.species))
+    if parsed.brand:
+        lines.append(_fmt_field("Бренд", parsed.brand))
+    if is_fish and parsed.subspecies:
+        lines.append(_fmt_field("Подвид", parsed.subspecies))
+    if is_fish and parsed.region:
+        lines.append(_fmt_field("Регион", parsed.region))
+    if parsed.weight_class:
+        lines.append(_fmt_field("Навеска", parsed.weight_class))
+    if is_fish and parsed.processing and parsed.processing != "unspecified":
+        lines.append(_fmt_field("Разделка", parsed.processing))
+    if is_fish and parsed.state and parsed.state != "unspecified":
+        lines.append(_fmt_field("Состояние", parsed.state))
+    if parsed.product_form and parsed.product_form != "сырьё":
+        lines.append(_fmt_field("Форма", parsed.product_form))
+    lines.append(_fmt_field("Объём", parsed.volume_kg, " кг"))
+    lines.append(_fmt_field("Цена для клиента", parsed.target_price_rub_kg, " ₽/кг"))
+    if target_str:
+        lines.append(_fmt_field("Дедлайн", target_str))
+    if parsed.client_hint:
+        lines.append(_fmt_field("Клиент", parsed.client_hint))
 
     return (
         header
-        + f"📋 *Понял заявку так:*\n\n"
-        + _fmt_field("Вид", parsed.species) + "\n"
-        + (_fmt_field("Подвид", parsed.subspecies) + "\n" if parsed.subspecies else "")
-        + (_fmt_field("Регион", parsed.region) + "\n" if parsed.region else "")
-        + _fmt_field("Навеска", parsed.weight_class) + "\n"
-        + _fmt_field("Разделка", parsed.processing) + "\n"
-        + _fmt_field("Состояние", parsed.state) + "\n"
-        + (_fmt_field("Форма", parsed.product_form) + "\n"
-           if parsed.product_form and parsed.product_form != "сырьё" else "")
-        + _fmt_field("Объём", parsed.volume_kg, " кг") + "\n"
-        + _fmt_field("Цена для клиента", parsed.target_price_rub_kg, " ₽/кг") + "\n"
-        + _fmt_field("Дедлайн", target_str) + "\n"
-        + (_fmt_field("Клиент", parsed.client_hint) + "\n" if parsed.client_hint else "")
-        + f"\n🛒 Закупщик: *{assignee_disp}*"
+        + "\n".join(lines)
+        + f"\n\n🛒 Закупщик: *{assignee_disp}*"
         + confidence_warn
     )
 
 
 def format_assignee_notification(request_id: int, parsed: ParsedRequest,
                                  created_by_name: str) -> str:
+    is_fish = (parsed.species or "").lower() in FISH_SPECIES
     parts = []
     if parsed.species:
         parts.append(parsed.species)
-    if parsed.subspecies:
+    if parsed.brand:
+        parts.append(parsed.brand)
+    if is_fish and parsed.subspecies:
         parts.append(parsed.subspecies)
-    if parsed.region:
+    if is_fish and parsed.region:
         parts.append(parsed.region)
-    if parsed.processing and parsed.processing != "unspecified":
+    if is_fish and parsed.processing and parsed.processing != "unspecified":
         parts.append(parsed.processing)
     if parsed.weight_class:
         parts.append(parsed.weight_class)
-    if parsed.state and parsed.state != "unspecified":
+    if is_fish and parsed.state and parsed.state != "unspecified":
         parts.append(parsed.state)
     if parsed.product_form and parsed.product_form != "сырьё":
         parts.append(parsed.product_form)
