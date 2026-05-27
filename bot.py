@@ -7288,6 +7288,14 @@ def main():
         except Exception as e:
             logger.error(f"pdz_catch_up_missed_jobs failed: {e}", exc_info=True)
 
+        # Catch-up для market_intel: при rebuild'ах чаще 30 мин IntervalTrigger
+        # никогда не успевает дёрнуться. Прогоняем разбор сразу на старте.
+        try:
+            from market_intel_processor import market_intel_cron_job
+            await market_intel_cron_job(app, db)
+        except Exception as e:
+            logger.error(f"market_intel startup catch-up failed: {e}", exc_info=True)
+
         # Ждём завершения старого инстанса и принудительно сбрасываем webhook
         import asyncio as _asyncio
         for attempt in range(5):
