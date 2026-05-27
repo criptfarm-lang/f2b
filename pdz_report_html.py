@@ -142,6 +142,7 @@ def build_pdz_payload(db) -> dict:
             "order_id": r.get("order_id") or "",
             "days_overdue": days_overdue,
             "unpaid": unpaid,
+            "touched": ppm_new is not None,  # менеджер поставил «Новую дату оплаты»
         })
 
     # Шаг 2: применить FIFO + balance=None skip. total_unpaid = real_overdue.
@@ -161,11 +162,14 @@ def build_pdz_payload(db) -> dict:
             continue  # FIFO-перекрытие
         # Самый старый просроченный заказ — для days_overdue и ссылки.
         oldest = max(data["overdue"], key=lambda x: x["days_overdue"])
+        touched_count = sum(1 for o in data["overdue"] if o.get("touched"))
+        orders_total = len(data["overdue"])
         debtors.append({
             "agent_id": aid,
             "agent_name": data["agent_name"],
             "manager_tag": data["manager_tag"],
-            "orders_count": len(data["overdue"]),
+            "orders_count": orders_total,
+            "orders_touched": touched_count,  # сколько с заполненной «Новой датой оплаты»
             "days_overdue": oldest["days_overdue"],
             "total_unpaid": real_overdue,
             "ms_url": _ms_url(oldest["order_id"]),
@@ -359,12 +363,29 @@ def _render_debtors(debtors: list) -> str:
         else:
             row_cls = ' class="row-old-overdue"' if days > 90 else ''
             status_cell = '<span class="muted">—</span>'
+
+        # Обработано = сколько просроченных заказов клиента имеют заполненную
+        # «Новую дату оплаты». Логика 2026-05-27: если менеджер физически
+        # открыл заказ в МС и поставил ppm_new — это значит «начал отрабатывать»
+        # (даже если эта новая дата уже в прошлом = срыв обещания).
+        orders_total = int(d.get("orders_count") or 0)
+        orders_touched = int(d.get("orders_touched") or 0)
+        if orders_total == 0:
+            touched_cell = '<span class="muted">—</span>'
+        elif orders_touched == 0:
+            touched_cell = f'<span class="bad-break">0/{orders_total}</span>'
+        elif orders_touched < orders_total:
+            touched_cell = f'<span style="color:#d97706">{orders_touched}/{orders_total}</span>'
+        else:
+            touched_cell = f'<span style="color:#059669">{orders_touched}/{orders_total}</span>'
+
         rows.append(
             f'<tr{row_cls}>'
             f'<td><a href="{_esc(d.get("ms_url"))}" target="_blank" rel="noopener">'
             f'{_esc(d.get("agent_name"))}</a></td>'
             f'<td>{_esc(d.get("manager_tag") or "—")}</td>'
-            f'<td class="num">{int(d.get("orders_count") or 0)}</td>'
+            f'<td class="num">{orders_total}</td>'
+            f'<td class="num">{touched_cell}</td>'
             f'<td class="num">{days}</td>'
             f'<td class="num">{breaks_cell}</td>'
             f'<td>{status_cell}</td>'
@@ -375,7 +396,9 @@ def _render_debtors(debtors: list) -> str:
         '<table>'
         '<thead><tr>'
         '<th>Клиент</th><th>Менеджер</th>'
-        '<th class="num">Заказов</th><th class="num">Дней просрочки</th>'
+        '<th class="num">Заказов</th>'
+        '<th class="num" title="Сколько заказов клиента менеджер уже открыл и проставил «Новую дату оплаты»">Обработано</th>'
+        '<th class="num">Дней просрочки</th>'
         '<th class="num">Срывов 90д</th><th>Статус</th><th class="num">Долг</th>'
         '</tr></thead>'
         f'<tbody>{"".join(rows)}</tbody>'
