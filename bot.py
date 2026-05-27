@@ -7279,14 +7279,18 @@ def main():
         await app.initialize()
         await app.start()
 
-        # Catch-up пропущенных PDZ-cron'ов: если контейнер пересобирался
-        # Amvera ПОСЛЕ cron-tick'а — AsyncIOScheduler без persistent jobstore
-        # этого не знает. Catch-up догоняет, иначе дайджест 14:10 теряется
-        # (как было 2026-05-22 и 2026-05-25).
-        try:
-            await pdz_catch_up_missed_jobs(app, db)
-        except Exception as e:
-            logger.error(f"pdz_catch_up_missed_jobs failed: {e}", exc_info=True)
+        # Catch-up пропущенных PDZ-cron'ов: fire-and-forget в фон. Иначе
+        # snapshot тянет МС API ~3 мин и блокирует start_polling — бот не
+        # отвечает на команды до окончания catch-up (наблюдалось 2026-05-27
+        # 17:50, когда я повторно ронял контейнер push'ами и polling никак
+        # не стартовал). Catch-up догонит в фоне, polling работает сразу.
+        import asyncio as _asyncio
+        async def _catchup_in_bg():
+            try:
+                await pdz_catch_up_missed_jobs(app, db)
+            except Exception as e:
+                logger.error(f"pdz_catch_up_missed_jobs failed: {e}", exc_info=True)
+        _asyncio.create_task(_catchup_in_bg())
 
         # Catch-up для market_intel: при rebuild'ах чаще 30 мин IntervalTrigger
         # никогда не успевает дёрнуться. Прогоняем разбор сразу на старте.
