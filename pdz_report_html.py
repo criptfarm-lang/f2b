@@ -263,7 +263,9 @@ def build_pdz_payload(db) -> dict:
         if payed >= total:
             continue
         ppm_initial = _to_date(r.get("ppm_initial"))
-        if not ppm_initial or ppm_initial >= today:
+        # ppm_initial <= today: включаем заказы, у которых срок истекает
+        # сегодня — менеджер мог проактивно открыть и поставить «Новую дату».
+        if not ppm_initial or ppm_initial > today:
             continue
         ppm_new = _to_date(r.get("ppm_new"))
         m = by_mgr.setdefault(tag, {
