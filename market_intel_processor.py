@@ -167,12 +167,12 @@ product_form: {", ".join(PRODUCT_FORM_ENUM)}
 """
 
 
-async def _call_claude(content) -> dict:
+async def _call_claude(content, max_tokens: int = 8192) -> dict:
     """Универсальный вызов Anthropic API. content — список content-blocks."""
     client = get_client()
     response = await client.messages.create(
         model=ANTHROPIC_MODEL,
-        max_tokens=8192,
+        max_tokens=max_tokens,
         system=_build_system_prompt(),
         messages=[{"role": "user", "content": content}],
     )
@@ -204,6 +204,40 @@ async def parse_photo_message(image_path: str, caption: str = "") -> dict:
         {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
         {"type": "text", "text": f"Фото прайс-листа из канала «Мониторинг».\nCaption (если есть): {caption or '(нет)'}\nИзвлеки все товарные позиции."},
     ])
+
+
+def _extract_pdf_text(pdf_path: str) -> str:
+    """pdfplumber → один текст со всех страниц. Python-only, без apt-poppler."""
+    import pdfplumber
+    parts = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, page in enumerate(pdf.pages, start=1):
+            t = page.extract_text() or ""
+            if t.strip():
+                parts.append(f"--- стр {i} ---\n{t}")
+    return "\n\n".join(parts)
+
+
+async def parse_pdf_message(pdf_path: str, caption: str = "") -> dict:
+    """PDF → pdftext → Claude Haiku.
+
+    Прайсы поставщиков (Moreodor, Inarctica, Fish2O) — это PDF на 1-5 страниц
+    с десятками-сотнями позиций. Vision дорого и медленно, нативный PDF в Haiku
+    не поддерживается. pdftotext через pdfplumber — Python-only, разумное качество.
+    Большие прайсы (>1000 позиций) уйдут в обрезку max_tokens=16k — это норма для MVP.
+    """
+    text = _extract_pdf_text(pdf_path)
+    if not text.strip():
+        logger.warning(f"market_intel: PDF {pdf_path} — pdfplumber вернул пустой текст")
+        return {"supplier_hint": None, "received_at": None, "lots": []}
+
+    return await _call_claude([
+        {"type": "text", "text": (
+            f"PDF-прайс из канала «Мониторинг» (извлечён pdftotext).\n"
+            f"Caption из TG: {caption or '(нет)'}\n\n"
+            f"Содержимое:\n{text}"
+        )},
+    ], max_tokens=16384)
 
 
 def _supplier_slug_from_hint(hint: str) -> Optional[str]:
@@ -320,10 +354,18 @@ async def process_pending(db, limit: int = 20) -> dict:
             elif mt == "photo" and file_path and os.path.exists(file_path):
                 result = await parse_photo_message(file_path, caption)
             elif mt == "document" and msg.get("file_ext") == "pdf":
-                # PDF skipped на MVP — слишком большие output tokens для прайсов 100+ позиций.
-                logger.info(f"market_intel: msg {msg_id} type=pdf SKIPPED (требует обработки скиллом)")
-                stats["skipped_pdf"] += 1
-                continue  # НЕ помечаем processed — пусть скилл обработает
+                if not file_path or not os.path.exists(file_path):
+                    logger.warning(f"market_intel: msg {msg_id} PDF file_path не найден ({file_path}), помечаю processed")
+                    db.mark_market_intel_processed(msg_id)
+                    stats["failed"] += 1
+                    continue
+                try:
+                    result = await parse_pdf_message(file_path, caption)
+                except Exception as e:
+                    logger.exception(f"market_intel: msg {msg_id} PDF parse failed: {e!r}")
+                    # НЕ помечаем processed — попробуем на следующем тике (вдруг временный сбой).
+                    stats["failed"] += 1
+                    continue
             else:
                 logger.warning(f"market_intel: msg {msg_id} type={mt} unknown, skip")
                 db.mark_market_intel_processed(msg_id)
@@ -356,11 +398,29 @@ async def process_pending(db, limit: int = 20) -> dict:
     return stats
 
 
+def _record_tick(db, status: str, detail: str = ""):
+    """Heartbeat в bot_settings. Чтобы видеть из БД, что cron живой и когда
+    он последний раз стартовал/завершился (без доступа к Amvera-логам)."""
+    try:
+        from zoneinfo import ZoneInfo
+        now_iso = datetime.now(ZoneInfo("Europe/Moscow")).isoformat()
+        db._execute(
+            "INSERT INTO bot_settings(key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            (f"market_intel_{status}_at", f"{now_iso} {detail}".strip()),
+        )
+    except Exception as e:
+        logger.warning(f"_record_tick: {e}")
+
+
 async def market_intel_cron_job(app, db):
-    """APScheduler entry-point. Вызывается каждые 30 мин в окне 9-19 МСК."""
+    """APScheduler entry-point. Вызывается каждые 30 мин 24/7."""
     logger.info("market_intel cron tick started")
+    _record_tick(db, "tick_started")
     try:
         stats = await process_pending(db)
         logger.info(f"market_intel cron: {stats}")
-    except Exception:
+        _record_tick(db, "tick_done", detail=str(stats))
+    except Exception as e:
         logger.exception("market_intel cron crashed")
+        _record_tick(db, "tick_crashed", detail=str(e))
