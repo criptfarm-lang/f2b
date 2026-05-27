@@ -102,7 +102,15 @@ def build_pdz_payload(db) -> dict:
 
     # Per-contractor FIFO + balance=None skip (та же логика что в
     # moysklad.pdz_overdue_for_manager и pdz_unprocessed_for_owner).
-    # Шаг 1: собрать per-agent overdue + in_сroк_unpaid.
+    # Шаг 1: собрать per-agent overdue + in_сroк_unpaid + work-метрики.
+    #
+    # work_total = заказы где ppm_initial < today И payed < sum (всё, что
+    #              формально просрочено по исходной дате — работа менеджера)
+    # work_touched = из work_total те где ppm_new is not null (менеджер
+    #                открыл карточку и поставил новую дату — неважно в прошлое
+    #                или будущее)
+    # Это важно: если менеджер согласовал перенос в будущее, заказ уходит из
+    # «overdue» в «in_сroк», но в work_touched учитывается — это его работа.
     by_agent_raw: dict[str, dict] = {}
     for r in rows:
         bal_raw = r.get("agent_balance")
@@ -133,7 +141,14 @@ def build_pdz_payload(db) -> dict:
             "agent_balance": balance,
             "overdue": [],
             "in_сroк_unpaid_total": 0.0,
+            "work_total": 0,
+            "work_touched": 0,
         })
+        # Считаем работу менеджера по исходной дате, не по effective.
+        if ppm_initial is not None and ppm_initial < today:
+            bucket["work_total"] += 1
+            if ppm_new is not None:
+                bucket["work_touched"] += 1
         if effective >= today:
             bucket["in_сroк_unpaid_total"] = round(bucket["in_сroк_unpaid_total"] + unpaid, 2)
             continue
@@ -142,7 +157,6 @@ def build_pdz_payload(db) -> dict:
             "order_id": r.get("order_id") or "",
             "days_overdue": days_overdue,
             "unpaid": unpaid,
-            "touched": ppm_new is not None,  # менеджер поставил «Новую дату оплаты»
         })
 
     # Шаг 2: применить FIFO + balance=None skip. total_unpaid = real_overdue.
@@ -162,14 +176,12 @@ def build_pdz_payload(db) -> dict:
             continue  # FIFO-перекрытие
         # Самый старый просроченный заказ — для days_overdue и ссылки.
         oldest = max(data["overdue"], key=lambda x: x["days_overdue"])
-        touched_count = sum(1 for o in data["overdue"] if o.get("touched"))
-        orders_total = len(data["overdue"])
         debtors.append({
             "agent_id": aid,
             "agent_name": data["agent_name"],
             "manager_tag": data["manager_tag"],
-            "orders_count": orders_total,
-            "orders_touched": touched_count,  # сколько с заполненной «Новой датой оплаты»
+            "orders_count": data["work_total"],          # всего заказов клиента с просроч. ppm_initial
+            "orders_touched": data["work_touched"],      # из них с заполн. «Новой датой оплаты»
             "days_overdue": oldest["days_overdue"],
             "total_unpaid": real_overdue,
             "ms_url": _ms_url(oldest["order_id"]),
