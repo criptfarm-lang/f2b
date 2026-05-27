@@ -218,6 +218,8 @@ def build_pdz_payload(db) -> dict:
     by_mgr: dict[str, dict] = {}
     for d in debtors:
         tag = (d.get("manager_tag") or "—").lower() or "—"
+        orders_total = int(d.get("orders_count") or 0)
+        orders_touched = int(d.get("orders_touched") or 0)
         m = by_mgr.get(tag)
         if m is None:
             by_mgr[tag] = {
@@ -225,11 +227,15 @@ def build_pdz_payload(db) -> dict:
                 "debtors_count": 1,
                 "breaks_count": int(d.get("breaks_count") or 0),
                 "total_debt": d["total_unpaid"],
+                "orders_total": orders_total,
+                "orders_touched": orders_touched,
             }
         else:
             m["debtors_count"] += 1
             m["breaks_count"] += int(d.get("breaks_count") or 0)
             m["total_debt"] = round(m["total_debt"] + d["total_unpaid"], 2)
+            m["orders_total"] += orders_total
+            m["orders_touched"] += orders_touched
     managers = sorted(by_mgr.values(), key=lambda x: x["total_debt"], reverse=True)
 
     # Топ-нарушители за 90д
@@ -319,6 +325,22 @@ tr.row-prepayment-only td { background: #fee2e2; }
 .stop-badge.stop { background: #fde68a; color: #7c2d12; }
 .stop-badge.prepay { background: #fecaca; color: #7f1d1d; }
 .muted { color: #9ca3af; }
+
+/* Плитки по менеджерам — сетка с прогресс-баром «обработано». */
+.mgr-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 14px; }
+.mgr-card { background: #fafaff; border: 1px solid #e8e5f5; border-radius: 10px;
+            padding: 14px 16px; }
+.mgr-name { font-size: 14px; font-weight: 600; color: #1e1b4b; margin-bottom: 4px; }
+.mgr-debt { font-size: 22px; font-weight: 700; color: #1e1b4b; margin-bottom: 8px;
+            font-variant-numeric: tabular-nums; }
+.mgr-meta { font-size: 12px; color: #6b7280; display: flex; gap: 6px; flex-wrap: wrap;
+            margin-bottom: 10px; }
+.mgr-meta .mgr-breaks { color: #c00; font-weight: 600; }
+.mgr-progress-label { display: flex; justify-content: space-between; font-size: 12px;
+                      color: #4b5563; margin-bottom: 4px; }
+.mgr-progress-bar { background: #e8e5f5; border-radius: 4px; height: 6px; overflow: hidden; }
+.mgr-progress-fill { height: 100%; transition: width 0.3s; }
 .empty { color: #6b7280; font-size: 13px; padding: 20px; text-align: center; }
 """
 
@@ -414,31 +436,62 @@ def _render_debtors(debtors: list) -> str:
 def _render_managers(managers: list) -> str:
     if not managers:
         return ''
-    rows = []
+
+    # Маппинг тегов на отображаемые имена (как в moysklad.PDZ_MANAGER_TAG_MAP).
+    DISPLAY = {
+        "баласанян":  "Карина Баласанян",
+        "скляр":      "Инесса Скляр",
+        "мерзлякова": "Елена Мерзлякова",
+        "дьяченко":   "Ирина Дьяченко",
+        "коликов":    "Денис Коликов",
+    }
+
+    cards = []
     for m in managers:
-        rows.append(
-            f'<tr>'
-            f'<td>{_esc(m.get("manager_tag") or "—")}</td>'
-            f'<td class="num">{int(m.get("debtors_count") or 0)}</td>'
-            f'<td class="num">{int(m.get("breaks_count") or 0)}</td>'
-            f'<td class="num">{_esc(_fmt_money(m.get("total_debt")))}</td>'
-            f'</tr>'
-        )
-    table = (
-        '<table>'
-        '<thead><tr>'
-        '<th>Менеджер</th>'
-        '<th class="num">Клиентов с долгом</th>'
-        '<th class="num">Срывов 90д</th>'
-        '<th class="num">Сумма долга</th>'
-        '</tr></thead>'
-        f'<tbody>{"".join(rows)}</tbody>'
-        '</table>'
-    )
+        tag = (m.get("manager_tag") or "—").lower()
+        name = DISPLAY.get(tag, m.get("manager_tag") or "—")
+        debtors_n = int(m.get("debtors_count") or 0)
+        orders_total = int(m.get("orders_total") or 0)
+        orders_touched = int(m.get("orders_touched") or 0)
+        breaks = int(m.get("breaks_count") or 0)
+        debt = m.get("total_debt") or 0
+
+        pct = (orders_touched * 100 // orders_total) if orders_total > 0 else 0
+
+        if orders_total == 0:
+            bar_color = "#9ca3af"
+        elif pct == 0:
+            bar_color = "#dc2626"  # красный
+        elif pct < 100:
+            bar_color = "#d97706"  # оранжевый
+        else:
+            bar_color = "#059669"  # зелёный
+
+        cards.append(f'''
+        <div class="mgr-card">
+          <div class="mgr-name">{_esc(name)}</div>
+          <div class="mgr-debt">{_esc(_fmt_money(debt))}</div>
+          <div class="mgr-meta">
+            <span>{debtors_n} клиент{'ов' if debtors_n%10 not in (1,2,3,4) or debtors_n%100 in (11,12,13,14) else ('а' if debtors_n%10 in (2,3,4) else '')}</span>
+            <span>•</span>
+            <span>{orders_total} заказ{'ов' if orders_total%10 not in (1,2,3,4) or orders_total%100 in (11,12,13,14) else ('а' if orders_total%10 in (2,3,4) else '')}</span>
+            {f'<span>•</span><span class="mgr-breaks">{breaks} срыв{"ов" if breaks%10 not in (1,2,3,4) or breaks%100 in (11,12,13,14) else ("а" if breaks%10 in (2,3,4) else "")} 90д</span>' if breaks > 0 else ''}
+          </div>
+          <div class="mgr-progress-label">
+            <span>Отработано: <strong>{orders_touched}/{orders_total}</strong></span>
+            <span style="color:{bar_color}"><strong>{pct}%</strong></span>
+          </div>
+          <div class="mgr-progress-bar">
+            <div class="mgr-progress-fill" style="width:{pct}%;background:{bar_color}"></div>
+          </div>
+        </div>
+        ''')
+
     return (
         '<div class="section">'
         '<div class="section-title">По менеджерам</div>'
-        f'{table}</div>'
+        f'<div class="mgr-grid">{"".join(cards)}</div>'
+        '</div>'
     )
 
 
