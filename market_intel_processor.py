@@ -240,14 +240,33 @@ async def parse_pdf_message(pdf_path: str, caption: str = "") -> dict:
     ], max_tokens=16384)
 
 
-def _supplier_slug_from_hint(hint: str) -> Optional[str]:
+def _supplier_slug_from_hint(hint: str) -> tuple[Optional[str], bool]:
+    """Возвращает (slug, is_known). is_known=True если матч с SUPPLIER_HINT_MAP,
+    False если slug сгенерирован из hint (новый/неопознанный поставщик).
+    Лоты от is_known=False помечаются confidence=needs-review."""
     if not hint:
-        return None
+        return None, False
     h = hint.lower().strip()
     for needle, slug in SUPPLIER_HINT_MAP.items():
         if needle in h:
-            return slug
-    return None
+            return slug, True
+    # Hint не в карте — генерим slug. Берём первое осмысленное слово, чистим.
+    import re as _re
+    # Игнорируем мусорные фразы из канала-обёртки.
+    GARBAGE = (
+        "мониторинг", "ооо фиш ту бизнес", "ооо «фиш ту бизнес»",
+        "важно", "не забывайте", "что-то от поставщика",
+        "кристина, сюда", "сюда пересылаем", "пересылаем",
+    )
+    for g in GARBAGE:
+        if g in h:
+            return None, False
+    # Берём первые 30 символов, оставляем только буквы/цифры/пробелы/дефисы.
+    cleaned = _re.sub(r"[^a-zа-я0-9\s\-]", "", h[:30]).strip()
+    cleaned = _re.sub(r"\s+", "-", cleaned)
+    if len(cleaned) < 2:
+        return None, False
+    return cleaned, False
 
 
 def _insert_lots(db, lots: list[dict], supplier_id: str, msg_id: int,
@@ -374,9 +393,9 @@ async def process_pending(db, limit: int = 20) -> dict:
 
             # Маппинг supplier
             hint = result.get("supplier_hint") or forward_from or caption[:50]
-            slug = _supplier_slug_from_hint(hint)
+            slug, is_known = _supplier_slug_from_hint(hint)
             if not slug:
-                logger.warning(f"market_intel: msg {msg_id} — supplier_slug не определён (hint={hint!r}); пропускаю с пометкой needs-review")
+                logger.warning(f"market_intel: msg {msg_id} — slug пустой (hint={hint!r}); пропускаю needs-review")
                 db.mark_market_intel_processed(msg_id)
                 stats["failed"] += 1
                 continue
@@ -386,12 +405,20 @@ async def process_pending(db, limit: int = 20) -> dict:
                 posted_at = msg.get("posted_at")
                 received_at = posted_at.strftime("%Y-%m-%d") if posted_at else datetime.now().strftime("%Y-%m-%d")
 
-            ins, skp = _insert_lots(db, result.get("lots", []), slug,
+            # Авто-slug (не из known map) → лоты помечаются needs-review.
+            lots_list = result.get("lots", [])
+            if not is_known:
+                for lot in lots_list:
+                    lot["confidence_self"] = "needs-review"
+                    lot.setdefault("notes", "")
+                    lot["notes"] = (lot["notes"] + f" [auto-slug from hint='{hint[:40]}']").strip()
+
+            ins, skp = _insert_lots(db, lots_list, slug,
                                      msg_id, file_path or f"msg_{msg_id}", received_at)
             db.mark_market_intel_processed(msg_id)
             stats["processed"] += 1
             stats["inserted_total"] += ins
-            logger.info(f"market_intel: msg {msg_id} → supplier={slug} lots_inserted={ins} skipped={skp}")
+            logger.info(f"market_intel: msg {msg_id} → supplier={slug} (known={is_known}) lots_inserted={ins} skipped={skp}")
         except Exception as e:
             logger.exception(f"market_intel: msg {msg_id} failed: {e!r}")
             stats["failed"] += 1
