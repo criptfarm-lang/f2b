@@ -245,13 +245,13 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
 
 
 async def handle_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждение/отмена черновика заявки на закупку (Phase 3.2)."""
+    """Подтверждение / дополнение / отмена черновика заявки на закупку (Phase 3.2)."""
     query = update.callback_query
     await query.answer()
     user = query.from_user
     action = query.data
 
-    draft = _draft_requests.pop(user.id, None)
+    draft = _draft_requests.get(user.id)
     if draft is None:
         await query.message.reply_text(
             "⚠️ Черновик заявки не найден (возможно, бот перезапускался). "
@@ -262,6 +262,8 @@ async def handle_request_callback(update: Update, context: ContextTypes.DEFAULT_
     parsed, assigned_to = draft
 
     if action == "req_cancel":
+        _draft_requests.pop(user.id, None)
+        _user_awaiting.pop(user.id, None)
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(
             "❌ Заявка отменена.",
@@ -269,11 +271,33 @@ async def handle_request_callback(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
+    if action == "req_amend":
+        _user_awaiting[user.id] = "request_text_amend"
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            "➕ Допиши недостающее одним сообщением — я перепарсу всё вместе.\n\n"
+            "_Пример: «по 720 ₽/кг, 200 кг, к четвергу»_",
+            parse_mode="Markdown",
+        )
+        return
+
     if action == "req_confirm":
         from request_handler import (
             insert_request, format_assignee_notification,
-            ASSIGNEE_TG, UNCLASSIFIED_NOTIFY_TG,
+            validate_request, ASSIGNEE_TG, UNCLASSIFIED_NOTIFY_TG,
         )
+        # Защита: пересчитать обязательные на момент confirm.
+        missing_req, _ = validate_request(parsed)
+        if missing_req:
+            await query.message.reply_text(
+                f"❌ Всё ещё не хватает обязательного: {', '.join(missing_req)}.\n"
+                "Жми «➕ Дополнить» и допиши.",
+            )
+            return
+
+        _draft_requests.pop(user.id, None)
+        _user_awaiting.pop(user.id, None)
+
         try:
             request_id = insert_request(
                 db, parsed, user.id, user.full_name or "", assigned_to,
@@ -1454,11 +1478,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
             return
 
-        elif awaiting == "request_text":
+        elif awaiting in ("request_text", "request_text_amend"):
             await message.reply_chat_action("typing")
             try:
-                from request_handler import parse_request_text, route_request, format_preview
-                parsed = await parse_request_text(text)
+                from request_handler import (
+                    parse_request_text, route_request, format_preview, validate_request,
+                )
+                # Amend — соединяем с предыдущим raw_text, чтобы LLM видел всё вместе.
+                if awaiting == "request_text_amend":
+                    prev = _draft_requests.get(user.id)
+                    base_text = prev[0].raw_text if prev else ""
+                    combined = (base_text + "\n" + text).strip() if base_text else text
+                else:
+                    combined = text
+                parsed = await parse_request_text(combined)
             except Exception as e:
                 logger.exception(f"request_text parse failed: {e}")
                 await message.reply_text(
@@ -1468,11 +1501,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             assigned_to = route_request(parsed.species)
             _draft_requests[user.id] = (parsed, assigned_to)
-            preview = format_preview(parsed, assigned_to)
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Подтвердить", callback_data="req_confirm"),
-                InlineKeyboardButton("❌ Отменить",   callback_data="req_cancel"),
-            ]])
+            missing_req, missing_rec = validate_request(parsed)
+            preview = format_preview(parsed, assigned_to, missing_req, missing_rec)
+
+            # Без обязательных полей — нет «Подтвердить», только «Дополнить»+«Отменить».
+            if missing_req:
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("➕ Дополнить", callback_data="req_amend"),
+                    InlineKeyboardButton("❌ Отменить",  callback_data="req_cancel"),
+                ]])
+            else:
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Подтвердить", callback_data="req_confirm"),
+                    InlineKeyboardButton("➕ Дополнить",  callback_data="req_amend"),
+                    InlineKeyboardButton("❌ Отменить",   callback_data="req_cancel"),
+                ]])
             await message.reply_text(preview, parse_mode="Markdown", reply_markup=kb)
             return
 

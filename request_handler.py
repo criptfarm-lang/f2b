@@ -297,6 +297,36 @@ def insert_request(db, parsed: ParsedRequest, created_by_tg: int,
     return request_id
 
 
+# ─── Валидация полноты заявки ──────────────────────────────────────────────
+
+# Обязательные поля: без них «Подтвердить» недоступен. Решено собственником
+# 2026-05-26: «не пропускаем без цены как минимум» + species + объём как фундамент.
+REQUIRED_FIELDS = [
+    ("species",              "вид"),
+    ("volume_kg",             "объём (кг)"),
+    ("target_price_rub_kg",   "бюджет (₽/кг)"),
+]
+
+# Желательные: при отсутствии — preview покажет рекомендацию, но «Подтвердить»
+# доступно (для морепродуктов калибр не всегда применим).
+RECOMMENDED_FIELDS = [
+    ("weight_class",   "навеска"),
+]
+
+
+def validate_request(parsed: "ParsedRequest") -> tuple[list[str], list[str]]:
+    """Возвращает (missing_required, missing_recommended)."""
+    missing_req = []
+    for field, label in REQUIRED_FIELDS:
+        if getattr(parsed, field) in (None, "", "unspecified"):
+            missing_req.append(label)
+    missing_rec = []
+    for field, label in RECOMMENDED_FIELDS:
+        if getattr(parsed, field) in (None, "", "unspecified"):
+            missing_rec.append(label)
+    return missing_req, missing_rec
+
+
 # ─── Форматирование preview / нотификации ─────────────────────────────────
 
 def _fmt_field(label: str, value, suffix: str = "") -> str:
@@ -305,7 +335,12 @@ def _fmt_field(label: str, value, suffix: str = "") -> str:
     return f"  • {label}: *{value}*{suffix}"
 
 
-def format_preview(parsed: ParsedRequest, assigned_to: Optional[str]) -> str:
+def format_preview(parsed: ParsedRequest, assigned_to: Optional[str],
+                   missing_req: list[str] = None,
+                   missing_rec: list[str] = None) -> str:
+    missing_req = missing_req or []
+    missing_rec = missing_rec or []
+
     target_str = parsed.target_date or "—"
     if parsed.target_date:
         try:
@@ -326,8 +361,22 @@ def format_preview(parsed: ParsedRequest, assigned_to: Optional[str]) -> str:
         None:        "общая очередь (species не определён)",
     }.get(assigned_to, f"`{assigned_to}`")
 
+    # Блок «не хватает» сверху — менеджер сразу видит, чего не хватает.
+    header = ""
+    if missing_req:
+        header += (
+            f"❌ *Не хватает обязательного:* {', '.join(missing_req)}\n"
+            f"_Жми «➕ Дополнить» и допиши недостающее._\n\n"
+        )
+    elif missing_rec:
+        header += (
+            f"💡 *Желательно добавить:* {', '.join(missing_rec)}\n"
+            f"_Можно подтвердить без, но закупщику будет полезно._\n\n"
+        )
+
     return (
-        f"📋 *Понял заявку так:*\n\n"
+        header
+        + f"📋 *Понял заявку так:*\n\n"
         + _fmt_field("Вид", parsed.species) + "\n"
         + (_fmt_field("Подвид", parsed.subspecies) + "\n" if parsed.subspecies else "")
         + (_fmt_field("Регион", parsed.region) + "\n" if parsed.region else "")
