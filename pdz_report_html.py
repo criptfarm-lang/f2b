@@ -100,18 +100,16 @@ def build_pdz_payload(db) -> dict:
         if updated_at is None or sa > updated_at:
             updated_at = sa
 
-    # Фильтруем «реально просроченные» = balance<0 + payed<total + effective<today.
-    # Логика идентична moysklad.pdz_overdue_for_manager, но без зависимости от него.
-    # balance>=0 → клиент по факту ничего не должен (банк не разнесён).
-    overdue_orders: list[dict] = []  # плоский список заказов
+    # Per-contractor FIFO + balance=None skip (та же логика что в
+    # moysklad.pdz_overdue_for_manager и pdz_unprocessed_for_owner).
+    # Шаг 1: собрать per-agent overdue + in_сroк_unpaid.
+    by_agent_raw: dict[str, dict] = {}
     for r in rows:
         bal_raw = r.get("agent_balance")
         try:
             balance = float(bal_raw) if bal_raw is not None else None
         except Exception:
             balance = None
-        if balance is not None and balance >= 0:
-            continue
         try:
             total = float(r.get("total_sum") or 0)
             payed = float(r.get("payed_sum") or 0)
@@ -122,53 +120,56 @@ def build_pdz_payload(db) -> dict:
         ppm_new = _to_date(r.get("ppm_new"))
         ppm_initial = _to_date(r.get("ppm_initial"))
         effective = ppm_new if ppm_new is not None else ppm_initial
-        if not effective or effective >= today:
+        if not effective:
             continue
-        unpaid = round(total - payed, 2)
-        days_overdue = (today - effective).days
-        overdue_orders.append({
-            "order_id": r.get("order_id") or "",
-            "order_name": r.get("order_name") or "",
-            "agent_id": r.get("agent_id") or "",
-            "agent_name": r.get("agent_name") or "—",
-            "manager_tag": r.get("manager_tag") or "",
-            "days_overdue": days_overdue,
-            "unpaid": unpaid,
-            "agent_balance": balance,
-        })
-
-    # Группировка по контрагенту
-    by_agent: dict[str, dict] = {}
-    for o in overdue_orders:
-        aid = o["agent_id"]
+        aid = r.get("agent_id") or ""
         if not aid:
             continue
-        g = by_agent.get(aid)
-        if g is None:
-            by_agent[aid] = {
-                "agent_id": aid,
-                "agent_name": o["agent_name"],
-                "manager_tag": o["manager_tag"],
-                "orders_count": 1,
-                "days_overdue": o["days_overdue"],
-                "total_unpaid": o["unpaid"],
-                "ms_url": _ms_url(o["order_id"]),
-                "oldest_effective_order_id": o["order_id"],
-                "_oldest_days": o["days_overdue"],
-            }
-        else:
-            g["orders_count"] += 1
-            g["total_unpaid"] = round(g["total_unpaid"] + o["unpaid"], 2)
-            if o["days_overdue"] > g["_oldest_days"]:
-                g["_oldest_days"] = o["days_overdue"]
-                g["days_overdue"] = o["days_overdue"]
-                g["ms_url"] = _ms_url(o["order_id"])
-                g["oldest_effective_order_id"] = o["order_id"]
+        unpaid = round(total - payed, 2)
+        bucket = by_agent_raw.setdefault(aid, {
+            "agent_id": aid,
+            "agent_name": r.get("agent_name") or "—",
+            "manager_tag": r.get("manager_tag") or "",
+            "agent_balance": balance,
+            "overdue": [],
+            "in_сroк_unpaid_total": 0.0,
+        })
+        if effective >= today:
+            bucket["in_сroк_unpaid_total"] = round(bucket["in_сroк_unpaid_total"] + unpaid, 2)
+            continue
+        days_overdue = (today - effective).days
+        bucket["overdue"].append({
+            "order_id": r.get("order_id") or "",
+            "days_overdue": days_overdue,
+            "unpaid": unpaid,
+        })
 
-    debtors = list(by_agent.values())
-    for g in debtors:
-        g.pop("_oldest_days", None)
-        g.pop("oldest_effective_order_id", None)
+    # Шаг 2: применить FIFO + balance=None skip. total_unpaid = real_overdue.
+    debtors: list[dict] = []
+    for aid, data in by_agent_raw.items():
+        if not data["overdue"]:
+            continue
+        bal = data["agent_balance"]
+        if bal is None:
+            continue  # balance не подтянулся в snapshot — пропускаем
+        if bal >= 0:
+            continue
+        bal_abs = abs(bal)
+        in_сroк = data["in_сroк_unpaid_total"]
+        real_overdue = max(0.0, round(bal_abs - in_сroк, 2))
+        if real_overdue < 0.01:
+            continue  # FIFO-перекрытие
+        # Самый старый просроченный заказ — для days_overdue и ссылки.
+        oldest = max(data["overdue"], key=lambda x: x["days_overdue"])
+        debtors.append({
+            "agent_id": aid,
+            "agent_name": data["agent_name"],
+            "manager_tag": data["manager_tag"],
+            "orders_count": len(data["overdue"]),
+            "days_overdue": oldest["days_overdue"],
+            "total_unpaid": real_overdue,
+            "ms_url": _ms_url(oldest["order_id"]),
+        })
 
     # Обогащение срывами за 90 дней
     breaks_map: dict[str, int] = {}

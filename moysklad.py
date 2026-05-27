@@ -2086,71 +2086,88 @@ def pdz_unprocessed_for_owner(db) -> dict:
 
     rows = db.get_latest_snapshot() if db is not None else []
 
-    # tag → agent_id → {agent_name, agent_balance, orders: [...]}
-    by_tag: dict = {}
-
+    # Шаг 1: собираем по агенту overdue-заказы + in_сroк_unpaid (нужно для FIFO).
+    # tag → agent_id → {agent_name, agent_balance, overdue: [], in_сroк_unpaid_total}
+    by_tag_agent: dict = {}
     for r in rows:
         row_tag = (r.get("manager_tag") or "").lower()
         if not row_tag or row_tag not in PDZ_MANAGER_TAG_MAP:
             continue
-
         ppm_new = _to_date(r.get("ppm_new"))
         ppm_initial = _to_date(r.get("ppm_initial"))
         effective = ppm_new if ppm_new is not None else ppm_initial
-        if not effective or effective >= today:
+        if not effective:
             continue
-
         payed = float(r.get("payed_sum") or 0)
         total = float(r.get("total_sum") or 0)
         if payed >= total:
             continue
-
-        # Фильтр против ложных просрочек (см. pdz_overdue_for_manager).
         bal_raw = r.get("agent_balance")
         agent_balance = float(bal_raw) if bal_raw is not None else None
-        if agent_balance is not None and agent_balance >= 0:
-            continue
+        aid = r.get("agent_id") or ""
 
-        # «Необработан»: ppm_new пустой ИЛИ ppm_new в прошлом/сегодня
-        # (= не пересогласовал в будущее).
-        if ppm_new is not None and ppm_new >= today:
+        bucket = by_tag_agent.setdefault(row_tag, {}).setdefault(aid, {
+            "agent_id": aid,
+            "agent_name": r.get("agent_name"),
+            "agent_balance": agent_balance,
+            "overdue": [],
+            "in_сroк_unpaid_total": 0.0,
+        })
+        unpaid = round(total - payed, 2)
+        if effective >= today:
+            bucket["in_сroк_unpaid_total"] = round(bucket["in_сroк_unpaid_total"] + unpaid, 2)
             continue
+        # «Необработан»: ppm_new пустой ИЛИ < today.
+        # (effective < today означает либо ppm_initial < today и ppm_new пустой,
+        # либо ppm_new < today — оба варианта = «менеджер не пересогласовал».)
 
         days_overdue = (today - effective).days
-        unpaid = round(total - payed, 2)
         order_id = r.get("order_id") or ""
-        order = {
+        bucket["overdue"].append({
             "order_id": order_id,
             "order_name": r.get("order_name"),
-            "agent_id": r.get("agent_id"),
+            "agent_id": aid,
             "agent_name": r.get("agent_name"),
             "effective_due_date": effective,
             "days_overdue": days_overdue,
             "unpaid_sum": unpaid,
             "ms_url": f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}",
             "agent_balance": agent_balance,
-        }
+        })
 
-        agent_bucket = by_tag.setdefault(row_tag, {}).setdefault(
-            order["agent_id"] or "",
-            {
-                "agent_id": order["agent_id"],
-                "agent_name": order["agent_name"],
-                "agent_balance": agent_balance,
-                "orders": [],
-            },
-        )
-        agent_bucket["orders"].append(order)
+    # Шаг 2: применить FIFO-фильтр (как в pdz_overdue_for_manager).
+    # balance=None → skip; balance>=0 → skip; real_overdue<0.01 → skip.
+    by_tag: dict = {}
+    agent_real_overdue: dict = {}  # aid → real_overdue
+    for tag, agents in by_tag_agent.items():
+        for aid, data in agents.items():
+            if not data["overdue"]:
+                continue
+            bal = data["agent_balance"]
+            if bal is None:
+                continue  # balance не подтянулся — не показываем (см. 1593622)
+            if bal >= 0:
+                continue
+            bal_abs = abs(bal)
+            in_сroк = data["in_сroк_unpaid_total"]
+            real_overdue = max(0.0, round(bal_abs - in_сroк, 2))
+            if real_overdue < 0.01:
+                continue  # FIFO-перекрытие
+            agent_real_overdue[aid] = real_overdue
+            by_tag.setdefault(tag, {})[aid] = data
 
     # Сводим order→agent в формат как у pdz_overdue_for_manager.
+    # total_unpaid = real_overdue по FIFO (не сумма по payedSum).
     result: dict = {}
     all_ids: list = []
     for tag, agents in by_tag.items():
         grouped = []
         for aid, data in agents.items():
-            orders = data["orders"]
+            orders = data["overdue"]
             oldest = min(orders, key=lambda x: x["effective_due_date"])
-            total_unpaid = round(sum(x["unpaid_sum"] for x in orders), 2)
+            total_unpaid = agent_real_overdue.get(
+                aid, round(sum(x["unpaid_sum"] for x in orders), 2)
+            )
             max_days = max(x["days_overdue"] for x in orders)
             grouped.append({
                 "agent_id": data["agent_id"],
