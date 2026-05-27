@@ -103,24 +103,37 @@ ENUM-значения (используй ТОЛЬКО эти, если не с�
 
 species: F2B — поставщик «одного окна» для HoReCa. Принимаем заявки и на рыбу,
 и на сопутку (сыр для роллов, овощи, соусы, рис и т.д.).
+
+КОНКРЕТНЫЙ продукт идёт в species, а не в subspecies. Примеры:
+«майонез Печагин» → species=майонез, brand=Печагин.
+«сыр творожный» → species=сыр, subspecies=творожный.
+«кетчуп Heinz» → species=кетчуп, brand=Heinz.
+«сметана 20%» → species=сметана.
+«огурцы свежие» → species=огурцы.
+
 Рыба: лосось, форель, кета, горбуша, нерка, кижуч, чавыча, треска, пикша,
 минтай, судак, сибас, дорадо, палтус, зубатка, масляная, тилапия, пангасиус,
 угорь, тунец, скумбрия, сельдь.
 Морепродукты: креветка, кальмар, осьминог, гребешок, мидия, устрица, краб,
 омар, лангустин.
-Икра: икра (для всех видов икры, subspecies = лососёвая/кетовая/щучья/форелевая).
-Сопутка для HoReCa:
-- сыр (творожный, сливочный, моцарелла, пармезан, фета и др. — subspecies)
-- молочка (сливки, йогурт, сметана и др.)
-- масло-сливочное, масло-растительное
-- овощи, фрукты, зелень
-- специи (соль, перец, травы)
-- соусы (соевый, мирин, унаги, спайси, васаби)
-- рис (для роллов), крупы (гречка и др.), мука, тесто
-- мясо, птица, яйцо
-- водоросли (нори, вакаме)
-- упаковка (контейнеры, плёнка)
-- прочее — только если ни одна категория не подходит.
+Икра: икра (для всех видов, subspecies = лососёвая/кетовая/щучья/форелевая).
+
+Сопутка для HoReCa — конкретные позиции в species:
+- Сыры: сыр (subspecies: творожный/сливочный/моцарелла/пармезан/фета/...).
+- Молочка: сметана, сливки, йогурт, ряженка, кефир.
+- Масла: масло-сливочное, масло-растительное (оливковое/подсолнечное в subspecies).
+- Соусы конкретно: майонез, кетчуп, горчица, соевый-соус, мирин, унаги, спайси,
+  васаби, ткемали. ВАЖНО: «майонез» — это species, а не subspecies «соусы».
+- Овощи, фрукты, зелень: можно как обобщённо «овощи», так и конкретно
+  «огурцы», «помидоры», «лимоны», «авокадо», «руккола».
+- Крупы и мучное: рис, гречка, мука, тесто, лапша.
+- Мясное: мясо (subspecies: говядина/свинина), птица (subspecies: курица/утка), яйцо.
+- Водоросли (нори, вакаме в subspecies).
+- Упаковка: контейнеры, плёнка, лотки.
+- прочее — только если ни одна категория и конкретный продукт не подходят.
+
+Если уверенность в распознавании конкретного продукта < 0.7 — НЕ объединяй в обобщённую
+категорию, оставь species=null и низкий confidence. Менеджер дополнит.
 
 processing: НПСГ, ПСГ, ПБГ, Б/Г, Trim PR, Trim A, Trim B, Trim C, Trim D,
 стейк, кусок, тушка, хвост, unspecified.
@@ -134,7 +147,16 @@ product_form: сырьё, слабосоль, сильносоль, х/к (хо�
 
 weight_class: свободный текст («5-6», «4+», «1.5-2.0», «2-3», «3.5+»).
 
-volume_kg: число в килограммах. «200 кг» → 200. «1 тонна» → 1000.
+volume_kg: ПОТРЕБНОСТЬ клиента в килограммах — сколько ему нужно товара.
+«200 кг» → 200. «1 тонна» → 1000.
+ВАЖНО: если в тексте число рядом с упаковкой («бочка 100 кг», «канистра 5л»,
+«пакет 1 кг», «лоток 250 г») — это размер тары, идёт в package, а НЕ в volume_kg.
+В volume_kg идёт ОТДЕЛЬНОЕ число, обозначающее общий вес заказа.
+Если непонятно — оставь volume_kg=null и проставь package.
+
+package: вид упаковки / тара (свободный текст). Примеры:
+«бочка 100 кг», «канистра 5 л», «лоток 250 г», «пакет 1 кг»,
+«коробка 6 шт по 1 л», «короб 10 кг». Иначе null.
 
 target_price_rub_kg: ЦЕНА ПРОДАЖИ КЛИЕНТУ в рублях за кг, не бюджет закупки.
 Менеджер пишет «продаю по 720 ₽», «отдадим клиенту за 800» — это сюда.
@@ -174,11 +196,26 @@ confidence: 0.00-1.00. < 0.50 если основные поля (species + proc
 
 Возвращай СТРОГО JSON со всеми полями.
 
-Пример: «Лосось ПБГ 5-6 охл 200 кг к четвергу до 720 ₽» →
-{{"species": "лосось", "subspecies": null, "region": null,
+Пример рыба: «Лосось ПБГ 5-6 охл 200 кг к четвергу, клиенту по 720 ₽» →
+{{"species": "лосось", "subspecies": null, "brand": null, "region": null,
  "weight_class": "5-6", "processing": "ПБГ", "state": "охл",
- "product_form": "сырьё", "volume_kg": 200, "target_price_rub_kg": 720,
- "target_date": "2026-05-28", "client_hint": null, "confidence": 0.95}}
+ "product_form": "сырьё", "package": null, "volume_kg": 200,
+ "target_price_rub_kg": 720, "target_date": "2026-05-28",
+ "client_hint": null, "confidence": 0.95}}
+
+Пример сопутка: «майонез Печагин 100 кг 240 ₽» →
+{{"species": "майонез", "subspecies": null, "brand": "Печагин", "region": null,
+ "weight_class": null, "processing": null, "state": null,
+ "product_form": null, "package": null, "volume_kg": 100,
+ "target_price_rub_kg": 240, "target_date": null,
+ "client_hint": null, "confidence": 0.95}}
+
+Пример сопутка с упаковкой: «майонез Mr.Ricco в канистрах 5 кг» →
+{{"species": "майонез", "subspecies": null, "brand": "Mr.Ricco", "region": null,
+ "weight_class": null, "processing": null, "state": null,
+ "product_form": null, "package": "канистра 5 кг", "volume_kg": null,
+ "target_price_rub_kg": null, "target_date": null,
+ "client_hint": null, "confidence": 0.90}}
 """
 
 
@@ -192,6 +229,7 @@ class ParsedRequest:
     processing: Optional[str]
     state: Optional[str]
     product_form: Optional[str]
+    package: Optional[str]
     volume_kg: Optional[float]
     target_price_rub_kg: Optional[float]
     target_date: Optional[str]    # ISO string для JSON-сериализации в draft
@@ -234,8 +272,8 @@ async def parse_request_text(text: str, today: Optional[date] = None) -> ParsedR
     if not json_match:
         return ParsedRequest(
             species=None, subspecies=None, brand=None, region=None, weight_class=None,
-            processing=None, state=None, product_form=None, volume_kg=None,
-            target_price_rub_kg=None, target_date=None, client_hint=None,
+            processing=None, state=None, product_form=None, package=None,
+            volume_kg=None, target_price_rub_kg=None, target_date=None, client_hint=None,
             confidence=0.0, raw_text=text,
         )
     try:
@@ -243,8 +281,8 @@ async def parse_request_text(text: str, today: Optional[date] = None) -> ParsedR
     except json.JSONDecodeError:
         return ParsedRequest(
             species=None, subspecies=None, brand=None, region=None, weight_class=None,
-            processing=None, state=None, product_form=None, volume_kg=None,
-            target_price_rub_kg=None, target_date=None, client_hint=None,
+            processing=None, state=None, product_form=None, package=None,
+            volume_kg=None, target_price_rub_kg=None, target_date=None, client_hint=None,
             confidence=0.0, raw_text=text,
         )
 
@@ -284,6 +322,7 @@ async def parse_request_text(text: str, today: Optional[date] = None) -> ParsedR
         processing=processing,
         state=state,
         product_form=product_form,
+        package=data.get("package"),
         volume_kg=_num(data.get("volume_kg")),
         target_price_rub_kg=_num(data.get("target_price_rub_kg")),
         target_date=td,
@@ -304,13 +343,13 @@ def insert_request(db, parsed: ParsedRequest, created_by_tg: int,
             INSERT INTO procurement.requests(
                 created_by_tg, created_by_name, raw_text,
                 species, subspecies, brand, region, weight_class,
-                processing, state, product_form,
+                processing, state, product_form, package,
                 volume_kg, target_price_rub_kg, target_date,
                 client_name, assigned_to, llm_confidence
             ) VALUES (
                 %s, %s, %s,
                 %s, %s, %s, %s, %s,
-                %s, %s, %s,
+                %s, %s, %s, %s,
                 %s, %s, %s,
                 %s, %s, %s
             )
@@ -320,7 +359,7 @@ def insert_request(db, parsed: ParsedRequest, created_by_tg: int,
                 created_by_tg, created_by_name, parsed.raw_text,
                 parsed.species, parsed.subspecies, parsed.brand, parsed.region,
                 parsed.weight_class, parsed.processing, parsed.state,
-                parsed.product_form,
+                parsed.product_form, parsed.package,
                 parsed.volume_kg, parsed.target_price_rub_kg,
                 parsed.target_date,
                 parsed.client_hint, assigned_to, parsed.confidence,
@@ -345,7 +384,7 @@ def insert_request(db, parsed: ParsedRequest, created_by_tg: int,
 # 2026-05-26: «не пропускаем без цены как минимум» + species + объём как фундамент.
 REQUIRED_FIELDS = [
     ("species",              "вид/категория"),
-    ("volume_kg",             "объём (кг)"),
+    ("volume_kg",             "потребность (кг)"),
     ("target_price_rub_kg",   "цена для клиента (₽/кг)"),
 ]
 
@@ -447,7 +486,9 @@ def format_preview(parsed: ParsedRequest, assigned_to: Optional[str],
         lines.append(_fmt_field("Состояние", parsed.state))
     if parsed.product_form and parsed.product_form != "сырьё":
         lines.append(_fmt_field("Форма", parsed.product_form))
-    lines.append(_fmt_field("Объём", parsed.volume_kg, " кг"))
+    lines.append(_fmt_field("Потребность", parsed.volume_kg, " кг"))
+    if parsed.package:
+        lines.append(_fmt_field("Упаковка", parsed.package))
     lines.append(_fmt_field("Цена для клиента", parsed.target_price_rub_kg, " ₽/кг"))
     if target_str:
         lines.append(_fmt_field("Дедлайн", target_str))
@@ -484,6 +525,8 @@ def format_assignee_notification(request_id: int, parsed: ParsedRequest,
         parts.append(parsed.product_form)
     if parsed.volume_kg:
         parts.append(f"{parsed.volume_kg:g} кг")
+    if parsed.package:
+        parts.append(parsed.package)
     summary = " · ".join(parts) if parts else "(детали в карточке)"
 
     target = ""
