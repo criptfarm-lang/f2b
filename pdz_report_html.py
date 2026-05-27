@@ -226,12 +226,16 @@ def build_pdz_payload(db) -> dict:
     except Exception:
         broken_90d = 0
 
-    # По менеджерам
+    # По менеджерам.
+    # debtors_count / total_debt берём из FIFO-отфильтрованных debtors.
+    # А orders_total / orders_touched (метрика «отработано») считаем НЕЗАВИСИМО
+    # от FIFO: по всем заказам в snapshot с ppm_initial < today И payed < sum.
+    # Иначе если клиент ушёл из FIFO (хвосты перекрыты приходами), вся работа
+    # менеджера по нему теряется — плитка показывает 0% даже когда менеджер
+    # реально отработал десятки заказов.
     by_mgr: dict[str, dict] = {}
     for d in debtors:
         tag = (d.get("manager_tag") or "—").lower() or "—"
-        orders_total = int(d.get("orders_count") or 0)
-        orders_touched = int(d.get("orders_touched") or 0)
         m = by_mgr.get(tag)
         if m is None:
             by_mgr[tag] = {
@@ -239,15 +243,41 @@ def build_pdz_payload(db) -> dict:
                 "debtors_count": 1,
                 "breaks_count": int(d.get("breaks_count") or 0),
                 "total_debt": d["total_unpaid"],
-                "orders_total": orders_total,
-                "orders_touched": orders_touched,
+                "orders_total": 0,    # заполним ниже из всех snapshot-rows
+                "orders_touched": 0,
             }
         else:
             m["debtors_count"] += 1
             m["breaks_count"] += int(d.get("breaks_count") or 0)
             m["total_debt"] = round(m["total_debt"] + d["total_unpaid"], 2)
-            m["orders_total"] += orders_total
-            m["orders_touched"] += orders_touched
+
+    # Независимый pass по snapshot: считаем работу менеджера по ВСЕМ заказам
+    # с просроченной исходной датой (без FIFO).
+    for r in rows:
+        tag = (r.get("manager_tag") or "—").lower() or "—"
+        try:
+            total = float(r.get("total_sum") or 0)
+            payed = float(r.get("payed_sum") or 0)
+        except Exception:
+            continue
+        if payed >= total:
+            continue
+        ppm_initial = _to_date(r.get("ppm_initial"))
+        if not ppm_initial or ppm_initial >= today:
+            continue
+        ppm_new = _to_date(r.get("ppm_new"))
+        m = by_mgr.setdefault(tag, {
+            "manager_tag": tag,
+            "debtors_count": 0,
+            "breaks_count": 0,
+            "total_debt": 0,
+            "orders_total": 0,
+            "orders_touched": 0,
+        })
+        m["orders_total"] += 1
+        if ppm_new is not None:
+            m["orders_touched"] += 1
+
     managers = sorted(by_mgr.values(), key=lambda x: x["total_debt"], reverse=True)
 
     # Топ-нарушители за 90д
