@@ -108,13 +108,14 @@ def _confirm_supplier(db, auto_slug: str, new_slug: str) -> int:
     )
     # перенос лотов + auto-confirm. Лоты, у которых species='прочее' или processing='unspecified',
     # оставляем в needs-review (там реальные проблемы нормализации, не slug).
+    # CASE → TEXT, нужен explicit cast в procurement.lot_confidence_enum.
     cur = db._execute(
         """UPDATE procurement.lots
            SET supplier_id = %s,
-               confidence = CASE
+               confidence = (CASE
                  WHEN species = 'прочее' OR processing = 'unspecified' THEN 'needs-review'
                  ELSE 'confirmed'
-               END
+               END)::procurement.lot_confidence_enum
            WHERE supplier_id = %s""",
         (new_slug, auto_slug),
     )
@@ -131,7 +132,8 @@ def _drop_supplier_lots(db, auto_slug: str) -> int:
 
 def _confirm_lot(db, lot_id: str) -> bool:
     cur = db._execute(
-        "UPDATE procurement.lots SET confidence = 'confirmed' WHERE lot_id = %s",
+        "UPDATE procurement.lots SET confidence = 'confirmed'::procurement.lot_confidence_enum "
+        "WHERE lot_id = %s",
         (lot_id,),
     )
     return (cur.rowcount or 0) > 0
