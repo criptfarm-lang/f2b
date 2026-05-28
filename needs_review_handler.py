@@ -63,8 +63,20 @@ def _translit_slug(text: str) -> str:
 # ─── Запросы к БД ───────────────────────────────────────────────────────────
 
 
+def _get_known_slugs(db) -> set[str]:
+    """KNOWN = статическая карта SUPPLIER_HINT_MAP + все slug'и из procurement.suppliers.
+
+    Поставщик считается подтверждённым (НЕ показываем как auto-slug в /needs_review),
+    если он уже есть в таблице procurement.suppliers — это либо bootstrap из known map,
+    либо результат предыдущего подтверждения через эту команду.
+    """
+    db_slugs = {r["slug"] for r in db._fetchall("SELECT slug FROM procurement.suppliers")}
+    return _KNOWN_SLUGS | db_slugs
+
+
 def _get_auto_slug_suppliers(db) -> list[dict]:
-    """Список поставщиков с needs-review лотами, чей slug — auto (не в SUPPLIER_HINT_MAP)."""
+    """Поставщики с needs-review лотами, чей slug ещё НЕ подтверждён."""
+    known = _get_known_slugs(db)
     rows = db._fetchall(
         """SELECT supplier_id, COUNT(*) AS lots_n,
                   ARRAY_AGG(DISTINCT species::text) AS species_kinds
@@ -74,14 +86,15 @@ def _get_auto_slug_suppliers(db) -> list[dict]:
            GROUP BY supplier_id
            ORDER BY lots_n DESC""",
     )
-    return [r for r in rows if r["supplier_id"] not in _KNOWN_SLUGS]
+    return [r for r in rows if r["supplier_id"] not in known]
 
 
 def _get_needs_review_lots(db, limit: int = 1) -> list[dict]:
-    """Лоты needs-review для УЖЕ confirmed-поставщиков (slug в SUPPLIER_HINT_MAP)."""
-    if not _KNOWN_SLUGS:
+    """Лоты needs-review для УЖЕ подтверждённых поставщиков (slug в procurement.suppliers + SUPPLIER_HINT_MAP)."""
+    known = _get_known_slugs(db)
+    if not known:
         return []
-    placeholders = ",".join(["%s"] * len(_KNOWN_SLUGS))
+    placeholders = ",".join(["%s"] * len(known))
     rows = db._fetchall(
         f"""SELECT lot_id, supplier_id, species::text AS species,
                    subspecies, region::text AS region, weight_class,
@@ -94,7 +107,7 @@ def _get_needs_review_lots(db, limit: int = 1) -> list[dict]:
               AND supplier_id IN ({placeholders})
             ORDER BY created_at ASC
             LIMIT %s""",
-        list(_KNOWN_SLUGS) + [limit],
+        list(known) + [limit],
     )
     return rows
 
