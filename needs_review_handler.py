@@ -158,9 +158,14 @@ def _confirm_lot(db, lot_id: str) -> bool:
     return (cur.rowcount or 0) > 0
 
 
-def _drop_lot(db, lot_id: str) -> bool:
+def _archive_lot(db, lot_id: str) -> bool:
+    """Архивирует лот — НЕ удаляем. Найдётся в /search через --include-archived
+    или по raw_text ILIKE если завтра прилетит запрос на такую категорию (суп,
+    маринад, упаковка и т.д.)."""
     cur = db._execute(
-        "DELETE FROM procurement.lots WHERE lot_id = %s", (lot_id,)
+        "UPDATE procurement.lots SET confidence = 'archived'::procurement.lot_confidence_enum "
+        "WHERE lot_id = %s",
+        (lot_id,),
     )
     return (cur.rowcount or 0) > 0
 
@@ -293,7 +298,7 @@ def _format_lot_card(lot: dict, db) -> tuple[str, InlineKeyboardMarkup]:
         rows.append(row)
     rows.append([
         InlineKeyboardButton("✅ Подтвердить", callback_data=f"nr_lok|{lot_id}"),
-        InlineKeyboardButton("❌ Отбросить", callback_data=f"nr_ldrop|{lot_id}"),
+        InlineKeyboardButton("📦 В архив", callback_data=f"nr_larch|{lot_id}"),
     ])
     return text, InlineKeyboardMarkup(rows)
 
@@ -389,12 +394,12 @@ async def cb_needs_review(update: Update, context: ContextTypes.DEFAULT_TYPE, db
                 await query.edit_message_text("✅ Лот подтверждён.")
             else:
                 await query.edit_message_text("ℹ Лот уже обработан или удалён.")
-        elif action == "nr_ldrop":
+        elif action == "nr_larch":
             lot_id = parts[1]
-            if _drop_lot(db, lot_id):
-                await query.edit_message_text("❌ Лот отброшен.")
+            if _archive_lot(db, lot_id):
+                await query.edit_message_text("📦 Лот в архиве. Найдётся через /search по raw_text.")
             else:
-                await query.edit_message_text("ℹ Лот уже обработан или удалён.")
+                await query.edit_message_text("ℹ Лот уже обработан.")
         elif action == "nr_s":
             # nr_s|<sid>|<code>|<value> — UPDATE одной колонки + refresh карточки
             sid, code, value = parts[1], parts[2], parts[3]

@@ -419,8 +419,13 @@ def _insert_lots(db, lots: list[dict], supplier_id: str, msg_id: int,
                 if product_form not in PRODUCT_FORM_ENUM:
                     product_form = "сырьё"
                 confidence = lot.get("confidence_self", "confirmed")
-                if confidence not in ("confirmed", "pending", "needs-review"):
+                if confidence not in ("confirmed", "pending", "needs-review", "archived"):
                     confidence = "confirmed"
+                # Лоты вне нашей таксономии (готовая продукция, упаковка, прочее)
+                # сразу в archived — не загружаем менеджера, но не теряем для /search
+                # по raw_text если завтра прилетит запрос.
+                if species == "прочее" or processing == "unspecified":
+                    confidence = "archived"
                 try:
                     price = float(lot["price_rub_kg"])
                 except (KeyError, TypeError, ValueError):
