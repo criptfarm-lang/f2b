@@ -6758,6 +6758,25 @@ def main():
         filters.Regex(r"^/(задача|поставить)(@\w+)?(\s|$)"),
         cmd_task,
     ))
+
+    # ─── /needs_review: подтверждение needs-review лотов (план 2026-05-28 Под-фаза 2) ──
+    from needs_review_handler import cmd_needs_review, cb_needs_review
+
+    async def _nr_guard_and_cmd(u, c):
+        if not u.effective_user or u.effective_user.id != OWNER_CHAT_ID:
+            await u.message.reply_text("⛔ Команда доступна только владельцу (bench-режим).")
+            return
+        await cmd_needs_review(u, c, db)
+
+    async def _nr_guard_and_cb(u, c):
+        if not u.callback_query or not u.callback_query.from_user \
+                or u.callback_query.from_user.id != OWNER_CHAT_ID:
+            await u.callback_query.answer("⛔ Нет доступа.", show_alert=True)
+            return
+        await cb_needs_review(u, c, db)
+
+    app.add_handler(CommandHandler("needs_review", _nr_guard_and_cmd))
+    app.add_handler(CallbackQueryHandler(_nr_guard_and_cb, pattern=r"^nr_"))
     app.add_handler(MessageHandler(
         filters.Regex(r"^/отмена(@\w+)?(\s|$)"),
         cmd_task_cancel,
