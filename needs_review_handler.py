@@ -226,32 +226,49 @@ async def cb_needs_review(update: Update, context: ContextTypes.DEFAULT_TYPE, db
     try:
         if action == "nr_sok":
             auto_slug = payload
-            new_slug = _translit_slug(auto_slug)
-            moved = _confirm_supplier(db, auto_slug, new_slug)
-            await query.edit_message_text(
-                f"✅ Поставщик подтверждён: `{auto_slug}` → `{new_slug}`. "
-                f"Перенесено {moved} лотов.",
-                parse_mode="Markdown",
+            # Idempotency: если auto_slug уже в procurement.suppliers (повторный
+            # клик по старой карточке в истории чата), не выполняем UPDATE.
+            existing = db._fetchone(
+                "SELECT 1 FROM procurement.suppliers WHERE slug = %s", (auto_slug,)
             )
+            if existing:
+                await query.edit_message_text(
+                    f"ℹ Поставщик `{auto_slug}` уже подтверждён ранее.",
+                    parse_mode="Markdown",
+                )
+            else:
+                new_slug = _translit_slug(auto_slug)
+                moved = _confirm_supplier(db, auto_slug, new_slug)
+                await query.edit_message_text(
+                    f"✅ Поставщик подтверждён: `{auto_slug}` → `{new_slug}`. "
+                    f"Перенесено {moved} лотов.",
+                    parse_mode="Markdown",
+                )
         elif action == "nr_sdrop":
             auto_slug = payload
             n = _drop_supplier_lots(db, auto_slug)
-            await query.edit_message_text(
-                f"❌ Отброшено {n} лотов от `{auto_slug}` (шум).",
-                parse_mode="Markdown",
-            )
+            if n == 0:
+                await query.edit_message_text(
+                    f"ℹ Лотов от `{auto_slug}` уже нет (обработан ранее).",
+                    parse_mode="Markdown",
+                )
+            else:
+                await query.edit_message_text(
+                    f"❌ Отброшено {n} лотов от `{auto_slug}` (шум).",
+                    parse_mode="Markdown",
+                )
         elif action == "nr_lok":
             lot_id = payload
             if _confirm_lot(db, lot_id):
                 await query.edit_message_text("✅ Лот подтверждён.")
             else:
-                await query.edit_message_text("⚠ Лот не найден (уже обработан?).")
+                await query.edit_message_text("ℹ Лот уже обработан или удалён.")
         elif action == "nr_ldrop":
             lot_id = payload
             if _drop_lot(db, lot_id):
                 await query.edit_message_text("❌ Лот отброшен.")
             else:
-                await query.edit_message_text("⚠ Лот не найден.")
+                await query.edit_message_text("ℹ Лот уже обработан или удалён.")
         else:
             await query.edit_message_text(f"⚠ Неизвестное действие: {action}")
             return
