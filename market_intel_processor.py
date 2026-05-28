@@ -179,10 +179,10 @@ product_form: {", ".join(PRODUCT_FORM_ENUM)}
 
 
 async def _call_claude(content, max_tokens: int = 8192, model: Optional[str] = None,
-                       _debug_label: str = "") -> dict:
+                       _debug_label: str = "", _debug_db=None) -> dict:
     """Универсальный вызов Anthropic API. content — список content-blocks.
     model — если None, используется ANTHROPIC_MODEL (Haiku по умолчанию).
-    _debug_label — если задан и lots=[], raw-ответ модели пишется в bot_settings."""
+    _debug_label + _debug_db — если заданы и lots=[], raw-ответ модели пишется в bot_settings."""
     client = get_client()
     used_model = model or ANTHROPIC_MODEL
     response = await client.messages.create(
@@ -206,27 +206,25 @@ async def _call_claude(content, max_tokens: int = 8192, model: Optional[str] = N
         logger.error(f"market_intel: JSON decode failed: {e}\ntext={text[:500]}")
         parsed = {"supplier_hint": None, "received_at": None, "lots": []}
 
-    # Debug: если lots пустой и есть метка — кладём raw-ответ в bot_settings
+    # Debug: если lots пустой и есть метка + db — кладём raw-ответ в bot_settings
     # (Amvera логи труднодоступны локально, БД — наш единственный канал).
-    if _debug_label and not parsed.get("lots"):
+    if _debug_label and _debug_db is not None and not parsed.get("lots"):
         try:
-            from database import get_db
-            db = get_db()
             usage = response.usage
-            snippet = raw_text[:800].replace("\n", "\\n")
+            snippet = raw_text[:1500].replace("\n", "\\n")
             debug_value = (
                 f"model={used_model} "
                 f"in={usage.input_tokens} out={usage.output_tokens} "
                 f"supplier_hint={parsed.get('supplier_hint')!r} "
                 f"raw={snippet}"
             )
-            db._execute(
+            _debug_db._execute(
                 "INSERT INTO bot_settings(key, value) VALUES (%s, %s) "
                 "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-                (f"market_intel_debug_{_debug_label}", debug_value[:2000]),
+                (f"market_intel_debug_{_debug_label}", debug_value[:3000]),
             )
         except Exception as dbg_err:
-            logger.warning(f"market_intel debug write failed: {dbg_err}")
+            logger.warning(f"market_intel debug write failed: {dbg_err!r}")
     return parsed
 
 
@@ -245,7 +243,7 @@ async def parse_photo_message(image_path: str, caption: str = "") -> dict:
     ])
 
 
-async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str = "") -> dict:
+async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str = "", debug_db=None) -> dict:
     """PDF → native document block в Claude Sonnet 4.6.
 
     План 2026-05-28: одна ступень — Sonnet видит PDF + caption (text_raw из TG)
@@ -283,7 +281,7 @@ async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str =
         },
     ]
     return await _call_claude(content, max_tokens=32768, model=ANTHROPIC_PDF_MODEL,
-                              _debug_label=debug_label)
+                              _debug_label=debug_label, _debug_db=debug_db)
 
 
 def _supplier_slug_from_hint(hint: str) -> tuple[Optional[str], bool]:
@@ -425,7 +423,8 @@ async def process_pending(db, limit: int = 20) -> dict:
                     stats["failed"] += 1
                     continue
                 try:
-                    result = await parse_pdf_message(file_path, caption, debug_label=f"msg{msg_id}")
+                    result = await parse_pdf_message(file_path, caption,
+                                                     debug_label=f"msg{msg_id}", debug_db=db)
                 except Exception as e:
                     logger.exception(f"market_intel: msg {msg_id} PDF parse failed: {e!r}")
                     # НЕ помечаем processed — попробуем на следующем тике (вдруг временный сбой).
