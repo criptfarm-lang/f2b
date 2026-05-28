@@ -16,9 +16,15 @@ env NR_OWNER_ZONE=belyakova|kristina, когда добавим chat_id оста
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 from typing import Optional
+
+
+def _h(s) -> str:
+    """HTML-экранирование. None → пустая строка."""
+    return html.escape(str(s)) if s is not None else ""
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
@@ -241,11 +247,11 @@ def _format_supplier_card(supplier: dict) -> tuple[str, InlineKeyboardMarkup]:
     species = supplier.get("species_kinds") or []
     species_str = ", ".join(sorted(s for s in species if s)[:6]) or "—"
     text = (
-        f"🆕 *Новый поставщик в канале*\n\n"
-        f"`{auto}`\n"
-        f"лотов: *{supplier['lots_n']}*\n"
-        f"species: {species_str}\n\n"
-        f"Предлагаемый slug: `{suggested}`"
+        f"🆕 <b>Новый поставщик в канале</b>\n\n"
+        f"<code>{_h(auto)}</code>\n"
+        f"лотов: <b>{supplier['lots_n']}</b>\n"
+        f"species: {_h(species_str)}\n\n"
+        f"Предлагаемый slug: <code>{_h(suggested)}</code>"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ Подтвердить как {suggested}",
@@ -258,19 +264,19 @@ def _format_supplier_card(supplier: dict) -> tuple[str, InlineKeyboardMarkup]:
 
 def _format_lot_card(lot: dict, db) -> tuple[str, InlineKeyboardMarkup]:
     parts = [
-        f"*{lot['supplier_id']}*",
-        f"{lot['species']}"
-        + (f"/{lot['subspecies']}" if lot.get("subspecies") else "")
-        + (f" • {lot['region']}" if lot.get("region") else ""),
-        f"{lot['processing']} / {lot['state']} / {lot.get('product_form') or 'сырьё'}",
-        f"вес: *{lot['weight_class']}*  цена: *{lot['price_rub_kg']} ₽/кг*",
+        f"<b>{_h(lot['supplier_id'])}</b>",
+        f"{_h(lot['species'])}"
+        + (f"/{_h(lot['subspecies'])}" if lot.get("subspecies") else "")
+        + (f" • {_h(lot['region'])}" if lot.get("region") else ""),
+        f"{_h(lot['processing'])} / {_h(lot['state'])} / {_h(lot.get('product_form') or 'сырьё')}",
+        f"вес: <b>{_h(lot['weight_class'])}</b>  цена: <b>{_h(lot['price_rub_kg'])} ₽/кг</b>",
     ]
     if lot.get("conditions"):
-        parts.append(f"_условия:_ {lot['conditions']}")
+        parts.append(f"<i>условия:</i> {_h(lot['conditions'])}")
     if lot.get("notes"):
-        parts.append(f"_notes:_ {lot['notes'][:80]}")
+        parts.append(f"<i>notes:</i> {_h(lot['notes'][:80])}")
     if lot.get("raw_text"):
-        parts.append(f"\n`{lot['raw_text'][:120]}`")
+        parts.append(f"\n<code>{_h(lot['raw_text'][:120])}</code>")
     text = "\n".join(parts)
 
     lot_id = str(lot["lot_id"])
@@ -300,9 +306,9 @@ def _format_enum_picker(db, lot: dict, code: str) -> tuple[str, InlineKeyboardMa
     sid = lot_id[:8]
     label = {"sp": "species", "pr": "processing", "st": "state"}[code]
     text = (
-        f"*{lot['supplier_id']}*\n"
-        f"Выбор `{label}` (сейчас: *{current}*)\n\n"
-        f"`{(lot.get('raw_text') or '')[:120]}`"
+        f"<b>{_h(lot['supplier_id'])}</b>\n"
+        f"Выбор <code>{label}</code> (сейчас: <b>{_h(current)}</b>)\n\n"
+        f"<code>{_h((lot.get('raw_text') or '')[:120])}</code>"
     )
     values = _get_enum_values(db, enum_type)
     # 3 кнопки в ряд, текущее значение исключаем
@@ -353,29 +359,29 @@ async def cb_needs_review(update: Update, context: ContextTypes.DEFAULT_TYPE, db
             )
             if existing:
                 await query.edit_message_text(
-                    f"ℹ Поставщик `{auto_slug}` уже подтверждён ранее.",
-                    parse_mode="Markdown",
+                    f"ℹ Поставщик <code>{_h(auto_slug)}</code> уже подтверждён ранее.",
+                    parse_mode="HTML",
                 )
             else:
                 new_slug = _translit_slug(auto_slug)
                 moved = _confirm_supplier(db, auto_slug, new_slug)
                 await query.edit_message_text(
-                    f"✅ Поставщик подтверждён: `{auto_slug}` → `{new_slug}`. "
+                    f"✅ Поставщик подтверждён: <code>{_h(auto_slug)}</code> → <code>{_h(new_slug)}</code>. "
                     f"Перенесено {moved} лотов.",
-                    parse_mode="Markdown",
+                    parse_mode="HTML",
                 )
         elif action == "nr_sdrop":
             auto_slug = parts[1]
             n = _drop_supplier_lots(db, auto_slug)
             if n == 0:
                 await query.edit_message_text(
-                    f"ℹ Лотов от `{auto_slug}` уже нет (обработан ранее).",
-                    parse_mode="Markdown",
+                    f"ℹ Лотов от <code>{_h(auto_slug)}</code> уже нет (обработан ранее).",
+                    parse_mode="HTML",
                 )
             else:
                 await query.edit_message_text(
-                    f"❌ Отброшено {n} лотов от `{auto_slug}` (шум).",
-                    parse_mode="Markdown",
+                    f"❌ Отброшено {n} лотов от <code>{_h(auto_slug)}</code> (шум).",
+                    parse_mode="HTML",
                 )
         elif action == "nr_lok":
             lot_id = parts[1]
@@ -404,7 +410,7 @@ async def cb_needs_review(update: Update, context: ContextTypes.DEFAULT_TYPE, db
             # refresh: подтягиваем обновлённый лот и редактируем карточку in-place
             lot = _resolve_lot_by_short_id(db, sid)
             text, kb = _format_lot_card(lot, db)
-            await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
             advance_to_next = False
         elif action == "nr_m":
             # nr_m|<sid>|<code> — открыть picker полного списка
@@ -417,7 +423,7 @@ async def cb_needs_review(update: Update, context: ContextTypes.DEFAULT_TYPE, db
                 await query.edit_message_text("ℹ Лот уже обработан или удалён.")
                 return
             text, kb = _format_enum_picker(db, lot, code)
-            await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
             advance_to_next = False
         elif action == "nr_b":
             # nr_b|<sid> — назад к карточке лота из picker
@@ -427,7 +433,7 @@ async def cb_needs_review(update: Update, context: ContextTypes.DEFAULT_TYPE, db
                 await query.edit_message_text("ℹ Лот уже обработан или удалён.")
                 return
             text, kb = _format_lot_card(lot, db)
-            await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
             advance_to_next = False
         else:
             await query.edit_message_text(f"⚠ Неизвестное действие: {action}")
@@ -446,13 +452,13 @@ async def _send_next(send_func, db, is_callback: bool) -> None:
     suppliers = _get_auto_slug_suppliers(db)
     if suppliers:
         text, kb = _format_supplier_card(suppliers[0])
-        await send_func(text, reply_markup=kb, parse_mode="Markdown")
+        await send_func(text, reply_markup=kb, parse_mode="HTML")
         return
 
     lots = _get_needs_review_lots(db, limit=1)
     if lots:
         text, kb = _format_lot_card(lots[0], db)
-        await send_func(text, reply_markup=kb, parse_mode="Markdown")
+        await send_func(text, reply_markup=kb, parse_mode="HTML")
         return
 
     # Пусто — всё подтверждено
