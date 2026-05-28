@@ -23,6 +23,9 @@ from claude_ai import get_client
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_MODEL = os.getenv("MARKET_INTEL_MODEL", "claude-haiku-4-5-20251001")
+# Отдельная модель для PDF — Sonnet 4.6 видит native PDF, понимает таблицы.
+# Haiku обрабатывает text/photo (дешевле). См. план 2026-05-28-автопарсер-pdf-прайсов.md.
+ANTHROPIC_PDF_MODEL = os.getenv("MARKET_INTEL_PDF_MODEL", "claude-sonnet-4-5-20250929")
 
 # ─── ENUM-перечни (зеркало procurement_app/migrations/001+002.sql) ─────────
 SPECIES_ENUM = [
@@ -138,6 +141,14 @@ product_form: {", ".join(PRODUCT_FORM_ENUM)}
 - «ДВ» = "Дальний Восток РФ"
 - Сёмга / Семга = лосось (subspecies="атлантический")
 
+ПРАВИЛА ЦЕНЫ (КРИТИЧНО — F2B работает в МСК):
+1. Если в строке прайса несколько городов (СПб/МСК/Липецк/ДВ) → берём цену для МСК. В conditions запиши "МСК".
+2. Если цена одна без указания города → берём её, в conditions локацию не указываем.
+3. Если в строке несколько цен по условиям оплаты (предоплата/отсрочка) → берём ПРЕДОПЛАТУ как опт. В conditions запиши "предоплата".
+4. Если в Caption (text_raw из TG) есть модификатор цены ("+7 руб для МСК", "к цене +7", "по Москве дороже на N", "акция -10%") — ПРИМЕНИ к цене для МСК и зафиксируй факт в notes (например "+7 ₽/кг для МСК из caption").
+5. Если в прайсе несколько городов и для МСК ПУСТО (нет цены, нет ● маркера) — строку ПРОПУСКАЕМ (не записываем в lots).
+6. ИГНОРИРУЕМ: вес тары/упаковки, период вылова, штрих-коды, артикулы (это либо в notes, либо вообще не записываем).
+
 Формат ответа — СТРОГО JSON-объект, никакого текста до или после:
 
 {{
@@ -167,11 +178,12 @@ product_form: {", ".join(PRODUCT_FORM_ENUM)}
 """
 
 
-async def _call_claude(content, max_tokens: int = 8192) -> dict:
-    """Универсальный вызов Anthropic API. content — список content-blocks."""
+async def _call_claude(content, max_tokens: int = 8192, model: Optional[str] = None) -> dict:
+    """Универсальный вызов Anthropic API. content — список content-blocks.
+    model — если None, используется ANTHROPIC_MODEL (Haiku по умолчанию)."""
     client = get_client()
     response = await client.messages.create(
-        model=ANTHROPIC_MODEL,
+        model=model or ANTHROPIC_MODEL,
         max_tokens=max_tokens,
         system=_build_system_prompt(),
         messages=[{"role": "user", "content": content}],
@@ -206,38 +218,44 @@ async def parse_photo_message(image_path: str, caption: str = "") -> dict:
     ])
 
 
-def _extract_pdf_text(pdf_path: str) -> str:
-    """pdfplumber → один текст со всех страниц. Python-only, без apt-poppler."""
-    import pdfplumber
-    parts = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            t = page.extract_text() or ""
-            if t.strip():
-                parts.append(f"--- стр {i} ---\n{t}")
-    return "\n\n".join(parts)
-
-
 async def parse_pdf_message(pdf_path: str, caption: str = "") -> dict:
-    """PDF → pdftext → Claude Haiku.
+    """PDF → native document block в Claude Sonnet 4.6.
 
-    Прайсы поставщиков (Moreodor, Inarctica, Fish2O) — это PDF на 1-5 страниц
-    с десятками-сотнями позиций. Vision дорого и медленно, нативный PDF в Haiku
-    не поддерживается. pdftotext через pdfplumber — Python-only, разумное качество.
-    Большие прайсы (>1000 позиций) уйдут в обрезку max_tokens=16k — это норма для MVP.
+    План 2026-05-28: одна ступень — Sonnet видит PDF + caption (text_raw из TG)
+    одним вызовом, разбирает шапки таблиц, объединённые ячейки, многоколоночность,
+    применяет модификаторы цены из caption ("+7 для МСК"). Стоимость ~5 ₽/PDF.
+    Предыдущая итерация (pdfplumber → плоский текст → Haiku) на табличных прайсах
+    типа Мореодор давала lots=[] — Haiku не справлялся с грязным текстовым месивом.
     """
-    text = _extract_pdf_text(pdf_path)
-    if not text.strip():
-        logger.warning(f"market_intel: PDF {pdf_path} — pdfplumber вернул пустой текст")
+    pdf_bytes = Path(pdf_path).read_bytes()
+    if not pdf_bytes:
+        logger.warning(f"market_intel: PDF {pdf_path} пустой")
         return {"supplier_hint": None, "received_at": None, "lots": []}
+    pdf_b64 = base64.b64encode(pdf_bytes).decode()
 
-    return await _call_claude([
-        {"type": "text", "text": (
-            f"PDF-прайс из канала «Мониторинг» (извлечён pdftotext).\n"
-            f"Caption из TG: {caption or '(нет)'}\n\n"
-            f"Содержимое:\n{text}"
-        )},
-    ], max_tokens=32768)
+    content = [
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": pdf_b64,
+            },
+        },
+        {
+            "type": "text",
+            "text": (
+                f"PDF-прайс из канала «Мониторинг».\n"
+                f"Caption из TG (text_raw — может содержать модификатор цены типа '+7 для МСК', "
+                f"информацию о локации, акциях): {caption or '(нет caption)'}\n\n"
+                f"Извлеки ВСЕ товарные позиции прайса. Применяй правила цены МСК / предоплата / "
+                f"caption-модификаторы из system prompt. Шапку поставщика, реквизиты, "
+                f"секции-заголовки CAPS — игнорируй (используй как контекст species, но не "
+                f"записывай в lots)."
+            ),
+        },
+    ]
+    return await _call_claude(content, max_tokens=32768, model=ANTHROPIC_PDF_MODEL)
 
 
 def _supplier_slug_from_hint(hint: str) -> tuple[Optional[str], bool]:
