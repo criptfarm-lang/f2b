@@ -149,33 +149,94 @@ product_form: {", ".join(PRODUCT_FORM_ENUM)}
 5. Если в прайсе несколько городов и для МСК ПУСТО (нет цены, нет ● маркера) — строку ПРОПУСКАЕМ (не записываем в lots).
 6. ИГНОРИРУЕМ: вес тары/упаковки, период вылова, штрих-коды, артикулы (это либо в notes, либо вообще не записываем).
 
-Формат ответа — СТРОГО JSON-объект, никакого текста до или после:
+Формат ответа — СТРОГО JSON-объект, БЕЗ markdown-fences, БЕЗ переносов внутри объектов lot (один lot на строку, compact JSON для экономии токенов):
 
 {{
-  "supplier_hint": "название поставщика как видишь (для маппинга на slug)",
-  "received_at": "YYYY-MM-DD дата прайса из заголовка или null",
+  "supplier_hint": "название поставщика как видишь",
+  "received_at": "YYYY-MM-DD или null",
   "lots": [
-    {{
-      "species": "из enum",
-      "subspecies": "опционально — атлантический/ваннамеи/чёрноморская/радужная/...",
-      "region": "из enum или null",
-      "weight_class": "точно из прайса, нормализуй запятые в точки",
-      "processing": "из enum",
-      "state": "из enum",
-      "product_form": "из enum (default 'сырьё')",
-      "price_rub_kg": число,
-      "volume_tier": "от 100 кг / от 1.5 т / null",
-      "conditions": "склад, упаковка — опционально",
-      "raw_text": "исходный текст позиции из прайса",
-      "confidence_self": "confirmed | needs-review",
-      "notes": "PREM сорт, % аллокации и т.п."
-    }}
+    {{"species":"из enum","weight_class":"вес/калибр","processing":"из enum","state":"из enum","price_rub_kg":число,"raw_text":"исходный текст"}}
   ]
 }}
 
-Если в сообщении не прайс-лист (короткая заметка, шум) — верни {{"supplier_hint": null, "received_at": null, "lots": []}}.
-Если сообщение — длинный многопозиционный прайс (50+ позиций), верни все позиции максимально полно.
+ОБЯЗАТЕЛЬНЫЕ ПОЛЯ в каждом lot: species, weight_class, processing, state, price_rub_kg, raw_text.
+
+ОПЦИОНАЛЬНЫЕ (добавляй только если есть значение, иначе НЕ включай ключ): subspecies, region, product_form (default «сырьё»), volume_tier, conditions, confidence_self (default «confirmed»; ставь «needs-review» при сомнении), notes.
+
+Если не прайс — верни {{"supplier_hint":null,"received_at":null,"lots":[]}}.
 """
+
+
+def _parse_truncated_json(text: str) -> dict:
+    """Восстанавливает максимум полных lot-объектов из обрезанного JSON-ответа.
+
+    Идея: ответ имеет вид {"supplier_hint":...,"received_at":...,"lots":[{...},{...},{...
+    где последний lot оборван. Ищем подстроку "lots":[ — всё ДО неё уходит в head;
+    после неё пытаемся последовательно дожевать lots, пока json.loads не упадёт.
+    """
+    fallback = {"supplier_hint": None, "received_at": None, "lots": []}
+    marker = '"lots"'
+    pos = text.find(marker)
+    if pos < 0:
+        return fallback
+    # найти открывающую [
+    br = text.find("[", pos)
+    if br < 0:
+        return fallback
+    # парсим элементы массива по одному, отслеживая баланс { } и кавычки
+    head_text = text[:br + 1] + "]}"
+    try:
+        head = json.loads(head_text)
+    except json.JSONDecodeError:
+        head = {}
+    supplier_hint = head.get("supplier_hint")
+    received_at = head.get("received_at")
+
+    lots = []
+    i = br + 1
+    n = len(text)
+    while i < n:
+        # пропускаем пробелы и запятые
+        while i < n and text[i] in " ,\n\r\t":
+            i += 1
+        if i >= n or text[i] != "{":
+            break
+        # ищем парную закрывающую } учитывая строки/escape
+        depth = 0
+        in_str = False
+        esc = False
+        j = i
+        while j < n:
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        j += 1
+                        break
+            j += 1
+        if depth != 0:
+            # объект оборван
+            break
+        chunk = text[i:j]
+        try:
+            lots.append(json.loads(chunk))
+        except json.JSONDecodeError:
+            break
+        i = j
+
+    return {"supplier_hint": supplier_hint, "received_at": received_at, "lots": lots}
 
 
 async def _call_claude(content, max_tokens: int = 8192, model: Optional[str] = None,
@@ -203,8 +264,15 @@ async def _call_claude(content, max_tokens: int = 8192, model: Optional[str] = N
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
-        logger.error(f"market_intel: JSON decode failed: {e}\ntext={text[:500]}")
-        parsed = {"supplier_hint": None, "received_at": None, "lots": []}
+        # Robust-fallback: ответ обрезан max_tokens'ом посередине lot'а.
+        # Ищем последний полный объект в lots: и закрываем массив + объект.
+        parsed = _parse_truncated_json(text)
+        if parsed.get("lots"):
+            logger.warning(
+                f"market_intel: JSON truncated, recovered {len(parsed['lots'])} lots from prefix"
+            )
+        else:
+            logger.error(f"market_intel: JSON decode failed: {e}\ntext={text[:500]}")
 
     # Debug: если lots пустой и есть метка + db — кладём raw-ответ в bot_settings
     # (Amvera логи труднодоступны локально, БД — наш единственный канал).
@@ -280,7 +348,7 @@ async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str =
             ),
         },
     ]
-    return await _call_claude(content, max_tokens=32768, model=ANTHROPIC_PDF_MODEL,
+    return await _call_claude(content, max_tokens=16384, model=ANTHROPIC_PDF_MODEL,
                               _debug_label=debug_label, _debug_db=debug_db)
 
 
