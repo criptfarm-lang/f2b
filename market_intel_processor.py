@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 ANTHROPIC_MODEL = os.getenv("MARKET_INTEL_MODEL", "claude-haiku-4-5-20251001")
 # Отдельная модель для PDF — Sonnet 4.6 видит native PDF, понимает таблицы.
 # Haiku обрабатывает text/photo (дешевле). См. план 2026-05-28-автопарсер-pdf-прайсов.md.
-ANTHROPIC_PDF_MODEL = os.getenv("MARKET_INTEL_PDF_MODEL", "claude-sonnet-4-5-20250929")
+ANTHROPIC_PDF_MODEL = os.getenv("MARKET_INTEL_PDF_MODEL", "claude-sonnet-4-6")
 
 # ─── ENUM-перечни (зеркало procurement_app/migrations/001+002.sql) ─────────
 SPECIES_ENUM = [
@@ -178,17 +178,21 @@ product_form: {", ".join(PRODUCT_FORM_ENUM)}
 """
 
 
-async def _call_claude(content, max_tokens: int = 8192, model: Optional[str] = None) -> dict:
+async def _call_claude(content, max_tokens: int = 8192, model: Optional[str] = None,
+                       _debug_label: str = "") -> dict:
     """Универсальный вызов Anthropic API. content — список content-blocks.
-    model — если None, используется ANTHROPIC_MODEL (Haiku по умолчанию)."""
+    model — если None, используется ANTHROPIC_MODEL (Haiku по умолчанию).
+    _debug_label — если задан и lots=[], raw-ответ модели пишется в bot_settings."""
     client = get_client()
+    used_model = model or ANTHROPIC_MODEL
     response = await client.messages.create(
-        model=model or ANTHROPIC_MODEL,
+        model=used_model,
         max_tokens=max_tokens,
         system=_build_system_prompt(),
         messages=[{"role": "user", "content": content}],
     )
     text = response.content[0].text
+    raw_text = text  # сохраняем до strip для диагностики
     # Иногда Claude добавляет ```json ... ``` обёртки — снимаем
     text = text.strip()
     if text.startswith("```"):
@@ -197,10 +201,33 @@ async def _call_claude(content, max_tokens: int = 8192, model: Optional[str] = N
         if text.startswith("json"):
             text = text[4:].lstrip()
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except json.JSONDecodeError as e:
         logger.error(f"market_intel: JSON decode failed: {e}\ntext={text[:500]}")
-        return {"supplier_hint": None, "received_at": None, "lots": []}
+        parsed = {"supplier_hint": None, "received_at": None, "lots": []}
+
+    # Debug: если lots пустой и есть метка — кладём raw-ответ в bot_settings
+    # (Amvera логи труднодоступны локально, БД — наш единственный канал).
+    if _debug_label and not parsed.get("lots"):
+        try:
+            from database import get_db
+            db = get_db()
+            usage = response.usage
+            snippet = raw_text[:800].replace("\n", "\\n")
+            debug_value = (
+                f"model={used_model} "
+                f"in={usage.input_tokens} out={usage.output_tokens} "
+                f"supplier_hint={parsed.get('supplier_hint')!r} "
+                f"raw={snippet}"
+            )
+            db._execute(
+                "INSERT INTO bot_settings(key, value) VALUES (%s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (f"market_intel_debug_{_debug_label}", debug_value[:2000]),
+            )
+        except Exception as dbg_err:
+            logger.warning(f"market_intel debug write failed: {dbg_err}")
+    return parsed
 
 
 async def parse_text_message(text: str) -> dict:
@@ -218,7 +245,7 @@ async def parse_photo_message(image_path: str, caption: str = "") -> dict:
     ])
 
 
-async def parse_pdf_message(pdf_path: str, caption: str = "") -> dict:
+async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str = "") -> dict:
     """PDF → native document block в Claude Sonnet 4.6.
 
     План 2026-05-28: одна ступень — Sonnet видит PDF + caption (text_raw из TG)
@@ -255,7 +282,8 @@ async def parse_pdf_message(pdf_path: str, caption: str = "") -> dict:
             ),
         },
     ]
-    return await _call_claude(content, max_tokens=32768, model=ANTHROPIC_PDF_MODEL)
+    return await _call_claude(content, max_tokens=32768, model=ANTHROPIC_PDF_MODEL,
+                              _debug_label=debug_label)
 
 
 def _supplier_slug_from_hint(hint: str) -> tuple[Optional[str], bool]:
@@ -397,7 +425,7 @@ async def process_pending(db, limit: int = 20) -> dict:
                     stats["failed"] += 1
                     continue
                 try:
-                    result = await parse_pdf_message(file_path, caption)
+                    result = await parse_pdf_message(file_path, caption, debug_label=f"msg{msg_id}")
                 except Exception as e:
                     logger.exception(f"market_intel: msg {msg_id} PDF parse failed: {e!r}")
                     # НЕ помечаем processed — попробуем на следующем тике (вдруг временный сбой).
