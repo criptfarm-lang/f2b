@@ -1,14 +1,14 @@
 """F2B — UI подтверждения needs-review лотов через бота «Эф».
 
-План 2026-05-28-автопарсер-pdf-прайсов.md, Под-фаза 2 (минимальная итерация).
+План 2026-05-28-автопарсер-pdf-прайсов.md, Под-фазы 2 + 2.x.
 
 Двухэтажный UI:
 1. Auto-slug поставщики (сгенерированные из caption, не в SUPPLIER_HINT_MAP)
    — групповая операция: 1 клик подтверждает всех лотов под этим slug'ом сразу.
 2. Лоты в needs-review для confirmed-поставщиков — по одному.
-
-В минимальной версии каждая карточка имеет 2 кнопки: Подтвердить / Отбросить.
-Inline-правка species/processing/state — следующая итерация (2.x).
+   Inline-правка species/processing/state прямо в карточке (Под-фаза 2.x):
+   текущее значение помечено ✓, top-2 наиболее частых из confirmed-лотов
+   + кнопка «Другое...» открывает picker со всеми ENUM-значениями.
 
 Per-zone routing временно отключён (для bench Виктор видит всё). Включится через
 env NR_OWNER_ZONE=belyakova|kristina, когда добавим chat_id остальных в БД.
@@ -159,6 +159,79 @@ def _drop_lot(db, lot_id: str) -> bool:
     return (cur.rowcount or 0) > 0
 
 
+# ─── ENUM-правка в карточке (Под-фаза 2.x) ──────────────────────────────────
+
+# Маппинг короткого кода поля → (имя колонки в БД, имя ENUM-типа).
+# Коды короткие, чтобы влезать в callback_data (64 байта Telegram-лимит).
+_FIELD_MAP = {
+    "sp": ("species", "procurement.species_enum"),
+    "pr": ("processing", "procurement.processing_enum"),
+    "st": ("state", "procurement.state_enum"),
+}
+
+_ENUM_VALUES_CACHE: dict[str, list[str]] = {}
+
+
+def _get_enum_values(db, enum_type: str) -> list[str]:
+    """Все значения ENUM в порядке определения. Кэшируем in-memory."""
+    if enum_type in _ENUM_VALUES_CACHE:
+        return _ENUM_VALUES_CACHE[enum_type]
+    schema, _, name = enum_type.partition(".")
+    rows = db._fetchall(
+        """SELECT e.enumlabel
+           FROM pg_type t
+           JOIN pg_enum e ON e.enumtypid = t.oid
+           JOIN pg_namespace n ON n.oid = t.typnamespace
+           WHERE n.nspname = %s AND t.typname = %s
+           ORDER BY e.enumsortorder""",
+        (schema, name),
+    )
+    values = [r["enumlabel"] for r in rows]
+    _ENUM_VALUES_CACHE[enum_type] = values
+    return values
+
+
+def _get_top_values(db, column: str, current_value: str, limit: int = 2) -> list[str]:
+    """Top-N наиболее частых значений колонки среди confirmed-лотов, исключая текущее."""
+    rows = db._fetchall(
+        f"""SELECT {column}::text AS v, COUNT(*) AS n
+            FROM procurement.lots
+            WHERE confidence = 'confirmed'
+              AND superseded_by_lot_id IS NULL
+              AND {column}::text <> %s
+            GROUP BY {column}
+            ORDER BY n DESC
+            LIMIT %s""",
+        (current_value, limit),
+    )
+    return [r["v"] for r in rows]
+
+
+def _resolve_lot_by_short_id(db, short_id: str) -> Optional[dict]:
+    """Восстанавливает полный лот по первым 8 chars UUID. При коллизии — первый."""
+    rows = db._fetchall(
+        """SELECT lot_id, supplier_id, species::text AS species,
+                  subspecies, region::text AS region, weight_class,
+                  processing::text AS processing, state::text AS state,
+                  product_form::text AS product_form, price_rub_kg,
+                  raw_text, notes, conditions, confidence::text AS confidence
+           FROM procurement.lots
+           WHERE lot_id::text LIKE %s
+           LIMIT 1""",
+        (short_id + "%",),
+    )
+    return rows[0] if rows else None
+
+
+def _set_lot_field(db, lot_id: str, column: str, enum_type: str, value: str) -> bool:
+    """UPDATE одной ENUM-колонки лота. Возвращает True если строка обновлена."""
+    cur = db._execute(
+        f"UPDATE procurement.lots SET {column} = %s::{enum_type} WHERE lot_id = %s",
+        (value, lot_id),
+    )
+    return (cur.rowcount or 0) > 0
+
+
 # ─── Карточки UI ────────────────────────────────────────────────────────────
 
 
@@ -183,7 +256,7 @@ def _format_supplier_card(supplier: dict) -> tuple[str, InlineKeyboardMarkup]:
     return text, kb
 
 
-def _format_lot_card(lot: dict) -> tuple[str, InlineKeyboardMarkup]:
+def _format_lot_card(lot: dict, db) -> tuple[str, InlineKeyboardMarkup]:
     parts = [
         f"*{lot['supplier_id']}*",
         f"{lot['species']}"
@@ -200,12 +273,51 @@ def _format_lot_card(lot: dict) -> tuple[str, InlineKeyboardMarkup]:
         parts.append(f"\n`{lot['raw_text'][:120]}`")
     text = "\n".join(parts)
 
-    lot_id = lot["lot_id"]
-    kb = InlineKeyboardMarkup([[
+    lot_id = str(lot["lot_id"])
+    sid = lot_id[:8]
+    rows = []
+    # Три ряда ENUM-правки. Каждый ряд: [текущее ✓] [top1] [top2] [Другое...]
+    for code, (column, enum_type) in _FIELD_MAP.items():
+        current = lot[column] or "—"
+        tops = _get_top_values(db, column, current, limit=2)
+        row = [InlineKeyboardButton(f"✓ {current}", callback_data="nr_nop")]
+        for v in tops:
+            row.append(InlineKeyboardButton(v, callback_data=f"nr_s|{sid}|{code}|{v}"))
+        row.append(InlineKeyboardButton("Другое…", callback_data=f"nr_m|{sid}|{code}"))
+        rows.append(row)
+    rows.append([
         InlineKeyboardButton("✅ Подтвердить", callback_data=f"nr_lok|{lot_id}"),
         InlineKeyboardButton("❌ Отбросить", callback_data=f"nr_ldrop|{lot_id}"),
-    ]])
-    return text, kb
+    ])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _format_enum_picker(db, lot: dict, code: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Карточка выбора значения ENUM из полного списка."""
+    column, enum_type = _FIELD_MAP[code]
+    current = lot[column] or "—"
+    lot_id = str(lot["lot_id"])
+    sid = lot_id[:8]
+    label = {"sp": "species", "pr": "processing", "st": "state"}[code]
+    text = (
+        f"*{lot['supplier_id']}*\n"
+        f"Выбор `{label}` (сейчас: *{current}*)\n\n"
+        f"`{(lot.get('raw_text') or '')[:120]}`"
+    )
+    values = _get_enum_values(db, enum_type)
+    # 3 кнопки в ряд, текущее значение исключаем
+    buttons = [v for v in values if v != current]
+    rows = []
+    row = []
+    for v in buttons:
+        row.append(InlineKeyboardButton(v, callback_data=f"nr_s|{sid}|{code}|{v}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("← Назад", callback_data=f"nr_b|{sid}")])
+    return text, InlineKeyboardMarkup(rows)
 
 
 # ─── Главные точки входа ────────────────────────────────────────────────────
@@ -219,13 +331,21 @@ async def cmd_needs_review(update: Update, context: ContextTypes.DEFAULT_TYPE, d
 async def cb_needs_review(update: Update, context: ContextTypes.DEFAULT_TYPE, db) -> None:
     """CallbackQueryHandler для всех nr_* кнопок."""
     query = update.callback_query
-    await query.answer()
     data = query.data or ""
-    action, _, payload = data.partition("|")
+
+    # nr_nop — уже выбранное значение ENUM, no-op
+    if data == "nr_nop":
+        await query.answer("Уже выбрано")
+        return
+
+    await query.answer()
+    parts = data.split("|")
+    action = parts[0]
+    advance_to_next = True  # для большинства действий — сразу следующая карточка
 
     try:
         if action == "nr_sok":
-            auto_slug = payload
+            auto_slug = parts[1]
             # Idempotency: если auto_slug уже в procurement.suppliers (повторный
             # клик по старой карточке в истории чата), не выполняем UPDATE.
             existing = db._fetchone(
@@ -245,7 +365,7 @@ async def cb_needs_review(update: Update, context: ContextTypes.DEFAULT_TYPE, db
                     parse_mode="Markdown",
                 )
         elif action == "nr_sdrop":
-            auto_slug = payload
+            auto_slug = parts[1]
             n = _drop_supplier_lots(db, auto_slug)
             if n == 0:
                 await query.edit_message_text(
@@ -258,17 +378,57 @@ async def cb_needs_review(update: Update, context: ContextTypes.DEFAULT_TYPE, db
                     parse_mode="Markdown",
                 )
         elif action == "nr_lok":
-            lot_id = payload
+            lot_id = parts[1]
             if _confirm_lot(db, lot_id):
                 await query.edit_message_text("✅ Лот подтверждён.")
             else:
                 await query.edit_message_text("ℹ Лот уже обработан или удалён.")
         elif action == "nr_ldrop":
-            lot_id = payload
+            lot_id = parts[1]
             if _drop_lot(db, lot_id):
                 await query.edit_message_text("❌ Лот отброшен.")
             else:
                 await query.edit_message_text("ℹ Лот уже обработан или удалён.")
+        elif action == "nr_s":
+            # nr_s|<sid>|<code>|<value> — UPDATE одной колонки + refresh карточки
+            sid, code, value = parts[1], parts[2], parts[3]
+            if code not in _FIELD_MAP:
+                await query.edit_message_text(f"⚠ Неизвестное поле: {code}")
+                return
+            lot = _resolve_lot_by_short_id(db, sid)
+            if not lot or lot.get("confidence") != "needs-review":
+                await query.edit_message_text("ℹ Лот уже обработан или удалён.")
+                return
+            column, enum_type = _FIELD_MAP[code]
+            _set_lot_field(db, str(lot["lot_id"]), column, enum_type, value)
+            # refresh: подтягиваем обновлённый лот и редактируем карточку in-place
+            lot = _resolve_lot_by_short_id(db, sid)
+            text, kb = _format_lot_card(lot, db)
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+            advance_to_next = False
+        elif action == "nr_m":
+            # nr_m|<sid>|<code> — открыть picker полного списка
+            sid, code = parts[1], parts[2]
+            if code not in _FIELD_MAP:
+                await query.edit_message_text(f"⚠ Неизвестное поле: {code}")
+                return
+            lot = _resolve_lot_by_short_id(db, sid)
+            if not lot or lot.get("confidence") != "needs-review":
+                await query.edit_message_text("ℹ Лот уже обработан или удалён.")
+                return
+            text, kb = _format_enum_picker(db, lot, code)
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+            advance_to_next = False
+        elif action == "nr_b":
+            # nr_b|<sid> — назад к карточке лота из picker
+            sid = parts[1]
+            lot = _resolve_lot_by_short_id(db, sid)
+            if not lot or lot.get("confidence") != "needs-review":
+                await query.edit_message_text("ℹ Лот уже обработан или удалён.")
+                return
+            text, kb = _format_lot_card(lot, db)
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+            advance_to_next = False
         else:
             await query.edit_message_text(f"⚠ Неизвестное действие: {action}")
             return
@@ -277,8 +437,8 @@ async def cb_needs_review(update: Update, context: ContextTypes.DEFAULT_TYPE, db
         await query.edit_message_text(f"⚠ Ошибка: {e!r}")
         return
 
-    # Сразу следующая карточка
-    await _send_next(query.message.reply_text, db, is_callback=True)
+    if advance_to_next:
+        await _send_next(query.message.reply_text, db, is_callback=True)
 
 
 async def _send_next(send_func, db, is_callback: bool) -> None:
@@ -291,7 +451,7 @@ async def _send_next(send_func, db, is_callback: bool) -> None:
 
     lots = _get_needs_review_lots(db, limit=1)
     if lots:
-        text, kb = _format_lot_card(lots[0])
+        text, kb = _format_lot_card(lots[0], db)
         await send_func(text, reply_markup=kb, parse_mode="Markdown")
         return
 
