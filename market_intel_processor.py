@@ -133,6 +133,9 @@ SUPPLIER_HINT_MAP = {
     "swfish": "farvater",
     "swfish.ru": "farvater",
     "swfishru": "farvater",
+    # Якимал (японская / европейская кухня, yakimal.com)
+    "якимал": "yakimal",
+    "yakimal": "yakimal",
     # DEFA Group (продаётся через Неву)
     "defa": "defa-fish",
     "дефа": "defa-fish",
