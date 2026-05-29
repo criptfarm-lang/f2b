@@ -13,8 +13,10 @@ HTML-отчёт «Дебиторка» — Фаза 5 плана 2026-05-20-пд
 from __future__ import annotations
 
 import html
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
+
+from moysklad import PDZ_GRACE_DAYS, _pdz_classify
 
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -100,17 +102,18 @@ def build_pdz_payload(db) -> dict:
         if updated_at is None or sa > updated_at:
             updated_at = sa
 
-    # Per-contractor FIFO + balance=None skip (та же логика что в
-    # moysklad.pdz_overdue_for_manager и pdz_unprocessed_for_owner).
+    # Per-contractor FIFO + balance=None skip + лаг PDZ_GRACE_DAYS дней от
+    # ppm_initial (та же логика что в moysklad.pdz_overdue_for_manager и
+    # pdz_unprocessed_for_owner).
     # Шаг 1: собрать per-agent overdue + in_сroк_unpaid + work-метрики.
     #
-    # work_total = заказы где ppm_initial < today И payed < sum (всё, что
-    #              формально просрочено по исходной дате — работа менеджера)
+    # work_total = заказы где ppm_initial + GRACE < today И payed < sum
+    #              (формально просрочено с учётом лага — работа менеджера).
     # work_touched = из work_total те где ppm_new is not null (менеджер
     #                открыл карточку и поставил новую дату — неважно в прошлое
-    #                или будущее)
-    # Это важно: если менеджер согласовал перенос в будущее, заказ уходит из
-    # «overdue» в «in_сroк», но в work_touched учитывается — это его работа.
+    #                или будущее).
+    # Заказы в grace-окне не считаются ни «к работе», ни «просроченными» —
+    # их защищает технический лаг от первой обещанной даты.
     by_agent_raw: dict[str, dict] = {}
     for r in rows:
         bal_raw = r.get("agent_balance")
@@ -127,8 +130,8 @@ def build_pdz_payload(db) -> dict:
             continue
         ppm_new = _to_date(r.get("ppm_new"))
         ppm_initial = _to_date(r.get("ppm_initial"))
-        effective = ppm_new if ppm_new is not None else ppm_initial
-        if not effective:
+        status, effective, days_overdue = _pdz_classify(ppm_initial, ppm_new, today)
+        if status == "skip":
             continue
         aid = r.get("agent_id") or ""
         if not aid:
@@ -144,15 +147,14 @@ def build_pdz_payload(db) -> dict:
             "work_total": 0,
             "work_touched": 0,
         })
-        # Считаем работу менеджера по исходной дате, не по effective.
-        if ppm_initial is not None and ppm_initial < today:
+        # Работа менеджера — по ppm_initial + GRACE (синхронно с дайджестом).
+        if ppm_initial is not None and today > ppm_initial + timedelta(days=PDZ_GRACE_DAYS):
             bucket["work_total"] += 1
             if ppm_new is not None:
                 bucket["work_touched"] += 1
-        if effective >= today:
+        if status in ("in_срок", "in_grace"):
             bucket["in_сroк_unpaid_total"] = round(bucket["in_сroк_unpaid_total"] + unpaid, 2)
             continue
-        days_overdue = (today - effective).days
         bucket["overdue"].append({
             "order_id": r.get("order_id") or "",
             "days_overdue": days_overdue,
