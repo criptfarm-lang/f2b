@@ -127,6 +127,12 @@ SUPPLIER_HINT_MAP = {
     # Sky Fish
     "sky fish": "sky-fish",
     "skyfish": "sky-fish",
+    # Фарватер (СПб, swfish.ru)
+    "фарватер": "farvater",
+    "farvater": "farvater",
+    "swfish": "farvater",
+    "swfish.ru": "farvater",
+    "swfishru": "farvater",
     # DEFA Group (продаётся через Неву)
     "defa": "defa-fish",
     "дефа": "defa-fish",
@@ -707,6 +713,17 @@ async def process_pending(db, limit: int = 20) -> dict:
             # (название нашего канала, попавшее в контекст PDF) или другим шумом.
             hint = forward_from or result.get("supplier_hint") or caption[:50]
             slug, is_known = _supplier_slug_from_hint(hint)
+            # Fix XLS (29.05 вечер): если Sonnet распознал лоты но supplier_hint пустой —
+            # сохраняем лоты под auto-slug `unknown-msgN` с пометкой needs-review,
+            # чтобы менеджер мог принять/переименовать через /needs_review.
+            # Раньше такой батч (msg=22 = 139 креветок) выбрасывался полностью.
+            if not slug and result.get("lots"):
+                slug = f"unknown-msg{msg_id}"
+                is_known = False
+                logger.warning(
+                    f"market_intel: msg {msg_id} — slug пустой, но lots={len(result['lots'])}; "
+                    f"сохраняю под auto-slug={slug}"
+                )
             if not slug:
                 logger.warning(f"market_intel: msg {msg_id} — slug пустой (hint={hint!r}); пропускаю needs-review")
                 # Fix D (29.05): debug-write при пустом slug — иначе случай
