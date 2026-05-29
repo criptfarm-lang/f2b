@@ -149,6 +149,24 @@ product_form: {", ".join(PRODUCT_FORM_ENUM)}
 5. Если в прайсе несколько городов и для МСК ПУСТО (нет цены, нет ● маркера) — строку ПРОПУСКАЕМ (не записываем в lots).
 6. ИГНОРИРУЕМ: вес тары/упаковки, период вылова, штрих-коды, артикулы (это либо в notes, либо вообще не записываем).
 
+ПРАВИЛА GROUP-BY ЗАГОЛОВКОВ (Fix E, 29.05 — типичная структура Невы / СМАРТ ФИШ):
+Многие прайсы используют структуру:
+  «Креветка ваннамей ОЧИЩ:»  ← заголовок-группировщик, species + processing
+    21/25 - 680₽
+    31/40 - 540₽
+    41/50 - 460₽
+Каждая строка под заголовком — отдельный лот. Species/processing/state из заголовка
+НАСЛЕДУЮТСЯ для всех строк группы пока не встретится новый заголовок другого species.
+То же для секций «КРАСНАЯ РЫБА» / «БЕЛАЯ РЫБА» / «МОРЕПРОДУКТЫ» — это не лоты, это
+контекст species. Извлекай ВСЕ строки группы как отдельные лоты с заголовочным
+species, а не только первую.
+
+ПРАВИЛО WEIGHT_CLASS (Fix C, 29.05):
+weight_class — ОБЯЗАТЕЛЬНОЕ поле в БД, NOT NULL. Если калибр в прайсе не указан
+вообще (например только species + цена) — поставь "unspecified". Если в прайсе
+штучный счёт креветок (21/25, 30/40) — это и есть weight_class ("21/25" как строка),
+а НЕ null.
+
 Формат ответа — СТРОГО JSON-объект, БЕЗ markdown-fences, БЕЗ переносов внутри объектов lot (один lot на строку, compact JSON для экономии токенов):
 
 {{
@@ -167,12 +185,20 @@ product_form: {", ".join(PRODUCT_FORM_ENUM)}
 """
 
 
+_HINT_RE = __import__("re").compile(r'"supplier_hint"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"')
+_RECV_RE = __import__("re").compile(r'"received_at"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"')
+
+
 def _parse_truncated_json(text: str) -> dict:
     """Восстанавливает максимум полных lot-объектов из обрезанного JSON-ответа.
 
     Идея: ответ имеет вид {"supplier_hint":...,"received_at":...,"lots":[{...},{...},{...
     где последний lot оборван. Ищем подстроку "lots":[ — всё ДО неё уходит в head;
     после неё пытаемся последовательно дожевать lots, пока json.loads не упадёт.
+
+    Fix A (29.05): supplier_hint и received_at извлекаем regex'ом, а не json.loads
+    головки. Раньше при наличии спецсимволов внутри hint json.loads падал и hint=null
+    → SkyFish-style fail: лоты есть, но slug не определён, весь batch выкидывался.
     """
     fallback = {"supplier_hint": None, "received_at": None, "lots": []}
     marker = '"lots"'
@@ -183,14 +209,13 @@ def _parse_truncated_json(text: str) -> dict:
     br = text.find("[", pos)
     if br < 0:
         return fallback
-    # парсим элементы массива по одному, отслеживая баланс { } и кавычки
-    head_text = text[:br + 1] + "]}"
-    try:
-        head = json.loads(head_text)
-    except json.JSONDecodeError:
-        head = {}
-    supplier_hint = head.get("supplier_hint")
-    received_at = head.get("received_at")
+
+    head_text = text[:br + 1]
+    # Regex по head — устойчиво к truncation внутри hint и спецсимволам.
+    hint_match = _HINT_RE.search(head_text)
+    recv_match = _RECV_RE.search(head_text)
+    supplier_hint = hint_match.group(1) if hint_match else None
+    received_at = recv_match.group(1) if recv_match else None
 
     lots = []
     i = br + 1
@@ -431,6 +456,15 @@ def _insert_lots(db, lots: list[dict], supplier_id: str, msg_id: int,
                 except (KeyError, TypeError, ValueError):
                     skipped += 1
                     continue
+                # Fix C (29.05): None в обязательных полях. dict.get("k", default)
+                # возвращает None если ключ есть с None — нужен `or default`.
+                # Креветка 21/25 (счёт штук) приходила с weight_class=None и роняла
+                # весь batch через NotNullViolation + InFailedSqlTransaction.
+                weight_class = lot.get("weight_class") or "unspecified"
+                # Fix B (29.05): SAVEPOINT для каждого INSERT — иначе первая ошибка
+                # абортит транзакцию и все последующие insert'ы валятся с
+                # InFailedSqlTransaction (msg_24 СМАРТ ФИШ потерял 13 валидных лотов).
+                cur.execute("SAVEPOINT lot_sp")
                 try:
                     cur.execute(
                         """INSERT INTO procurement.lots (
@@ -446,7 +480,7 @@ def _insert_lots(db, lots: list[dict], supplier_id: str, msg_id: int,
                         WHERE superseded_by_lot_id IS NULL DO NOTHING""",
                         (
                             species, lot.get("subspecies"), region,
-                            lot.get("weight_class", "unspecified"),
+                            weight_class,
                             processing, state, product_form, price,
                             lot.get("volume_tier"), lot.get("conditions"),
                             supplier_id, received_at, valid_until, msg_id,
@@ -458,7 +492,9 @@ def _insert_lots(db, lots: list[dict], supplier_id: str, msg_id: int,
                         inserted += 1
                     else:
                         skipped += 1
+                    cur.execute("RELEASE SAVEPOINT lot_sp")
                 except Exception as e:
+                    cur.execute("ROLLBACK TO SAVEPOINT lot_sp")
                     logger.error(f"market_intel: insert lot failed: {e!r}; lot={lot}")
                     skipped += 1
         conn.commit()
@@ -514,6 +550,24 @@ async def process_pending(db, limit: int = 20) -> dict:
             slug, is_known = _supplier_slug_from_hint(hint)
             if not slug:
                 logger.warning(f"market_intel: msg {msg_id} — slug пустой (hint={hint!r}); пропускаю needs-review")
+                # Fix D (29.05): debug-write при пустом slug — иначе случай
+                # «Sonnet распознал N лотов, но supplier_hint оборван → batch выкинут»
+                # не оставляет следов в bot_settings.market_intel_debug_*.
+                try:
+                    sample = (result.get("lots") or [])[:3]
+                    debug_value = (
+                        f"reason=empty_slug hint={hint!r} forward_from={forward_from!r} "
+                        f"file={file_path or 'msg_'+str(msg_id)} "
+                        f"lots_parsed={len(result.get('lots') or [])} "
+                        f"sample_lots={sample!r}"
+                    )
+                    db._execute(
+                        "INSERT INTO bot_settings(key, value) VALUES (%s, %s) "
+                        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                        (f"market_intel_debug_msg{msg_id}", debug_value[:3000]),
+                    )
+                except Exception as dbg_err:
+                    logger.warning(f"market_intel debug-empty-slug write failed: {dbg_err!r}")
                 db.mark_market_intel_processed(msg_id)
                 stats["failed"] += 1
                 continue
