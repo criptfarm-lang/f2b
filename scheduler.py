@@ -160,24 +160,14 @@ def setup_scheduler(app: Application, db):
     )
 
     # Каждые 30 мин — обработка прайс-листов из канала «Мониторинг».
-    # Скилл update-market-intel остаётся для PDF и сложных кейсов (manual fallback);
-    # cron автоматически разбирает text/photo. План: 2026-05-22, Фаза 1.4.
-    #
-    # Заменено CronTrigger(hour='9-19', minute='*/30') → IntervalTrigger(minutes=30).
-    # Зафиксировано 2026-05-26: CronTrigger с двумя ограничителями (hour+minute)
-    # не дёргал job ни разу 12:00-16:30 МСК, даже с misfire_grace_time=3600.
-    # IntervalTrigger надёжнее: первый tick через 30 сек после старта, дальше каждые 30 мин.
-    # Окно 9-19 МСК потеряли (теперь 24/7), но это OK для MVP — обработка прайсов
-    # имеет low cost и нет вреда от ночного запуска.
-    from market_intel_processor import market_intel_cron_job
-    scheduler.add_job(
-        market_intel_cron_job,
-        IntervalTrigger(minutes=30, timezone=MSK),
-        args=[app, db],
-        id="market_intel_process",
-        misfire_grace_time=3600, coalesce=True,
-        next_run_time=datetime.now(MSK) + timedelta(seconds=30),
-    )
+    # ВАЖНО (29.05): market_intel вынесен из AsyncIOScheduler в PTB JobQueue
+    # (см. bot.py app.job_queue.run_repeating). Причина: AsyncIOScheduler
+    # 28.05 завис на tick 18:04 (job больше не триггерился 15 часов),
+    # 29.05 после рестарта повторил то же — выполнил 1 tick и забыл job.
+    # CronTrigger вариант (hour='9-19', minute='*/30') ранее тоже не дёргал
+    # 12:00-16:30 МСК. PTB JobQueue работает стабильно (retry_pending_idents
+    # каждый час подтверждён). market_intel_cron_job импортируется и вызывается
+    # из bot.py wrapper'а.
 
     scheduler.start()
     logger.info("✅ Планировщик запущен")

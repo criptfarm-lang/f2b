@@ -6758,6 +6758,25 @@ def main():
         filters.Regex(r"^/(задача|поставить)(@\w+)?(\s|$)"),
         cmd_task,
     ))
+
+    # ─── /needs_review: подтверждение needs-review лотов (план 2026-05-28 Под-фаза 2) ──
+    from needs_review_handler import cmd_needs_review, cb_needs_review
+
+    async def _nr_guard_and_cmd(u, c):
+        if not u.effective_user or u.effective_user.id != OWNER_CHAT_ID:
+            await u.message.reply_text("⛔ Команда доступна только владельцу (bench-режим).")
+            return
+        await cmd_needs_review(u, c, db)
+
+    async def _nr_guard_and_cb(u, c):
+        if not u.callback_query or not u.callback_query.from_user \
+                or u.callback_query.from_user.id != OWNER_CHAT_ID:
+            await u.callback_query.answer("⛔ Нет доступа.", show_alert=True)
+            return
+        await cb_needs_review(u, c, db)
+
+    app.add_handler(CommandHandler("needs_review", _nr_guard_and_cmd))
+    app.add_handler(CallbackQueryHandler(_nr_guard_and_cb, pattern=r"^nr_"))
     app.add_handler(MessageHandler(
         filters.Regex(r"^/отмена(@\w+)?(\s|$)"),
         cmd_task_cancel,
@@ -6836,6 +6855,19 @@ def main():
             logger.error(f"retry_pending_idents: {e}", exc_info=True)
 
     app.job_queue.run_repeating(retry_pending_idents, interval=3600, first=300)
+
+    # market_intel — через PTB JobQueue (а не AsyncIOScheduler, который 28-29.05
+    # дважды зависал после первого tick'а). PTB JobQueue работает стабильно
+    # (retry_pending_idents подтверждён в логах каждый час).
+    from market_intel_processor import market_intel_cron_job as _market_intel_cron
+
+    async def _market_intel_job_wrapper(context):
+        try:
+            await _market_intel_cron(app, db)
+        except Exception as e:
+            logger.error(f"market_intel job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_market_intel_job_wrapper, interval=1800, first=30)
 
     # Запускаем webhook-сервер и polling параллельно
     import aiohttp.web as web
@@ -7266,6 +7298,58 @@ def main():
         web_app.router.add_get("/market-intel/unprocessed", handle_market_intel_unprocessed)
         web_app.router.add_post("/market-intel/processed", handle_market_intel_processed)
         web_app.router.add_post("/market-intel/alert", handle_market_intel_alert)
+
+        # ─── Internal notify_manager (procurement webapp → бот) ───────────────
+        # План: F2B второй мозг/plans/2026-05-28-дашборд-закупщика-с-матчером.md, Фаза 4.
+        # Webapp procurement_app пишет в outbox и POSTит сюда. Мы пересылаем
+        # сообщение менеджеру в TG. Защита: X-Internal-Secret = BOT_INTERNAL_NOTIFY_SECRET.
+        # Идемпотентность: in-process set {(request_id, text_hash)} переживает retry,
+        # но сбрасывается при рестарте контейнера — это OK, webapp ставит delivered_at
+        # только на ответ 200, дубль доставляется максимум один раз.
+        import hashlib as _hashlib
+        _notify_delivered_keys: set = set()
+        _notify_delivered_keys_limit = 5000  # защита от бесконечного роста памяти
+
+        async def handle_internal_notify_manager(request):
+            import secrets as _secrets
+            expected = os.getenv("BOT_INTERNAL_NOTIFY_SECRET", "")
+            got = request.headers.get("X-Internal-Secret", "")
+            # constant-time сравнение, как в procurement_app/main.py verify_csrf
+            if not expected or not _secrets.compare_digest(got, expected):
+                return web.Response(text="forbidden", status=403)
+            try:
+                data = await request.json()
+                request_id = int(data["request_id"])
+                manager_tg_id = int(data["manager_tg_id"])
+                text = str(data["text"])
+            except Exception as e:
+                return web.json_response({"ok": False, "error": f"bad body: {e}"}, status=400)
+            if not text.strip():
+                return web.json_response({"ok": False, "error": "empty text"}, status=400)
+
+            text_hash = _hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+            key = (request_id, text_hash)
+            if key in _notify_delivered_keys:
+                # уже доставляли — webapp получит 200 и не будет ретраить.
+                return web.json_response({"ok": True, "idempotent": True})
+
+            try:
+                sent = await app.bot.send_message(
+                    chat_id=manager_tg_id,
+                    text=text,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error(f"internal_notify_manager send failed: req={request_id} mgr={manager_tg_id} err={e}")
+                return web.json_response({"ok": False, "error": str(e)[:300]}, status=500)
+
+            # успех — фиксируем идемпотентность; чистим самые старые если превысили лимит.
+            if len(_notify_delivered_keys) >= _notify_delivered_keys_limit:
+                _notify_delivered_keys.clear()
+            _notify_delivered_keys.add(key)
+            return web.json_response({"ok": True, "message_id": sent.message_id})
+
+        web_app.router.add_post("/internal/notify_manager", handle_internal_notify_manager)
 
         port = int(os.getenv("PORT", "8080"))
         runner = web.AppRunner(web_app)
