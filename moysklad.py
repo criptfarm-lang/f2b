@@ -91,6 +91,61 @@ def fmt_money(amount: float) -> str:
 
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 
+# Глобальный throttle на МС API через monkey-patch aiohttp.ClientSession._request.
+# Инцидент 2026-05-29: при превышении ~45 req/3s МойСклад автоматически отключает
+# JSON API у сотрудника (см. memory feedback-ms-json-api-restriction-check).
+# Сидим заметно ниже: 10 req/sec.
+#
+# Патч ставится один раз при импорте модуля и срабатывает ТОЛЬКО когда URL
+# содержит api.moysklad.ru — другие API (Wazzup, amoCRM, Yandex, Telegram, DashaMail)
+# не задеты. Лимит общий на весь процесс — на все aiohttp-сессии разом, где бы
+# их ни создавали (и в moysklad.py, и в bot.py, и в скриптах).
+_MS_MIN_INTERVAL_SEC = 0.10
+_ms_throttle_lock = asyncio.Lock()
+_ms_last_call_ts = 0.0
+
+
+async def _ms_throttle() -> None:
+    global _ms_last_call_ts
+    async with _ms_throttle_lock:
+        loop = asyncio.get_event_loop()
+        now = loop.time()
+        wait = _MS_MIN_INTERVAL_SEC - (now - _ms_last_call_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _ms_last_call_ts = loop.time()
+
+
+def _install_ms_throttle_patch() -> None:
+    if getattr(aiohttp.ClientSession, "_ms_throttle_installed", False):
+        return
+    _orig_request = aiohttp.ClientSession._request
+
+    async def _patched_request(self, method, str_or_url, **kwargs):
+        is_ms = "api.moysklad.ru" in str(str_or_url)
+        if not is_ms:
+            return await _orig_request(self, method, str_or_url, **kwargs)
+        # МС: throttle + retry на 429 (rate-limit от самого МС).
+        # 29.05.2026 burst дал 624 ответа 429, потом МС отключил нам JSON API.
+        # Серия 429 без backoff = триггер для антифрода. Поэтому при 429 ждём дольше.
+        backoff = 1.0
+        for attempt in range(3):
+            await _ms_throttle()
+            resp = await _orig_request(self, method, str_or_url, **kwargs)
+            if resp.status != 429 or attempt == 2:
+                return resp
+            resp.release()
+            await asyncio.sleep(backoff)
+            backoff *= 2
+        return resp
+
+    aiohttp.ClientSession._request = _patched_request
+    aiohttp.ClientSession._ms_throttle_installed = True
+
+
+_install_ms_throttle_patch()
+
+
 def get_headers():
     token = os.getenv("MOYSKLAD_TOKEN")
     if not token:
