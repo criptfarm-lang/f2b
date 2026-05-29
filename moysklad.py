@@ -1362,10 +1362,14 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
                         logger.info(f"Excluding {agent['name']}: covered by non-overdue {not_overdue_sum:.2f}")
                         continue
 
-                    # Распределяем effective_overdue по просроченным заказам (старые первые)
+                    # LIFO: распределяем effective_overdue от свежих просрочек
+                    # к старым. Свежие платежи покрывают старые отгрузки —
+                    # старые мартовские/апрельские «закрываются», в выдачу идут
+                    # самые новые из просроченных. Кейс ДЖИФУДСЕРВИСЕС 2026-05-29.
                     overdue_only = sorted(
                         [d for d in agent["demands"] if d.get("days", 0) > 0],
-                        key=lambda x: x.get("due", "")
+                        key=lambda x: x.get("due", ""),
+                        reverse=True,
                     )
                     remaining = effective_overdue
                     overdue_demands = []
@@ -1702,6 +1706,45 @@ def _pdz_classify(ppm_initial, ppm_new, today):
     if today <= ppm_initial + _td(days=PDZ_GRACE_DAYS):
         return ("in_grace", effective, 0)
     return ("overdue", effective, (today - effective).days)
+
+
+def _pdz_lifo_cover(overdue_orders: list, real_overdue: float) -> list:
+    """LIFO-распределение real_overdue по overdue-заказам: свежие первыми.
+
+    overdue_orders — список dict с ключами effective_due_date, unpaid_sum,
+    days_overdue (плюс остальные передаются как есть).
+
+    Возвращает covered_orders — подмножество overdue_orders, отсортированное
+    по effective_due_date убыванию, с обрезанной unpaid_sum, сумма которых
+    точно равна real_overdue (с точностью копейки).
+
+    Логика: МойСклад payed_sum раздельно по заказам ненадёжен — бухгалтерия
+    часто не разносит paymentin. Текущий balance клиента (real_overdue) —
+    единственная правда. Распределяем его на самые свежие просроченные
+    заказы, потому что свежие платежи сначала покрывают старые отгрузки
+    (FIFO по платежам = LIFO по «оставшимся в долге» заказам).
+
+    Пример: клиент должен 100к, заказы [#A 17.03 на 80к, #B 12.05 на 50к].
+    real_overdue=60к → 60к падает на #B, #A считается погашенным (max_days
+    становится 17 дней вместо 73).
+    """
+    if real_overdue <= 0 or not overdue_orders:
+        return []
+    sorted_desc = sorted(
+        overdue_orders, key=lambda x: x["effective_due_date"], reverse=True
+    )
+    covered: list = []
+    remaining = real_overdue
+    for o in sorted_desc:
+        if remaining <= 0.01:
+            break
+        unpaid = float(o.get("unpaid_sum") or 0)
+        take = min(remaining, unpaid)
+        if take <= 0:
+            continue
+        covered.append({**o, "unpaid_sum": round(take, 2)})
+        remaining -= take
+    return covered
 
 
 def compute_promise_events(today_rows: list, yesterday_rows: list) -> list:
@@ -2046,23 +2089,28 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
     grouped: list = []
     for aid, data in by_agent.items():
         agent_orders = data["orders"]
-        # Самый старый просроченный заказ — по возрастанию effective_due_date.
-        oldest = min(agent_orders, key=lambda x: x["effective_due_date"])
-        # total_unpaid = real_overdue по FIFO (|balance| − in_сроке), а не
-        # сумма по всем неоплаченным заказам. Fallback на сумму по заказам —
-        # только если balance запроса упал (см. agent_real_overdue выше).
+        # total_unpaid = real_overdue по FIFO (|balance| − in_сроке), fallback
+        # на сумму по заказам если balance запроса упал.
         total_unpaid = agent_real_overdue.get(
             aid, round(sum(x["unpaid_sum"] for x in agent_orders), 2)
         )
-        max_days = max(x["days_overdue"] for x in agent_orders)
+        # LIFO-распределение: real_overdue падает на самые свежие просрочки.
+        # Старые мартовские/апрельские «закрываются» свежими платежами —
+        # max_days, orders_count и ссылка идут по covered (а не по всем
+        # неоплаченным). Кейс ДЖИФУДСЕРВИСЕС 2026-05-29.
+        covered = _pdz_lifo_cover(agent_orders, total_unpaid)
+        if not covered:
+            covered = agent_orders  # балансовый fallback (никогда не должен сработать)
+        oldest_in_covered = min(covered, key=lambda x: x["effective_due_date"])
+        max_days = max(x["days_overdue"] for x in covered)
         grouped.append({
             "agent_id": aid,
             "agent_name": data["agent_name"],
             "agent_balance": data["agent_balance"],
             "total_unpaid": total_unpaid,
             "max_days_overdue": max_days,
-            "orders_count": len(agent_orders),
-            "ms_url_first_order": oldest["ms_url"],
+            "orders_count": len(covered),
+            "ms_url_first_order": oldest_in_covered["ms_url"],
         })
 
     # Обогащение счётчиком срывов за 90 дней (Фаза 4.5).
@@ -2270,19 +2318,24 @@ def pdz_unprocessed_for_owner(db) -> dict:
         grouped = []
         for aid, data in agents.items():
             orders = data["overdue"]
-            oldest = min(orders, key=lambda x: x["effective_due_date"])
             total_unpaid = agent_real_overdue.get(
                 aid, round(sum(x["unpaid_sum"] for x in orders), 2)
             )
-            max_days = max(x["days_overdue"] for x in orders)
+            # LIFO: real_overdue падает на свежие просрочки, старые считаются
+            # покрытыми платежами (см. кейс ДЖИФУДСЕРВИСЕС 2026-05-29).
+            covered = _pdz_lifo_cover(orders, total_unpaid)
+            if not covered:
+                covered = orders
+            oldest_in_covered = min(covered, key=lambda x: x["effective_due_date"])
+            max_days = max(x["days_overdue"] for x in covered)
             grouped.append({
                 "agent_id": data["agent_id"],
                 "agent_name": data["agent_name"],
                 "agent_balance": data["agent_balance"],
                 "total_unpaid": total_unpaid,
                 "max_days_overdue": max_days,
-                "orders_count": len(orders),
-                "ms_url_first_order": oldest["ms_url"],
+                "orders_count": len(covered),
+                "ms_url_first_order": oldest_in_covered["ms_url"],
             })
             if data.get("agent_id"):
                 all_ids.append(data["agent_id"])

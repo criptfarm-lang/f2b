@@ -176,17 +176,33 @@ def build_pdz_payload(db) -> dict:
         real_overdue = max(0.0, round(bal_abs - in_сroк, 2))
         if real_overdue < 0.01:
             continue  # FIFO-перекрытие
-        # Самый старый просроченный заказ — для days_overdue и ссылки.
-        oldest = max(data["overdue"], key=lambda x: x["days_overdue"])
+        # LIFO: распределяем real_overdue от свежих просрочек (мин days_overdue)
+        # к старым. Старые мартовские/апрельские «закрываются» свежими
+        # платежами — days_overdue считается по самому старому из covered.
+        # Кейс ДЖИФУДСЕРВИСЕС 2026-05-29.
+        sorted_lifo = sorted(data["overdue"], key=lambda x: x["days_overdue"])
+        covered: list = []
+        remaining = real_overdue
+        for o in sorted_lifo:
+            if remaining <= 0.01:
+                break
+            take = min(remaining, float(o.get("unpaid") or 0))
+            if take <= 0:
+                continue
+            covered.append({**o, "unpaid": round(take, 2)})
+            remaining -= take
+        if not covered:
+            covered = data["overdue"]
+        oldest_in_covered = max(covered, key=lambda x: x["days_overdue"])
         debtors.append({
             "agent_id": aid,
             "agent_name": data["agent_name"],
             "manager_tag": data["manager_tag"],
             "orders_count": data["work_total"],          # всего заказов клиента с просроч. ppm_initial
             "orders_touched": data["work_touched"],      # из них с заполн. «Новой датой оплаты»
-            "days_overdue": oldest["days_overdue"],
+            "days_overdue": oldest_in_covered["days_overdue"],
             "total_unpaid": real_overdue,
-            "ms_url": _ms_url(oldest["order_id"]),
+            "ms_url": _ms_url(oldest_in_covered["order_id"]),
         })
 
     # Обогащение срывами за 90 дней
