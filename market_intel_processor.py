@@ -655,15 +655,28 @@ def _supplier_slug_from_hint(hint: str) -> tuple[Optional[str], bool]:
 
 
 def _insert_lots(db, lots: list[dict], supplier_id: str, msg_id: int,
-                 source_file: str, received_at: str) -> tuple[int, int]:
-    """INSERT в procurement.lots. Возвращает (inserted, skipped)."""
+                 source_file: str, received_at: str,
+                 posted_at: Optional[datetime] = None) -> tuple[int, int]:
+    """INSERT в procurement.lots. Возвращает (inserted, skipped).
+
+    received_at: дата из Sonnet (шапка прайса). Может быть в прошлом если Sonnet
+    распознал «МАЙ 2026» как 01.05. В таком случае берём posted_at (когда файл
+    реально пришёл в канал) — это безопасный fallback.
+    """
+    # Безопасный received_at: max(parsed_received_at, posted_at). Никогда не позволяем
+    # быть в прошлом - иначе fresh_only фильтр в /search отрежет лоты сразу.
     try:
-        valid_until = (datetime.strptime(received_at, "%Y-%m-%d").date()
-                       + timedelta(days=14)).isoformat()
+        parsed_dt = datetime.strptime(received_at, "%Y-%m-%d").date()
     except (ValueError, TypeError):
-        # fallback: сегодня + 14 дней
-        valid_until = (datetime.now().date() + timedelta(days=14)).isoformat()
-        received_at = datetime.now().date().isoformat()
+        parsed_dt = None
+    posted_dt = posted_at.date() if posted_at else datetime.now().date()
+    if parsed_dt is None or parsed_dt < posted_dt:
+        # Sonnet вернул мусор или прошлую дату → доверяем posted_at от Telegram.
+        received_at = posted_dt.isoformat()
+        effective_dt = posted_dt
+    else:
+        effective_dt = parsed_dt
+    valid_until = (effective_dt + timedelta(days=14)).isoformat()
 
     db._ensure_connection() if hasattr(db, "_ensure_connection") else None
     conn = db.conn
@@ -869,7 +882,8 @@ async def process_pending(db, limit: int = 20) -> dict:
                     lot["notes"] = (lot["notes"] + f" [auto-slug from hint='{hint[:40]}']").strip()
 
             ins, skp = _insert_lots(db, lots_list, slug,
-                                     msg_id, file_path or f"msg_{msg_id}", received_at)
+                                     msg_id, file_path or f"msg_{msg_id}", received_at,
+                                     posted_at=msg.get("posted_at"))
             db.mark_market_intel_processed(msg_id)
             stats["processed"] += 1
             stats["inserted_total"] += ins
