@@ -163,11 +163,16 @@ SUPPLIER_HINT_MAP = {
 
 
 def _build_system_prompt() -> str:
-    return f"""Ты парсер прайс-листа поставщика рыбы / морепродуктов для F2B (АО ФИШ ТУ БИЗНЕС).
+    return f"""Ты парсер прайс-листа поставщика ПИЩЕВОЙ ПРОДУКЦИИ для HoReCa (рестораны, гостиницы).
+F2B (АО ФИШ ТУ БИЗНЕС) - комплексное снабжение ресторанов: рыба+морепродукты, специи,
+водоросли, кунжуты, гарниры, упаковка, готовые продукты японской/европейской кухни.
+Прайсы НЕ ОБЯЗАТЕЛЬНО про рыбу - могут быть про специи, водоросли, бамбуковые листья,
+салат Чука, упаковку, тапиоку, соусы, спаржу, и т.д. Все эти позиции тоже извлекаем.
 
-Из текста / фото / PDF извлеки СПИСОК лотов. Один лот = одна товарная позиция одной ступени цены.
+Из текста / фото / PDF / XLS извлеки СПИСОК ЛОТОВ. Один лот = одна товарная позиция одной ступени цены.
 
-Закрытые ENUM-перечни (используй ТОЛЬКО эти значения; если нет подходящего — `прочее`/`unspecified` с пометкой `confidence_self: needs-review`):
+Закрытые ENUM-перечни (используй ТОЛЬКО эти значения; если позиция не вписывается в
+рыбный enum - ставь species='прочее', а реальное название клади в subspecies или notes):
 
 species: {", ".join(SPECIES_ENUM)}
 regions: {", ".join(REGION_ENUM)}
@@ -175,7 +180,7 @@ processing: {", ".join(PROCESSING_ENUM)}
 state: {", ".join(STATE_ENUM)}
 product_form: {", ".join(PRODUCT_FORM_ENUM)}
 
-ПОДСКАЗКИ для маппинга:
+ПОДСКАЗКИ для маппинга РЫБЫ И МОРЕПРОДУКТОВ:
 - HG / HGT (head gutted) → processing="ПБГ" или "HGT" если упоминается tail-off
 - HON (head-on) → processing="ПСГ"
 - HLSO/HOSO/PDTO/PDTL — для креветок, как processing
@@ -189,6 +194,22 @@ product_form: {", ".join(PRODUCT_FORM_ENUM)}
 - Регион «РФ» = Россия общая (если конкретного региона нет)
 - «ДВ» = "Дальний Восток РФ"
 - Сёмга / Семга = лосось (subspecies="атлантический")
+
+ПОДСКАЗКИ для НЕ-РЫБЫ (специи, водоросли, гарниры, упаковка, готовые блюда):
+- species="прочее" ВСЕГДА (нет в нашем рыбном enum)
+- subspecies = реальное название позиции (например "водоросли вакаме", "кунжут белый",
+  "бамбуковые листья", "салат Чука", "имбирь маринованный розовый", "тапиока")
+- processing="unspecified" (не применимо к специям/готовке)
+- state: если упаковка сухая (специи, водоросли сушёные, кунжуты) → "сушёный";
+  если заморожен (Чука с/м, готовые блюда IQF) → "глубокая-заморозка" или "IQF";
+  если охл — "охл"; если не указано — "unspecified"
+- product_form="сырьё" по умолчанию (хотя для специй и упаковки это формально не сырьё,
+  но product_form_enum рыбный - принимаем как fallback)
+- НЕ archive не-рыбные позиции — F2B расширяет ассортимент HoReCa, эти товары
+  нужны менеджеру наравне с рыбой.
+
+ЯВНО archived (мусор, не товар): доставка, реквизиты, телефоны, ИНН, заголовки разделов,
+шапки таблиц, сумма заказа. Эти позиции вообще не извлекаем (lots=[] для таких строк).
 
 ПРАВИЛА ЦЕНЫ (КРИТИЧНО — F2B работает в МСК):
 1. Если в строке прайса несколько городов (СПб/МСК/Липецк/ДВ) → берём цену для МСК. В conditions запиши "МСК".
@@ -392,18 +413,24 @@ async def _call_claude(content, max_tokens: int = 8192, model: Optional[str] = N
     return parsed
 
 
-async def parse_text_message(text: str) -> dict:
+async def parse_text_message(text: str, original_filename: str = "") -> dict:
     return await _call_claude([
         {"type": "text", "text": f"Текст сообщения из канала «Мониторинг»:\n\n{text}"}
     ])
 
 
-async def parse_photo_message(image_path: str, caption: str = "") -> dict:
+async def parse_photo_message(image_path: str, caption: str = "", original_filename: str = "") -> dict:
     img_b64 = base64.b64encode(Path(image_path).read_bytes()).decode()
     media_type = "image/jpeg" if image_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
     return await _call_claude([
         {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
-        {"type": "text", "text": f"Фото прайс-листа из канала «Мониторинг».\nCaption (если есть): {caption or '(нет)'}\nИзвлеки все товарные позиции."},
+        {"type": "text", "text": (
+            f"Фото прайс-листа.\n"
+            f"Caption: {caption or '(нет)'}\n"
+            f"Оригинальное имя файла: {original_filename or '(нет)'}\n"
+            f"Извлеки ВСЕ товарные позиции — рыба, специи, водоросли, гарниры, упаковка и т.д. "
+            f"supplier_hint бери из caption / имени файла / шапки фото."
+        )},
     ])
 
 
@@ -459,7 +486,7 @@ def _flatten_xls_to_text(xls_path: str, max_chars: int = 24000) -> str:
     return "\n".join(parts)
 
 
-async def parse_xls_message(xls_path: str, caption: str = "", debug_label: str = "", debug_db=None) -> dict:
+async def parse_xls_message(xls_path: str, caption: str = "", debug_label: str = "", debug_db=None, original_filename: str = "") -> dict:
     """XLS/XLSX → flatten в text → Sonnet 4.6.
 
     Sonnet не имеет native XLS-блока (как PDF native document). Поэтому:
@@ -484,17 +511,21 @@ async def parse_xls_message(xls_path: str, caption: str = "", debug_label: str =
         {
             "type": "text",
             "text": (
-                f"XLS/XLSX-прайс поставщика рыбы (плоский дамп всех листов).\n"
+                f"XLS/XLSX-прайс пищевых товаров для HoReCa (плоский дамп всех листов).\n"
+                f"Может быть рыба, специи, водоросли, кунжуты, гарниры, упаковка - любые товары.\n"
                 f"Формат: «Rн: cell1 | cell2 | cell3 | ...» где Rн - номер строки.\n"
                 f"Шапка таблицы (например «# | НАИМЕНОВАНИЕ | ПРОИЗВОДИТЕЛЬ | СПб | Мск») "
-                f"даёт контекст что значит каждая колонка. Применяй правила цены из system "
-                f"prompt: если колонки СПб и Мск разные — бери Мск; если города нет — бери "
-                f"единственную цену. Игнорируй секции-заголовки и реквизиты, бери только товарные строки.\n\n"
-                f"Caption от пересылающего: {caption or '(нет caption)'}\n\n"
-                f"supplier_hint = название поставщика-производителя/дистрибьютора из шапки таблицы "
-                f"(например «ФАРВАТЕР», «Юнифрост», «Sky Fish»). НЕ возвращай как supplier_hint "
-                f"общие термины («прайс», «склад», «прайс-лист»), наши каналы («Мониторинг») "
-                f"или наш юрлица («ФИШ ТУ БИЗНЕС»).\n\n"
+                f"даёт контекст колонок. Если колонки СПб и Мск — бери Мск; если города нет — единственную цену. "
+                f"Игнорируй секции-заголовки и реквизиты, бери только товарные строки.\n\n"
+                f"Caption от пересылающего: {caption or '(нет caption)'}\n"
+                f"Оригинальное имя файла: {original_filename or '(нет)'}\n"
+                f"   ВАЖНО: имя файла часто содержит бренд поставщика - например \n"
+                f"   «ЯКИМАЛ Прайс МАЙ 2026.xlsx» → supplier_hint=\"Якимал\". \n"
+                f"   Используй это как ПЕРВЫЙ источник supplier_hint когда caption пустой.\n\n"
+                f"supplier_hint = название поставщика-производителя/дистрибьютора. ИСТОЧНИКИ в порядке приоритета: "
+                f"1) имя файла, 2) шапка таблицы / логотип в первых строках (ЯКИМАЛ, ФАРВАТЕР, Юнифрост, Sky Fish), "
+                f"3) первое чёткое название бренда. НЕ возвращай: общие термины («прайс», «склад», «прайс-лист»), "
+                f"наши каналы («Мониторинг»), наше юрлицо («ФИШ ТУ БИЗНЕС»).\n\n"
                 f"Дамп таблицы:\n{flat_text}"
             ),
         },
@@ -503,7 +534,7 @@ async def parse_xls_message(xls_path: str, caption: str = "", debug_label: str =
                               _debug_label=debug_label, _debug_db=debug_db)
 
 
-async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str = "", debug_db=None) -> dict:
+async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str = "", debug_db=None, original_filename: str = "") -> dict:
     """PDF → native document block в Claude Sonnet 4.6.
 
     План 2026-05-28: одна ступень — Sonnet видит PDF + caption (text_raw из TG)
@@ -530,18 +561,21 @@ async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str =
         {
             "type": "text",
             "text": (
-                f"PDF-прайс поставщика рыбы.\n"
-                f"Caption от пересылающего (может содержать модификатор цены типа '+7 для МСК', "
-                f"локацию, акции): {caption or '(нет caption)'}\n\n"
+                f"PDF-прайс пищевых товаров для HoReCa (может быть рыба, специи, водоросли, "
+                f"гарниры, упаковка, готовые блюда - любые товары для ресторанов).\n"
+                f"Caption: {caption or '(нет caption)'}\n"
+                f"Оригинальное имя файла: {original_filename or '(нет)'}\n"
+                f"   ВАЖНО: имя файла часто содержит бренд поставщика. Используй как первый \n"
+                f"   источник supplier_hint когда caption пустой.\n\n"
                 f"Извлеки ВСЕ товарные позиции прайса. Применяй правила цены МСК / предоплата / "
                 f"caption-модификаторы из system prompt.\n"
-                f"supplier_hint = название КОНКРЕТНОГО поставщика-производителя или дистрибьютора "
-                f"(берём из шапки PDF: «ООО Мореодор», «Sky Fish», «UltraFish», «DEFA Group» и т.п.). "
-                f"НЕ возвращай как supplier_hint названия наших каналов («Мониторинг», «Эф»), "
-                f"наш юрлица («ФИШ ТУ БИЗНЕС») или общие термины («прайс», «прайс-лист»). "
-                f"Если в шапке нет явного бренда поставщика — supplier_hint=null.\n"
-                f"Шапку поставщика, реквизиты, секции-заголовки CAPS — игнорируй "
-                f"(используй как контекст species, но не записывай в lots)."
+                f"supplier_hint - источники в порядке приоритета: 1) имя файла, "
+                f"2) шапка PDF (логотип/название компании: «ООО Мореодор», «Sky Fish», "
+                f"«UltraFish», «DEFA Group», «ЯКИМАЛ», «Фарватер»), 3) реквизиты "
+                f"(ИНН/название юрлица если явно поставщик). "
+                f"НЕ возвращай: «Мониторинг», «Эф», «ФИШ ТУ БИЗНЕС», «прайс», «прайс-лист». "
+                f"Если бренда совсем нет — supplier_hint=null.\n"
+                f"Шапку, реквизиты, секции-заголовки CAPS — игнорируй (только контекст species, не записывай как lot)."
             ),
         },
     ]
@@ -611,18 +645,21 @@ def _insert_lots(db, lots: list[dict], supplier_id: str, msg_id: int,
                     processing = "unspecified"
                 state = lot.get("state")
                 if state not in STATE_ENUM:
-                    state = "глубокая-заморозка"
+                    # Fix (29.05): не-рыбные товары часто без state. Default
+                    # на 'глубокая-заморозка' плох для специй / сухих водорослей.
+                    # Используем 'unspecified' (добавлен в enum миграцией 29.05).
+                    state = "unspecified"
                 product_form = lot.get("product_form", "сырьё")
                 if product_form not in PRODUCT_FORM_ENUM:
                     product_form = "сырьё"
                 confidence = lot.get("confidence_self", "confirmed")
                 if confidence not in ("confirmed", "pending", "needs-review", "archived"):
                     confidence = "confirmed"
-                # Лоты вне нашей таксономии (готовая продукция, упаковка, прочее)
-                # сразу в archived — не загружаем менеджера, но не теряем для /search
-                # по raw_text если завтра прилетит запрос.
-                if species == "прочее" or processing == "unspecified":
-                    confidence = "archived"
+                # Fix (29.05): НЕ archive не-рыбные позиции автоматом.
+                # F2B расширяет ассортимент HoReCa - специи/водоросли/гарниры/упаковка
+                # должны быть в основной выдаче наравне с рыбой. Архив только если
+                # Sonnet явно поставил confidence_self='archived' (мусорная позиция:
+                # доставка, реквизиты).
                 try:
                     price = float(lot["price_rub_kg"])
                 except (KeyError, TypeError, ValueError):
@@ -687,6 +724,7 @@ async def process_pending(db, limit: int = 20) -> dict:
         caption = msg.get("text_raw") or ""
         forward_from = msg.get("forward_from") or ""
         file_path = msg.get("file_path")
+        original_filename = msg.get("original_filename") or ""
         try:
             if mt == "text":
                 if not caption.strip():
@@ -694,9 +732,9 @@ async def process_pending(db, limit: int = 20) -> dict:
                     db.mark_market_intel_processed(msg_id)
                     stats["processed"] += 1
                     continue
-                result = await parse_text_message(caption)
+                result = await parse_text_message(caption, original_filename=original_filename)
             elif mt == "photo" and file_path and os.path.exists(file_path):
-                result = await parse_photo_message(file_path, caption)
+                result = await parse_photo_message(file_path, caption, original_filename=original_filename)
             elif mt == "document" and msg.get("file_ext") == "pdf":
                 if not file_path or not os.path.exists(file_path):
                     logger.warning(f"market_intel: msg {msg_id} PDF file_path не найден ({file_path}), помечаю processed")
@@ -705,7 +743,8 @@ async def process_pending(db, limit: int = 20) -> dict:
                     continue
                 try:
                     result = await parse_pdf_message(file_path, caption,
-                                                     debug_label=f"msg{msg_id}", debug_db=db)
+                                                     debug_label=f"msg{msg_id}", debug_db=db,
+                                                     original_filename=original_filename)
                 except Exception as e:
                     logger.exception(f"market_intel: msg {msg_id} PDF parse failed: {e!r}")
                     # НЕ помечаем processed — попробуем на следующем тике (вдруг временный сбой).
@@ -719,7 +758,8 @@ async def process_pending(db, limit: int = 20) -> dict:
                     continue
                 try:
                     result = await parse_xls_message(file_path, caption,
-                                                     debug_label=f"msg{msg_id}", debug_db=db)
+                                                     debug_label=f"msg{msg_id}", debug_db=db,
+                                                     original_filename=original_filename)
                 except Exception as e:
                     logger.exception(f"market_intel: msg {msg_id} XLS parse failed: {e!r}")
                     stats["failed"] += 1

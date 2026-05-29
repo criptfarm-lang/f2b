@@ -2954,6 +2954,7 @@ async def handle_market_intel_post(update: Update, context: ContextTypes.DEFAULT
     # Тип сообщения и file_id (если есть)
     file_id = None
     file_ext = None
+    original_filename = None  # 29.05: сохраняем оригинальное имя файла из TG как контекст для Sonnet
     if msg.photo:
         file_id = msg.photo[-1].file_id  # наибольшее разрешение
         file_ext = "jpg"
@@ -2962,6 +2963,7 @@ async def handle_market_intel_post(update: Update, context: ContextTypes.DEFAULT
         file_id = msg.document.file_id
         # выбираем расширение по mime/имени
         fname = msg.document.file_name or ""
+        original_filename = fname or None
         if "." in fname:
             file_ext = fname.rsplit(".", 1)[-1].lower()[:8]
         else:
@@ -3012,6 +3014,7 @@ async def handle_market_intel_post(update: Update, context: ContextTypes.DEFAULT
         file_path=file_path,
         file_ext=file_ext,
         forward_from=forward_from,
+        original_filename=original_filename,
     )
     if saved_id:
         logger.info(

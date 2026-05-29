@@ -835,17 +835,23 @@ class Database:
         file_path: Optional[str] = None,
         file_ext: Optional[str] = None,
         forward_from: Optional[str] = None,
+        original_filename: Optional[str] = None,
     ) -> Optional[int]:
-        """Сохраняет сообщение из канала «Мониторинг». Возвращает id или None если уже есть (UNIQUE chat_id, tg_msg_id)."""
+        """Сохраняет сообщение из канала «Мониторинг». Возвращает id или None если уже есть (UNIQUE chat_id, tg_msg_id).
+
+        original_filename (29.05) — оригинальное имя файла из Telegram (например
+        "ЯКИМАЛ Прайс МАЙ 2026.xlsx"). Главный контекст для Sonnet когда caption
+        и forward_from пустые: имя файла часто содержит бренд поставщика.
+        """
         self._ensure_connection()
         with self.conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO market_intel_messages
-                   (tg_msg_id, chat_id, posted_at, msg_type, text_raw, file_path, file_ext, forward_from)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                   (tg_msg_id, chat_id, posted_at, msg_type, text_raw, file_path, file_ext, forward_from, original_filename)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (chat_id, tg_msg_id) DO NOTHING
                    RETURNING id""",
-                (tg_msg_id, chat_id, posted_at, msg_type, text_raw, file_path, file_ext, forward_from),
+                (tg_msg_id, chat_id, posted_at, msg_type, text_raw, file_path, file_ext, forward_from, original_filename),
             )
             row = cur.fetchone()
             self.conn.commit()
@@ -854,7 +860,7 @@ class Database:
     def get_unprocessed_market_intel(self, limit: int = 100) -> List[Dict]:
         return self._fetchall(
             """SELECT id, tg_msg_id, chat_id, posted_at, msg_type, text_raw,
-                      file_path, file_ext, forward_from, created_at
+                      file_path, file_ext, forward_from, original_filename, created_at
                FROM market_intel_messages
                WHERE processed_at IS NULL
                ORDER BY posted_at ASC
