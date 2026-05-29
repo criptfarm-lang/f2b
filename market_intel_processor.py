@@ -376,6 +376,102 @@ async def parse_photo_message(image_path: str, caption: str = "") -> dict:
     ])
 
 
+def _flatten_xls_to_text(xls_path: str, max_chars: int = 80000) -> str:
+    """Открывает XLS/XLSX и возвращает плоский text-дамп всех листов/строк/ячеек.
+
+    Sonnet не умеет читать XLS как native document, поэтому мы делаем flatten:
+    ```
+    === Sheet: 'Прайс' ===
+    R1: ФАРВАТЕР | ООО Фарватер | ИНН 7813266850 | Санкт-Петербург
+    R2:  | (812) 500-05-65 | swfish.ru
+    ...
+    R6: # | МОРЕПРОДУКТЫ | ПРОИЗВОДИТЕЛЬ | НАЛИЧИЕ | СПб | Мск
+    R7: 1 | Капуста МОРСКАЯ 16+ | Китай | склад | 505,00 | 509,00
+    ```
+    Sonnet по контексту понимает шапку (R6 — header) и cell-positions.
+    Обрезаем длину чтобы не превысить input window Sonnet (~200k токенов).
+    """
+    ext = xls_path.lower().rsplit(".", 1)[-1]
+    parts = []
+    if ext == "xlsx":
+        from openpyxl import load_workbook
+        wb = load_workbook(xls_path, read_only=True, data_only=True)
+        for sheet in wb.worksheets:
+            parts.append(f"\n=== Sheet: {sheet.title!r} ===\n")
+            for r_idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+                if all(c is None or str(c).strip() == "" for c in row):
+                    continue
+                cells = [str(c).strip().replace("|", "/").replace("\n", " ") if c is not None else "" for c in row]
+                line = f"R{r_idx}: " + " | ".join(cells)
+                parts.append(line[:500])  # ограничиваем length одной строки
+                if sum(len(p) for p in parts) > max_chars:
+                    parts.append(f"\n... (truncated at {max_chars} chars)\n")
+                    return "\n".join(parts)
+        wb.close()
+    elif ext == "xls":
+        import xlrd
+        wb = xlrd.open_workbook(xls_path)
+        for sheet in wb.sheets():
+            parts.append(f"\n=== Sheet: {sheet.name!r} ===\n")
+            for r_idx in range(sheet.nrows):
+                row = sheet.row_values(r_idx)
+                if all(str(c).strip() == "" for c in row):
+                    continue
+                cells = [str(c).strip().replace("|", "/").replace("\n", " ") for c in row]
+                line = f"R{r_idx+1}: " + " | ".join(cells)
+                parts.append(line[:500])
+                if sum(len(p) for p in parts) > max_chars:
+                    parts.append(f"\n... (truncated at {max_chars} chars)\n")
+                    return "\n".join(parts)
+    else:
+        raise ValueError(f"unsupported xls extension: {ext}")
+    return "\n".join(parts)
+
+
+async def parse_xls_message(xls_path: str, caption: str = "", debug_label: str = "", debug_db=None) -> dict:
+    """XLS/XLSX → flatten в text → Sonnet 4.6.
+
+    Sonnet не имеет native XLS-блока (как PDF native document). Поэтому:
+    1. openpyxl/xlrd читает все листы/строки/ячейки.
+    2. _flatten_xls_to_text формирует текстовое представление с координатами cells.
+    3. Sonnet получает это как user text + caption + system prompt.
+
+    Шапка таблицы (как «# | МОРЕПРОДУКТЫ | ПРОИЗВОДИТЕЛЬ | НАЛИЧИЕ | СПб | Мск»)
+    и merged cells читаются как plain row — Sonnet по контексту понимает что
+    колонка «Мск» это цена для МСК (правила цены в system-prompt применяются).
+    """
+    try:
+        flat_text = _flatten_xls_to_text(xls_path)
+    except Exception as e:
+        logger.error(f"market_intel: XLS flatten failed for {xls_path}: {e!r}")
+        return {"supplier_hint": None, "received_at": None, "lots": []}
+    if not flat_text.strip():
+        logger.warning(f"market_intel: XLS {xls_path} пустой после flatten")
+        return {"supplier_hint": None, "received_at": None, "lots": []}
+
+    content = [
+        {
+            "type": "text",
+            "text": (
+                f"XLS/XLSX-прайс поставщика рыбы (плоский дамп всех листов).\n"
+                f"Формат: «Rн: cell1 | cell2 | cell3 | ...» где Rн - номер строки.\n"
+                f"Шапка таблицы (например «# | НАИМЕНОВАНИЕ | ПРОИЗВОДИТЕЛЬ | СПб | Мск») "
+                f"даёт контекст что значит каждая колонка. Применяй правила цены из system "
+                f"prompt: если колонки СПб и Мск разные — бери Мск; если города нет — бери "
+                f"единственную цену. Игнорируй секции-заголовки и реквизиты, бери только товарные строки.\n\n"
+                f"Caption от пересылающего: {caption or '(нет caption)'}\n\n"
+                f"supplier_hint = название поставщика-производителя/дистрибьютора из шапки таблицы "
+                f"(например «ФАРВАТЕР», «Юнифрост», «Sky Fish»). НЕ возвращай как supplier_hint "
+                f"общие термины («прайс», «склад», «прайс-лист»), наши каналы («Мониторинг») "
+                f"или наш юрлица («ФИШ ТУ БИЗНЕС»).\n\n"
+                f"Дамп таблицы:\n{flat_text}"
+            ),
+        },
+    ]
+    return await _call_claude(content, max_tokens=16384, model=ANTHROPIC_PDF_MODEL,
+                              _debug_label=debug_label, _debug_db=debug_db)
+
+
 async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str = "", debug_db=None) -> dict:
     """PDF → native document block в Claude Sonnet 4.6.
 
@@ -582,6 +678,19 @@ async def process_pending(db, limit: int = 20) -> dict:
                 except Exception as e:
                     logger.exception(f"market_intel: msg {msg_id} PDF parse failed: {e!r}")
                     # НЕ помечаем processed — попробуем на следующем тике (вдруг временный сбой).
+                    stats["failed"] += 1
+                    continue
+            elif mt == "document" and msg.get("file_ext") in ("xls", "xlsx"):
+                if not file_path or not os.path.exists(file_path):
+                    logger.warning(f"market_intel: msg {msg_id} XLS file_path не найден ({file_path}), помечаю processed")
+                    db.mark_market_intel_processed(msg_id)
+                    stats["failed"] += 1
+                    continue
+                try:
+                    result = await parse_xls_message(file_path, caption,
+                                                     debug_label=f"msg{msg_id}", debug_db=db)
+                except Exception as e:
+                    logger.exception(f"market_intel: msg {msg_id} XLS parse failed: {e!r}")
                     stats["failed"] += 1
                     continue
             else:
