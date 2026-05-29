@@ -85,31 +85,71 @@ PRODUCT_FORM_ENUM = [
 
 # Маппинг подсказок поставщиков → slug в procurement.suppliers.
 # Расширяется по мере появления новых поставщиков в канале.
+# ВАЖНО: маппинг проверяется в порядке итерации, более специфичные ключи
+# должны идти РАНЬШЕ общих (например "юнифрост иран" > "юнифрост").
 SUPPLIER_HINT_MAP = {
+    # Премиум лосось Мурманск
+    "альфа-марин": "alfa-marin",
+    "альфа марин": "alfa-marin",
+    "alfa marin": "alfa-marin",
+    "alfa-marin": "alfa-marin",
+    # Мореодор
     "мореодор": "moreodor",
     "moreodor": "moreodor",
+    # fish2o / Inarctica / Мурман Экспорт
     "мурман экспорт": "fish2o-murman-export",
     "fish2o": "fish2o-murman-export",
     "inarctica": "fish2o-murman-export",
+    # Лаки Фиш
     "лаки фиш": "luckyfish",
     "luckyfish": "luckyfish",
+    # Тем Групп
     "тем групп": "tem-grupp-artur",
     "tem grupp": "tem-grupp-artur",
     "артур": "tem-grupp-artur",
+    # Карелия
     "федоренко": "fedorenko-karelia",
     "карелия федоренко": "fedorenko-karelia",
+    # Смарт ЧМ
     "смарт": "smart-chm",
     "smart": "smart-chm",
-    "хотенко": "khotenko-andrey",
-    "волна": "volna-vladimir",
+    # Иран (несколько поставщиков)
+    "юнифрост иран": "junifrost-iran",  # порядок важен: до общего "юнифрост"
+    "junifrost iran": "junifrost-iran",
     "ирна": "irna",
     "эрам": "eram-iran",
-    "юнифрост": "junifrost-iran",
+    # Юнифрост Россия (другой поставщик, не путать с Iran)
+    "unifrost.ru": "unifrost-ru",
+    "unifrostru": "unifrost-ru",
+    "григор": "unifrost-ru",
+    "юнифрост": "unifrost-ru",  # дефолт без квалификатора — РФ
+    "unifrost": "unifrost-ru",
+    # Sky Fish
+    "sky fish": "sky-fish",
+    "skyfish": "sky-fish",
+    # DEFA Group (продаётся через Неву)
+    "defa": "defa-fish",
+    "дефа": "defa-fish",
+    # Нева-Опт
+    "нева опт": "нева-опт",
+    "нева-опт": "нева-опт",
+    "neva": "нева-опт",
+    # Настоящая Рыбная Компания (Шикотан)
+    "настоящая рыбная": "nrk",
+    "шикотан": "nrk",
+    "nrk": "nrk",
+    # UltraFish
+    "ultrafish": "ultrafish",
+    "ультрафиш": "ultrafish",
+    # Остров-Фиш
+    "остров": "ostrov-fish",
+    "ostrov": "ostrov-fish",
+    # Прочие (точечные контакты)
+    "хотенко": "khotenko-andrey",
+    "волна": "volna-vladimir",
     "сити-ритейл": "sk-retail",
     "ск ритейл": "sk-retail",
     "дмитрий": "dmitriy-turkey-georgia",
-    "sky fish": "sky-fish",
-    "skyfish": "sky-fish",
 }
 
 
@@ -363,13 +403,18 @@ async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str =
         {
             "type": "text",
             "text": (
-                f"PDF-прайс из канала «Мониторинг».\n"
-                f"Caption из TG (text_raw — может содержать модификатор цены типа '+7 для МСК', "
-                f"информацию о локации, акциях): {caption or '(нет caption)'}\n\n"
+                f"PDF-прайс поставщика рыбы.\n"
+                f"Caption от пересылающего (может содержать модификатор цены типа '+7 для МСК', "
+                f"локацию, акции): {caption or '(нет caption)'}\n\n"
                 f"Извлеки ВСЕ товарные позиции прайса. Применяй правила цены МСК / предоплата / "
-                f"caption-модификаторы из system prompt. Шапку поставщика, реквизиты, "
-                f"секции-заголовки CAPS — игнорируй (используй как контекст species, но не "
-                f"записывай в lots)."
+                f"caption-модификаторы из system prompt.\n"
+                f"supplier_hint = название КОНКРЕТНОГО поставщика-производителя или дистрибьютора "
+                f"(берём из шапки PDF: «ООО Мореодор», «Sky Fish», «UltraFish», «DEFA Group» и т.п.). "
+                f"НЕ возвращай как supplier_hint названия наших каналов («Мониторинг», «Эф»), "
+                f"наш юрлица («ФИШ ТУ БИЗНЕС») или общие термины («прайс», «прайс-лист»). "
+                f"Если в шапке нет явного бренда поставщика — supplier_hint=null.\n"
+                f"Шапку поставщика, реквизиты, секции-заголовки CAPS — игнорируй "
+                f"(используй как контекст species, но не записывай в lots)."
             ),
         },
     ]
@@ -545,8 +590,13 @@ async def process_pending(db, limit: int = 20) -> dict:
                 stats["processed"] += 1
                 continue
 
-            # Маппинг supplier
-            hint = result.get("supplier_hint") or forward_from or caption[:50]
+            # Маппинг supplier.
+            # Fix (29.05): forward_from приоритетнее чем supplier_hint от Sonnet.
+            # Причина: forward_from = title исходного канала откуда переслали (например
+            # "Мореодор", "fish2o X Inarctica"), это детерминированный сигнал из Telegram.
+            # supplier_hint от Sonnet — эвристика из шапки PDF, может быть "Мониторинг"
+            # (название нашего канала, попавшее в контекст PDF) или другим шумом.
+            hint = forward_from or result.get("supplier_hint") or caption[:50]
             slug, is_known = _supplier_slug_from_hint(hint)
             if not slug:
                 logger.warning(f"market_intel: msg {msg_id} — slug пустой (hint={hint!r}); пропускаю needs-review")
