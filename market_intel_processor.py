@@ -314,15 +314,37 @@ async def _call_claude(content, max_tokens: int = 8192, model: Optional[str] = N
                        _debug_label: str = "", _debug_db=None) -> dict:
     """Универсальный вызов Anthropic API. content — список content-blocks.
     model — если None, используется ANTHROPIC_MODEL (Haiku по умолчанию).
-    _debug_label + _debug_db — если заданы и lots=[], raw-ответ модели пишется в bot_settings."""
+    _debug_label + _debug_db — если заданы и lots=[], raw-ответ модели пишется в bot_settings.
+
+    Retry на 429 (RateLimitError) с экспоненциальным backoff (65с, 130с, 195с)
+    чтобы пережить минутный rate limit window Anthropic tier-1.
+    """
+    import asyncio as _asyncio
     client = get_client()
     used_model = model or ANTHROPIC_MODEL
-    response = await client.messages.create(
-        model=used_model,
-        max_tokens=max_tokens,
-        system=_build_system_prompt(),
-        messages=[{"role": "user", "content": content}],
-    )
+    response = None
+    for attempt in range(3):
+        try:
+            response = await client.messages.create(
+                model=used_model,
+                max_tokens=max_tokens,
+                system=_build_system_prompt(),
+                messages=[{"role": "user", "content": content}],
+            )
+            break
+        except Exception as e:
+            err_msg = str(e)
+            if "rate_limit" in err_msg.lower() or "429" in err_msg:
+                wait_sec = 65 * (attempt + 1)
+                logger.warning(
+                    f"market_intel: rate-limit hit (attempt {attempt+1}/3), "
+                    f"sleeping {wait_sec}s before retry"
+                )
+                await _asyncio.sleep(wait_sec)
+                continue
+            raise
+    if response is None:
+        raise RuntimeError("market_intel: rate-limit retries exhausted (3×65s)")
     text = response.content[0].text
     raw_text = text  # сохраняем до strip для диагностики
     # Иногда Claude добавляет ```json ... ``` обёртки — снимаем
@@ -382,7 +404,7 @@ async def parse_photo_message(image_path: str, caption: str = "") -> dict:
     ])
 
 
-def _flatten_xls_to_text(xls_path: str, max_chars: int = 80000) -> str:
+def _flatten_xls_to_text(xls_path: str, max_chars: int = 24000) -> str:
     """Открывает XLS/XLSX и возвращает плоский text-дамп всех листов/строк/ячеек.
 
     Sonnet не умеет читать XLS как native document, поэтому мы делаем flatten:
