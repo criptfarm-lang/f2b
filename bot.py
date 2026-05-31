@@ -7387,18 +7387,21 @@ def main():
         except Exception as e:
             logger.error(f"market_intel startup catch-up failed: {e}", exc_info=True)
 
-        # Ждём завершения старого инстанса и принудительно сбрасываем webhook
+        # Ждём завершения старого инстанса и сбрасываем webhook.
+        # drop_pending_updates=False - чтобы Telegram отдал накопленное
+        # за время rebuild'а (иначе теряем channel_post канала «Мониторинг»,
+        # подтверждено окнами потерь 28.05 13:01 и 29.05 15:02-15:03).
         import asyncio as _asyncio
         for attempt in range(5):
             try:
-                await app.bot.delete_webhook(drop_pending_updates=True)
+                await app.bot.delete_webhook(drop_pending_updates=False)
                 break
             except Exception as e:
                 logger.warning(f"delete_webhook attempt {attempt+1}: {e}")
                 await _asyncio.sleep(2)
 
         await app.updater.start_polling(
-            drop_pending_updates=True,
+            drop_pending_updates=False,
             allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post", "callback_query", "business_connection"]
         )
         logger.info("🤖 Бот запущен!")
