@@ -873,11 +873,32 @@ async def process_pending(db, limit: int = 20) -> dict:
                 posted_at = msg.get("posted_at")
                 received_at = posted_at.strftime("%Y-%m-%d") if posted_at else datetime.now().strftime("%Y-%m-%d")
 
-            # Авто-slug (не из known map) → лоты помечаются needs-review.
+            # Авто-slug (не из known map). Раньше — все лоты needs-review,
+            # из-за чего ~90% needs-review копилось из-за непривязанных
+            # поставщиков (1003/1098 на 31.05). Теперь: если batch
+            # «качественный» (>=5 лотов и >=90% валидных по обязательным
+            # ENUM-полям) — ставим confidence=pending: лоты валидны и
+            # видны в find-raw (расширен на confirmed+pending), но
+            # маркированы как «новый поставщик, проверь имя».
+            # Иначе как раньше — needs-review.
             lots_list = result.get("lots", [])
-            if not is_known:
+            if not is_known and lots_list:
+                valid_n = sum(
+                    1 for lot in lots_list
+                    if lot.get("species") in SPECIES_ENUM
+                    and lot.get("price_rub_kg")
+                    and lot.get("weight_class")
+                    and lot.get("processing") in PROCESSING_ENUM
+                )
+                quality_batch = (
+                    len(lots_list) >= 5
+                    and valid_n / len(lots_list) >= 0.9
+                )
+                new_conf = "pending" if quality_batch else "needs-review"
                 for lot in lots_list:
-                    lot["confidence_self"] = "needs-review"
+                    if lot.get("confidence_self") == "archived":
+                        continue
+                    lot["confidence_self"] = new_conf
                     lot.setdefault("notes", "")
                     lot["notes"] = (lot["notes"] + f" [auto-slug from hint='{hint[:40]}']").strip()
 
