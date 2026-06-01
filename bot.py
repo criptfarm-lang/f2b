@@ -5425,11 +5425,23 @@ async def _build_report_data() -> dict:
     }
     current_month_key = today.strftime("%Y-%m")
     if current_month_key in MONTHLY_PLANS:
-        PLANS = MONTHLY_PLANS[current_month_key]
+        PLANS = {mgr: dict(v) for mgr, v in MONTHLY_PLANS[current_month_key].items()}
     else:
         latest_month = max(MONTHLY_PLANS.keys())
-        logger.warning(f"План на {current_month_key} не задан в MONTHLY_PLANS, использую {latest_month}")
-        PLANS = MONTHLY_PLANS[latest_month]
+        logger.warning(f"План на {current_month_key} не задан в MONTHLY_PLANS, использую {latest_month} как fallback (override из БД ниже)")
+        PLANS = {mgr: dict(v) for mgr, v in MONTHLY_PLANS[latest_month].items()}
+    # Перекрытие из БД: monthly_target_{period}_{mgr}_{metric} (set_monthly / set_monthly_bulk)
+    for mgr_name in list(PLANS.keys()):
+        for metric in ("revenue", "shipments", "clients", "new_clients", "attracted"):
+            try:
+                row = db._fetchone(
+                    "SELECT value FROM bot_settings WHERE key=%s",
+                    (f"monthly_target_{current_month_key}_{mgr_name}_{metric}",)
+                )
+                if row:
+                    PLANS[mgr_name][metric] = float(row["value"])
+            except Exception:
+                pass
     WEEKLY_PLANS = {
         "Инесса Скляр":     {"shipments": 25,  "revenue": 2_000_000,  "clients": 10, "new_clients": 1, "attracted": 250_000},
         "Карина Баласанян": {"shipments": 40,  "revenue": 1_200_000,  "clients": 16, "new_clients": 1, "attracted": 275_000},
@@ -5971,6 +5983,156 @@ async def cmd_set_weekly_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text('\n'.join(msg_parts))
 
 
+_PERIOD_RE = re.compile(r'^(20\d{2})-(0[1-9]|1[0-2])$')
+
+
+def _parse_monthly_period(token: str) -> str | None:
+    """'2026-06' → '2026-06'. Иначе None."""
+    return token if _PERIOD_RE.match(token) else None
+
+
+def _parse_monthly_bulk(text: str) -> tuple[str | None, list, list]:
+    """Как _parse_weekly_bulk, но первая значимая строка может быть периодом YYYY-MM.
+
+    Возвращает (period_or_None, успехи, ошибки).
+    Если период не указан — period_or_None=None, вызывающий проставляет текущий месяц.
+    """
+    lines = text.split('\n')
+    period: str | None = None
+    rest_lines = lines
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        parsed = _parse_monthly_period(line)
+        if parsed:
+            period = parsed
+            rest_lines = lines[:i] + lines[i + 1:]
+        break
+    successes, errors = _parse_weekly_bulk('\n'.join(rest_lines))
+    return period, successes, errors
+
+
+async def cmd_set_monthly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/set_monthly [имя] [показатель] [значение] [YYYY-MM?] — задать месячный план.
+
+    Без 4-го аргумента — текущий месяц.
+    Показатели: выручка, отгрузки, акб, новые, привл.
+    """
+    if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Использование: /set_monthly [имя] [показатель] [значение] [YYYY-MM]\n"
+            "Показатели: выручка, отгрузки, акб, новые, привл\n"
+            "Пример: /set_monthly Карина выручка 6000000\n"
+            "Пример с месяцем: /set_monthly Карина выручка 6000000 2026-07\n\n"
+            "Для нескольких значений сразу — /set_monthly_bulk"
+        )
+        return
+    name_part = context.args[0].lower()
+    metric_part = context.args[1].lower()
+    try:
+        value = float(context.args[2].replace(',', '.'))
+    except ValueError:
+        await update.message.reply_text("❌ Значение должно быть числом")
+        return
+    period = datetime.now().strftime("%Y-%m")
+    if len(context.args) >= 4:
+        parsed = _parse_monthly_period(context.args[3])
+        if not parsed:
+            await update.message.reply_text(f"❌ Период '{context.args[3]}' не похож на YYYY-MM")
+            return
+        period = parsed
+    mgr_name = _MGR_NAME_MAP.get(name_part)
+    if not mgr_name:
+        await update.message.reply_text(f"❌ Менеджер '{context.args[0]}' не найден.")
+        return
+    metric_key = _WEEKLY_METRIC_MAP.get(metric_part)
+    if not metric_key:
+        await update.message.reply_text(f"❌ Показатель '{context.args[1]}' не найден.\nДоступные: выручка, отгрузки, акб, новые, привл")
+        return
+    key = f"monthly_target_{period}_{mgr_name}_{metric_key}"
+    db._execute(
+        "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
+        (key, str(value), str(value))
+    )
+    label = _WEEKLY_METRIC_LABELS.get(metric_key, metric_key)
+    await update.message.reply_text(f"✅ Месячный план *{label}* {period} для *{mgr_name}*: {value:,.0f}", parse_mode="Markdown")
+
+
+async def cmd_set_monthly_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/set_monthly_bulk — задать месячные планы списком (многострочно).
+
+    Первая строка может быть периодом YYYY-MM (по умолчанию — текущий месяц).
+
+    Пример:
+        /set_monthly_bulk
+        2026-06
+        Карина: выручка 6 млн, отгрузки 170, акб 44
+        Лена: выручка 5 млн, отгрузки 55, акб 20
+
+    Метрики и формат чисел — как в /set_weekly_bulk.
+    """
+    if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
+        return
+    raw_text = update.message.text or ''
+    lines = raw_text.split('\n')
+    first_stripped = re.sub(r'^/\S+\s*', '', lines[0]) if lines else ''
+    body = '\n'.join(([first_stripped] if first_stripped.strip() else []) + lines[1:])
+
+    if not body.strip():
+        await update.message.reply_text(
+            "Использование: пришли команду + (опц.) период YYYY-MM + список менеджеров.\n\n"
+            "Пример:\n"
+            "/set_monthly_bulk\n"
+            "2026-06\n"
+            "Инесса: выручка 22 млн, отгрузки 210, акб 28\n"
+            "Карина: выручка 6 млн, отгрузки 170, акб 44\n"
+            "Лена: выручка 5 млн, отгрузки 55, акб 20\n"
+            "Ирина: выручка 1 млн, отгрузки 10, акб 5\n"
+            "Денис: выручка 2,5 млн, отгрузки 30, акб 15\n\n"
+            "Без строки YYYY-MM — применится к текущему месяцу.\n"
+            "Метрики: выручка, отгрузки, акб, новые, привл."
+        )
+        return
+
+    period, successes, errors = _parse_monthly_bulk(body)
+    if period is None:
+        period = datetime.now().strftime("%Y-%m")
+
+    applied: list = []
+    for mgr_name, metric_key, value in successes:
+        try:
+            db._execute(
+                "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
+                (f"monthly_target_{period}_{mgr_name}_{metric_key}", str(value), str(value))
+            )
+            applied.append((mgr_name, metric_key, value))
+        except Exception as e:
+            errors.append((f"{mgr_name} {metric_key}={value}", f"DB-ошибка: {e}"))
+
+    msg_parts: list = [f"📅 Период: *{period}*"]
+    if applied:
+        from collections import OrderedDict
+        by_mgr: "OrderedDict[str, list]" = OrderedDict()
+        for mgr, metric, val in applied:
+            by_mgr.setdefault(mgr, []).append((metric, val))
+        msg_parts.append(f"✅ Обновлено целей: {len(applied)}")
+        for mgr, items in by_mgr.items():
+            parts = []
+            for metric, val in items:
+                label = _WEEKLY_METRIC_LABELS.get(metric, metric)
+                num = f"{val:,.0f}".replace(',', ' ')
+                parts.append(f"{label} {num}")
+            msg_parts.append(f"• {mgr}: {', '.join(parts)}")
+    if errors:
+        msg_parts.append(f"\n❌ Ошибок: {len(errors)}")
+        for ctx_str, err in errors:
+            msg_parts.append(f"• {ctx_str} → {err}")
+    if not applied and not errors:
+        msg_parts.append("Нечего обновлять.")
+    await update.message.reply_text('\n'.join(msg_parts), parse_mode="Markdown")
 
 
 async def cmd_managers(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6729,6 +6891,8 @@ def main():
     app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
     app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
     app.add_handler(CommandHandler("set_weekly_bulk", cmd_set_weekly_bulk))
+    app.add_handler(CommandHandler("set_monthly", cmd_set_monthly))
+    app.add_handler(CommandHandler("set_monthly_bulk", cmd_set_monthly_bulk))
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
     app.add_handler(CommandHandler("ms_attributes", cmd_ms_attributes))
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
