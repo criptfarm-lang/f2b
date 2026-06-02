@@ -572,7 +572,9 @@ async def parse_xls_message(xls_path: str, caption: str = "", debug_label: str =
             ),
         },
     ]
-    return await _call_claude(content, max_tokens=16384, model=ANTHROPIC_PDF_MODEL,
+    # max_tokens=32768: Sonnet 4.6 умеет до 64k output. Поднимаем с 16384,
+    # т.к. большие XLS-прайсы обрезались. ~80 байт на lot × 400 ≈ 32k tokens.
+    return await _call_claude(content, max_tokens=32768, model=ANTHROPIC_PDF_MODEL,
                               _debug_label=debug_label, _debug_db=debug_db)
 
 
@@ -621,7 +623,9 @@ async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str =
             ),
         },
     ]
-    return await _call_claude(content, max_tokens=16384, model=ANTHROPIC_PDF_MODEL,
+    # max_tokens=32768: см. parse_xls_message — Sonnet 4.6 умеет до 64k,
+    # Мореодор 108/~400 confirmed из-за обрезки.
+    return await _call_claude(content, max_tokens=32768, model=ANTHROPIC_PDF_MODEL,
                               _debug_label=debug_label, _debug_db=debug_db)
 
 
