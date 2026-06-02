@@ -6968,6 +6968,31 @@ def main():
     # Планировщик
     setup_scheduler(app, db)
 
+    # Алерт собственнику при приближении к авто-блоку JSON API МС.
+    # Инциденты 29.05 и 01.06.2026: МС блокирует при >200 ответов 429/мин или
+    # >400 ответов 429/час. Шлём TG-алерт заранее (порог 50/мин или 100/час).
+    try:
+        from moysklad import set_429_alert_callback
+
+        async def _ms_429_owner_alert(cnt_min: int, cnt_hour: int):
+            text = (
+                f"⚠️ МС API: 429-шторм\n"
+                f"• {cnt_min}/мин (авто-блок при 200)\n"
+                f"• {cnt_hour}/час (авто-блок при 400)\n\n"
+                f"Бот сам ушёл в long-sleep 30 с после каждой 429. "
+                f"Если шторм не утихнет — поможет рестарт бота или временно "
+                f"остановить тяжёлые отчёты."
+            )
+            try:
+                await app.bot.send_message(chat_id=OWNER_CHAT_ID, text=text)
+            except Exception as _e:
+                logger.warning(f"_ms_429_owner_alert send_message: {_e}")
+
+        set_429_alert_callback(_ms_429_owner_alert)
+        logger.info("✅ МС 429-алерт собственнику зарегистрирован")
+    except Exception as _e:
+        logger.warning(f"Не удалось зарегистрировать MS 429-алерт: {_e}")
+
     async def retry_pending_idents(context):
         """Каждый час проверяем отложенные идентификации и повторяем запрос."""
         try:

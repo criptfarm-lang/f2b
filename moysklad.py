@@ -92,17 +92,48 @@ def fmt_money(amount: float) -> str:
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 
 # Глобальный throttle на МС API через monkey-patch aiohttp.ClientSession._request.
-# Инцидент 2026-05-29: при превышении ~45 req/3s МойСклад автоматически отключает
-# JSON API у сотрудника (см. memory feedback-ms-json-api-restriction-check).
-# Сидим заметно ниже: 10 req/sec.
+# История:
+#   29.05.2026 — первый автоблок JSON API 1.2 (burst 55 req/sec, 624 ответа 429).
+#     Поставил throttle 10 req/sec + retry с backoff 1→2→4.
+#   01.06.2026 — повтор. Burst 09:59-10:08 МСК, 1546 ответов 429, пик 428/min.
+#     При throttle 10 req/sec реальный темп был ~7 req/sec — то есть скрытый порог
+#     МС ниже 10. Серия retry-backoff после 429 ВРЕДНА: каждый retry тоже считается
+#     ошибкой 429 и приближает блок (пороги поддержки МС: >200/min или >400/hour).
 #
-# Патч ставится один раз при импорте модуля и срабатывает ТОЛЬКО когда URL
-# содержит api.moysklad.ru — другие API (Wazzup, amoCRM, Yandex, Telegram, DashaMail)
-# не задеты. Лимит общий на весь процесс — на все aiohttp-сессии разом, где бы
-# их ни создавали (и в moysklad.py, и в bot.py, и в скриптах).
-_MS_MIN_INTERVAL_SEC = 0.10
+# Новые меры:
+#   - Throttle 5 req/sec (запас ~30% к наблюдаемому скрытому порогу ~7).
+#   - На 429 НЕ retry-в-цикле. Один long-sleep 30 с и одна повторная попытка.
+#   - Счётчик 429/min и /hour: при подходе к порогам поддержки МС (50/min, 100/hour
+#     — 4× запас) пишем ERROR в лог + опционально шлём TG-алерт через зарегистрированный
+#     callback из bot.py (см. set_429_alert_callback).
+_MS_MIN_INTERVAL_SEC = 0.20  # 5 req/sec
+_MS_429_LONG_SLEEP_SEC = 30.0
 _ms_throttle_lock = asyncio.Lock()
 _ms_last_call_ts = 0.0
+
+# Счётчики 429 — кольца timestamp'ов
+_ms_429_timestamps: list[float] = []
+_ms_429_lock = asyncio.Lock()
+_ms_429_alert_cb = None  # async callable (count_min, count_hour) → None
+_ms_429_last_alert_ts = 0.0
+
+# Пороги авто-блока МС (от поддержки 01.06.2026):
+#   - >200 ответов 429 за минуту → блок
+#   - >400 ответов 429 за час    → блок
+# Алертим заранее с запасом 4×.
+MS_429_ALERT_PER_MIN = 50
+MS_429_ALERT_PER_HOUR = 100
+MS_429_ALERT_COOLDOWN_SEC = 300.0
+
+
+def set_429_alert_callback(cb) -> None:
+    """Регистрирует TG-callback для алерта о приближении к авто-блоку МС.
+
+    cb — async (count_per_min: int, count_per_hour: int) -> None. Вызывается
+    при каждом превышении порога с антиспам-cooldown.
+    """
+    global _ms_429_alert_cb
+    _ms_429_alert_cb = cb
 
 
 async def _ms_throttle() -> None:
@@ -116,6 +147,40 @@ async def _ms_throttle() -> None:
         _ms_last_call_ts = loop.time()
 
 
+async def _record_429() -> None:
+    """Регистрирует ответ 429 от МС, при подходе к порогу — алерт."""
+    global _ms_429_last_alert_ts
+    import time as _t
+    now = _t.time()
+    async with _ms_429_lock:
+        _ms_429_timestamps.append(now)
+        # выкидываем всё старше 1 часа
+        cutoff = now - 3600
+        while _ms_429_timestamps and _ms_429_timestamps[0] < cutoff:
+            _ms_429_timestamps.pop(0)
+        cnt_hour = len(_ms_429_timestamps)
+        cnt_min = sum(1 for ts in _ms_429_timestamps if ts >= now - 60)
+
+    above = cnt_min >= MS_429_ALERT_PER_MIN or cnt_hour >= MS_429_ALERT_PER_HOUR
+    if not above:
+        return
+
+    # Антиспам: алертить не чаще раз в 5 минут
+    if now - _ms_429_last_alert_ts < MS_429_ALERT_COOLDOWN_SEC:
+        return
+    _ms_429_last_alert_ts = now
+
+    logger.error(
+        f"⚠️ МС 429-шторм: {cnt_min}/мин, {cnt_hour}/час "
+        f"(пороги авто-блока 200/мин и 400/час)"
+    )
+    if _ms_429_alert_cb is not None:
+        try:
+            await _ms_429_alert_cb(cnt_min, cnt_hour)
+        except Exception as e:
+            logger.warning(f"_record_429 alert_cb failed: {e}")
+
+
 def _install_ms_throttle_patch() -> None:
     if getattr(aiohttp.ClientSession, "_ms_throttle_installed", False):
         return
@@ -125,18 +190,21 @@ def _install_ms_throttle_patch() -> None:
         is_ms = "api.moysklad.ru" in str(str_or_url)
         if not is_ms:
             return await _orig_request(self, method, str_or_url, **kwargs)
-        # МС: throttle + retry на 429 (rate-limit от самого МС).
-        # 29.05.2026 burst дал 624 ответа 429, потом МС отключил нам JSON API.
-        # Серия 429 без backoff = триггер для антифрода. Поэтому при 429 ждём дольше.
-        backoff = 1.0
-        for attempt in range(3):
-            await _ms_throttle()
-            resp = await _orig_request(self, method, str_or_url, **kwargs)
-            if resp.status != 429 or attempt == 2:
-                return resp
-            resp.release()
-            await asyncio.sleep(backoff)
-            backoff *= 2
+        # Первая попытка
+        await _ms_throttle()
+        resp = await _orig_request(self, method, str_or_url, **kwargs)
+        if resp.status != 429:
+            return resp
+        # Получили 429 — учитываем в счётчике
+        await _record_429()
+        # Один long-sleep и одна повторная попытка. Никаких циклов retry —
+        # каждый retry на 429 наращивает счётчик и ускоряет авто-блок.
+        resp.release()
+        await asyncio.sleep(_MS_429_LONG_SLEEP_SEC)
+        await _ms_throttle()
+        resp = await _orig_request(self, method, str_or_url, **kwargs)
+        if resp.status == 429:
+            await _record_429()
         return resp
 
     aiohttp.ClientSession._request = _patched_request
