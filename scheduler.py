@@ -365,13 +365,20 @@ async def pdz_catch_up_missed_jobs(app: Application, db):
     now = datetime.now(MSK)
     today = now.date()
 
+    # Порядок намеренно НЕ хронологический. catch_up идёт fire-and-forget
+    # (см. bot.py _catchup_in_bg). При частых rebuild Amvera SIGTERM может
+    # оборвать catch_up в середине. Поэтому быстрые TG-сводки (digest ~5с,
+    # owner_pending ~2с) - впереди медленных snapshot (70с МС API), даже
+    # если хронологически snapshot раньше. Регрессия 2026-06-04: 3-4 дня
+    # подряд catch_up успевал только до snapshot и обрывался, дайджесты
+    # пропадали. См. retro 2026-06-04.
     pdz_jobs = [
+        ("pdz_send_digests_1300",        13,  0, pdz_send_digests_job),
+        ("pdz_send_owner_pending_1505",  15,  5, pdz_send_owner_pending_job),
         ("pdz_snapshot_1245",            12, 45, pdz_take_snapshot_job),
         ("pdz_snapshot_1250",            12, 50, pdz_take_snapshot_job),
         ("pdz_process_events_1252",      12, 52, pdz_process_events_job),
-        ("pdz_send_digests_1300",        13,  0, pdz_send_digests_job),
         ("pdz_generate_html_1305",       13,  5, pdz_generate_html_job),
-        ("pdz_send_owner_pending_1505",  15,  5, pdz_send_owner_pending_job),
     ]
 
     caught = 0
