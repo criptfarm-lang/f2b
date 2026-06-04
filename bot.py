@@ -7062,6 +7062,24 @@ def main():
     app.job_queue.run_repeating(_market_intel_job_wrapper, interval=1800, first=30)
 
     # ────────────────────────────────────────────────────────────────────
+    # Wazzup AI-классификатор: запросы клиентов по номенклатуре. Фаза 3
+    # плана 2026-05-25. Раз в 15 мин в окне 09-19 МСК Пн-Пт. Сейчас только
+    # копит данные в wazzup_classifications, без TG-алертов (Фазы 4-6 —
+    # после юр-проверки 152-ФЗ + согласования с командой ОП).
+    # Offline F1=0.97 (эксперимент 2026-06-04).
+    # ────────────────────────────────────────────────────────────────────
+    async def _wazzup_classifier_job(context):
+        try:
+            from wazzup_classifier import run_classification_batch
+            stats = await run_classification_batch(db)
+            if stats.get("processed", 0) > 0:
+                logger.info(f"wazzup_classifier job: {stats}")
+        except Exception as e:
+            logger.error(f"wazzup_classifier job: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_wazzup_classifier_job, interval=900, first=120)
+
+    # ────────────────────────────────────────────────────────────────────
     # Wazzup freshness watchdog: алерт собственнику если БД молчит >2ч в
     # рабочее время. Защита от повторного перехвата webhook AMGROUP-style
     # (см. retrospectives/2026-06-03-аудит-инфраструктуры-wazzup-amgbp.md).
