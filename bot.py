@@ -6937,6 +6937,75 @@ def main():
                 q.message.text + "\n\n✅ В работу.",
                 parse_mode=None,
             )
+        elif action == "req":
+            # Конвертация sink → procurement.requests для дашборда закупщика.
+            # Идемпотентность: ON CONFLICT по wazzup_message_id обходится через
+            # status='converted' в assortment_requests.
+            try:
+                ar = db._fetchone(
+                    """SELECT id, chat_id, contact_name, raw_text, species_normalized,
+                              sku_or_description, urgency, llm_confidence, status,
+                              converted_request_id
+                       FROM procurement.assortment_requests
+                       WHERE wazzup_message_id = %s""",
+                    (message_id,),
+                )
+                if not ar:
+                    await q.edit_message_text(
+                        q.message.text + "\n\n⚠️ Запрос не найден в sink.",
+                        parse_mode=None,
+                    )
+                    return
+                if ar["status"] == "converted":
+                    rid = ar["converted_request_id"]
+                    await q.edit_message_text(
+                        q.message.text + f"\n\n📋 Уже создана заявка #{rid}.",
+                        parse_mode=None,
+                    )
+                    return
+                row = db._fetchone(
+                    """INSERT INTO procurement.requests
+                       (created_by_tg, created_by_name, raw_text,
+                        species, llm_confidence, client_name, status, comment)
+                       VALUES (%s,%s,%s,%s,%s,%s,'новая',%s)
+                       RETURNING request_id""",
+                    (
+                        q.from_user.id,
+                        q.from_user.full_name or "owner",
+                        ar["raw_text"],
+                        ar["species_normalized"],
+                        ar["llm_confidence"],
+                        ar["contact_name"],
+                        f"Авто из Wazzup-классификатора. {ar['sku_or_description'] or ''}",
+                    ),
+                )
+                rid = row["request_id"]
+                db._execute(
+                    """UPDATE procurement.assortment_requests
+                       SET status='converted', converted_request_id=%s,
+                           status_changed_at=NOW(), status_changed_by=%s
+                       WHERE id=%s""",
+                    (rid, q.from_user.full_name or "owner", ar["id"]),
+                )
+                db._execute(
+                    """INSERT INTO procurement.request_events
+                       (request_id, actor, event_type, payload)
+                       VALUES (%s, %s, 'created_from_wazzup', %s::jsonb)""",
+                    (
+                        rid, q.from_user.full_name or "owner",
+                        f'{{"assortment_request_id": {ar["id"]}, "source": "wazzup_classifier"}}',
+                    ),
+                )
+                await q.edit_message_text(
+                    q.message.text + f"\n\n📋 Заявка #{rid} создана. Закупщик увидит в дашборде.",
+                    parse_mode=None,
+                )
+            except Exception as e:
+                logger.error(f"handle_wzc_callback req: {e}", exc_info=True)
+                await q.edit_message_text(
+                    q.message.text + f"\n\n⚠️ Ошибка создания заявки: {type(e).__name__}",
+                    parse_mode=None,
+                )
 
     app.add_handler(CallbackQueryHandler(handle_wzc_callback, pattern="^wzc:"))
     # ─── Алармы amoCRM ───────────────────────────────────────────────────────

@@ -173,6 +173,20 @@ async def _send_request_alert(
     quote = msg["text"][:300]
     manager = msg.get("manager_name") or "?"
 
+    # Deeplink в приложение закупщика с pre-filled фильтрами.
+    # /search принимает species, weight_class, processing, state.
+    procurement_base = os.getenv(
+        "PROCUREMENT_URL", "https://f2b-procurement-victor03.amvera.io"
+    )
+    from urllib.parse import urlencode
+    search_params = {}
+    if species:
+        search_params["species"] = species
+    # Note: weight_class/processing/state у нас нет в structured-виде из
+    # классификатора (только в sku_or_description text). В v2 можно добавить
+    # отдельные поля в промпт. Сейчас фильтруем только по species.
+    search_url = f"{procurement_base}/search?{urlencode(search_params)}" if search_params else f"{procurement_base}/search"
+
     text = (
         f"{emoji} *Запрос по номенклатуре*\n\n"
         f"*Клиент:* {contact}\n"
@@ -180,16 +194,22 @@ async def _send_request_alert(
         f"*Что просят:* {sku}\n"
         f"*Срочность:* {urgency}\n\n"
         f"_«{quote}»_\n\n"
-        f"[💬 Чат в Wazzup](https://app.wazzup24.com/chat/{chat_id})"
+        f"[💬 Чат в Wazzup](https://app.wazzup24.com/chat/{chat_id})  |  "
+        f"[🔍 Варианты у поставщиков]({search_url})"
     )
 
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     # CallbackData формат: wzc:<action>:<message_id> — короткая, до 64 байт
     mid = msg["message_id"][:40]
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ В работу", callback_data=f"wzc:ok:{mid}"),
-        InlineKeyboardButton("👎 Ложный", callback_data=f"wzc:fp:{mid}"),
-    ]])
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 → Заявка закупщику", callback_data=f"wzc:req:{mid}"),
+        ],
+        [
+            InlineKeyboardButton("✅ В работу", callback_data=f"wzc:ok:{mid}"),
+            InlineKeyboardButton("👎 Ложный", callback_data=f"wzc:fp:{mid}"),
+        ],
+    ])
 
     try:
         sent = await bot_app.bot.send_message(
@@ -225,7 +245,8 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
     # Берём входящие за последние 2ч которые ещё не классифицированы
     # с этой версией промпта.
     rows = db._fetchall(
-        """SELECT m.message_id, m.chat_id, m.contact_name, m.text
+        """SELECT m.message_id, m.chat_id, m.contact_name, m.manager_name,
+                  m.sent_at, m.text
         FROM wazzup_messages m
         LEFT JOIN wazzup_classifications c
                ON c.message_id = m.message_id
@@ -280,6 +301,30 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
             stats["processed"] += 1
             if is_req:
                 stats["requests_found"] += 1
+                # Записываем в sink procurement.assortment_requests
+                # (см. план 2026-05-25, раздел Sink). При подтверждении
+                # собственником через TG-кнопку → конвертация в
+                # procurement.requests для дашборда закупщика.
+                try:
+                    db._execute(
+                        """INSERT INTO procurement.assortment_requests
+                           (wazzup_message_id, chat_id, contact_name, manager_name,
+                            raw_text, species_normalized, sku_or_description,
+                            urgency, llm_confidence, sent_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (wazzup_message_id) DO NOTHING""",
+                        (
+                            m["message_id"], m["chat_id"],
+                            m.get("contact_name"), m.get("manager_name"),
+                            m["text"], result.get("species_normalized"),
+                            result.get("sku_or_description"),
+                            result.get("urgency"),
+                            result.get("confidence"),
+                            m.get("sent_at"),
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(f"wazzup_classifier: assortment_requests insert failed: {e}")
                 if bot_app is not None:
                     await _send_request_alert(bot_app, db, m, result)
         except Exception as e:
