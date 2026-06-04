@@ -7061,6 +7061,55 @@ def main():
 
     app.job_queue.run_repeating(_market_intel_job_wrapper, interval=1800, first=30)
 
+    # ────────────────────────────────────────────────────────────────────
+    # Wazzup freshness watchdog: алерт собственнику если БД молчит >2ч в
+    # рабочее время. Защита от повторного перехвата webhook AMGROUP-style
+    # (см. retrospectives/2026-06-03-аудит-инфраструктуры-wazzup-amgbp.md).
+    # Бьёт раз в час 09-19 МСК Пн-Пт. Анти-спам: 1 алерт за 6 часов.
+    # ────────────────────────────────────────────────────────────────────
+    _wazzup_alert_last_ts = [0]  # mutable closure cell
+
+    async def _wazzup_freshness_check(context):
+        from datetime import datetime, timezone, timedelta
+        import time as _time
+        now_msk = datetime.now(timezone(timedelta(hours=3)))
+        if now_msk.weekday() >= 5:
+            return
+        if not (9 <= now_msk.hour < 19):
+            return
+        try:
+            row = db._fetchone(
+                "SELECT MAX(sent_at) AS last FROM wazzup_messages"
+            )
+            last = row.get("last") if row else None
+            if last is None:
+                gap_h = 999
+            else:
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                gap_h = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+            if gap_h < 2:
+                return
+            if _time.time() - _wazzup_alert_last_ts[0] < 6 * 3600:
+                return
+            _wazzup_alert_last_ts[0] = _time.time()
+            await context.bot.send_message(
+                OWNER_CHAT_ID,
+                f"⚠️ Wazzup БД молчит {gap_h:.1f}ч (последнее: {last}).\n\n"
+                f"Возможные причины:\n"
+                f"• AMGROUP опять перехватили webhook (cms.amgbp.ru).\n"
+                f"• Сам Wazzup24 отвалил канал/пайплайн.\n\n"
+                f"Команда для верификации в этом чате:\n"
+                f"«проверь Wazzup webhook»",
+            )
+            logger.warning(
+                f"wazzup_freshness: gap={gap_h:.1f}h, alert sent to OWNER"
+            )
+        except Exception as e:
+            logger.error(f"wazzup_freshness_check: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_wazzup_freshness_check, interval=3600, first=600)
+
     # Запускаем webhook-сервер и polling параллельно
     import aiohttp.web as web
 
