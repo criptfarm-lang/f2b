@@ -128,7 +128,87 @@ async def _check_freshness(db) -> bool:
     return gap_h < 24
 
 
-async def run_classification_batch(db, force: bool = False) -> dict:
+URGENCY_EMOJI = {"срочно": "🔴", "уточнение": "🟡", "общий": "🟢"}
+
+
+async def _is_duplicate_alert(db, chat_id: str, species: str | None) -> bool:
+    """Дедуп: 1 алерт на пару (chat_id, species_normalized) за 1 час."""
+    row = db._fetchone(
+        """SELECT 1 FROM wazzup_alerts_sent
+           WHERE chat_id = %s
+             AND COALESCE(species_normalized,'') = COALESCE(%s,'')
+             AND sent_at > NOW() - INTERVAL '1 hour'
+           LIMIT 1""",
+        (chat_id, species),
+    )
+    return row is not None
+
+
+async def _send_request_alert(
+    bot_app, db, msg: dict, classification: dict
+) -> int | None:
+    """Шлёт TG-алерт собственнику + сохраняет в wazzup_alerts_sent.
+    Returns tg_message_id или None при ошибке.
+
+    MVP: получатель — только OWNER_CHAT_ID. Закупщик зоны + менеджер сделки
+    (по плану Фазы 4) — отложено на v2 после первой недели прода.
+    """
+    import os
+    owner_id_raw = os.getenv("OWNER_CHAT_ID")
+    if not owner_id_raw:
+        logger.warning("wazzup_classifier: OWNER_CHAT_ID not set, alert skipped")
+        return None
+    owner_id = int(owner_id_raw)
+
+    chat_id = msg["chat_id"]
+    species = classification.get("species_normalized")
+
+    if await _is_duplicate_alert(db, chat_id, species):
+        return None
+
+    urgency = classification.get("urgency", "общий")
+    emoji = URGENCY_EMOJI.get(urgency, "⚪")
+    contact = msg.get("contact_name") or "?"
+    sku = classification.get("sku_or_description") or "(не определено)"
+    quote = msg["text"][:300]
+    manager = msg.get("manager_name") or "?"
+
+    text = (
+        f"{emoji} *Запрос по номенклатуре*\n\n"
+        f"*Клиент:* {contact}\n"
+        f"*Менеджер:* {manager}\n"
+        f"*Что просят:* {sku}\n"
+        f"*Срочность:* {urgency}\n\n"
+        f"_«{quote}»_\n\n"
+        f"[💬 Чат в Wazzup](https://app.wazzup24.com/chat/{chat_id})"
+    )
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    # CallbackData формат: wzc:<action>:<message_id> — короткая, до 64 байт
+    mid = msg["message_id"][:40]
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ В работу", callback_data=f"wzc:ok:{mid}"),
+        InlineKeyboardButton("👎 Ложный", callback_data=f"wzc:fp:{mid}"),
+    ]])
+
+    try:
+        sent = await bot_app.bot.send_message(
+            owner_id, text, parse_mode="Markdown",
+            reply_markup=kb, disable_web_page_preview=True,
+        )
+        db._execute(
+            """INSERT INTO wazzup_alerts_sent
+               (chat_id, species_normalized, tg_message_id_owner)
+               VALUES (%s,%s,%s)""",
+            (chat_id, species, sent.message_id),
+        )
+        return sent.message_id
+    except Exception as e:
+        logger.warning(f"wazzup_classifier: alert send failed: {type(e).__name__}: {e}")
+        return None
+
+
+async def run_classification_batch(db, force: bool = False, bot_app=None) -> dict:
     """Один проход: выбирает до 100 необработанных входящих за последние 2ч,
     классифицирует, сохраняет результаты. Идемпотентно через UNIQUE(message_id,
     prompt_version) + ON CONFLICT DO NOTHING.
@@ -200,6 +280,8 @@ async def run_classification_batch(db, force: bool = False) -> dict:
             stats["processed"] += 1
             if is_req:
                 stats["requests_found"] += 1
+                if bot_app is not None:
+                    await _send_request_alert(bot_app, db, m, result)
         except Exception as e:
             logger.warning(f"wazzup_classifier: db save failed for {m['message_id']}: {e}")
             stats["errors"] += 1

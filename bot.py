@@ -6905,6 +6905,40 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing|wazzup_later)"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
+
+    # ─── Wazzup classifier — кнопки на TG-алертах запроса по номенклатуре ──
+    async def handle_wzc_callback(update, context):
+        q = update.callback_query
+        await q.answer()
+        try:
+            _, action, message_id = q.data.split(":", 2)
+        except ValueError:
+            return
+        if action == "fp":
+            # Ложно-позитивный → пишем feedback для re-train
+            db._execute(
+                """UPDATE wazzup_classifications
+                   SET feedback = 'false_positive'
+                   WHERE message_id = %s""",
+                (message_id,),
+            )
+            await q.edit_message_text(
+                q.message.text + "\n\n👎 Помечено как ложный — пойдёт в re-train.",
+                parse_mode=None,
+            )
+        elif action == "ok":
+            db._execute(
+                """UPDATE wazzup_classifications
+                   SET feedback = 'confirmed'
+                   WHERE message_id = %s""",
+                (message_id,),
+            )
+            await q.edit_message_text(
+                q.message.text + "\n\n✅ В работу.",
+                parse_mode=None,
+            )
+
+    app.add_handler(CallbackQueryHandler(handle_wzc_callback, pattern="^wzc:"))
     # ─── Алармы amoCRM ───────────────────────────────────────────────────────
     app.add_handler(CommandHandler("myamoid", lambda u, c: cmd_myamoid(u, c, db)))
     app.add_handler(CommandHandler("amo_setup", cmd_amo_setup))
@@ -7071,13 +7105,69 @@ def main():
     async def _wazzup_classifier_job(context):
         try:
             from wazzup_classifier import run_classification_batch
-            stats = await run_classification_batch(db)
+            stats = await run_classification_batch(db, bot_app=app)
             if stats.get("processed", 0) > 0:
                 logger.info(f"wazzup_classifier job: {stats}")
         except Exception as e:
             logger.error(f"wazzup_classifier job: {e}", exc_info=True)
 
     app.job_queue.run_repeating(_wazzup_classifier_job, interval=900, first=120)
+
+    # ────────────────────────────────────────────────────────────────────
+    # Wazzup classifier — дневная сводка собственнику 17:00 МСК.
+    # Счётчик за день + топ-5 срочных. Если 0 — «0 запросов, всё тихо».
+    # ────────────────────────────────────────────────────────────────────
+    from wazzup_classifier import URGENCY_EMOJI
+
+    async def _wazzup_daily_summary(context):
+        from datetime import datetime, timezone, timedelta
+        now_msk = datetime.now(timezone(timedelta(hours=3)))
+        if now_msk.weekday() >= 5:
+            return
+        try:
+            total = db._fetchone("""
+                SELECT COUNT(*) AS n
+                FROM wazzup_classifications c
+                JOIN wazzup_messages m ON m.message_id=c.message_id
+                WHERE c.is_nomenclature_request = TRUE
+                  AND m.sent_at::date = (NOW() AT TIME ZONE 'Europe/Moscow')::date
+            """)["n"]
+            urgent = db._fetchall("""
+                SELECT m.contact_name, c.sku_or_description, c.urgency,
+                       c.species_normalized
+                FROM wazzup_classifications c
+                JOIN wazzup_messages m ON m.message_id=c.message_id
+                WHERE c.is_nomenclature_request = TRUE
+                  AND m.sent_at::date = (NOW() AT TIME ZONE 'Europe/Moscow')::date
+                ORDER BY CASE c.urgency
+                            WHEN 'срочно' THEN 1
+                            WHEN 'уточнение' THEN 2
+                            ELSE 3 END,
+                         m.sent_at DESC
+                LIMIT 5
+            """)
+            if total == 0:
+                text = "📊 *Wazzup-сводка за день*\n\n0 запросов по номенклатуре — всё тихо."
+            else:
+                lines = [f"📊 *Wazzup-сводка за день*\n\nВсего запросов: *{total}*\n\nТоп-5:"]
+                for r in urgent:
+                    em = URGENCY_EMOJI.get(r["urgency"], "⚪")
+                    sku = (r["sku_or_description"] or "—")[:80]
+                    contact = (r["contact_name"] or "?")[:25]
+                    lines.append(f"{em} {contact}: {sku}")
+                text = "\n".join(lines)
+            await context.bot.send_message(
+                OWNER_CHAT_ID, text, parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"_wazzup_daily_summary: {e}", exc_info=True)
+
+    # 17:00 МСК = 14:00 UTC
+    from datetime import time as _dt_time, timezone as _tz_for_job
+    app.job_queue.run_daily(
+        _wazzup_daily_summary,
+        time=_dt_time(hour=14, minute=0, tzinfo=_tz_for_job.utc),
+    )
 
     # ────────────────────────────────────────────────────────────────────
     # Wazzup freshness watchdog: алерт собственнику если БД молчит >2ч в
