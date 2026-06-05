@@ -1702,6 +1702,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "missing_labels": [m[1] for m in missing_ask],
                     "missing_idx": 0,
                 }
+                try:
+                    import json as _j
+                    db._execute("INSERT INTO pending_contracts (user_id, data) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET data=%s,created_at=NOW()", (user.id, _j.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str), _j.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str)))
+                except Exception: pass
                 await message.reply_text(
                     f"📄 *{contract_data['buyer_name']}*\n\nУточни:\n*{missing_ask[0][1]}*?",
                     parse_mode="Markdown"
@@ -2027,6 +2031,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_c["missing_idx"] = idx
 
         if idx < len(keys):
+            try:
+                import json as _j
+                db._execute("INSERT INTO pending_contracts (user_id, data) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET data=%s,created_at=NOW()", (user.id, _j.dumps(pending_c, ensure_ascii=False, default=str), _j.dumps(pending_c, ensure_ascii=False, default=str)))
+            except Exception: pass
             await message.reply_text(f"✅ Принято.\n\n*{labels[idx]}*?", parse_mode="Markdown")
         else:
             _pending_contracts.pop(user.id, None)
