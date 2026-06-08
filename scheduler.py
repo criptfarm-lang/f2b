@@ -159,6 +159,20 @@ def setup_scheduler(app: Application, db):
         id="op_new_share_snapshot_fri_08"
     )
 
+    # Каждые 4 ч — warm-up кэша отчёта ОП (TTL в БД 5 ч). Без прогрева первый
+    # /op_report после простоя падал в 504 «upstream request timeout» от Amvera
+    # ingress: handle_web_report пытался синхронно собрать данные из МС+amoCRM
+    # и не укладывался в таймаут. Первый прогон через 60 с после старта —
+    # «горячий» кэш после деплоя.
+    scheduler.add_job(
+        refresh_op_report_cache_job,
+        IntervalTrigger(hours=4, timezone=MSK),
+        args=[app, db],
+        id="refresh_op_report_cache",
+        next_run_time=datetime.now(MSK) + timedelta(seconds=60),
+        misfire_grace_time=3600, coalesce=True,
+    )
+
     # Каждые 30 мин — обработка прайс-листов из канала «Мониторинг».
     # ВАЖНО (29.05): market_intel вынесен из AsyncIOScheduler в PTB JobQueue
     # (см. bot.py app.job_queue.run_repeating). Причина: AsyncIOScheduler
@@ -1128,4 +1142,27 @@ async def op_new_share_snapshot_job(app: Application, db):
                 logger.error(
                     f"op_new_share_snapshot_job: TG-алерт не доставлен: {send_err}"
                 )
+        return {"status": "error", "error": str(e)}
+
+
+async def refresh_op_report_cache_job(app: Application, db):
+    """Прогревает кэш отчёта ОП каждые 4 ч.
+
+    TTL в БД — 5 ч (database.get_report_cache, INTERVAL '300 minutes'),
+    запас 1 ч. Зачем: handle_web_report при пустом кэше пытается синхронно
+    собрать данные из МС + amoCRM и не укладывается в таймаут Amvera ingress
+    (504 «upstream request timeout»). _refresh_report_cache живёт в bot.py —
+    late import чтобы избежать циркулярки scheduler ↔ bot.
+    """
+    logger.info(
+        f"refresh_op_report_cache_job стартовала в "
+        f"{datetime.now(MSK):%Y-%m-%d %H:%M %Z}"
+    )
+    try:
+        from bot import _refresh_report_cache
+        await _refresh_report_cache()
+        logger.info("refresh_op_report_cache_job OK")
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"refresh_op_report_cache_job: {e}", exc_info=True)
         return {"status": "error", "error": str(e)}
