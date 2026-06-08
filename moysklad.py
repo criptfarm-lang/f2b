@@ -4864,3 +4864,258 @@ def compute_contacts_color(cp_attrs: dict) -> dict:
         "max": mx_raw, "telegram": tg,
         "max_valid": max_valid, "tg_valid": tg_valid,
     }
+
+
+# ─── Автоподстановка «Дата планируемой оплаты» ─────────────────────────────
+# План 2026-05-20-автоподстановка-исходной-даты-оплаты.md.
+# Архитектура: cron-polling каждые 10 мин (не webhook+PATCH), Dolibarr-стиль
+# «посчитал → заморозил», три слоя защиты поля (см. план Фаза 3).
+
+_PPM_INITIAL_ATTR_NAME = "Дата планируемой оплаты"
+_DAYS_DELAY_ATTR_NAME = "Дней отсрочки"
+_AUTOFILL_META_CACHE: dict = {}  # (entity_type, attr_name) → metadata dict
+PAYMENT_PLANNED_ZERO_ALERT_THRESHOLD_RUB = 50_000
+
+
+async def _autofill_get_attr_meta(session: aiohttp.ClientSession, entity_type: str, attr_name: str):
+    key = (entity_type, attr_name)
+    cached = _AUTOFILL_META_CACHE.get(key)
+    if cached:
+        return cached
+    url = f"{MS_BASE}/entity/{entity_type}/metadata/attributes"
+    async with session.get(url, headers=get_headers()) as resp:
+        if resp.status != 200:
+            return None
+        data = await resp.json()
+    for a in data.get("rows", []) or []:
+        if a.get("name") == attr_name:
+            _AUTOFILL_META_CACHE[key] = a
+            return a
+    return None
+
+
+def _autofill_fmt_ms_dt(dt) -> str:
+    """МС-формат: yyyy-MM-dd HH:mm:ss.SSS (МСК, без TZ)."""
+    return dt.strftime("%Y-%m-%d %H:%M:%S.000")
+
+
+async def payment_planned_autofill_tick(
+    db,
+    hours_back: int = 24,
+    order_id: Optional[str] = None,
+    dry_run: bool = False,
+) -> dict:
+    """Tick автоподстановки «Дата планируемой оплаты». Idempotent: skip если поле заполнено.
+
+    Параметры:
+        db: Database — для self-write markers и audit log
+        hours_back: окно недавних заказов (по умолчанию 24ч)
+        order_id: точечный запуск по одному заказу (для тестов)
+        dry_run: не делать PATCH, только посчитать и залогировать
+
+    Возврат: dict со счётчиками и списком zero_alerts (для TG).
+    """
+    from datetime import datetime, timedelta
+    try:
+        from zoneinfo import ZoneInfo
+        msk = ZoneInfo("Europe/Moscow")
+    except Exception:
+        msk = None
+
+    now = datetime.now(msk) if msk else datetime.utcnow()
+
+    result = {
+        "processed": 0,
+        "patched": 0,
+        "skipped_filled": 0,
+        "skipped_no_agent": 0,
+        "skipped_patch_failed": 0,
+        "dry_run": dry_run,
+        "zero_alerts": [],
+        "errors": [],
+    }
+
+    async with aiohttp.ClientSession() as session:
+        ppm_meta = await _autofill_get_attr_meta(session, "customerorder", _PPM_INITIAL_ATTR_NAME)
+        delay_meta = await _autofill_get_attr_meta(session, "counterparty", _DAYS_DELAY_ATTR_NAME)
+        if not ppm_meta or not delay_meta:
+            msg = (
+                f"autofill_tick: не найдены custom-атрибуты — "
+                f"ppm_meta={bool(ppm_meta)} delay_meta={bool(delay_meta)}"
+            )
+            logger.error(msg)
+            result["errors"].append(msg)
+            return result
+
+        ppm_attr_id = ppm_meta.get("id")
+
+        # Шаг 1: сбор заказов
+        orders: list = []
+        if order_id:
+            url = f"{MS_BASE}/entity/customerorder/{order_id}?expand=agent,attributes"
+            async with session.get(url, headers=get_headers()) as resp:
+                if resp.status == 200:
+                    orders = [await resp.json()]
+                else:
+                    body = await resp.text()
+                    msg = f"autofill_tick: GET single {order_id} status={resp.status} body={body[:200]}"
+                    logger.error(msg)
+                    result["errors"].append(msg)
+                    return result
+        else:
+            window_start = now - timedelta(hours=hours_back)
+            filter_str = f"moment>={window_start.strftime('%Y-%m-%d %H:%M:%S')}"
+            offset = 0
+            while True:
+                params = {
+                    "limit": 100,
+                    "offset": offset,
+                    "expand": "agent,attributes",
+                    "order": "moment,desc",
+                    "filter": filter_str,
+                }
+                async with session.get(f"{MS_BASE}/entity/customerorder", headers=get_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        msg = f"autofill_tick: list status={resp.status} body={body[:200]}"
+                        logger.error(msg)
+                        result["errors"].append(msg)
+                        break
+                    data = await resp.json()
+                batch = data.get("rows", []) or []
+                orders.extend(batch)
+                if len(batch) < 100:
+                    break
+                offset += 100
+
+        # Шаг 2: кэш «дней отсрочки» по контрагентам в рамках tick'а
+        delay_cache: dict = {}
+
+        async def _get_delay(agent_id_: str) -> int:
+            if agent_id_ in delay_cache:
+                return delay_cache[agent_id_]
+            try:
+                url_cp = f"{MS_BASE}/entity/counterparty/{agent_id_}?expand=attributes"
+                async with session.get(url_cp, headers=get_headers()) as resp_cp:
+                    if resp_cp.status != 200:
+                        delay_cache[agent_id_] = 0
+                        return 0
+                    cp = await resp_cp.json()
+            except Exception as ex:
+                logger.warning(f"autofill_tick: GET counterparty {agent_id_} failed: {ex}")
+                delay_cache[agent_id_] = 0
+                return 0
+            delay_ = 0
+            for a in cp.get("attributes", []) or []:
+                if a.get("name") == _DAYS_DELAY_ATTR_NAME:
+                    v = a.get("value")
+                    if isinstance(v, (int, float)):
+                        delay_ = int(v)
+                    break
+            delay_cache[agent_id_] = delay_
+            return delay_
+
+        # Шаг 3: обработка заказов
+        from datetime import datetime as _dt
+        for order in orders:
+            result["processed"] += 1
+
+            already_filled = False
+            for a in order.get("attributes", []) or []:
+                if a.get("name") == _PPM_INITIAL_ATTR_NAME and a.get("value"):
+                    already_filled = True
+                    break
+            if already_filled:
+                result["skipped_filled"] += 1
+                continue
+
+            agent = order.get("agent") or {}
+            agent_id_ = agent.get("id")
+            if not agent_id_:
+                href = (agent.get("meta") or {}).get("href") or ""
+                if href:
+                    agent_id_ = href.rstrip("/").split("/")[-1] or None
+            if not agent_id_:
+                result["skipped_no_agent"] += 1
+                continue
+
+            delay = await _get_delay(agent_id_)
+
+            moment_raw = order.get("moment") or ""
+            try:
+                moment_dt = _dt.strptime(moment_raw[:19], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                logger.warning(f"autofill_tick: can't parse moment={moment_raw}")
+                continue
+            expected_dt = moment_dt + timedelta(days=delay)
+            expected_value = _autofill_fmt_ms_dt(expected_dt)
+            expected_date = expected_dt.date()
+            order_id_v = order.get("id")
+            order_name = order.get("name")
+            order_sum_rub = (order.get("sum") or 0) / 100.0
+            agent_name = agent.get("name") or ""
+
+            if not dry_run:
+                try:
+                    db.mark_bot_self_write(order_id_v, "ppm_initial", expected_value)
+                except Exception as ex:
+                    logger.warning(f"autofill_tick: mark_self_write({order_id_v}) failed: {ex}")
+
+                patch_body = {
+                    "attributes": [
+                        {
+                            "meta": {
+                                "href": f"{MS_BASE}/entity/customerorder/metadata/attributes/{ppm_attr_id}",
+                                "type": "attributemetadata",
+                                "mediaType": "application/json",
+                            },
+                            "value": expected_value,
+                        }
+                    ]
+                }
+                headers_patch = dict(get_headers())
+                headers_patch["X-Lognex-WebHook-Disable"] = "1"
+                url_patch = f"{MS_BASE}/entity/customerorder/{order_id_v}"
+                try:
+                    async with session.put(url_patch, headers=headers_patch, json=patch_body) as resp_p:
+                        if resp_p.status not in (200, 201):
+                            body = await resp_p.text()
+                            logger.error(
+                                f"autofill_tick: PATCH {order_id_v} status={resp_p.status} body={body[:200]}"
+                            )
+                            result["skipped_patch_failed"] += 1
+                            continue
+                except Exception as ex:
+                    logger.error(f"autofill_tick: PATCH {order_id_v} ex={ex}")
+                    result["skipped_patch_failed"] += 1
+                    continue
+
+                try:
+                    db.log_payment_planned_audit(
+                        order_id=order_id_v,
+                        order_name=order_name,
+                        agent_id=agent_id_,
+                        agent_name=agent_name,
+                        old_date=None,
+                        new_date=expected_date,
+                        expected_date=expected_date,
+                        changed_by=f"bot:autofill(delay={delay})",
+                        source="cron_autofill",
+                    )
+                except Exception as ex:
+                    logger.warning(f"autofill_tick: audit log({order_id_v}) failed: {ex}")
+
+                result["patched"] += 1
+
+            if delay == 0 and order_sum_rub > PAYMENT_PLANNED_ZERO_ALERT_THRESHOLD_RUB:
+                result["zero_alerts"].append({
+                    "order_id": order_id_v,
+                    "order_name": order_name or "",
+                    "agent_id": agent_id_,
+                    "agent_name": agent_name,
+                    "sum_rub": order_sum_rub,
+                    "order_href": f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id_v}",
+                })
+
+    return result
+

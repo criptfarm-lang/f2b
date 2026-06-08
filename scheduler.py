@@ -159,6 +159,22 @@ def setup_scheduler(app: Application, db):
         id="op_new_share_snapshot_fri_08"
     )
 
+    # ─── Автоподстановка «Дата планируемой оплаты» (план 2026-05-20-автоподстановка) ──
+    # Cron каждые 10 мин. Сам job стартует только при PAYMENT_PLANNED_AUTOFILL_ENABLED=1.
+    # Регистрация закомментирована до ревизии договоров с допсоглашениями
+    # (решение собственника 2026-06-08). После ревизии:
+    #   1) проставить «Дней отсрочки» по ключевым клиентам через UI МС
+    #   2) export PAYMENT_PLANNED_AUTOFILL_ENABLED=1 в Amvera env
+    #   3) раскомментить блок ниже
+    #   4) commit + push на Amvera
+    # scheduler.add_job(
+    #     payment_planned_autofill_job,
+    #     IntervalTrigger(minutes=10, timezone=MSK),
+    #     args=[app, db],
+    #     id="payment_planned_autofill_10min",
+    #     misfire_grace_time=600, coalesce=True,
+    # )
+
     # Каждые 4 ч — warm-up кэша отчёта ОП (TTL в БД 5 ч). Без прогрева первый
     # /op_report после простоя падал в 504 «upstream request timeout» от Amvera
     # ingress: handle_web_report пытался синхронно собрать данные из МС+amoCRM
@@ -1166,3 +1182,68 @@ async def refresh_op_report_cache_job(app: Application, db):
     except Exception as e:
         logger.error(f"refresh_op_report_cache_job: {e}", exc_info=True)
         return {"status": "error", "error": str(e)}
+
+
+# ─── Автоподстановка «Дата планируемой оплаты» (план 2026-05-20-автоподстановка) ──
+# Cron-tick, primary mechanism. Activation gated by PAYMENT_PLANNED_AUTOFILL_ENABLED
+# env-var ("1" / "true"). Регистрация cron'а сейчас закомментирована в setup_scheduler.
+
+async def payment_planned_autofill_job(app: Application, db) -> dict:
+    """Cron-tick автоподстановки «Даты планируемой оплаты» + TG-алерты собственнику.
+
+    Включается env-флагом PAYMENT_PLANNED_AUTOFILL_ENABLED. Если выключен — silently skip.
+    Шлёт собственнику один TG-message со списком zero-delay+большая сумма (триггер на
+    ревизию договора с клиентом).
+    """
+    enabled = (os.getenv("PAYMENT_PLANNED_AUTOFILL_ENABLED", "") or "").strip().lower() in {"1", "true", "yes"}
+    if not enabled:
+        logger.info("payment_planned_autofill_job: disabled by env (PAYMENT_PLANNED_AUTOFILL_ENABLED!=1), skip")
+        return {"status": "disabled"}
+
+    logger.info(
+        f"payment_planned_autofill_job стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}"
+    )
+    try:
+        from moysklad import payment_planned_autofill_tick
+        res = await payment_planned_autofill_tick(db, hours_back=24)
+        try:
+            db.cleanup_bot_self_writes(older_than_seconds=300)
+        except Exception as ex:
+            logger.warning(f"cleanup_bot_self_writes failed: {ex}")
+        logger.info(f"payment_planned_autofill_job: {res}")
+    except Exception as e:
+        logger.error(f"payment_planned_autofill_job: tick failed: {e}", exc_info=True)
+        return {"status": "error", "error": str(e)}
+
+    # TG-алерт собственнику по zero_alerts (delay=0 + сумма > порога)
+    try:
+        owner_id_raw = os.getenv("OWNER_CHAT_ID", "")
+        owner_id = int(owner_id_raw) if owner_id_raw else None
+    except ValueError:
+        owner_id = None
+
+    alerts = res.get("zero_alerts") or []
+    if owner_id and alerts:
+        lines = [
+            f"Автоподстановка даты оплаты: {len(alerts)} заказ(ов) с пустой отсрочкой при сумме > {int(50_000):,} ₽".replace(",", " "),
+            "",
+            "Возможно у клиента есть отсрочка по договору, но не проставлена в карточке — это сигнал на ревизию.",
+            "",
+        ]
+        for a in alerts[:15]:
+            name = _md_escape(a.get("agent_name") or a.get("order_name") or "—")
+            href = a.get("order_href") or ""
+            sum_rub = a.get("sum_rub") or 0
+            lines.append(f"• [{name}]({href}) — {sum_rub:,.0f} ₽".replace(",", " "))
+        if len(alerts) > 15:
+            lines.append(f"… и ещё {len(alerts) - 15}")
+        text = "\n".join(lines)
+        try:
+            await app.bot.send_message(
+                chat_id=owner_id, text=text, parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning(f"payment_planned_autofill_job: TG send failed: {e}")
+
+    return {"status": "ok", **res}

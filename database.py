@@ -436,6 +436,35 @@ class Database:
             )""",
             "CREATE INDEX IF NOT EXISTS idx_client_stop_flags_agent ON client_stop_flags (agent_id)",
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_client_stop_flags_active ON client_stop_flags (agent_id) WHERE removed_at IS NULL",
+            # ── Автоподстановка «Дата планируемой оплаты» (план 2026-05-20-автоподстановка) ──
+            # Маркер «бот только что записал значение» — используется в UPDATE-обработчике,
+            # чтобы не алертить на собственный PATCH. TTL ~60с (Очистка в _payment_planned_cleanup).
+            """CREATE TABLE IF NOT EXISTS bot_self_writes (
+                order_id TEXT NOT NULL,
+                field TEXT NOT NULL,
+                value TEXT NOT NULL,
+                ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (order_id, field)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_bot_self_writes_ts ON bot_self_writes (ts)",
+            # Лог изменений «Даты планируемой оплаты»: и собственные autofill-вставки бота,
+            # и изменения менеджеров (через webhook UPDATE).
+            # source: 'cron_autofill' | 'webhook_update' | 'manual_mcp' | 'test'.
+            """CREATE TABLE IF NOT EXISTS payment_planned_audit (
+                id BIGSERIAL PRIMARY KEY,
+                order_id TEXT NOT NULL,
+                order_name TEXT,
+                agent_id TEXT,
+                agent_name TEXT,
+                old_date DATE,
+                new_date DATE,
+                expected_date DATE,
+                changed_by TEXT,
+                source TEXT,
+                ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_ppa_order_ts ON payment_planned_audit (order_id, ts DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ppa_ts ON payment_planned_audit (ts DESC)",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:
@@ -449,6 +478,61 @@ class Database:
         self._execute(
             "INSERT INTO pdz_results (manager_name, manager_user_id, result_text) VALUES (%s,%s,%s)",
             (manager_name, manager_user_id, result_text)
+        )
+
+    # ─── Автоподстановка ppm_initial (план 2026-05-20-автоподстановка) ────
+    def mark_bot_self_write(self, order_id: str, field: str, value: str):
+        self._execute(
+            """INSERT INTO bot_self_writes (order_id, field, value, ts)
+               VALUES (%s,%s,%s, NOW())
+               ON CONFLICT (order_id, field) DO UPDATE SET value = EXCLUDED.value, ts = NOW()""",
+            (order_id, field, value),
+        )
+
+    def consume_bot_self_write(self, order_id: str, field: str, value: str, ttl_seconds: int = 60) -> bool:
+        """Если за TTL последний self-write по (order_id, field) совпал по значению — удалить запись и вернуть True."""
+        row = self._fetchone(
+            """SELECT 1 FROM bot_self_writes
+               WHERE order_id=%s AND field=%s AND value=%s
+                 AND ts > NOW() - (%s || ' seconds')::interval""",
+            (order_id, field, value, str(ttl_seconds)),
+        )
+        if not row:
+            return False
+        self._execute(
+            "DELETE FROM bot_self_writes WHERE order_id=%s AND field=%s",
+            (order_id, field),
+        )
+        return True
+
+    def cleanup_bot_self_writes(self, older_than_seconds: int = 300):
+        self._execute(
+            "DELETE FROM bot_self_writes WHERE ts < NOW() - (%s || ' seconds')::interval",
+            (str(older_than_seconds),),
+        )
+
+    def log_payment_planned_audit(
+        self, order_id: str, order_name, agent_id, agent_name,
+        old_date, new_date, expected_date, changed_by: str, source: str,
+    ):
+        self._execute(
+            """INSERT INTO payment_planned_audit
+               (order_id, order_name, agent_id, agent_name,
+                old_date, new_date, expected_date, changed_by, source)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (order_id, order_name, agent_id, agent_name,
+             old_date, new_date, expected_date, changed_by, source),
+        )
+
+    def get_payment_planned_history(self, order_id: str, limit: int = 50) -> List[Dict]:
+        return self._fetchall(
+            """SELECT ts, source, changed_by, old_date, new_date, expected_date,
+                      agent_name, order_name
+               FROM payment_planned_audit
+               WHERE order_id=%s
+               ORDER BY ts DESC
+               LIMIT %s""",
+            (order_id, limit),
         )
 
     # ─── ПДЗ-автоматика: снимки и журнал обещаний (Фаза 2) ────────────────

@@ -6907,6 +6907,9 @@ def main():
     app.add_handler(CommandHandler("fishki_remind_dry", cmd_fishki_remind_dry))
     app.add_handler(CommandHandler("fishki_remind_send", cmd_fishki_remind_send))
     app.add_handler(CommandHandler("fishki_remind_stop", cmd_fishki_remind_stop))
+    # План 2026-05-20-автоподстановка-исходной-даты-оплаты, Фазы 2-3
+    app.add_handler(CommandHandler("payment_planned_autofill_test", cmd_payment_planned_autofill_test))
+    app.add_handler(CommandHandler("payment_planned_history", cmd_payment_planned_history))
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_approval_callback, pattern="^appr_"))
@@ -7989,8 +7992,241 @@ async def process_ms_webhook(data: dict, bot):
             if action == "CREATE":
                 await check_logistics_alert(order_href, bot, group_chat_id)
 
+            # Аудит «Дата планируемой оплаты» (план 2026-05-20-автоподстановка, Фаза 3).
+            # Включается env-флагом PAYMENT_PLANNED_AUTOFILL_ENABLED. Слой 1 — self-write
+            # маркер не алертит на собственный PATCH. Слой 2 — запись в audit. Слой 3 — TG.
+            if action == "UPDATE" and os.getenv("PAYMENT_PLANNED_AUTOFILL_ENABLED", "").strip().lower() in {"1","true","yes"}:
+                try:
+                    await check_payment_planned_audit(order_href, bot, db)
+                except Exception as ex_aud:
+                    logger.warning(f"check_payment_planned_audit({order_id}): {ex_aud}")
+
     except Exception as e:
         logger.error(f"process_ms_webhook: {e}")
+
+
+async def check_payment_planned_audit(order_href: str, bot, db):
+    """Проверяет «Дату планируемой оплаты» после UPDATE-webhook'а.
+
+    Если значение отличается от расчётного (counterparty.days_delay + order.moment),
+    и это не самопатч бота (см. слой 1) — алерт собственнику + запись в audit log.
+    Без авто-revert — alert-only (план Фаза 3, решение #8).
+    """
+    from moysklad import get_headers, MS_BASE, _PPM_INITIAL_ATTR_NAME, _DAYS_DELAY_ATTR_NAME, _autofill_fmt_ms_dt
+    import aiohttp
+    from datetime import datetime, timedelta
+
+    order_url = order_href.split("?")[0]
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{order_url}?expand=agent,attributes", headers=get_headers()) as resp:
+            if resp.status != 200:
+                return
+            order = await resp.json()
+
+        order_id_v = order.get("id")
+        order_name = order.get("name")
+        agent = order.get("agent") or {}
+        agent_id = agent.get("id")
+        if not agent_id:
+            href = (agent.get("meta") or {}).get("href") or ""
+            if href:
+                agent_id = href.rstrip("/").split("/")[-1] or None
+        if not agent_id:
+            return
+
+        current_raw = None
+        for a in order.get("attributes", []) or []:
+            if a.get("name") == _PPM_INITIAL_ATTR_NAME:
+                current_raw = a.get("value")
+                break
+        if not current_raw:
+            return  # поле пустое, ничего сверять
+
+        # Слой 1: если это наш самопатч — гасим без алерта
+        try:
+            if db.consume_bot_self_write(order_id_v, "ppm_initial", str(current_raw), ttl_seconds=60):
+                return
+        except Exception as ex:
+            logger.warning(f"consume_self_write({order_id_v}): {ex}")
+
+        # Считаем expected
+        async with session.get(f"{MS_BASE}/entity/counterparty/{agent_id}?expand=attributes", headers=get_headers()) as resp_cp:
+            if resp_cp.status != 200:
+                return
+            cp = await resp_cp.json()
+        delay = 0
+        for a in cp.get("attributes", []) or []:
+            if a.get("name") == _DAYS_DELAY_ATTR_NAME:
+                v = a.get("value")
+                if isinstance(v, (int, float)):
+                    delay = int(v)
+                break
+
+        moment_raw = order.get("moment") or ""
+        try:
+            moment_dt = datetime.strptime(moment_raw[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return
+        expected_dt = moment_dt + timedelta(days=delay)
+        expected_value = _autofill_fmt_ms_dt(expected_dt)
+
+        if str(current_raw).strip() == expected_value.strip():
+            return  # совпадает, нормально
+
+        # Кто менял
+        changed_by = "unknown"
+        try:
+            async with session.get(f"{MS_BASE}/entity/customerorder/{order_id_v}/audit", headers=get_headers()) as resp_a:
+                if resp_a.status == 200:
+                    adata = await resp_a.json()
+                    rows = adata.get("rows", []) or []
+                    if rows:
+                        last = rows[0]
+                        emp = last.get("employee") or {}
+                        changed_by = emp.get("name") or "unknown"
+        except Exception:
+            pass
+
+        # Парсим current → date
+        from datetime import datetime as _dt2
+        try:
+            current_date = _dt2.strptime(str(current_raw)[:19], "%Y-%m-%d %H:%M:%S").date()
+        except Exception:
+            current_date = None
+        agent_name = agent.get("name") or ""
+
+        try:
+            db.log_payment_planned_audit(
+                order_id=order_id_v,
+                order_name=order_name,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                old_date=None,
+                new_date=current_date,
+                expected_date=expected_dt.date(),
+                changed_by=changed_by,
+                source="webhook_update",
+            )
+        except Exception as ex:
+            logger.warning(f"audit log({order_id_v}): {ex}")
+
+        # TG-алерт собственнику
+        try:
+            owner_id_raw = os.getenv("OWNER_CHAT_ID", "")
+            owner_id = int(owner_id_raw) if owner_id_raw else None
+        except ValueError:
+            owner_id = None
+        if not owner_id:
+            return
+
+        href_order = f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id_v}"
+        text = (
+            f"⚠️ Заказ [{agent_name or order_name or '—'}]({href_order}): "
+            f"«Дата планируемой оплаты» изменена менеджером {changed_by}\n"
+            f"Сейчас: {current_date.strftime('%d.%m.%Y') if current_date else '—'}\n"
+            f"Ожидалось по договору: {expected_dt.date().strftime('%d.%m.%Y')} (отсрочка {delay} дн.)\n"
+            f"История: /payment_planned_history {order_id_v}"
+        )
+        try:
+            await bot.send_message(
+                chat_id=owner_id, text=text, parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+        except Exception as ex:
+            logger.warning(f"check_payment_planned_audit: TG send failed: {ex}")
+
+
+async def cmd_payment_planned_autofill_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """OWNER-only. Тест cron-tick'а автоподстановки «Дата планируемой оплаты».
+
+    /payment_planned_autofill_test                — dry-run за 24ч (без PATCH)
+    /payment_planned_autofill_test <order_id>     — dry-run одного заказа
+    /payment_planned_autofill_test live           — реальный PATCH за 24ч
+    /payment_planned_autofill_test live <order_id> — реальный PATCH одного заказа
+    """
+    if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
+        await update.message.reply_text("⛔ Только для собственника.")
+        return
+
+    args = list(context.args or [])
+    live = False
+    target_order_id = None
+    if args and args[0].lower() == "live":
+        live = True
+        args.pop(0)
+    if args:
+        target_order_id = args[0]
+
+    from moysklad import payment_planned_autofill_tick
+    await update.message.reply_text(
+        f"⏳ Запускаю autofill_tick {'(LIVE PATCH)' if live else '(dry-run)'}"
+        + (f" для заказа {target_order_id}" if target_order_id else " за 24ч окно")
+    )
+    try:
+        res = await payment_planned_autofill_tick(
+            db, hours_back=24, order_id=target_order_id, dry_run=not live,
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    lines = [
+        f"Результат autofill_tick {'(LIVE)' if live else '(dry-run)'}:",
+        f"  обработано: {res.get('processed')}",
+        f"  PATCH: {res.get('patched')}",
+        f"  skip filled: {res.get('skipped_filled')}",
+        f"  skip no agent: {res.get('skipped_no_agent')}",
+        f"  PATCH failed: {res.get('skipped_patch_failed')}",
+        f"  zero-delay alerts: {len(res.get('zero_alerts') or [])}",
+    ]
+    if res.get("errors"):
+        lines.append("Errors:")
+        for e in (res.get("errors") or [])[:5]:
+            lines.append(f"  {e}")
+    alerts = res.get("zero_alerts") or []
+    if alerts:
+        lines.append("")
+        lines.append("Заказы без отсрочки (топ 10):")
+        for a in alerts[:10]:
+            lines.append(
+                f"  • {a.get('agent_name') or '—'} — {a.get('sum_rub'):,.0f} ₽  ({a.get('order_id')})".replace(",", " ")
+            )
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_payment_planned_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """OWNER-only. История изменений «Дата планируемой оплаты» по заказу.
+
+    /payment_planned_history <order_id>
+    """
+    if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
+        await update.message.reply_text("⛔ Только для собственника.")
+        return
+    if not context.args:
+        await update.message.reply_text("Формат: /payment_planned_history <order_id>")
+        return
+    order_id_q = context.args[0].strip()
+    rows = db.get_payment_planned_history(order_id_q, limit=50)
+    if not rows:
+        await update.message.reply_text(f"По заказу {order_id_q} истории нет.")
+        return
+    lines = [f"История «Даты планируемой оплаты» — заказ {order_id_q}"]
+    name_set = False
+    for r in rows:
+        if not name_set and (r.get("agent_name") or r.get("order_name")):
+            lines.append(f"Клиент: {r.get('agent_name') or '—'} · заказ: {r.get('order_name') or '—'}")
+            name_set = True
+        ts = r.get("ts")
+        ts_s = ts.strftime("%d.%m.%Y %H:%M") if ts else "—"
+        nd = r.get("new_date")
+        nd_s = nd.strftime("%d.%m.%Y") if nd else "—"
+        exp = r.get("expected_date")
+        exp_s = exp.strftime("%d.%m.%Y") if exp else "—"
+        lines.append(
+            f"{ts_s} · {r.get('source') or '—'} · {r.get('changed_by') or '—'} · "
+            f"new={nd_s} (ожид={exp_s})"
+        )
+    await update.message.reply_text("\n".join(lines))
 
 async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
     """Проверяет адрес доставки заказа на соответствие расписанию логистики."""
