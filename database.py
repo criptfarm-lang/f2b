@@ -394,6 +394,13 @@ class Database:
             # (payed_sum<total_sum, но клиент по факту ничего не должен — оплата
             # не разнесена бухгалтерией). См. moysklad.pdz_overdue_for_manager.
             "ALTER TABLE pdz_snapshots ADD COLUMN IF NOT EXISTS agent_balance NUMERIC(14,2)",
+            # 2026-06-08: страховка взаиморасчётами за 45 дней. Семантика:
+            # residual = opening_45d − payments_45d. Если ≤ 0 — клиент за окно
+            # полностью закрыл то, что висело на T-45 (приходы покрыли начальный
+            # долг). Формальная просрочка из периода до окна = ложный сигнал
+            # (бухгалтерия криво разнесла оплаты, balance отражает остаток уже
+            # по НОВЫМ отгрузкам в окне). См. plans/2026-06-08-pdz-fix-cashflow-coverage.md.
+            "ALTER TABLE pdz_snapshots ADD COLUMN IF NOT EXISTS coverage_residual_45d NUMERIC(14,2)",
             # Журнал обещаний оплаты. event_type = 'set' | 'moved' | 'broken'.
             """CREATE TABLE IF NOT EXISTS promise_log (
                 id SERIAL PRIMARY KEY,
@@ -470,6 +477,7 @@ class Database:
                 r.get("payed_sum"),
                 r.get("total_sum"),
                 r.get("agent_balance"),
+                r.get("coverage_residual_45d"),
             )
             for r in rows
         ]
@@ -478,8 +486,8 @@ class Database:
                 """INSERT INTO pdz_snapshots
                    (snap_date, order_id, order_name, agent_id, agent_name,
                     manager_tag, ppm_initial, ppm_new, reason_id, payed_sum,
-                    total_sum, agent_balance)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    total_sum, agent_balance, coverage_residual_45d)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 params,
             )
             self.conn.commit()
@@ -490,7 +498,7 @@ class Database:
         return self._fetchall(
             """SELECT id, snap_at, snap_date, order_id, order_name, agent_id,
                       agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
-                      payed_sum, total_sum, agent_balance
+                      payed_sum, total_sum, agent_balance, coverage_residual_45d
                FROM pdz_snapshots
                WHERE snap_date = %s
                ORDER BY snap_at DESC, id ASC""",
@@ -512,7 +520,7 @@ class Database:
             """SELECT DISTINCT ON (order_id)
                       id, snap_at, snap_date, order_id, order_name, agent_id,
                       agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
-                      payed_sum, total_sum, agent_balance
+                      payed_sum, total_sum, agent_balance, coverage_residual_45d
                FROM pdz_snapshots
                WHERE snap_date = %s
                ORDER BY order_id, snap_at DESC""",
@@ -545,7 +553,7 @@ class Database:
             SELECT DISTINCT ON (order_id)
                    id, snap_at, snap_date, order_id, order_name, agent_id,
                    agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
-                   payed_sum, total_sum, agent_balance
+                   payed_sum, total_sum, agent_balance, coverage_residual_45d
             FROM pdz_snapshots
             WHERE snap_date = %s
             ORDER BY order_id, snap_at DESC, id DESC

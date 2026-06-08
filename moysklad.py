@@ -1710,6 +1710,68 @@ async def pdz_take_snapshot() -> list:
                 f"контрагентов; balance>=0 (не должны): {non_debtors}; запросы упали: {failed}"
             )
 
+            # ── Обогащение coverage_residual_45d (страховка от ложных PDZ) ──
+            # Для каждого должника считаем «непокрытый остаток начального долга»
+            # за окно 45 дней через /entity/demand + /entity/paymentin + /entity/cashin.
+            # Если residual ≤ 0 → за окно клиент полностью закрыл то, что висело
+            # на T-45 (приходы покрыли начальный). Формальные просрочки до T-45
+            # = ложный сигнал (бухгалтерия криво разнесла оплаты).
+            # См. plans/2026-06-08-pdz-fix-cashflow-coverage.md.
+            today_msk = snap_date  # snap_date уже МСК (строка 1542)
+
+            debtor_ids = [
+                aid for aid, b in balance_map.items()
+                if b is not None and b < 0
+            ]
+            residual_map: dict = {}
+            logger.info(
+                f"pdz_take_snapshot: считаю coverage_residual_45d для {len(debtor_ids)} должников"
+            )
+
+            async def _fetch_residual(aid: str):
+                bal = balance_map.get(aid)
+                if bal is None or bal >= 0:
+                    return aid, None
+                debt = -bal  # bal < 0 → клиент должен нам
+                try:
+                    val = await fetch_coverage_residual_for_window(
+                        aid, debt_today=debt, today=today_msk,
+                        window_days=PDZ_CASHFLOW_WINDOW_DAYS,
+                    )
+                except Exception as ex_o:
+                    logger.warning(
+                        f"pdz_take_snapshot residual {aid[:8]} {type(ex_o).__name__}: {ex_o}"
+                    )
+                    val = None
+                return aid, val
+
+            BATCH_RESIDUAL = 2
+            for i in range(0, len(debtor_ids), BATCH_RESIDUAL):
+                chunk = debtor_ids[i:i + BATCH_RESIDUAL]
+                results = await asyncio.gather(
+                    *(_fetch_residual(aid) for aid in chunk),
+                    return_exceptions=False,
+                )
+                for aid, val in results:
+                    residual_map[aid] = val
+                if i + BATCH_RESIDUAL < len(debtor_ids):
+                    await asyncio.sleep(0.2)
+
+            # Раскладываем residual по строкам (None для не-должников и для упавших).
+            for r in rows:
+                r["coverage_residual_45d"] = residual_map.get(r.get("agent_id"))
+
+            covered_count = sum(
+                1 for v in residual_map.values() if v is not None and v <= 0
+            )
+            failed_residual = sum(1 for v in residual_map.values() if v is None)
+            logger.info(
+                f"pdz_take_snapshot: coverage_residual_45d посчитан для "
+                f"{len(residual_map) - failed_residual}/{len(residual_map)} должников; "
+                f"residual≤0 (за {PDZ_CASHFLOW_WINDOW_DAYS}д закрыли начальное): {covered_count}; "
+                f"запросы упали: {failed_residual}"
+            )
+
             logger.info(f"pdz_take_snapshot: {len(rows)} строк готово к записи (с ppm_initial, не розница)")
             return rows
     except Exception as e:
@@ -2052,12 +2114,15 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
             continue
         bal_raw = r.get("agent_balance")
         agent_balance = float(bal_raw) if bal_raw is not None else None
+        residual_raw = r.get("coverage_residual_45d")
+        coverage_residual_45d = float(residual_raw) if residual_raw is not None else None
         aid = r.get("agent_id") or ""
 
         bucket = by_agent_unpaid.setdefault(aid, {
             "agent_id": aid,
             "agent_name": r.get("agent_name"),
             "balance": agent_balance,
+            "coverage_residual_45d": coverage_residual_45d,
             "overdue": [],
             "in_сroк_unpaid_total": 0.0,
         })
@@ -2088,6 +2153,7 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
     orders: list = []
     skipped_fifo_covered = 0
     skipped_balance_unknown = 0
+    skipped_cashflow_covered = 0
     # Параллельно с orders храним per-agent real_overdue, чтобы в grouped
     # показывать сумму = «реальная просрочка» (после вычета новых в-срок отгрузок
     # из общего долга контрагента), а не «сумма по всем неоплаченным заказам».
@@ -2115,6 +2181,20 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
             # просрочка только из-за неразнесённой оплаты).
             skipped_balance_ok += 1
             continue
+        # Страховка взаиморасчётами за 45 дней (2026-06-08). Если за окно
+        # клиент полностью закрыл то, что висело на T-45 (residual ≤ 0) —
+        # формальные просрочки иллюзорны (бухгалтерия криво разнесла оплаты,
+        # balance показывает остаток уже по НОВЫМ отгрузкам). См. кейс
+        # ООО «ЧЕСТНАЯ РЫБА» 2026-06-05 + plans/2026-06-08-pdz-fix-cashflow-coverage.md.
+        # residual=None → запрос упал, fallback на FIFO (не скрываем).
+        residual = data.get("coverage_residual_45d")
+        if residual is not None and residual <= 0:
+            skipped_cashflow_covered += 1
+            logger.info(
+                f"pdz_overdue_for_manager({manager_tag}): {data['agent_name']!r} "
+                f"скрыт по cashflow-45 — residual={residual:.2f} ≤ 0"
+            )
+            continue
         bal_abs = abs(bal)
         in_сroк = data["in_сroк_unpaid_total"]
         real_overdue = max(0.0, round(bal_abs - in_сroк, 2))
@@ -2129,12 +2209,13 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
         agent_real_overdue[aid] = real_overdue
         orders.extend(data["overdue"])
 
-    if skipped_balance_ok or skipped_fifo_covered or skipped_balance_unknown:
+    if skipped_balance_ok or skipped_fifo_covered or skipped_balance_unknown or skipped_cashflow_covered:
         logger.info(
             f"pdz_overdue_for_manager({manager_tag}): пропущено "
             f"{skipped_balance_ok} с balance>=0, "
             f"{skipped_fifo_covered} с FIFO-перекрытием, "
-            f"{skipped_balance_unknown} с balance=None"
+            f"{skipped_balance_unknown} с balance=None, "
+            f"{skipped_cashflow_covered} с cashflow-45 покрытием"
         )
 
     if not group_by_agent:
@@ -2325,12 +2406,15 @@ def pdz_unprocessed_for_owner(db) -> dict:
             continue
         bal_raw = r.get("agent_balance")
         agent_balance = float(bal_raw) if bal_raw is not None else None
+        residual_raw = r.get("coverage_residual_45d")
+        coverage_residual_45d = float(residual_raw) if residual_raw is not None else None
         aid = r.get("agent_id") or ""
 
         bucket = by_tag_agent.setdefault(row_tag, {}).setdefault(aid, {
             "agent_id": aid,
             "agent_name": r.get("agent_name"),
             "agent_balance": agent_balance,
+            "coverage_residual_45d": coverage_residual_45d,
             "overdue": [],
             "in_сroк_unpaid_total": 0.0,
         })
@@ -2359,6 +2443,7 @@ def pdz_unprocessed_for_owner(db) -> dict:
 
     # Шаг 2: применить FIFO-фильтр (как в pdz_overdue_for_manager).
     # balance=None → skip; balance>=0 → skip; real_overdue<0.01 → skip.
+    # coverage_residual_45d ≤ 0 → skip (страховка взаиморасчётами, 2026-06-08).
     by_tag: dict = {}
     agent_real_overdue: dict = {}  # aid → real_overdue
     for tag, agents in by_tag_agent.items():
@@ -2370,6 +2455,9 @@ def pdz_unprocessed_for_owner(db) -> dict:
                 continue  # balance не подтянулся — не показываем (см. 1593622)
             if bal >= 0:
                 continue
+            residual = data.get("coverage_residual_45d")
+            if residual is not None and residual <= 0:
+                continue  # за 45 дней клиент закрыл начальное → не алертим
             bal_abs = abs(bal)
             in_сroк = data["in_сroк_unpaid_total"]
             real_overdue = max(0.0, round(bal_abs - in_сroк, 2))
@@ -4414,6 +4502,89 @@ async def _fetch_incoming_payments(agent_id: str, since_iso: str) -> list[dict]:
         except Exception as e:
             logger.error(f"_fetch_incoming_payments[{entity}]: {e}")
     return results
+
+
+# ─── PDZ: страховка взаиморасчётами за окно (2026-06-08) ─────────────────
+# Окно для проверки «закрыл ли клиент за период то, что висело на T−N».
+# Если за 45 дней приход покрыл начальный остаток → формальная просрочка
+# из периода до окна = ложный сигнал (бухгалтерия криво разнесла оплаты).
+# Источник правды по логике — plans/2026-06-08-pdz-fix-cashflow-coverage.md.
+PDZ_CASHFLOW_WINDOW_DAYS = 45
+
+
+async def fetch_coverage_residual_for_window(
+    agent_id: str,
+    debt_today: float,
+    today=None,
+    window_days: int = PDZ_CASHFLOW_WINDOW_DAYS,
+) -> Optional[float]:
+    """Считает «остаток непокрытого начального долга» контрагента за окно T−window_days.
+
+    Шаг 1 — реконструкция начального остатка (opening):
+      opening = debt_today − (demands_за_окно − payments_за_окно)
+    Это аналитика отчёта «Взаиморасчёты»: конечный остаток минус чистое движение.
+
+    Шаг 2 — коэффициент покрытия начального долга свежими приходами:
+      residual = opening − payments_за_окно
+
+    Семантика:
+      - residual ≤ 0 → за окно клиент полностью закрыл то, что висело на T−N
+        (приходы покрыли начальный долг). Все формально просроченные заказы
+        с ppm_initial до T−N считаются фактически погашенными — бухгалтерия
+        разнесла payedSum криво, а balance отражает остаток уже по НОВЫМ
+        отгрузкам в окне. В дайджест такого клиента не показываем.
+      - residual > 0 → клиент НЕ закрыл начальное за окно. Старая просрочка
+        реальна, оставляем в дайджесте.
+
+    Возвращает None если любой запрос к МС упал — fallback на FIFO-логику
+    (memory: reference_f2b_ms_payedSum_unreliable).
+
+    debt_today передаётся снаружи (из уже подтянутого balance_map) — экономит
+    один лишний /report/counterparty.
+    """
+    from datetime import datetime, timedelta
+    if today is None:
+        today = _now_msk().date()
+    since_dt = datetime.combine(today, datetime.min.time()) - timedelta(days=window_days)
+    since_iso = since_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        payments = await _fetch_incoming_payments(agent_id, since_iso)
+        payments_sum = sum(p["sum"] for p in payments)
+    except Exception as e:
+        logger.warning(f"fetch_coverage_residual[{agent_id[:8]}] payments: {e}")
+        return None
+
+    demands_sum = 0.0
+    try:
+        agent_href = f"{MS_BASE}/entity/counterparty/{agent_id}"
+        next_url = f"{MS_BASE}/entity/demand?filter=agent={agent_href}"
+        async with aiohttp.ClientSession() as session:
+            for _ in range(20):  # safety bound
+                async with session.get(
+                    next_url, headers=get_headers(),
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            f"fetch_coverage_residual[{agent_id[:8]}] demands {resp.status}"
+                        )
+                        return None
+                    data = await resp.json()
+                for row in data.get("rows", []) or []:
+                    m = row.get("moment", "")
+                    if m and m >= since_iso:
+                        demands_sum += (row.get("sum", 0) or 0) / 100
+                next_url = data.get("meta", {}).get("nextHref")
+                if not next_url:
+                    break
+    except Exception as e:
+        logger.warning(f"fetch_coverage_residual[{agent_id[:8]}] demands: {e}")
+        return None
+
+    opening = debt_today - (demands_sum - payments_sum)
+    residual = opening - payments_sum
+    return round(residual, 2)
 
 
 async def compute_cashflow_color(agent_id: str, today=None, window_days: int = 30) -> dict:
