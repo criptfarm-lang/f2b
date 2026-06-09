@@ -4060,13 +4060,14 @@ async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/op_report — ссылки на персональные дашборды мотивации 5 менеджеров ОП.
+    """/op_report — сводный отчёт ОП за текущий месяц + ссылки на дашборды.
 
-    Раньше отдавал отдельный HTML-отчёт с агрегатом по всем менеджерам.
-    Уточнено собственником 2026-06-09: один источник правды — дашборды
-    мотивации в quiz-game (manager_dashboard_data + /manager/{tag}/dashboard).
-    Команда просто показывает 5 персональных ссылок с актуальными токенами
-    из manager_dashboard_tokens.
+    Тянет payload из manager_dashboard_data (заполняется cron'ом f2b-publisher
+    каждые 30 мин), агрегирует по компании, показывает план/факт по каждому
+    менеджеру + кликабельную ссылку на детальный дашборд.
+
+    Уточнено собственником 2026-06-09: один источник правды — manager_dashboard_data.
+    Старый HTML-отчёт (_build_report_data + /report endpoint) — deprecated, удалить.
     """
     msg = update.effective_message
     if not msg:
@@ -4074,32 +4075,141 @@ async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     BASE_URL = "https://f2b-fishki-victor03.amvera.io"
     NAMES = {
         "баласанян": "Карина Баласанян",
-        "дьяченко": "Ирина Дьяченко",
-        "коликов": "Денис Коликов",
+        "дьяченко":  "Ирина Дьяченко",
+        "коликов":   "Денис Коликов",
         "мерзлякова": "Елена Мерзлякова",
-        "скляр": "Инесса Скляр",
+        "скляр":     "Инесса Скляр",
     }
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+    period = f"{now_msk.year}-{now_msk.month:02d}"
+    period_label = now_msk.strftime("%B %Y").lower()
+    months_ru = {"january":"январь","february":"февраль","march":"март","april":"апрель",
+                 "may":"май","june":"июнь","july":"июль","august":"август",
+                 "september":"сентябрь","october":"октябрь","november":"ноябрь","december":"декабрь"}
+    for en, ru in months_ru.items():
+        period_label = period_label.replace(en, ru)
     try:
         rows = db._fetchall(
-            "SELECT manager_tag, token FROM manager_dashboard_tokens ORDER BY manager_tag",
-            None,
+            """SELECT d.manager_tag, d.payload, t.token, d.updated_at
+               FROM manager_dashboard_data d
+               LEFT JOIN manager_dashboard_tokens t ON t.manager_tag = d.manager_tag
+               WHERE d.period = %s
+               ORDER BY d.manager_tag""",
+            (period,),
         )
     except Exception as e:
         logger.error(f"cmd_op_report: db fail: {e}")
-        await msg.reply_text(f"⚠️ Не удалось достать токены: {e}")
+        await msg.reply_text(f"⚠️ Не удалось достать данные: {e}")
         return
     if not rows:
         await msg.reply_text(
-            "Токены менеджеров не заведены. Сначала запусти "
-            "`scripts/upload_manager_dashboard_snapshot.py --issue-token` для каждого тега.",
+            f"Данных за {period} нет в manager_dashboard_data. "
+            "Запусти cron f2b-publisher или scripts/manager_dashboard_data.py."
         )
         return
-    lines = ["📊 *Дашборды мотивации ОП:*", ""]
+
+    def fmt_rub(n):
+        if n is None:
+            return "—"
+        if n >= 1_000_000:
+            return f"{n/1_000_000:.1f}М"
+        if n >= 1_000:
+            return f"{n/1_000:.0f}к"
+        return f"{n:.0f}"
+
+    def pct(num, den):
+        if not den or den <= 0:
+            return None
+        return num / den * 100
+
+    # Агрегаты по компании
+    tot_paid = tot_paid_plan = 0.0
+    tot_shipped = 0.0
+    tot_akb = tot_akb_plan = 0
+    tot_pdz_clients = 0
+    tot_pdz_sum = 0.0
+    by_mgr = []
+    last_updated = None
     for r in rows:
         tag = r.get("manager_tag", "")
-        token = r.get("token", "")
-        name = NAMES.get(tag, tag)
-        lines.append(f"• [{name}]({BASE_URL}/manager/{tag}/dashboard?token={token})")
+        payload = r.get("payload") or {}
+        if isinstance(payload, str):
+            import json as _json
+            payload = _json.loads(payload)
+        upd = r.get("updated_at")
+        if upd and (last_updated is None or upd > last_updated):
+            last_updated = upd
+        paid       = float(payload.get("paid_revenue_month") or 0)
+        plan_paid  = float(payload.get("revenue_plan_rub") or 0)
+        shipped    = float(payload.get("shipped_revenue_month") or 0)
+        akb        = int(payload.get("akb_month") or 0)
+        akb_plan   = int(payload.get("akb_plan_count") or 0)
+        margin     = payload.get("margin_pct_manager")
+        attest     = payload.get("attestation_pct")
+        pdz_list   = payload.get("pdz_list") or []
+        pdz_sum    = sum(float(x.get("amount_rub") or 0) for x in pdz_list)
+        token      = r.get("token") or ""
+
+        tot_paid       += paid
+        tot_paid_plan  += plan_paid
+        tot_shipped    += shipped
+        tot_akb        += akb
+        tot_akb_plan   += akb_plan
+        tot_pdz_clients += len(pdz_list)
+        tot_pdz_sum    += pdz_sum
+
+        by_mgr.append({
+            "tag": tag, "name": NAMES.get(tag, tag),
+            "paid": paid, "plan_paid": plan_paid,
+            "shipped": shipped, "akb": akb, "akb_plan": akb_plan,
+            "margin": margin, "attest": attest, "pdz_sum": pdz_sum,
+            "token": token,
+        })
+
+    paid_pct = pct(tot_paid, tot_paid_plan)
+    akb_pct  = pct(tot_akb, tot_akb_plan)
+
+    # Сортировка: по проценту выполнения плана выручки, убывание (лучшие сверху)
+    by_mgr.sort(key=lambda x: -(pct(x["paid"], x["plan_paid"]) or 0))
+
+    lines = [f"📊 *Отчёт ОП · {period_label}*"]
+    if last_updated:
+        from zoneinfo import ZoneInfo as _ZI
+        upd_msk = last_updated.astimezone(_ZI("Europe/Moscow"))
+        lines.append(f"_снято {upd_msk:%d.%m %H:%M} МСК_")
+    lines.append("")
+    lines.append("*🏢 По компании:*")
+    paid_pct_str = f"{paid_pct:.0f}%" if paid_pct is not None else "—"
+    akb_pct_str  = f"{akb_pct:.0f}%"  if akb_pct  is not None else "—"
+    lines.append(f"💰 Выручка приход: *{fmt_rub(tot_paid)} ₽* из {fmt_rub(tot_paid_plan)} ({paid_pct_str})")
+    lines.append(f"🚚 Отгружено: *{fmt_rub(tot_shipped)} ₽*")
+    lines.append(f"👥 АКБ: *{tot_akb}* из {tot_akb_plan} ({akb_pct_str})")
+    lines.append(f"🔴 PDZ: *{tot_pdz_clients} конт.* на {fmt_rub(tot_pdz_sum)} ₽")
+    lines.append("")
+    lines.append("*👥 По менеджерам (по % выручки):*")
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    for i, m in enumerate(by_mgr):
+        medal = medals[i] if i < len(medals) else "•"
+        url = f"{BASE_URL}/manager/{m['tag']}/dashboard?token={m['token']}"
+        p_pct = pct(m["paid"], m["plan_paid"])
+        a_pct = pct(m["akb"], m["akb_plan"])
+        p_pct_str = f"{p_pct:.0f}%" if p_pct is not None else "—"
+        a_pct_str = f"{a_pct:.0f}%" if a_pct is not None else "—"
+        margin_str = f"{m['margin']:.0f}%" if m['margin'] is not None else "—"
+        attest_str = f"{m['attest']}%"     if m['attest'] is not None else "—"
+        pdz_str    = f" · PDZ {fmt_rub(m['pdz_sum'])}" if m['pdz_sum'] > 0 else ""
+        lines.append("")
+        lines.append(f"{medal} [*{m['name']}*]({url})")
+        lines.append(
+            f"   💰 {fmt_rub(m['paid'])}/{fmt_rub(m['plan_paid'])} ({p_pct_str}) · "
+            f"👥 {m['akb']}/{m['akb_plan']} ({a_pct_str})"
+        )
+        lines.append(
+            f"   📈 маржа {margin_str} · 🎓 аттест. {attest_str}{pdz_str}"
+        )
+
     await msg.reply_text(
         "\n".join(lines),
         parse_mode="Markdown",
