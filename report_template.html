@@ -394,6 +394,17 @@ function renderMgrDetail(mg){
   const nsWrap = '<div style="margin-top:12px;padding-top:10px;border-top:1px solid #e8e5f5;">'
                + nsCard + '</div>';
 
+  // Кнопка-ссылка на персональный дашборд мотивации (2026-06-09).
+  const motiUrl = (DATA.motivation_links || {})[mg];
+  const motiBtn = motiUrl
+    ? '<a href="'+motiUrl+'" target="_blank" rel="noopener" '
+      +'style="display:inline-flex;align-items:center;gap:6px;'
+      +'margin-top:14px;padding:8px 14px;border-radius:8px;'
+      +'background:'+color+';color:#fff;text-decoration:none;'
+      +'font-size:13px;font-weight:600;">'
+      +'🎯 Дашборд мотивации →</a>'
+    : '';
+
   document.getElementById('mgr-detail').innerHTML=
     '<div class="detail-card" style="border:2px solid '+color+'">'
    +'<div class="dc-header">'
@@ -403,6 +414,7 @@ function renderMgrDetail(mg){
    +rows
    +nsWrap
    +'<div style="margin-top:8px">'+badges+'</div>'
+   +motiBtn
    +'</div>';
 }
 
