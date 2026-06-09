@@ -4060,17 +4060,51 @@ async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_op_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/op_report — временная ссылка на интерактивный отчёт ОП."""
-    token = db.create_report_link(mgr_filter=None, ttl_minutes=60)
-    base = os.getenv("RAILWAY_PUBLIC_DOMAIN", "f2b-production.up.railway.app")
-    url = f"https://{base}/report?token={token}"
+    """/op_report — ссылки на персональные дашборды мотивации 5 менеджеров ОП.
+
+    Раньше отдавал отдельный HTML-отчёт с агрегатом по всем менеджерам.
+    Уточнено собственником 2026-06-09: один источник правды — дашборды
+    мотивации в quiz-game (manager_dashboard_data + /manager/{tag}/dashboard).
+    Команда просто показывает 5 персональных ссылок с актуальными токенами
+    из manager_dashboard_tokens.
+    """
     msg = update.effective_message
-    if msg:
-        await msg.reply_text(f"📊 Отчёт ОП (действует 1 час):\n{url}")
-    # Обновляем кэш в фоне если он устарел
-    if not db.get_report_cache():
-        import asyncio
-        asyncio.ensure_future(_refresh_report_cache())
+    if not msg:
+        return
+    BASE_URL = "https://f2b-fishki-victor03.amvera.io"
+    NAMES = {
+        "баласанян": "Карина Баласанян",
+        "дьяченко": "Ирина Дьяченко",
+        "коликов": "Денис Коликов",
+        "мерзлякова": "Елена Мерзлякова",
+        "скляр": "Инесса Скляр",
+    }
+    try:
+        rows = db._fetchall(
+            "SELECT manager_tag, token FROM manager_dashboard_tokens ORDER BY manager_tag",
+            None,
+        )
+    except Exception as e:
+        logger.error(f"cmd_op_report: db fail: {e}")
+        await msg.reply_text(f"⚠️ Не удалось достать токены: {e}")
+        return
+    if not rows:
+        await msg.reply_text(
+            "Токены менеджеров не заведены. Сначала запусти "
+            "`scripts/upload_manager_dashboard_snapshot.py --issue-token` для каждого тега.",
+        )
+        return
+    lines = ["📊 *Дашборды мотивации ОП:*", ""]
+    for r in rows:
+        tag = r.get("manager_tag", "")
+        token = r.get("token", "")
+        name = NAMES.get(tag, tag)
+        lines.append(f"• [{name}]({BASE_URL}/manager/{tag}/dashboard?token={token})")
+    await msg.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
 
 async def cmd_test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/test_fact [тег] — тест получения отгрузок по тегу за текущий месяц."""
