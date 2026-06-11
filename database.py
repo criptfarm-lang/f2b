@@ -401,6 +401,10 @@ class Database:
             # (бухгалтерия криво разнесла оплаты, balance отражает остаток уже
             # по НОВЫМ отгрузкам в окне). См. plans/2026-06-08-pdz-fix-cashflow-coverage.md.
             "ALTER TABLE pdz_snapshots ADD COLUMN IF NOT EXISTS coverage_residual_45d NUMERIC(14,2)",
+            # 2026-06-11: UNIQUE индекс против дублей. Раньше при 3 запусках
+            # cron в день копилось ×3 = 53к дублей в БД (на 23к уникальных).
+            # save_pdz_snapshot теперь использует ON CONFLICT DO UPDATE.
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_pdz_snapshots_date_order ON pdz_snapshots (snap_date, order_id)",
             # Журнал обещаний оплаты. event_type = 'set' | 'moved' | 'broken'.
             """CREATE TABLE IF NOT EXISTS promise_log (
                 id SERIAL PRIMARY KEY,
@@ -566,12 +570,30 @@ class Database:
             for r in rows
         ]
         with self.conn.cursor() as cur:
+            # ON CONFLICT DO UPDATE — защита от дублей при повторных cron
+            # в один день (раньше за день копилось ×3 = 53к дублей в БД).
+            # UNIQUE индекс uq_pdz_snapshots_date_order гарантирует
+            # уникальность (snap_date, order_id). См. retro 2026-06-11.
             cur.executemany(
                 """INSERT INTO pdz_snapshots
                    (snap_date, order_id, order_name, agent_id, agent_name,
                     manager_tag, ppm_initial, ppm_new, reason_id, payed_sum,
                     total_sum, agent_balance, coverage_residual_45d)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (snap_date, order_id) DO UPDATE SET
+                     snap_at = EXCLUDED.snap_at,
+                     order_name = EXCLUDED.order_name,
+                     agent_id = EXCLUDED.agent_id,
+                     agent_name = EXCLUDED.agent_name,
+                     manager_tag = EXCLUDED.manager_tag,
+                     ppm_initial = EXCLUDED.ppm_initial,
+                     ppm_new = EXCLUDED.ppm_new,
+                     reason_id = EXCLUDED.reason_id,
+                     payed_sum = EXCLUDED.payed_sum,
+                     total_sum = EXCLUDED.total_sum,
+                     agent_balance = EXCLUDED.agent_balance,
+                     coverage_residual_45d = EXCLUDED.coverage_residual_45d
+                """,
                 params,
             )
             self.conn.commit()
