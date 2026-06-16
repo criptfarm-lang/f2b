@@ -552,6 +552,7 @@ def _build_approval_text(
     client_name: str, manager_name: str,
     credit: dict, contract: dict, overdue: dict, cashflow: dict, price: dict,
     site: dict, contacts: dict,
+    payment_planned_date: str = "",
 ) -> str:
     """
     Шаблон алерта. Порядок строк (по убыванию важности):
@@ -628,6 +629,11 @@ def _build_approval_text(
         )
     else:
         lines.append(f"🟢 *Просрочка:* нет")
+
+    # 3a. Дата планируемой оплаты — то, что бот проставил автоматом
+    # из План.даты отгрузки + дней отсрочки (план 2026-05-20-автоподстановка).
+    if payment_planned_date:
+        lines.append(f"⚪ *Оплата:* {payment_planned_date}")
 
     # 4. ДДС
     explain = cashflow.get("explain", "")
@@ -775,11 +781,26 @@ async def check_approval_needed(order_href: str, bot, db):
             "site": site["color"],
             "contacts": contacts["color"],
         }
+        # Дата планируемой оплаты — то что выставил webhook-autofill за 60с до
+        # этого алерта. Берём из attributes заказа, форматируем DD.MM.YYYY.
+        ppm_str = ""
+        for a in order.get("attributes", []) or []:
+            if a.get("name") == "Дата планируемой оплаты":
+                v = a.get("value")
+                if v:
+                    try:
+                        from datetime import datetime as _dt
+                        ppm_str = _dt.strptime(str(v)[:19], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y")
+                    except Exception:
+                        ppm_str = str(v)[:10]
+                break
+
         alert_text = _build_approval_text(
             order_name=order_name, order_sum=order_sum, state_name=state_name,
             client_name=agent_name, manager_name=manager_name,
             credit=credit, contract=contract, overdue=overdue, cashflow=cashflow,
             price=price, site=site, contacts=contacts,
+            payment_planned_date=ppm_str,
         )
 
         # 6. Дедуп: sum_hash = округлённая сумма в ₽
