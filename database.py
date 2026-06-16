@@ -469,6 +469,15 @@ class Database:
             )""",
             "CREATE INDEX IF NOT EXISTS idx_ppa_order_ts ON payment_planned_audit (order_id, ts DESC)",
             "CREATE INDEX IF NOT EXISTS idx_ppa_ts ON payment_planned_audit (ts DESC)",
+            # Snapshot «Дней отсрочки» по контрагентам — для алерта об изменении.
+            # Первый encounter контрагента → baseline без алерта; последующие
+            # с другим значением → TG-алерт собственнику + UPDATE snapshot.
+            """CREATE TABLE IF NOT EXISTS counterparty_delay_snapshots (
+                agent_id TEXT PRIMARY KEY,
+                agent_name TEXT,
+                days INT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:
@@ -555,6 +564,28 @@ class Database:
             (order_id, target_date),
         )
         return bool(row)
+
+    def get_counterparty_delay_snapshot(self, agent_id: str) -> Optional[int]:
+        """Возвращает последний сохранённый snapshot «Дней отсрочки» по контрагенту.
+        None — если контрагента ещё не видели (baseline ещё не записан).
+        """
+        row = self._fetchone(
+            "SELECT days FROM counterparty_delay_snapshots WHERE agent_id=%s",
+            (agent_id,),
+        )
+        return row["days"] if row else None
+
+    def upsert_counterparty_delay_snapshot(self, agent_id: str, agent_name: str, days: int):
+        """Перезаписывает snapshot «Дней отсрочки» (baseline или после алерта)."""
+        self._execute(
+            """INSERT INTO counterparty_delay_snapshots (agent_id, agent_name, days, updated_at)
+               VALUES (%s, %s, %s, NOW())
+               ON CONFLICT (agent_id) DO UPDATE
+                 SET agent_name = EXCLUDED.agent_name,
+                     days       = EXCLUDED.days,
+                     updated_at = NOW()""",
+            (agent_id, agent_name, days),
+        )
 
     def has_bot_autofill_for_order(self, order_id: str) -> bool:
         """True если бот когда-либо подставлял «Дату планируемой оплаты» на

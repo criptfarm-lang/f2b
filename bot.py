@@ -3233,9 +3233,18 @@ async def cmd_add_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with session.post(api_url, headers=headers, json=payload) as resp:
                 data = await resp.json()
                 if resp.status in (200, 201):
-                    results.append(f"✅ {action}: id={data.get('id')}")
+                    results.append(f"✅ customerorder.{action}: id={data.get('id')}")
                 else:
-                    results.append(f"❌ {action}: {data}")
+                    results.append(f"❌ customerorder.{action}: {data}")
+
+        # counterparty.UPDATE — для алерта об изменении «Дней отсрочки»
+        payload_cp = {"url": webhook_url, "action": "UPDATE", "entityType": "counterparty", "diffType": "NONE"}
+        async with session.post(api_url, headers=headers, json=payload_cp) as resp:
+            data = await resp.json()
+            if resp.status in (200, 201):
+                results.append(f"✅ counterparty.UPDATE: id={data.get('id')}")
+            else:
+                results.append(f"❌ counterparty.UPDATE: {data}")
 
     await update.message.reply_text("Вебхуки МойСклад:\n" + "\n".join(results))
 
@@ -8024,6 +8033,18 @@ async def process_ms_webhook(data: dict, bot):
         for event in events:
             meta = event.get("meta", {})
             entity_type = meta.get("type", "")
+
+            # counterparty.UPDATE — отдельная ветка: алерт собственнику об
+            # изменении «Дней отсрочки» (не связан со светофором заказов).
+            if entity_type == "counterparty":
+                cp_href = meta.get("href", "")
+                if cp_href and event.get("action") == "UPDATE":
+                    try:
+                        await check_counterparty_delay_change(cp_href, bot, db)
+                    except Exception as ex_cd:
+                        logger.warning(f"check_counterparty_delay_change: {ex_cd}")
+                continue
+
             if entity_type != "customerorder":
                 continue
 
@@ -8093,6 +8114,87 @@ async def process_ms_webhook(data: dict, bot):
 
     except Exception as e:
         logger.error(f"process_ms_webhook: {e}")
+
+
+async def check_counterparty_delay_change(cp_href: str, bot, db):
+    """При UPDATE контрагента: если «Дней отсрочки» сменилось vs snapshot — TG-алерт.
+
+    Первый encounter (snapshot отсутствует) = baseline без алерта.
+    Кто менял — берём из /entity/counterparty/{id}/audit.
+    """
+    from moysklad import get_headers, MS_BASE, _DAYS_DELAY_ATTR_NAME
+    import aiohttp
+
+    cp_url = cp_href.split("?")[0]
+    agent_id = cp_url.rstrip("/").split("/")[-1]
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{cp_url}?expand=attributes", headers=get_headers()) as resp:
+            if resp.status != 200:
+                return
+            cp = await resp.json()
+
+        agent_name = cp.get("name") or ""
+        new_delay = None
+        for a in cp.get("attributes", []) or []:
+            if a.get("name") == _DAYS_DELAY_ATTR_NAME:
+                v = a.get("value")
+                if isinstance(v, (int, float)):
+                    new_delay = int(v)
+                break
+
+        if new_delay is None:
+            return  # отсрочка не задана — не трекаем
+
+        try:
+            old_delay = db.get_counterparty_delay_snapshot(agent_id)
+        except Exception as ex:
+            logger.warning(f"get_counterparty_delay_snapshot({agent_id}): {ex}")
+            return
+
+        # Baseline: первый раз видим контрагента — записываем без алерта
+        if old_delay is None:
+            try:
+                db.upsert_counterparty_delay_snapshot(agent_id, agent_name, new_delay)
+            except Exception as ex:
+                logger.warning(f"upsert_counterparty_delay_snapshot baseline({agent_id}): {ex}")
+            return
+
+        if old_delay == new_delay:
+            return  # ничего не изменилось
+
+        # Изменение → определяем кто менял (best-effort)
+        changed_by = "unknown"
+        try:
+            async with session.get(f"{MS_BASE}/entity/counterparty/{agent_id}/audit", headers=get_headers()) as resp_a:
+                if resp_a.status == 200:
+                    adata = await resp_a.json()
+                    rows = adata.get("rows", []) or []
+                    if rows:
+                        emp = (rows[0].get("employee") or {})
+                        changed_by = emp.get("name") or "unknown"
+        except Exception:
+            pass
+
+        # TG-алерт собственнику
+        try:
+            owner_id = int(os.getenv("OWNER_CHAT_ID", "0") or 0)
+            if owner_id:
+                text = (
+                    f"📋 *Контрагент:* [{agent_name}]"
+                    f"(https://online.moysklad.ru/app/#company/edit?id={agent_id})\n"
+                    f"«Дней отсрочки» изменено: *{old_delay} → {new_delay}* дн.\n"
+                    f"Изменил: {changed_by}"
+                )
+                await bot.send_message(chat_id=owner_id, text=text, parse_mode="Markdown", disable_web_page_preview=True)
+        except Exception as ex:
+            logger.warning(f"counterparty_delay alert send: {ex}")
+
+        # Обновляем snapshot
+        try:
+            db.upsert_counterparty_delay_snapshot(agent_id, agent_name, new_delay)
+        except Exception as ex:
+            logger.warning(f"upsert_counterparty_delay_snapshot after-alert({agent_id}): {ex}")
 
 
 async def check_payment_planned_audit(order_href: str, bot, db):
