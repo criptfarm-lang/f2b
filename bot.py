@@ -8132,6 +8132,17 @@ async def check_payment_planned_audit(order_href: str, bot, db):
         if not current_raw:
             return  # поле пустое, ничего сверять
 
+        # Исторические заказы — бот не имел контроля над ними до 16.06.2026.
+        # Если в payment_planned_audit нет ни одной записи cron/webhook_autofill
+        # по этому order_id — менеджер когда-то поставил дату руками, и сверять
+        # её с расчётной по сегодняшней отсрочке бессмысленно. Поймали на
+        # ООО Фелиса (заказ от апреля).
+        try:
+            if not db.has_bot_autofill_for_order(order_id_v):
+                return
+        except Exception as ex:
+            logger.warning(f"has_bot_autofill_for_order({order_id_v}): {ex}")
+
         # Слой 1: если это наш самопатч — гасим без алерта
         try:
             if db.consume_bot_self_write(order_id_v, "ppm_initial", str(current_raw), ttl_seconds=60):

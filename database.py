@@ -556,6 +556,20 @@ class Database:
         )
         return bool(row)
 
+    def has_bot_autofill_for_order(self, order_id: str) -> bool:
+        """True если бот когда-либо подставлял «Дату планируемой оплаты» на
+        этом заказе. Используется для отсечки «исторических» заказов (созданных
+        ДО активации autofill 16.06.2026) — на них бот не имел контроля,
+        алерты об «изменении менеджером» по таким заказам ложные.
+        """
+        row = self._fetchone(
+            """SELECT 1 FROM payment_planned_audit
+               WHERE order_id=%s AND source LIKE '%%autofill%%'
+               LIMIT 1""",
+            (order_id,),
+        )
+        return bool(row)
+
     # ─── ПДЗ-автоматика: снимки и журнал обещаний (Фаза 2) ────────────────
     def save_pdz_snapshot(self, rows: List[Dict]) -> int:
         """Batch insert строк снимка состояния заказов.
