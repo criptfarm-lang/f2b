@@ -473,7 +473,7 @@ async def detect_task_completion(text: str, open_tasks: list, author: str = "") 
     try:
         client = get_client()
         resp = await client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -583,7 +583,7 @@ async def dispatch(query: str, user_name: str, context_data: str = "",
         )
 
         response = await get_client().messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=500,
             system=DISPATCHER_PROMPT,
             messages=[{"role": "user", "content": user_context}]
@@ -632,7 +632,7 @@ async def smart_answer(query: str, user_name: str, context_data: str = "") -> st
 Никогда не говори что у тебя нет доступа к фото — фото есть в МойСклад."""
 
         response = await get_client().messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=800,
             system=system,
             messages=[{"role": "user", "content": f"{user_name} спрашивает: {query}"}]
@@ -697,7 +697,7 @@ async def extract_tasks_from_message(text: str, author: str) -> list:
 Только JSON, без пояснений."""
 
         response = await get_client().messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -720,7 +720,7 @@ async def generate_morning_summary(tasks_today: list, tasks_overdue: list) -> st
                                   for t in tasks_overdue]) or "нет"
 
         response = await get_client().messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=500,
             messages=[{"role": "user", "content":
                 f"Составь короткое деловое утреннее сообщение для рабочей Telegram-группы.\n\n"
@@ -807,7 +807,7 @@ async def analyze_pdz_responses(results: dict) -> str:
 Только сводка, без вступления."""
 
         response = await get_client().messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=1500,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -847,7 +847,7 @@ async def analyze_call(transcript: str, manager: str, client_phone: str) -> str:
 Будь краток. Если что-то не упоминалось — не пиши этот пункт."""
 
         response = await get_client().messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=600,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -951,7 +951,7 @@ async def parse_task_draft(user_text: str, employees: list, now_msk) -> dict:
 Верни ТОЛЬКО JSON, без комментариев и без ```."""
 
     response = await get_client().messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}],
     )
