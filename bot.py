@@ -8143,12 +8143,14 @@ async def check_payment_planned_audit(order_href: str, bot, db):
                     delay = int(v)
                 break
 
-        moment_raw = order.get("moment") or ""
+        # База расчёта — План.дата отгрузки (deliveryPlannedMoment); фолбэк на moment.
+        # Решено 16.06.2026: отсрочка считается от факта отгрузки.
+        base_raw = order.get("deliveryPlannedMoment") or order.get("moment") or ""
         try:
-            moment_dt = datetime.strptime(moment_raw[:19], "%Y-%m-%d %H:%M:%S")
+            base_dt = datetime.strptime(base_raw[:19], "%Y-%m-%d %H:%M:%S")
         except Exception:
             return
-        expected_dt = moment_dt + timedelta(days=delay)
+        expected_dt = base_dt + timedelta(days=delay)
         expected_value = _autofill_fmt_ms_dt(expected_dt)
 
         if str(current_raw).strip() == expected_value.strip():

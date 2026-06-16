@@ -5071,13 +5071,16 @@ async def payment_planned_autofill_tick(
 
             delay = await _get_delay(agent_id_)
 
-            moment_raw = order.get("moment") or ""
+            # База расчёта — План.дата отгрузки (deliveryPlannedMoment); если не задана,
+            # фолбэк на дату создания заказа. Решено 16.06.2026 (Виктор): отсрочка
+            # считается от факта отгрузки, не от оформления.
+            base_raw = order.get("deliveryPlannedMoment") or order.get("moment") or ""
             try:
-                moment_dt = _dt.strptime(moment_raw[:19], "%Y-%m-%d %H:%M:%S")
+                base_dt = _dt.strptime(base_raw[:19], "%Y-%m-%d %H:%M:%S")
             except Exception:
-                logger.warning(f"autofill_tick: can't parse moment={moment_raw}")
+                logger.warning(f"autofill_tick: can't parse base date={base_raw}")
                 continue
-            expected_dt = moment_dt + timedelta(days=delay)
+            expected_dt = base_dt + timedelta(days=delay)
             expected_value = _autofill_fmt_ms_dt(expected_dt)
             expected_date = expected_dt.date()
             order_id_v = order.get("id")
