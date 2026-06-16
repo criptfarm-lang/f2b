@@ -159,16 +159,9 @@ def setup_scheduler(app: Application, db):
         id="op_new_share_snapshot_fri_08"
     )
 
-    # ─── Автоподстановка «Дата планируемой оплаты» (план 2026-05-20-автоподстановка) ──
-    # Cron каждые 10 мин. Сам job стартует только при PAYMENT_PLANNED_AUTOFILL_ENABLED=1.
-    # Активирован 2026-06-16 после ревизии 169 договоров (см. plan «Статус реализации»).
-    scheduler.add_job(
-        payment_planned_autofill_job,
-        IntervalTrigger(minutes=10, timezone=MSK),
-        args=[app, db],
-        id="payment_planned_autofill_10min",
-        misfire_grace_time=600, coalesce=True,
-    )
+    # Автоподстановка «Дата планируемой оплаты» вынесена в PTB JobQueue в bot.py
+    # (16.06.2026): AsyncIOScheduler пропускал tick 15:56 МСК даже при next_run_time
+    # в job-листинге — тот же паттерн, что с market_intel 28-29.05.
 
     # Каждые 4 ч — warm-up кэша отчёта ОП (TTL в БД 5 ч). Без прогрева первый
     # /op_report после простоя падал в 504 «upstream request timeout» от Amvera

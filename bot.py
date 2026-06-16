@@ -7230,6 +7230,20 @@ def main():
 
     app.job_queue.run_repeating(_market_intel_job_wrapper, interval=1800, first=30)
 
+    # Автоподстановка «Дата планируемой оплаты» — каждые 10 мин. Перенесена из
+    # AsyncIOScheduler 16.06.2026: tick 15:56 МСК пропустился без ошибок (тот же
+    # паттерн, что с market_intel 28-29.05). Сам job стартует только при
+    # PAYMENT_PLANNED_AUTOFILL_ENABLED=1 (env-gating внутри функции).
+    from scheduler import payment_planned_autofill_job as _payment_planned_autofill
+
+    async def _payment_planned_autofill_wrapper(context):
+        try:
+            await _payment_planned_autofill(app, db)
+        except Exception as e:
+            logger.error(f"payment_planned_autofill job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_payment_planned_autofill_wrapper, interval=600, first=60)
+
     # ────────────────────────────────────────────────────────────────────
     # Wazzup AI-классификатор: запросы клиентов по номенклатуре. Фаза 3
     # плана 2026-05-25. Раз в 15 мин в окне 09-19 МСК Пн-Пт. Сейчас только
