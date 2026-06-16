@@ -8162,8 +8162,16 @@ async def check_payment_planned_audit(order_href: str, bot, db):
         expected_dt = base_dt + timedelta(days=delay)
         expected_value = _autofill_fmt_ms_dt(expected_dt)
 
-        if str(current_raw).strip() == expected_value.strip():
-            return  # совпадает, нормально
+        # Сравниваем по дате, не по строке — иначе любой UPDATE заказа (позиции,
+        # комментарий, статус) на котором МС перепишет time-компонент даты с
+        # «20:00:00.000» на «14:43:00.000» поднимает ложный алерт. 16.06.2026
+        # поймали на заказе 02571 (Скляр→Дубинин редактировали позиции).
+        try:
+            current_dt_cmp = datetime.strptime(str(current_raw)[:19], "%Y-%m-%d %H:%M:%S")
+            if current_dt_cmp.date() == expected_dt.date():
+                return  # дата совпадает — нет повода алертить
+        except Exception:
+            pass
 
         # Кто менял
         changed_by = "unknown"
