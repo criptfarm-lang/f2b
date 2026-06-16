@@ -4285,10 +4285,13 @@ APPROVAL_STATE_OVER_LIMIT  = "462ee41b-b554-11f0-0a80-15a000036d2c"  # «ЗА Л
 APPROVAL_STATE_AGREED      = "005f3651-9a9a-11f0-0a80-03a900027474"  # «Согласован»
 
 # UUID кастомных атрибутов counterparty
-ATTR_CP_CREDIT_LIMIT = "fd6e0220-b553-11f0-0a80-114f000373a7"  # long, required (₽)
-ATTR_CP_SITE         = "9e4fb8db-b55f-11f0-0a80-196e000604d3"  # link, required
-ATTR_CP_MAX          = "1505236e-34d7-11f1-0a80-1489000ec449"  # string
-ATTR_CP_TELEGRAM     = "15052610-34d7-11f1-0a80-1489000ec44a"  # string
+ATTR_CP_CREDIT_LIMIT     = "fd6e0220-b553-11f0-0a80-114f000373a7"  # long, required (₽)
+ATTR_CP_SITE             = "9e4fb8db-b55f-11f0-0a80-196e000604d3"  # link, required
+ATTR_CP_MAX              = "1505236e-34d7-11f1-0a80-1489000ec449"  # string
+ATTR_CP_TELEGRAM         = "15052610-34d7-11f1-0a80-1489000ec44a"  # string
+ATTR_CP_CONTRACT_SIGNED  = "57ad9627-696b-11f1-0a80-1340000ba884"  # boolean
+ATTR_CP_CONTRACT_NUMBER  = "6ce27c40-633f-11f1-0a80-034000364b19"  # text
+ATTR_CP_DAYS_DELAY       = "6ce27a3b-633f-11f1-0a80-034000364b18"  # long
 
 # UUID кастомного атрибута customerorder (Дата плановой оплаты)
 ATTR_CO_PAYMENT_PLANNED = "327940fd-b54e-11f0-0a80-0066000d5578"  # time
@@ -4380,19 +4383,26 @@ async def load_counterparty_attrs(agent_id: str) -> dict:
             ) as resp:
                 if resp.status != 200:
                     logger.error(f"load_counterparty_attrs: {resp.status} для {agent_id}")
-                    return {"site": "", "max": "", "telegram": "", "credit_limit": 0, "_raw_attrs": []}
+                    return {"site": "", "max": "", "telegram": "", "credit_limit": 0,
+                            "contract_signed": False, "contract_number": "", "days_delay": 0,
+                            "_raw_attrs": []}
                 cp = await resp.json()
     except Exception as e:
         logger.error(f"load_counterparty_attrs: {e}")
-        return {"site": "", "max": "", "telegram": "", "credit_limit": 0, "_raw_attrs": []}
+        return {"site": "", "max": "", "telegram": "", "credit_limit": 0,
+                "contract_signed": False, "contract_number": "", "days_delay": 0,
+                "_raw_attrs": []}
 
     attrs = cp.get("attributes", []) or []
     return {
-        "site":         (_extract_attr_value(attrs, ATTR_CP_SITE) or "").strip(),
-        "max":          (_extract_attr_value(attrs, ATTR_CP_MAX) or "").strip(),
-        "telegram":     (_extract_attr_value(attrs, ATTR_CP_TELEGRAM) or "").strip(),
-        "credit_limit": _extract_attr_value(attrs, ATTR_CP_CREDIT_LIMIT) or 0,
-        "_raw_attrs":   attrs,
+        "site":            (_extract_attr_value(attrs, ATTR_CP_SITE) or "").strip(),
+        "max":             (_extract_attr_value(attrs, ATTR_CP_MAX) or "").strip(),
+        "telegram":        (_extract_attr_value(attrs, ATTR_CP_TELEGRAM) or "").strip(),
+        "credit_limit":    _extract_attr_value(attrs, ATTR_CP_CREDIT_LIMIT) or 0,
+        "contract_signed": bool(_extract_attr_value(attrs, ATTR_CP_CONTRACT_SIGNED)),
+        "contract_number": (_extract_attr_value(attrs, ATTR_CP_CONTRACT_NUMBER) or "").strip(),
+        "days_delay":      _extract_attr_value(attrs, ATTR_CP_DAYS_DELAY) or 0,
+        "_raw_attrs":      attrs,
     }
 
 
@@ -4424,6 +4434,26 @@ def compute_credit_color(cp_attrs: dict, current_debt: float, order_sum: float) 
         "current_debt": current_debt or 0.0,
         "order_sum": order_sum or 0.0,
         "effective_debt": effective_debt,
+    }
+
+
+def compute_contract_color(cp_attrs: dict) -> dict:
+    """
+    Блок «Договор» светофора. cp_attrs = результат load_counterparty_attrs().
+    🟢 если установлена галочка «Договор подписан»; 🔴 иначе.
+    № договора и дни отсрочки показываются справкой рядом, на цвет не влияют.
+    """
+    signed = bool(cp_attrs.get("contract_signed"))
+    number = (cp_attrs.get("contract_number") or "").strip()
+    try:
+        days = int(cp_attrs.get("days_delay") or 0)
+    except (TypeError, ValueError):
+        days = 0
+    return {
+        "color":  "green" if signed else "red",
+        "signed": signed,
+        "number": number,
+        "days":   days,
     }
 
 

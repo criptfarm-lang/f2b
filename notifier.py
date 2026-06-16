@@ -515,7 +515,7 @@ async def manual_send_fishki(order_id: str, db) -> tuple[bool, str]:
 # ============================================================================
 # Объединённый алерт «На согласовании» / «ЗА ЛИМИТОМ»
 # План: 2026-05-21-объединённый-алерт-на-согласование.md, Фаза 3.
-# Светофор: Лимит → Просрочка → ДДС → Цена → Дата оплаты → Сайт → Контакты.
+# Светофор: Лимит → Договор → Просрочка → ДДС → Сайт → Контакты → Цена.
 # ============================================================================
 
 MS_STATE_ON_APPROVAL = "005f34bf-9a9a-11f0-0a80-03a900027473"
@@ -550,19 +550,19 @@ def _fmt_money(amount: float) -> str:
 def _build_approval_text(
     order_name: str, order_sum: float, state_name: str,
     client_name: str, manager_name: str,
-    credit: dict, overdue: dict, cashflow: dict, price: dict,
+    credit: dict, contract: dict, overdue: dict, cashflow: dict, price: dict,
     site: dict, contacts: dict,
 ) -> str:
     """
     Шаблон алерта. Порядок строк (по убыванию важности):
-      Лимит → Просрочка → ДДС → Сайт → Контакты → Цена (внизу — длинный список).
-    all-green → одна сводная строка; иначе — 6 строк светофора.
+      Лимит → Договор → Просрочка → ДДС → Сайт → Контакты → Цена (внизу — длинный список).
+    all-green → одна сводная строка; иначе — 7 строк светофора.
     """
     from datetime import datetime, timezone, timedelta
     now_msk = datetime.now(timezone(timedelta(hours=3)))
     sent_at = now_msk.strftime("%H:%M")
 
-    colors = [credit["color"], overdue["color"], cashflow["color"],
+    colors = [credit["color"], contract["color"], overdue["color"], cashflow["color"],
               price["color"], site["color"], contacts["color"]]
     all_green = all(c == "green" for c in colors)
 
@@ -577,8 +577,8 @@ def _build_approval_text(
         if credit.get("limit", 0) > 0:
             limit_pct = int(credit["effective_debt"] / credit["limit"] * 100)
         body = (
-            f"\n🟢 Все 6 проверок ОК "
-            f"(лимит {limit_pct}% · ДДС {cashflow.get('n_days', 0)}д · "
+            f"\n🟢 Все 7 проверок ОК "
+            f"(лимит {limit_pct}% · договор · ДДС {cashflow.get('n_days', 0)}д · "
             f"долг {_fmt_money(credit.get('current_debt', 0))} _на {sent_at}_ · "
             f"сайт · контакты · цена)\n"
         )
@@ -605,7 +605,22 @@ def _build_approval_text(
             f"_(на {sent_at})_"
         )
 
-    # 2. Просрочка
+    # 2. Договор
+    # Цвет: 🟢 подписан / 🔴 не подписан. № договора и дни отсрочки — справка,
+    # на цвет не влияют (только подсказывают согласующему условия работы).
+    if contract["color"] == "green":
+        parts_c = ["подписан"]
+        if contract.get("number"):
+            parts_c.append(f"№ {contract['number']}")
+        if contract.get("days", 0) > 0:
+            parts_c.append(f"отсрочка {contract['days']} дн")
+        else:
+            parts_c.append("отсрочка не указана")
+        lines.append(f"🟢 *Договор:* " + " · ".join(parts_c))
+    else:
+        lines.append(f"🔴 *Договор:* не подписан")
+
+    # 3. Просрочка
     if overdue["color"] == "red":
         lines.append(
             f"🔴 *Просрочка:* {overdue.get('days', 0)} дн "
@@ -614,17 +629,17 @@ def _build_approval_text(
     else:
         lines.append(f"🟢 *Просрочка:* нет")
 
-    # 3. ДДС
+    # 4. ДДС
     explain = cashflow.get("explain", "")
     lines.append(f"{_icon(cashflow['color'])} *ДДС:* {explain}")
 
-    # 4. Сайт
+    # 5. Сайт
     if site["color"] == "green":
         lines.append(f"🟢 *Сайт:* {site['raw_value'][:60]}")
     else:
         lines.append(f"🔴 *Сайт:* {site.get('raw_value', '') or 'не заполнен'}")
 
-    # 5. Контакты
+    # 6. Контакты
     mx = contacts.get("max", "")
     tg = contacts.get("telegram", "")
     if contacts["color"] == "green":
@@ -637,7 +652,7 @@ def _build_approval_text(
     else:
         lines.append(f"🔴 *Контакты:* Max={mx or '—'} / TG={tg or '—'}")
 
-    # 6. Цена — внизу, длинный список не мешает читать остальные строки
+    # 7. Цена — внизу, длинный список не мешает читать остальные строки
     items = price.get("items", [])
     if items:
         n = len(items)
@@ -670,7 +685,8 @@ async def check_approval_needed(order_href: str, bot, db):
         from moysklad import (
             get_headers, MS_BASE,
             load_counterparty_attrs,
-            compute_credit_color, compute_overdue_color, compute_cashflow_color,
+            compute_credit_color, compute_contract_color,
+            compute_overdue_color, compute_cashflow_color,
             compute_price_color,
             compute_site_color, compute_contacts_color,
         )
@@ -745,12 +761,14 @@ async def check_approval_needed(order_href: str, bot, db):
         # отдаёт только просроченную часть, а для лимита нужна вся текущая дебиторка.
         current_debt = cashflow.get("current_debt", 0) or 0
         credit = compute_credit_color(cp_attrs, current_debt=current_debt, order_sum=order_sum)
+        contract = compute_contract_color(cp_attrs)
         site = compute_site_color(cp_attrs)
         contacts = compute_contacts_color(cp_attrs)
 
         # 5. Сборка текста + colors_json для confirmation flow
         colors_json = {
             "credit": credit["color"],
+            "contract": contract["color"],
             "overdue": overdue["color"],
             "cashflow": cashflow["color"],
             "price": price["color"],
@@ -760,8 +778,8 @@ async def check_approval_needed(order_href: str, bot, db):
         alert_text = _build_approval_text(
             order_name=order_name, order_sum=order_sum, state_name=state_name,
             client_name=agent_name, manager_name=manager_name,
-            credit=credit, overdue=overdue, cashflow=cashflow, price=price,
-            site=site, contacts=contacts,
+            credit=credit, contract=contract, overdue=overdue, cashflow=cashflow,
+            price=price, site=site, contacts=contacts,
         )
 
         # 6. Дедуп: sum_hash = округлённая сумма в ₽
