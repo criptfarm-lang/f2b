@@ -8053,9 +8053,18 @@ async def process_ms_webhook(data: dict, bot):
             # атомарный дедуп через pending_approval_alerts (UNIQUE order_id+sum_hash).
             # Заменил собой старые check_debtor_alert (в группу PRO) и self-standing
             # check_order_prices alert (в личку) — оба выпилены в Фазе 5.
+            # 16.06.2026: задержка 60 сек, чтобы webhook-autofill «Даты планируемой
+            # оплаты» успел отработать, и светофор уходил собственнику с уже
+            # заполненной датой. Дубли при CREATE+UPDATE гасит UNIQUE pending_approval_alerts.
             if action in ("UPDATE", "CREATE"):
                 from notifier import check_approval_needed
-                await check_approval_needed(order_href, bot, db)
+                async def _delayed_approval(href=order_href):
+                    try:
+                        await asyncio.sleep(60)
+                        await check_approval_needed(href, bot, db)
+                    except Exception as ex_app:
+                        logger.warning(f"delayed check_approval_needed({order_id}): {ex_app}")
+                asyncio.create_task(_delayed_approval())
 
             # Проверяем логистику — только при создании заказа
             if action == "CREATE":
