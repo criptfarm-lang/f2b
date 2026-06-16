@@ -563,8 +563,9 @@ def _build_approval_text(
     now_msk = datetime.now(timezone(timedelta(hours=3)))
     sent_at = now_msk.strftime("%H:%M")
 
+    payment_color = "green" if payment_planned_date else "red"
     colors = [credit["color"], contract["color"], overdue["color"], cashflow["color"],
-              price["color"], site["color"], contacts["color"]]
+              price["color"], site["color"], contacts["color"], payment_color]
     all_green = all(c == "green" for c in colors)
 
     header = (
@@ -578,10 +579,10 @@ def _build_approval_text(
         if credit.get("limit", 0) > 0:
             limit_pct = int(credit["effective_debt"] / credit["limit"] * 100)
         body = (
-            f"\n🟢 Все 7 проверок ОК "
+            f"\n🟢 Все 8 проверок ОК "
             f"(лимит {limit_pct}% · договор · ДДС {cashflow.get('n_days', 0)}д · "
             f"долг {_fmt_money(credit.get('current_debt', 0))} _на {sent_at}_ · "
-            f"сайт · контакты · цена)\n"
+            f"сайт · контакты · цена · оплата {payment_planned_date})\n"
         )
         return header + body
 
@@ -632,8 +633,11 @@ def _build_approval_text(
 
     # 3a. Дата планируемой оплаты — то, что бот проставил автоматом
     # из План.даты отгрузки + дней отсрочки (план 2026-05-20-автоподстановка).
+    # 🔴 если пустая — сигнал: контрагент без отсрочки или autofill не отработал.
     if payment_planned_date:
-        lines.append(f"⚪ *Оплата:* {payment_planned_date}")
+        lines.append(f"🟢 *Оплата:* {payment_planned_date}")
+    else:
+        lines.append(f"🔴 *Оплата:* не задана")
 
     # 4. ДДС
     explain = cashflow.get("explain", "")
