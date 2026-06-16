@@ -5765,6 +5765,40 @@ async def cmd_set_attestation(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(f"✅ Аттестация {label} для {mgr_name}: {value}%")
 
 
+async def cmd_attestation_cta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/attestation_cta on|off - открыть/закрыть окно одноразовой аттестации для всех 5 менеджеров ОП.
+
+    `on`: сжигает все предыдущие токены (status='expired') и выставляет флаг,
+    при следующем открытии дашборда менеджер получит свежий issued-токен и CTA.
+    `off`: только убирает флаг - CTA скрывается; уже выданные токены не трогаются."""
+    if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
+        return
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        await update.message.reply_text(
+            "Использование: /attestation_cta on|off\n"
+            "on  - открыть окно (новые токены всем 5 менеджерам, CTA появится на дашбордах)\n"
+            "off - закрыть окно (CTA скроется)"
+        )
+        return
+    mode = context.args[0].lower()
+    db._execute(
+        "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
+        ("attestation_cta_open", mode, mode),
+    )
+    if mode == "on":
+        db._execute(
+            "UPDATE manager_attestations SET status='expired' "
+            "WHERE status IN ('issued','opened','completed')"
+        )
+        await update.message.reply_text(
+            "✅ Окно аттестации открыто.\n"
+            "При следующем открытии дашборда у 5 менеджеров появится кнопка «Пройти аттестацию».\n"
+            "Напомни им: открыл - проходи сразу до конца, закрытие вкладки = использованная попытка."
+        )
+    else:
+        await update.message.reply_text("✅ Окно аттестации закрыто. CTA скрыта у всех.")
+
+
 def get_weekly_targets(mgr_name: str) -> dict:
     """Возвращает накопительные недельные цели менеджера из БД."""
     result = {}
@@ -6917,6 +6951,7 @@ def main():
     # Фаза 5: HTML-отчёт «Дебиторка» — ручной запуск регенерации (только собственник).
     app.add_handler(CommandHandler("pdz_html", cmd_pdz_html))
     app.add_handler(CommandHandler("set_attestation", cmd_set_attestation))
+    app.add_handler(CommandHandler("attestation_cta", cmd_attestation_cta))
     app.add_handler(CommandHandler("set_weekly", cmd_set_weekly))
     app.add_handler(CommandHandler("set_weekly_bulk", cmd_set_weekly_bulk))
     app.add_handler(CommandHandler("set_monthly", cmd_set_monthly))
