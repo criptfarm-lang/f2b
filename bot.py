@@ -8166,12 +8166,27 @@ async def check_payment_planned_audit(order_href: str, bot, db):
         # комментарий, статус) на котором МС перепишет time-компонент даты с
         # «20:00:00.000» на «14:43:00.000» поднимает ложный алерт. 16.06.2026
         # поймали на заказе 02571 (Скляр→Дубинин редактировали позиции).
+        current_date_cmp = None
         try:
             current_dt_cmp = datetime.strptime(str(current_raw)[:19], "%Y-%m-%d %H:%M:%S")
-            if current_dt_cmp.date() == expected_dt.date():
+            current_date_cmp = current_dt_cmp.date()
+            if current_date_cmp == expected_dt.date():
                 return  # дата совпадает — нет повода алертить
         except Exception:
             pass
+
+        # Дата отличается от expected, но если бот сам когда-либо ставил это
+        # значение — значит у контрагента позже изменилась отсрочка, реальной
+        # правки от менеджера не было. Не алертим (история есть в audit-логе).
+        # Поймали 16.06.2026 на ООО Печи: бот поставил 01.07 при отсрочке 14
+        # дн, потом отсрочка стала 21 дн, expected стал 08.07 — но менеджер
+        # дату не трогал.
+        if current_date_cmp is not None:
+            try:
+                if db.was_payment_planned_set_by_bot(order_id_v, current_date_cmp):
+                    return
+            except Exception as ex:
+                logger.warning(f"was_payment_planned_set_by_bot({order_id_v}): {ex}")
 
         # Кто менял
         changed_by = "unknown"

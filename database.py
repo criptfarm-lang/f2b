@@ -539,6 +539,23 @@ class Database:
             (order_id, limit),
         )
 
+    def was_payment_planned_set_by_bot(self, order_id: str, target_date) -> bool:
+        """True если бот сам когда-либо ставил target_date в качестве новой
+        «Даты планируемой оплаты» (cron_autofill / webhook_autofill).
+
+        Используется в check_payment_planned_audit для гашения ложных алертов
+        когда у контрагента позже изменилась отсрочка: дата осталась той,
+        что бот поставил при создании, никакой менеджер её не трогал.
+        """
+        row = self._fetchone(
+            """SELECT 1 FROM payment_planned_audit
+               WHERE order_id=%s AND new_date=%s
+                 AND source LIKE '%%autofill%%'
+               LIMIT 1""",
+            (order_id, target_date),
+        )
+        return bool(row)
+
     # ─── ПДЗ-автоматика: снимки и журнал обещаний (Фаза 2) ────────────────
     def save_pdz_snapshot(self, rows: List[Dict]) -> int:
         """Batch insert строк снимка состояния заказов.
