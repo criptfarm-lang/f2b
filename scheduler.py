@@ -161,19 +161,14 @@ def setup_scheduler(app: Application, db):
 
     # ─── Автоподстановка «Дата планируемой оплаты» (план 2026-05-20-автоподстановка) ──
     # Cron каждые 10 мин. Сам job стартует только при PAYMENT_PLANNED_AUTOFILL_ENABLED=1.
-    # Регистрация закомментирована до ревизии договоров с допсоглашениями
-    # (решение собственника 2026-06-08). После ревизии:
-    #   1) проставить «Дней отсрочки» по ключевым клиентам через UI МС
-    #   2) export PAYMENT_PLANNED_AUTOFILL_ENABLED=1 в Amvera env
-    #   3) раскомментить блок ниже
-    #   4) commit + push на Amvera
-    # scheduler.add_job(
-    #     payment_planned_autofill_job,
-    #     IntervalTrigger(minutes=10, timezone=MSK),
-    #     args=[app, db],
-    #     id="payment_planned_autofill_10min",
-    #     misfire_grace_time=600, coalesce=True,
-    # )
+    # Активирован 2026-06-16 после ревизии 169 договоров (см. plan «Статус реализации»).
+    scheduler.add_job(
+        payment_planned_autofill_job,
+        IntervalTrigger(minutes=10, timezone=MSK),
+        args=[app, db],
+        id="payment_planned_autofill_10min",
+        misfire_grace_time=600, coalesce=True,
+    )
 
     # Каждые 4 ч — warm-up кэша отчёта ОП (TTL в БД 5 ч). Без прогрева первый
     # /op_report после простоя падал в 504 «upstream request timeout» от Amvera
