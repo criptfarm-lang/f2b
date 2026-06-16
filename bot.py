@@ -8061,6 +8061,18 @@ async def process_ms_webhook(data: dict, bot):
             if action == "CREATE":
                 await check_logistics_alert(order_href, bot, group_chat_id)
 
+            # Реактивная автоподстановка «Даты планируемой оплаты» — сразу
+            # после сохранения заказа (16.06.2026). Cron в JobQueue остаётся
+            # safety-net на 10 мин против потерь webhook'а.
+            if action in ("UPDATE", "CREATE") and os.getenv("PAYMENT_PLANNED_AUTOFILL_ENABLED", "").strip().lower() in {"1","true","yes"}:
+                try:
+                    from moysklad import payment_planned_autofill_tick
+                    res_af = await payment_planned_autofill_tick(db, order_id=order_id)
+                    if res_af.get("patched", 0) > 0:
+                        logger.info(f"payment_planned_autofill webhook({order_id}): {res_af}")
+                except Exception as ex_af:
+                    logger.warning(f"payment_planned_autofill webhook({order_id}): {ex_af}")
+
             # Аудит «Дата планируемой оплаты» (план 2026-05-20-автоподстановка, Фаза 3).
             # Включается env-флагом PAYMENT_PLANNED_AUTOFILL_ENABLED. Слой 1 — self-write
             # маркер не алертит на собственный PATCH. Слой 2 — запись в audit. Слой 3 — TG.
