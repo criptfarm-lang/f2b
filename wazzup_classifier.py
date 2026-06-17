@@ -17,7 +17,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 from anthropic import AsyncAnthropic
 
@@ -76,6 +78,37 @@ FEWSHOT = [
     {"role": "user", "content": "Сообщение от клиента «Татьяна»: «Спасибо!»"},
     {"role": "assistant", "content": '{"is_nomenclature_request": false, "sku_or_description": null, "species_normalized": null, "urgency": "общий", "confidence": 0.99, "reason": "Благодарность, не запрос"}'},
 ]
+
+
+async def _resolve_amocrm_lead_id(chat_id: Optional[str], contact_name: Optional[str]) -> Optional[int]:
+    """Best-effort резолв chat_id (Wazzup) → lead_id (amoCRM).
+
+    WhatsApp chat_id формата '<phone>@c.us' → достаём phone → find_contact_by_phone →
+    активный lead через get_leads_by_contact.
+    Telegram chat_id числовой — телефона из него не достать, fallback по contact_name.
+    При любой ошибке возвращаем None — фронт даст пользователю кнопку «🔍 Найти в amoCRM».
+    """
+    if not chat_id:
+        return None
+    try:
+        from amocrm import find_contact_by_phone, find_contact_by_name, get_leads_by_contact
+
+        contact = None
+        m = re.match(r"^(\d{10,13})@", chat_id)
+        if m:
+            contact = await find_contact_by_phone(m.group(1))
+        if not contact and contact_name:
+            contacts = await find_contact_by_name(contact_name)
+            contact = contacts[0] if contacts else None
+        if not contact:
+            return None
+        leads = await get_leads_by_contact(int(contact["id"]))
+        if not leads:
+            return None
+        return int(leads[0]["id"])
+    except Exception as e:
+        logger.info(f"wazzup_classifier: lead_id resolve failed chat_id={chat_id}: {e}")
+        return None
 
 
 def _get_client() -> AsyncAnthropic:
@@ -301,6 +334,14 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
             stats["processed"] += 1
             if is_req:
                 stats["requests_found"] += 1
+                # Резолв amoCRM lead_id по chat_id для прямой ссылки в дашборде
+                # закупщика (правка 2026-06-17). chat_id Wazzup для WhatsApp =
+                # «<phone>@c.us», вытаскиваем телефон → find_contact_by_phone →
+                # первый активный lead. Best-effort: если резолв не удался,
+                # пишем NULL (фронт даёт fallback-кнопку «🔍 Найти в amoCRM»).
+                amocrm_lead_id = await _resolve_amocrm_lead_id(
+                    m.get("chat_id"), m.get("contact_name")
+                )
                 # Записываем в sink procurement.assortment_requests
                 # (см. план 2026-05-25, раздел Sink). При подтверждении
                 # собственником через TG-кнопку → конвертация в
@@ -310,8 +351,8 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
                         """INSERT INTO procurement.assortment_requests
                            (wazzup_message_id, chat_id, contact_name, manager_name,
                             raw_text, species_normalized, sku_or_description,
-                            urgency, llm_confidence, sent_at)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            urgency, llm_confidence, sent_at, amocrm_lead_id)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                            ON CONFLICT (wazzup_message_id) DO NOTHING""",
                         (
                             m["message_id"], m["chat_id"],
@@ -321,6 +362,7 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
                             result.get("urgency"),
                             result.get("confidence"),
                             m.get("sent_at"),
+                            amocrm_lead_id,
                         ),
                     )
                 except Exception as e:
