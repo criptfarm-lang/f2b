@@ -111,6 +111,30 @@ async def _resolve_amocrm_lead_id(chat_id: Optional[str], contact_name: Optional
         return None
 
 
+async def _resolve_amocrm_responsible(lead_id: Optional[int]) -> tuple[Optional[int], Optional[str]]:
+    """По lead_id берём responsible_user_id из сделки + имя через /users/<id>.
+
+    Возвращает (user_id, name). При неудаче — (None, None); дашборд закупщика
+    тогда показывает имя из Wazzup-сообщения (parser_manager_name) как fallback.
+    """
+    if not lead_id:
+        return None, None
+    try:
+        from amocrm import get_lead, amo_get
+        lead = await get_lead(int(lead_id))
+        if not lead:
+            return None, None
+        user_id = lead.get("responsible_user_id")
+        if not user_id:
+            return None, None
+        user = await amo_get(f"/users/{int(user_id)}")
+        name = (user or {}).get("name") if isinstance(user, dict) else None
+        return int(user_id), name
+    except Exception as e:
+        logger.info(f"wazzup_classifier: responsible resolve failed lead_id={lead_id}: {e}")
+        return None, None
+
+
 def _get_client() -> AsyncAnthropic:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
@@ -334,14 +358,14 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
             stats["processed"] += 1
             if is_req:
                 stats["requests_found"] += 1
-                # Резолв amoCRM lead_id по chat_id для прямой ссылки в дашборде
-                # закупщика (правка 2026-06-17). chat_id Wazzup для WhatsApp =
-                # «<phone>@c.us», вытаскиваем телефон → find_contact_by_phone →
-                # первый активный lead. Best-effort: если резолв не удался,
-                # пишем NULL (фронт даёт fallback-кнопку «🔍 Найти в amoCRM»).
+                # Резолв amoCRM lead_id + responsible (правки 2026-06-17).
+                # chat_id Wazzup → contact → lead → responsible user.
+                # Best-effort: каждый шаг может вернуть None, фронт покажет
+                # fallback-кнопку «🔍 Найти в amoCRM» и имя из Wazzup как backup.
                 amocrm_lead_id = await _resolve_amocrm_lead_id(
                     m.get("chat_id"), m.get("contact_name")
                 )
+                resp_user_id, resp_name = await _resolve_amocrm_responsible(amocrm_lead_id)
                 # Записываем в sink procurement.assortment_requests
                 # (см. план 2026-05-25, раздел Sink). При подтверждении
                 # собственником через TG-кнопку → конвертация в
@@ -351,8 +375,9 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
                         """INSERT INTO procurement.assortment_requests
                            (wazzup_message_id, chat_id, contact_name, manager_name,
                             raw_text, species_normalized, sku_or_description,
-                            urgency, llm_confidence, sent_at, amocrm_lead_id)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            urgency, llm_confidence, sent_at, amocrm_lead_id,
+                            amocrm_responsible_user_id, amocrm_responsible_name)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                            ON CONFLICT (wazzup_message_id) DO NOTHING""",
                         (
                             m["message_id"], m["chat_id"],
@@ -363,6 +388,7 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
                             result.get("confidence"),
                             m.get("sent_at"),
                             amocrm_lead_id,
+                            resp_user_id, resp_name,
                         ),
                     )
                 except Exception as e:
