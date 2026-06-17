@@ -5779,14 +5779,15 @@ async def cmd_attestation_cta(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     `on`: сжигает все предыдущие токены (status='expired') и выставляет флаг,
     при следующем открытии дашборда менеджер получит свежий issued-токен и CTA.
-    `off`: только убирает флаг - CTA скрывается; уже выданные токены не трогаются."""
+    `off`: убирает флаг + сжигает issued/opened токены (completed не трогаем — там
+    результат уже зафиксирован). Сохранённая менеджером ссылка перестаёт работать."""
     if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
         return
     if not context.args or context.args[0].lower() not in ("on", "off"):
         await update.message.reply_text(
             "Использование: /attestation_cta on|off\n"
             "on  - открыть окно (новые токены всем 5 менеджерам, CTA появится на дашбордах)\n"
-            "off - закрыть окно (CTA скроется)"
+            "off - закрыть окно (CTA скроется + issued/opened токены сжигаются)"
         )
         return
     mode = context.args[0].lower()
@@ -5805,7 +5806,13 @@ async def cmd_attestation_cta(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Напомни им: открыл - проходи сразу до конца, закрытие вкладки = использованная попытка."
         )
     else:
-        await update.message.reply_text("✅ Окно аттестации закрыто. CTA скрыта у всех.")
+        # Сжигаем issued/opened, чтобы сохранённая менеджером ссылка перестала работать.
+        # completed не трогаем - результат уже зафиксирован.
+        db._execute(
+            "UPDATE manager_attestations SET status='expired' "
+            "WHERE status IN ('issued','opened')"
+        )
+        await update.message.reply_text("✅ Окно аттестации закрыто. CTA скрыта у всех + неиспользованные токены сожжены.")
 
 
 def get_weekly_targets(mgr_name: str) -> dict:
