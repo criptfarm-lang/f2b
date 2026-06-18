@@ -397,8 +397,8 @@ async def _send_fishki_mailing(order: dict, db) -> tuple[bool, str]:
             )
             logger.warning(f"notifier: short-link failed ({_e}), используем длинную")
         msg += (
-            f"\n\n🎣 Ваш бонус за заказ!\n"
-            f"Играть: {quiz_url}"
+            f"\n\nКое-что приготовили для вас в благодарность за заказ:\n"
+            f"{quiz_url}"
         )
         logger.info(f"notifier: квиз добавлен для {agent_name}")
 
