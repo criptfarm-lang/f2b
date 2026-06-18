@@ -363,6 +363,21 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
                     m.get("chat_id"), m.get("contact_name")
                 )
                 resp_user_id, resp_name = await _resolve_amocrm_responsible(amocrm_lead_id)
+
+                # manager_name: webhook для входящих не присылает crmUserId,
+                # поэтому m["manager_name"] почти всегда пуст. Fallback на
+                # wazzup_contact_map.manager (поле, которое собственник
+                # проставляет вручную при идентификации новых чатов).
+                effective_manager = m.get("manager_name") or ""
+                if not effective_manager and m.get("chat_id"):
+                    cm = db._fetchone(
+                        "SELECT manager FROM wazzup_contact_map "
+                        "WHERE chat_id = %s AND manager IS NOT NULL AND manager <> '' "
+                        "LIMIT 1",
+                        (m["chat_id"],),
+                    )
+                    if cm and cm.get("manager"):
+                        effective_manager = cm["manager"]
                 # Записываем в sink procurement.assortment_requests
                 # (см. план 2026-05-25, раздел Sink). При подтверждении
                 # собственником через TG-кнопку → конвертация в
@@ -378,7 +393,7 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
                            ON CONFLICT (wazzup_message_id) DO NOTHING""",
                         (
                             m["message_id"], m["chat_id"],
-                            m.get("contact_name"), m.get("manager_name"),
+                            m.get("contact_name"), effective_manager,
                             m["text"], result.get("species_normalized"),
                             result.get("sku_or_description"),
                             result.get("urgency"),
