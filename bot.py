@@ -7008,21 +7008,20 @@ def main():
                 q.message.text + "\n\n👎 Помечено как ложный — пойдёт в re-train.",
                 parse_mode=None,
             )
-        elif action == "ok":
+        elif action in ("ok", "req"):
+            # «✅ В работу» = подтверждение классификатора + создание заявки
+            # закупщику в одном клике. `req` — legacy-алиас для старых сообщений
+            # в чате (до 2026-06-18 кнопка была отдельной). См. план
+            # plans/2026-06-18-wzc-merge-ok-req.md.
+            #
+            # Идемпотентность: assortment_requests.status='converted' блокирует
+            # повторное создание; на повторный клик показываем номер существующей.
             db._execute(
                 """UPDATE wazzup_classifications
                    SET feedback = 'confirmed'
                    WHERE message_id = %s""",
                 (message_id,),
             )
-            await q.edit_message_text(
-                q.message.text + "\n\n✅ В работу.",
-                parse_mode=None,
-            )
-        elif action == "req":
-            # Конвертация sink → procurement.requests для дашборда закупщика.
-            # Идемпотентность: ON CONFLICT по wazzup_message_id обходится через
-            # status='converted' в assortment_requests.
             try:
                 ar = db._fetchone(
                     """SELECT id, chat_id, contact_name, raw_text, species_normalized,
@@ -7079,11 +7078,11 @@ def main():
                     ),
                 )
                 await q.edit_message_text(
-                    q.message.text + f"\n\n📋 Заявка #{rid} создана. Закупщик увидит в дашборде.",
+                    q.message.text + f"\n\n✅ Заявка #{rid} создана, закупщик увидит в дашборде.",
                     parse_mode=None,
                 )
             except Exception as e:
-                logger.error(f"handle_wzc_callback req: {e}", exc_info=True)
+                logger.error(f"handle_wzc_callback ok: {e}", exc_info=True)
                 await q.edit_message_text(
                     q.message.text + f"\n\n⚠️ Ошибка создания заявки: {type(e).__name__}",
                     parse_mode=None,

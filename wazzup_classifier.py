@@ -260,9 +260,6 @@ async def _send_request_alert(
     mid = msg["message_id"][:40]
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📋 → Заявка закупщику", callback_data=f"wzc:req:{mid}"),
-        ],
-        [
             InlineKeyboardButton("✅ В работу", callback_data=f"wzc:ok:{mid}"),
             InlineKeyboardButton("👎 Ложный", callback_data=f"wzc:fp:{mid}"),
         ],
