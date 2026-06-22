@@ -4458,21 +4458,132 @@ def compute_contract_color(cp_attrs: dict) -> dict:
 
 
 async def compute_overdue_color(agent_id: str) -> dict:
+    """Блок 2 светофора. Просрочка > PDZ_GRACE_DAYS → красный.
+
+    Использует тот же пайплайн, что дайджест/HTML/owner_pending
+    (`pdz_overdue_for_manager`):
+      1. balance из /report/counterparty/{id}; balance≥0 → green.
+      2. Тянем все customerorder агента, классифицируем _pdz_classify
+         (учитывает PDZ_GRACE_DAYS=3 и ppm_new).
+      3. real_overdue = max(0, |balance| − sum(unpaid в-сроке+in_grace)).
+         Хвосты по payedSum, перекрытые приходами, скрываются.
+      4. Cashflow-страховка: если за 45 дней приходы покрыли opening
+         (residual ≤ 0) — формальные просрочки иллюзорны → green.
+      5. _pdz_lifo_cover на overdue: real_overdue падает на свежие просрочки.
+      6. max_days, debt = real_overdue. >3 дн → red.
+
+    Старая get_counterparty_debt с LIFO-по-payedSum ненадёжна: при добавлении
+    свежего заказа «остаток» баланса случайно ложится на разный старый заказ,
+    результат скачет (см. кейс ЧЕСТНАЯ РЫБА 22.06.2026, было «95 дн / 535 ₽»).
     """
-    Блок 2 светофора. Просрочка >3 дн → красный.
-    Обёртка над существующей get_counterparty_debt: переиспользуем её алгоритм
-    (vычитание текущего долга из свежих заказов с datepayplanned).
-    Возвращает {color, days, debt}.
-    """
-    OVERDUE_THRESHOLD_DAYS = 3
-    info = await get_counterparty_debt(agent_id)
-    debt = info.get("debt", 0) if info else 0
-    days = info.get("overdue_days", 0) if info else 0
-    if debt > 0 and days > OVERDUE_THRESHOLD_DAYS:
-        color = "red"
-    else:
-        color = "green"
-    return {"color": color, "days": days, "debt": debt}
+    import aiohttp
+    from datetime import datetime
+    from zoneinfo import ZoneInfo as _ZI
+
+    OVERDUE_THRESHOLD_DAYS = PDZ_GRACE_DAYS
+    today = datetime.now(_ZI("Europe/Moscow")).date()
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            cp_href = f"{MS_BASE}/entity/counterparty/{agent_id}"
+
+            async with session.get(
+                f"{MS_BASE}/report/counterparty/{agent_id}",
+                headers=get_headers(),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"compute_overdue_color: report/counterparty {resp.status}")
+                    return {"color": "yellow", "days": 0, "debt": 0}
+                rdata = await resp.json()
+
+            balance = (rdata.get("balance", 0) or 0) / 100
+            if balance >= 0:
+                return {"color": "green", "days": 0, "debt": 0}
+            debt_today = abs(balance)
+
+            all_orders: list = []
+            offset = 0
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/customerorder",
+                    headers=get_headers(),
+                    params={
+                        "filter": f"agent={cp_href}",
+                        "expand": "attributes",
+                        "limit": 100,
+                        "offset": offset,
+                        "order": "moment,desc",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"compute_overdue_color: customerorder {resp.status}")
+                        break
+                    data = await resp.json()
+                rows = data.get("rows", []) or []
+                all_orders.extend(rows)
+                if len(rows) < 100:
+                    break
+                offset += 100
+    except Exception as e:
+        logger.error(f"compute_overdue_color({agent_id[:8]}): {e}", exc_info=True)
+        return {"color": "yellow", "days": 0, "debt": 0}
+
+    in_сroк_total = 0.0
+    overdue_orders: list = []
+    for o in all_orders:
+        ppm_initial_raw = None
+        ppm_new_raw = None
+        for attr in o.get("attributes", []):
+            nm = attr.get("name")
+            if nm == "Дата планируемой оплаты":
+                ppm_initial_raw = attr.get("value")
+            elif nm == "НОВАЯ дата оплаты":
+                ppm_new_raw = attr.get("value")
+        ppm_initial = _parse_ms_date(ppm_initial_raw) if ppm_initial_raw else None
+        if ppm_initial is None:
+            continue
+        ppm_new = _parse_ms_date(ppm_new_raw) if ppm_new_raw else None
+        total = (o.get("sum", 0) or 0) / 100
+        payed = (o.get("payedSum", 0) or 0) / 100
+        unpaid = round(total - payed, 2)
+        if unpaid <= 0:
+            continue
+        status, effective, days_overdue = _pdz_classify(ppm_initial, ppm_new, today)
+        if status in ("in_срок", "in_grace"):
+            in_сroк_total = round(in_сroк_total + unpaid, 2)
+        elif status == "overdue":
+            overdue_orders.append({
+                "effective_due_date": effective,
+                "unpaid_sum": unpaid,
+                "days_overdue": days_overdue,
+            })
+
+    real_overdue = max(0.0, round(debt_today - in_сroк_total, 2))
+    if real_overdue < 0.01 or not overdue_orders:
+        return {"color": "green", "days": 0, "debt": 0}
+
+    # Cashflow-страховка 45 дней: если приходы за окно покрыли opening,
+    # формальная просрочка иллюзорна (бухгалтерия криво разнесла оплаты).
+    try:
+        residual = await fetch_coverage_residual_for_window(
+            agent_id, debt_today=debt_today
+        )
+    except Exception as e:
+        logger.warning(f"compute_overdue_color: coverage_residual_45d failed: {e}")
+        residual = None
+    if residual is not None and residual <= 0:
+        return {"color": "green", "days": 0, "debt": 0}
+
+    covered = _pdz_lifo_cover(overdue_orders, real_overdue)
+    if not covered:
+        return {"color": "green", "days": 0, "debt": 0}
+
+    max_days = max(c["days_overdue"] for c in covered)
+    debt = real_overdue
+    color = "red" if (debt > 0 and max_days > OVERDUE_THRESHOLD_DAYS) else "green"
+    return {"color": color, "days": max_days, "debt": debt}
 
 
 # Кеш текущего сальдо контрагента (используется внутри compute_cashflow_color
