@@ -62,7 +62,7 @@ SYSTEM_PROMPT = """Ты — классификатор B2B-переписок к
 {
   "is_nomenclature_request": bool,
   "sku_or_description": "что просят, краткое описание" | null,
-  "species_normalized": "одно из: лосось/форель/треска/судак/окунь/.../другое" | null,
+  "species_normalized": "одно из: лосось/форель/треска/судак/окунь/.../прочее (используй species_enum БД: НИКОГДА не возвращай 'другое'; для редких видов рыбы — ближайшее из enum либо 'прочее' + оригинал в sku_or_description)" | null,
   "urgency": "срочно" | "уточнение" | "общий",
   "confidence": float от 0 до 1,
   "reason": "1-фраза почему"
