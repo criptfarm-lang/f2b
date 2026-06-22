@@ -7089,6 +7089,44 @@ def main():
                 )
 
     app.add_handler(CallbackQueryHandler(handle_wzc_callback, pattern="^wzc:"))
+
+    # ─── DashaMail weekly: «Запланировать» из cron-уведомления ──────────────
+    async def handle_dashamail_callback(update, context):
+        q = update.callback_query
+        await q.answer()
+        if not q.from_user or q.from_user.id != OWNER_CHAT_ID:
+            await q.answer("⛔ Только для собственника.", show_alert=True)
+            return
+        try:
+            _, action, cid_str = q.data.split(":", 2)
+            cid = int(cid_str)
+        except Exception:
+            await q.edit_message_text(q.message.text + "\n\n⚠️ Неверный callback_data")
+            return
+        if action != "schedule":
+            return
+        from dashamail_scheduler import schedule_campaign
+        await q.edit_message_text(q.message.text + f"\n\n⏳ Планирую CID={cid}…")
+        try:
+            res = await asyncio.to_thread(schedule_campaign, cid)
+        except Exception as e:
+            logger.error(f"dashamail schedule_campaign exception: {e}", exc_info=True)
+            await q.edit_message_text(q.message.text + f"\n\n❌ Исключение: {type(e).__name__}: {e}")
+            return
+        if res.get("ok"):
+            await q.edit_message_text(
+                q.message.text + f"\n\n✅ Запланировано на {res['scheduled_at']}"
+            )
+        else:
+            await q.edit_message_text(
+                q.message.text + (
+                    f"\n\n⚠️ Не удалось запланировать: {res.get('err')}"
+                    f"\nДобей вручную: {res.get('wizard_url')}"
+                )
+            )
+
+    app.add_handler(CallbackQueryHandler(handle_dashamail_callback, pattern="^dashamail:"))
+
     # ─── Алармы amoCRM ───────────────────────────────────────────────────────
     app.add_handler(CommandHandler("myamoid", lambda u, c: cmd_myamoid(u, c, db)))
     app.add_handler(CommandHandler("amo_setup", cmd_amo_setup))
