@@ -65,7 +65,11 @@ PRICE_KINDS = [
 
 
 def keychain(s: str, a: str | None = None) -> str:
-    """Сначала env (Amvera прод), затем macOS Keychain (локальная отладка)."""
+    """Сначала env (Amvera прод), затем macOS Keychain (локальная отладка).
+
+    Amvera запрещает `!` и кавычки в значениях env. Префикс `b64:` распаковывается.
+    """
+    import base64
     env_map = {
         "f2b-dashamail-api-key": "DASHAMAIL_API_KEY",
         "f2b-dashamail": "DASHAMAIL_PASSWORD",
@@ -73,6 +77,8 @@ def keychain(s: str, a: str | None = None) -> str:
     env_name = env_map.get(s, s.upper().replace("-", "_"))
     v = os.environ.get(env_name)
     if v:
+        if v.startswith("b64:"):
+            return base64.b64decode(v[4:]).decode("utf-8")
         return v
     cmd = ["security", "find-generic-password", "-s", s, "-w"]
     if a:

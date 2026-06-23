@@ -45,9 +45,14 @@ def schedule_campaign(cid: int) -> dict[str, Any]:
     if sync_playwright is None:
         return {"ok": False, "err": "playwright not installed", "wizard_url": f"https://lk.dashamail.ru/wizard.php?id={cid}"}
 
-    password = os.environ.get("DASHAMAIL_PASSWORD")
-    if not password:
+    raw = os.environ.get("DASHAMAIL_PASSWORD")
+    if not raw:
         return {"ok": False, "err": "DASHAMAIL_PASSWORD env not set"}
+    if raw.startswith("b64:"):
+        import base64
+        password = base64.b64decode(raw[4:]).decode("utf-8")
+    else:
+        password = raw
 
     target = _next_monday_11msk()
     # формат для UI: "DD.MM.YYYY HH:MM"
