@@ -159,6 +159,19 @@ def setup_scheduler(app: Application, db):
         id="op_new_share_snapshot_fri_08"
     )
 
+    # ПН 09:00 МСК — еженедельная прайс-рассылка DashaMail.
+    # План: 2026-06-22-email-pipeline-fix, Фаза C.2. Скрипт через DashaMail
+    # API копирует последнюю SENT прайс-кампанию, патчит PDF/href/дату/subject,
+    # шлёт Виктору TG-сообщение с inline-кнопкой «Запланировать» которая идёт
+    # в handle_dashamail_callback (bot.py).
+    scheduler.add_job(
+        dashamail_weekly_send_job,
+        CronTrigger(day_of_week='mon', hour=9, minute=0, timezone=MSK),
+        args=[app, db],
+        id="dashamail_weekly_send_mon_09",
+        misfire_grace_time=3600, coalesce=True,
+    )
+
     # Автоподстановка «Дата планируемой оплаты» вынесена в PTB JobQueue в bot.py
     # (16.06.2026): AsyncIOScheduler пропускал tick 15:56 МСК даже при next_run_time
     # в job-листинге — тот же паттерн, что с market_intel 28-29.05.
@@ -1235,3 +1248,38 @@ async def payment_planned_autofill_job(app: Application, db) -> dict:
             logger.warning(f"payment_planned_autofill_job: TG send failed: {e}")
 
     return {"status": "ok", **res}
+
+
+async def dashamail_weekly_send_job(app: Application, db) -> None:
+    """ПН 09:00 МСК — еженедельная прайс-рассылка DashaMail.
+
+    Запускает scripts/dashamail_weekly_send.py как subprocess (там Playwright
+    sync — не миксуется с asyncio loop). Скрипт сам шлёт уведомление Виктору
+    в TG через прямой Bot API. План: 2026-06-22-email-pipeline-fix, Фаза C.
+    """
+    import sys
+    from pathlib import Path
+
+    logger.info(f"dashamail_weekly_send стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}")
+    script = Path(__file__).resolve().parent / "scripts" / "dashamail_weekly_send.py"
+    if not script.is_file():
+        logger.error(f"dashamail_weekly_send_job: script not found: {script}")
+        return
+    # Передаём env с TG_BOT_TOKEN (бот хранит токен как TELEGRAM_BOT_TOKEN).
+    env = dict(os.environ)
+    if "TELEGRAM_BOT_TOKEN" in env and "TG_BOT_TOKEN" not in env:
+        env["TG_BOT_TOKEN"] = env["TELEGRAM_BOT_TOKEN"]
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(script),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=900)
+    except asyncio.TimeoutError:
+        proc.kill()
+        logger.error("dashamail_weekly_send_job: timeout 900s — script killed")
+        return
+    out = stdout.decode("utf-8", errors="replace")
+    logger.info(f"dashamail_weekly_send_job rc={proc.returncode}\n{out[-3000:]}")

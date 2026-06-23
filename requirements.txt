@@ -9,3 +9,5 @@ matplotlib
 pdfplumber==0.11.4
 openpyxl==3.1.5
 xlrd==2.0.1
+playwright==1.49.0
+requests
