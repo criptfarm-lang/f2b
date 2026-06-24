@@ -2078,7 +2078,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = clean_query(text)
 
     # ── Всё через Claude — он сам разбирается что нужно ──
-    await message.reply_chat_action("typing")
+    # typing — косметика; сетевой дёрг к api.telegram.org не должен ронять весь handler
+    # (24.06.2026 — ConnectTimeout здесь убил ответ на «Эф, когда доставка в Красногорск»)
+    try:
+        await message.reply_chat_action("typing")
+    except Exception as e:
+        logger.warning(f"reply_chat_action(typing) failed (non-fatal): {e}")
     context_data = db.get_context_summary()
     chat_history = db.format_history(chat_id, limit=40)
     memories = db.format_memories()
