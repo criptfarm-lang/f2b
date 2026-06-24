@@ -111,6 +111,44 @@ async def _resolve_amocrm_lead_id(chat_id: Optional[str], contact_name: Optional
         return None
 
 
+# Закупщики F2B — если responsible сделки или автор исходящих в Wazzup-чате
+# совпадает, входящее сообщение трактуем как ответ поставщика, не клиента,
+# и не заводим заявку. Список ведём вручную; матч по подстроке lower().
+PROCUREMENT_RESPONSIBLE_KEYWORDS = ("павленко", "белякова", "кристина", "александра белякова")
+
+# Маркеры исходящих сообщений от закупщиков (когда у чата нет lead в amoCRM
+# и resp_name недоступен — спасают подписи Кристины/Александры).
+PROCUREMENT_OUTBOUND_MARKERS = ("отдел снабжения", "отдела снабжения", "снабжения f2b", "снабжения ао фиш ту бизнес")
+
+
+def _is_procurement_chat(db, chat_id: Optional[str], resp_name: Optional[str]) -> bool:
+    """True, если чат принадлежит закупке (входящие = ответы поставщика).
+
+    Сигналы:
+    1. amoCRM responsible сделки — закупщик (Павленко/Белякова).
+    2. В чате есть исходящее с подписью «отдел снабжения» за последние 30 дней.
+    """
+    if resp_name:
+        rn = resp_name.lower()
+        if any(kw in rn for kw in PROCUREMENT_RESPONSIBLE_KEYWORDS):
+            return True
+    if not chat_id:
+        return False
+    try:
+        row = db._fetchone(
+            "SELECT 1 FROM wazzup_messages "
+            "WHERE chat_id = %s AND is_outbound = TRUE "
+            "  AND sent_at > NOW() - INTERVAL '30 days' "
+            "  AND (" + " OR ".join(["lower(text) LIKE %s"] * len(PROCUREMENT_OUTBOUND_MARKERS)) + ") "
+            "LIMIT 1",
+            (chat_id, *[f"%{m}%" for m in PROCUREMENT_OUTBOUND_MARKERS]),
+        )
+        return bool(row)
+    except Exception as e:
+        logger.info(f"wazzup_classifier: procurement chat check failed chat_id={chat_id}: {e}")
+        return False
+
+
 async def _resolve_amocrm_responsible(lead_id: Optional[int]) -> tuple[Optional[int], Optional[str]]:
     """По lead_id берём responsible_user_id из сделки + имя через /users/<id>.
 
@@ -363,6 +401,17 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
                     m.get("chat_id"), m.get("contact_name")
                 )
                 resp_user_id, resp_name = await _resolve_amocrm_responsible(amocrm_lead_id)
+
+                # Если ответственный по сделке — закупщик F2B (или в чате есть
+                # исходящие с подписью «отдел снабжения»), это переписка с
+                # поставщиком: входящее = его прайс/ответ, а не запрос клиента.
+                # Не заводим заявку и не алертим.
+                if _is_procurement_chat(db, m.get("chat_id"), resp_name):
+                    logger.info(
+                        f"wazzup_classifier: skipped procurement-owned chat "
+                        f"chat_id={m.get('chat_id')} resp={resp_name!r}"
+                    )
+                    return
 
                 # manager_name: webhook для входящих не присылает crmUserId,
                 # поэтому m["manager_name"] почти всегда пуст. Fallback на
