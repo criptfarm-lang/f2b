@@ -2348,11 +2348,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lat, lon = coords
         dist_from_moscow = _haversine(lat, lon, 55.7558, 37.6173)
-        if dist_from_moscow < 35:
-            await message.reply_text("🚛 Адрес в московской агломерации — доставляем в любой рабочий день.", parse_mode="Markdown")
-            return
 
-        # Ищем ближайший город
+        # Ищем ближайший маршрутный город (из расписания)
         nearest_city = None
         nearest_dist = float("inf")
         for city, (clat, clon) in DELIVERY_CITIES_COORDS.items():
@@ -2361,25 +2358,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 nearest_dist = dist
                 nearest_city = city
 
-        if nearest_dist > 25 or not nearest_city:
+        def _days_for(city_name):
+            for _kw, _info in _CITY_INDEX.items():
+                if _info["canonical"] == city_name:
+                    return [WEEKDAYS_RU[d] for d in sorted(_info["days"])]
+            return []
+
+        # 1) Очень близко (≤15 км) к маршрутному городу → это его маршрут
+        if nearest_city and nearest_dist <= 15:
+            days = _days_for(nearest_city)
+            days_str = ", ".join(days) if days else "уточни у руководителя"
             await message.reply_text(
-                f"😕 Адрес *{address}* не входит ни в одно наше направление МО.\n"
-                f"Уточни у руководителя.",
+                f"🚛 *{address.split(',')[0].strip()}* — направление *{nearest_city}* ({round(nearest_dist)} км)\n"
+                f"📅 Дни доставки: *{days_str}*",
                 parse_mode="Markdown"
             )
             return
 
-        # Нашли ближайший город — берём его дни
-        days = []
-        for keyword, info in _CITY_INDEX.items():
-            if info["canonical"] == nearest_city:
-                days = [WEEKDAYS_RU[d] for d in sorted(info["days"])]
-                break
+        # 2) В пределах московской агломерации (<35 км от центра) → любой рабочий день
+        if dist_from_moscow < 35:
+            await message.reply_text("🚛 Адрес в московской агломерации — доставляем в любой рабочий день.", parse_mode="Markdown")
+            return
 
-        days_str = ", ".join(days) if days else "уточни у руководителя"
+        # 3) Дальний матч до 25 км → выдаём с пометкой «близко к»
+        if nearest_city and nearest_dist <= 25:
+            days = _days_for(nearest_city)
+            days_str = ", ".join(days) if days else "уточни у руководителя"
+            await message.reply_text(
+                f"🚛 Адрес близко к *{nearest_city}* ({round(nearest_dist)} км)\n"
+                f"📅 Дни доставки: *{days_str}*",
+                parse_mode="Markdown"
+            )
+            return
+
+        # 4) Не входит ни в одно направление МО
         await message.reply_text(
-            f"🚛 Адрес близко к *{nearest_city}* ({round(nearest_dist)} км)\n"
-            f"📅 Дни доставки: *{days_str}*",
+            f"😕 Адрес *{address}* не входит ни в одно наше направление МО.\n"
+            f"Уточни у руководителя.",
             parse_mode="Markdown"
         )
 

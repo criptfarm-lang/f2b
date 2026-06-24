@@ -60,28 +60,51 @@ def _haversine(lat1, lon1, lat2, lon2) -> float:
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
 
+async def _geocode_once(address: str) -> tuple:
+    """Один проход геокодера. Возвращает (lat, lon) или None."""
+    import urllib.parse
+    params = urllib.parse.urlencode({
+        "apikey": YANDEX_GEOCODER_KEY,
+        "geocode": address,
+        "format": "json",
+        "results": 1,
+        "ll": "37.6173,55.7558",
+        "spn": "2.0,2.0",
+    })
+    url = f"https://geocode-maps.yandex.ru/1.x/?{params}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+    members = data.get("response", {}).get("GeoObjectCollection", {}).get("featureMember", [])
+    if not members:
+        return None
+    pos = members[0]["GeoObject"]["Point"]["pos"]
+    lon, lat = map(float, pos.split())
+    return lat, lon
+
+
 async def geocode_address(address: str) -> tuple:
-    """Геокодирует адрес через Яндекс. Возвращает (lat, lon) или None."""
+    """Геокодирует адрес через Яндекс. Возвращает (lat, lon) или None.
+
+    На голые названия городов МО («Дедовск», «Руза») Яндекс часто возвращает
+    пустой featureMember. Если первый проход пустой и в адресе нет уточнения
+    (область/город/Россия) — повторяем с «, Московская область».
+    """
     try:
-        import urllib.parse
-        params = urllib.parse.urlencode({
-            "apikey": YANDEX_GEOCODER_KEY,
-            "geocode": address,
-            "format": "json",
-            "results": 1,
-            "ll": "37.6173,55.7558",
-            "spn": "2.0,2.0",
-        })
-        url = f"https://geocode-maps.yandex.ru/1.x/?{params}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-        pos = (data["response"]["GeoObjectCollection"]
-               ["featureMember"][0]["GeoObject"]["Point"]["pos"])
-        lon, lat = map(float, pos.split())
-        return lat, lon
+        coords = await _geocode_once(address)
+        if coords:
+            return coords
+        addr_lower = address.lower()
+        if not any(x in addr_lower for x in ["москва", "московская", "область", "обл.", "moscow", "россия"]):
+            retry_query = f"{address}, Московская область"
+            logger.info(f"geocode_address: пустой ответ по '{address}', retry с '{retry_query}'")
+            coords = await _geocode_once(retry_query)
+            if coords:
+                return coords
+        logger.info(f"geocode_address: ничего не нашли для '{address}'")
+        return None
     except Exception as e:
         logger.warning(f"geocode_address error: {e}")
         return None
