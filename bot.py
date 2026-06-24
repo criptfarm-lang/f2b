@@ -2304,7 +2304,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("❌ Укажи адрес или город.")
             return
         await message.reply_chat_action("typing")
-        from moysklad import check_delivery_schedule, DELIVERY_CITIES_COORDS, _CITY_INDEX, WEEKDAYS_RU, geocode_address, _haversine
+        from moysklad import check_delivery_schedule, DELIVERY_CITIES_COORDS, _CITY_INDEX, WEEKDAYS_RU, geocode_address, _haversine, MOSCOW_AGGLOMERATION_KEYWORDS
 
         # Текстовый поиск по городу
         address_lower = address.lower()
@@ -2329,6 +2329,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "москва" in address_lower or "moscow" in address_lower:
             await message.reply_text("🚛 *Москва* — доставляем в любой рабочий день.", parse_mode="Markdown")
             return
+
+        # Ближняя агломерация (Красногорск, Реутов, Балашиха и т.п.) — до геокодера,
+        # т.к. Яндекс по голому названию города часто отдаёт пустой результат
+        for kw, canonical in MOSCOW_AGGLOMERATION_KEYWORDS.items():
+            if kw in address_lower:
+                await message.reply_text(
+                    f"🚛 *{canonical}* — московская агломерация, доставляем в любой рабочий день.",
+                    parse_mode="Markdown"
+                )
+                return
 
         # Геокодируем
         coords = await geocode_address(address)
