@@ -124,9 +124,13 @@ PROCUREMENT_OUTBOUND_MARKERS = ("отдел снабжения", "отдела �
 def _is_procurement_chat(db, chat_id: Optional[str], resp_name: Optional[str]) -> bool:
     """True, если чат принадлежит закупке (входящие = ответы поставщика).
 
-    Сигналы:
+    Сигналы (любой достаточен):
     1. amoCRM responsible сделки — закупщик (Павленко/Белякова).
-    2. В чате есть исходящее с подписью «отдел снабжения» за последние 30 дней.
+    2. Ручная разметка чата в wazzup_contact_map (источник правды собственника):
+       role 'игнор'/'закупщик', company_name '__ignore__' или тег «поставщик».
+       Самый надёжный сигнал — для Telegram-чатов amoCRM-резолв по имени
+       нестабилен (дубли контактов), а тут разметка курируется руками.
+    3. В чате есть исходящее с подписью «отдел снабжения» за последние 30 дней.
     """
     if resp_name:
         rn = resp_name.lower()
@@ -134,6 +138,20 @@ def _is_procurement_chat(db, chat_id: Optional[str], resp_name: Optional[str]) -
             return True
     if not chat_id:
         return False
+    try:
+        row = db._fetchone(
+            "SELECT 1 FROM wazzup_contact_map "
+            "WHERE chat_id = %s AND ("
+            "  lower(coalesce(role, '')) IN ('игнор', 'закупщик') "
+            "  OR company_name = '__ignore__' "
+            "  OR lower(coalesce(tags, '')) LIKE %s) "
+            "LIMIT 1",
+            (chat_id, "%поставщ%"),
+        )
+        if row:
+            return True
+    except Exception as e:
+        logger.info(f"wazzup_classifier: contact_map check failed chat_id={chat_id}: {e}")
     try:
         row = db._fetchone(
             "SELECT 1 FROM wazzup_messages "
