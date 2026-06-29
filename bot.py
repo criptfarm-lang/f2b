@@ -5469,6 +5469,58 @@ async def _build_report_data() -> dict:
             "Ирина Дьяченко":   {"shipments": 4,   "revenue": 500_000,    "clients": 2,  "new_clients": 1, "attracted": 12_500},
             "Денис Коликов":    {"shipments": 15,  "revenue": 1_000_000,  "clients": 12, "new_clients": 5, "attracted": 50_000},
         },
+        # 2026-06 — из БД-оверрайдов (revenue/shipments/clients), new/attracted перенесены с мая
+        "2026-06": {
+            "Инесса Скляр":     {"shipments": 170, "revenue": 18_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
+            "Карина Баласанян": {"shipments": 170, "revenue": 6_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
+            "Елена Мерзлякова": {"shipments": 55,  "revenue": 5_000_000,  "clients": 20, "new_clients": 5, "attracted": 300_000},
+            "Ирина Дьяченко":   {"shipments": 10,  "revenue": 1_000_000,  "clients": 5,  "new_clients": 1, "attracted": 12_500},
+            "Денис Коликов":    {"shipments": 30,  "revenue": 2_500_000,  "clients": 15, "new_clients": 5, "attracted": 50_000},
+        },
+        # 2026-07..12 — собственник продиктовал ТОЛЬКО выручку (сессия 2026-06-29).
+        # Прочие метрики несены флэтом с июня (shipments/clients) и мая (new/attracted).
+        "2026-07": {
+            "Инесса Скляр":     {"shipments": 170, "revenue": 19_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
+            "Карина Баласанян": {"shipments": 170, "revenue": 5_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
+            "Елена Мерзлякова": {"shipments": 55,  "revenue": 5_000_000,  "clients": 20, "new_clients": 5, "attracted": 300_000},
+            "Ирина Дьяченко":   {"shipments": 10,  "revenue": 1_500_000,  "clients": 5,  "new_clients": 1, "attracted": 12_500},
+            "Денис Коликов":    {"shipments": 30,  "revenue": 4_800_000,  "clients": 15, "new_clients": 5, "attracted": 50_000},
+        },
+        "2026-08": {
+            "Инесса Скляр":     {"shipments": 170, "revenue": 20_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
+            "Карина Баласанян": {"shipments": 170, "revenue": 5_500_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
+            "Елена Мерзлякова": {"shipments": 55,  "revenue": 6_000_000,  "clients": 20, "new_clients": 5, "attracted": 300_000},
+            "Ирина Дьяченко":   {"shipments": 10,  "revenue": 2_700_000,  "clients": 5,  "new_clients": 1, "attracted": 12_500},
+            "Денис Коликов":    {"shipments": 30,  "revenue": 7_000_000,  "clients": 15, "new_clients": 5, "attracted": 50_000},
+        },
+        "2026-09": {
+            "Инесса Скляр":     {"shipments": 170, "revenue": 21_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
+            "Карина Баласанян": {"shipments": 170, "revenue": 6_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
+            "Елена Мерзлякова": {"shipments": 55,  "revenue": 6_700_000,  "clients": 20, "new_clients": 5, "attracted": 300_000},
+            "Ирина Дьяченко":   {"shipments": 10,  "revenue": 3_500_000,  "clients": 5,  "new_clients": 1, "attracted": 12_500},
+            "Денис Коликов":    {"shipments": 30,  "revenue": 10_000_000, "clients": 15, "new_clients": 5, "attracted": 50_000},
+        },
+        "2026-10": {
+            "Инесса Скляр":     {"shipments": 170, "revenue": 22_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
+            "Карина Баласанян": {"shipments": 170, "revenue": 6_500_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
+            "Елена Мерзлякова": {"shipments": 55,  "revenue": 8_000_000,  "clients": 20, "new_clients": 5, "attracted": 300_000},
+            "Ирина Дьяченко":   {"shipments": 10,  "revenue": 4_500_000,  "clients": 5,  "new_clients": 1, "attracted": 12_500},
+            "Денис Коликов":    {"shipments": 30,  "revenue": 11_000_000, "clients": 15, "new_clients": 5, "attracted": 50_000},
+        },
+        "2026-11": {
+            "Инесса Скляр":     {"shipments": 170, "revenue": 23_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
+            "Карина Баласанян": {"shipments": 170, "revenue": 7_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
+            "Елена Мерзлякова": {"shipments": 55,  "revenue": 10_000_000, "clients": 20, "new_clients": 5, "attracted": 300_000},
+            "Ирина Дьяченко":   {"shipments": 10,  "revenue": 5_500_000,  "clients": 5,  "new_clients": 1, "attracted": 12_500},
+            "Денис Коликов":    {"shipments": 30,  "revenue": 12_000_000, "clients": 15, "new_clients": 5, "attracted": 50_000},
+        },
+        "2026-12": {
+            "Инесса Скляр":     {"shipments": 170, "revenue": 24_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
+            "Карина Баласанян": {"shipments": 170, "revenue": 7_500_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
+            "Елена Мерзлякова": {"shipments": 55,  "revenue": 12_000_000, "clients": 20, "new_clients": 5, "attracted": 300_000},
+            "Ирина Дьяченко":   {"shipments": 10,  "revenue": 6_500_000,  "clients": 5,  "new_clients": 1, "attracted": 12_500},
+            "Денис Коликов":    {"shipments": 30,  "revenue": 13_000_000, "clients": 15, "new_clients": 5, "attracted": 50_000},
+        },
     }
     current_month_key = today.strftime("%Y-%m")
     if current_month_key in MONTHLY_PLANS:
