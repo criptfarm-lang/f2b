@@ -214,7 +214,18 @@ brand: бренд / производитель продукта (не магаз
 
 confidence: 0.00-1.00. < 0.50 если основные поля (species + processing) не извлекаются.
 
-Возвращай СТРОГО JSON со всеми полями.
+Возвращай СТРОГО ОДИН JSON-объект со всеми полями. НИКОГДА не возвращай
+JSON-массив. Если в заявке несколько клиентов или несколько объёмов одного и
+того же товара — ОБЪЕДИНИ в один объект: сложи объёмы в volume_kg и перечисли
+клиентов через запятую в client_hint.
+
+Пример несколько клиентов: «Кальмар командорский чищенный 830 ₽, 100 кг для
+ЗДРАСТЕ, 40 кг для Чайна Ньюс» →
+{{"species": "кальмар", "subspecies": "командорский", "brand": null,
+ "region": null, "weight_class": null, "processing": null, "state": null,
+ "product_form": "сырьё", "package": null, "volume_kg": 140,
+ "target_price_rub_kg": 830, "target_date": null,
+ "client_hint": "ЗДРАСТЕ, Чайна Ньюс", "confidence": 0.92}}
 
 Пример рыба: «Лосось ПБГ 5-6 охл 200 кг к четвергу, клиенту по 720 ₽» →
 {{"species": "лосось", "subspecies": null, "brand": null, "region": null,
@@ -264,6 +275,80 @@ def _validate_enum(v: Optional[str], allowed: set) -> Optional[str]:
     return v if v in allowed else None
 
 
+def _merge_request_objs(objs: list) -> Optional[dict]:
+    """Несколько клиентов/объёмов одного товара → один объект.
+
+    Haiku изредка отдаёт JSON-массив (по объекту на клиента), хотя в промпте
+    просим один. Сливаем: объёмы суммируем, client_hint объединяем, остальные
+    поля берём из первого непустого.
+    """
+    objs = [o for o in objs if isinstance(o, dict)]
+    if not objs:
+        return None
+    if len(objs) == 1:
+        return objs[0]
+    merged = dict(objs[0])
+    total = 0.0
+    has_vol = False
+    hints = []
+    for o in objs:
+        v = o.get("volume_kg")
+        if v is not None:
+            try:
+                total += float(v)
+                has_vol = True
+            except (TypeError, ValueError):
+                pass
+        h = o.get("client_hint")
+        if h and h not in hints:
+            hints.append(str(h))
+    for o in objs[1:]:
+        for k, val in o.items():
+            if merged.get(k) in (None, "") and val not in (None, ""):
+                merged[k] = val
+    merged["volume_kg"] = total if has_vol else None
+    merged["client_hint"] = ", ".join(hints) if hints else None
+    return merged
+
+
+def _extract_json_obj(raw: str) -> Optional[dict]:
+    """Достаёт dict из ответа LLM. Терпим к ```json-ограде и к массиву объектов."""
+    s = raw.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+    # Прямой разбор (объект или массив)
+    for candidate in (s, None):
+        if candidate is None:
+            break
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            break
+        if isinstance(obj, list):
+            return _merge_request_objs(obj)
+        if isinstance(obj, dict):
+            return obj
+    # Фолбэк: массив [...] целиком, затем одиночный объект {...}
+    arr = re.search(r"\[.*\]", s, re.DOTALL)
+    if arr:
+        try:
+            obj = json.loads(arr.group(0))
+            if isinstance(obj, list):
+                return _merge_request_objs(obj)
+        except json.JSONDecodeError:
+            pass
+    one = re.search(r"\{.*?\}", s, re.DOTALL)
+    if one:
+        try:
+            obj = json.loads(one.group(0))
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 async def parse_request_text(text: str, today: Optional[date] = None) -> ParsedRequest:
     """Дёргает Claude Haiku 4.5 + валидирует ENUM."""
     from anthropic import AsyncAnthropic
@@ -288,17 +373,8 @@ async def parse_request_text(text: str, today: Optional[date] = None) -> ParsedR
         messages=[{"role": "user", "content": text.strip()}],
     )
     raw = msg.content[0].text.strip()
-    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not json_match:
-        return ParsedRequest(
-            species=None, subspecies=None, brand=None, region=None, weight_class=None,
-            processing=None, state=None, product_form=None, package=None,
-            volume_kg=None, target_price_rub_kg=None, target_date=None, client_hint=None,
-            confidence=0.0, raw_text=text,
-        )
-    try:
-        data = json.loads(json_match.group(0))
-    except json.JSONDecodeError:
+    data = _extract_json_obj(raw)
+    if data is None:
         return ParsedRequest(
             species=None, subspecies=None, brand=None, region=None, weight_class=None,
             processing=None, state=None, product_form=None, package=None,
