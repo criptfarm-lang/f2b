@@ -5480,11 +5480,11 @@ async def _build_report_data() -> dict:
         # 2026-07..12 — собственник продиктовал ТОЛЬКО выручку (сессия 2026-06-29).
         # Прочие метрики несены флэтом с июня (shipments/clients) и мая (new/attracted).
         "2026-07": {
-            "Инесса Скляр":     {"shipments": 170, "revenue": 19_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
-            "Карина Баласанян": {"shipments": 170, "revenue": 5_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
-            "Елена Мерзлякова": {"shipments": 55,  "revenue": 5_000_000,  "clients": 20, "new_clients": 5, "attracted": 300_000},
-            "Ирина Дьяченко":   {"shipments": 10,  "revenue": 1_500_000,  "clients": 5,  "new_clients": 1, "attracted": 12_500},
-            "Денис Коликов":    {"shipments": 30,  "revenue": 4_800_000,  "clients": 15, "new_clients": 5, "attracted": 50_000},
+            "Инесса Скляр":     {"shipments": 170, "revenue": 19_000_000, "clients": 26, "new_clients": 5, "attracted": 1_000_000},
+            "Карина Баласанян": {"shipments": 170, "revenue": 5_000_000,  "clients": 50, "new_clients": 5, "attracted": 1_200_000},
+            "Елена Мерзлякова": {"shipments": 55,  "revenue": 5_000_000,  "clients": 20, "new_clients": 5, "attracted": 200_000},
+            "Ирина Дьяченко":   {"shipments": 10,  "revenue": 1_500_000,  "clients": 10, "new_clients": 1, "attracted": 20_000},
+            "Денис Коликов":    {"shipments": 30,  "revenue": 4_800_000,  "clients": 20, "new_clients": 5, "attracted": 80_000},
         },
         "2026-08": {
             "Инесса Скляр":     {"shipments": 170, "revenue": 20_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
