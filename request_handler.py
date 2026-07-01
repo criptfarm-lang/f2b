@@ -214,39 +214,50 @@ brand: бренд / производитель продукта (не магаз
 
 confidence: 0.00-1.00. < 0.50 если основные поля (species + processing) не извлекаются.
 
-Возвращай СТРОГО ОДИН JSON-объект со всеми полями. НИКОГДА не возвращай
-JSON-массив. Если в заявке несколько клиентов или несколько объёмов одного и
-того же товара — ОБЪЕДИНИ в один объект: сложи объёмы в volume_kg и перечисли
-клиентов через запятую в client_hint.
+Возвращай JSON-МАССИВ объектов — ПО ОДНОМУ объекту на КАЖДЫЙ отдельный товар
+в заявке. Даже если товар один — верни массив из одного объекта. Никаких
+комментариев, никакого markdown — только массив.
 
-Пример несколько клиентов: «Кальмар командорский чищенный 830 ₽, 100 кг для
-ЗДРАСТЕ, 40 кг для Чайна Ньюс» →
-{{"species": "кальмар", "subspecies": "командорский", "brand": null,
+Правило разбиения:
+- РАЗНЫЕ товары (отличаются видом, разделкой, навеской, упаковкой ИЛИ ценой) —
+  это РАЗНЫЕ объекты массива. Пример: «филе грудки … по 360 ₽» и «филе бедра …
+  по 370 ₽» — два разных объекта, НЕ объединять.
+- ОДИН И ТОТ ЖЕ товар для НЕСКОЛЬКИХ клиентов или несколькими партиями — ОДИН
+  объект: сложи объёмы в volume_kg и перечисли клиентов через запятую в
+  client_hint.
+
+Пример один товар — несколько клиентов: «Кальмар командорский чищенный 830 ₽,
+100 кг для ЗДРАСТЕ, 40 кг для Чайна Ньюс» →
+[{{"species": "кальмар", "subspecies": "командорский", "brand": null,
  "region": null, "weight_class": null, "processing": null, "state": null,
  "product_form": "сырьё", "package": null, "volume_kg": 140,
  "target_price_rub_kg": 830, "target_date": null,
- "client_hint": "ЗДРАСТЕ, Чайна Ньюс", "confidence": 0.92}}
+ "client_hint": "ЗДРАСТЕ, Чайна Ньюс", "confidence": 0.92}}]
+
+Пример несколько РАЗНЫХ товаров (курица): «филе грудки б/к подложка 2000 кг
+ООО ТК по 360 ₽; филе бедра б/к монолит 500 кг ООО ТК по 370 ₽» →
+[{{"species": "птица", "subspecies": "курица", "brand": null, "region": null,
+ "weight_class": null, "processing": null, "state": null, "product_form": "сырьё",
+ "package": "подложка", "volume_kg": 2000, "target_price_rub_kg": 360,
+ "target_date": null, "client_hint": "ООО ТК", "confidence": 0.9}},
+ {{"species": "птица", "subspecies": "курица", "brand": null, "region": null,
+ "weight_class": null, "processing": null, "state": null, "product_form": "сырьё",
+ "package": "монолит", "volume_kg": 500, "target_price_rub_kg": 370,
+ "target_date": null, "client_hint": "ООО ТК", "confidence": 0.9}}]
 
 Пример рыба: «Лосось ПБГ 5-6 охл 200 кг к четвергу, клиенту по 720 ₽» →
-{{"species": "лосось", "subspecies": null, "brand": null, "region": null,
+[{{"species": "лосось", "subspecies": null, "brand": null, "region": null,
  "weight_class": "5-6", "processing": "ПБГ", "state": "охл",
  "product_form": "сырьё", "package": null, "volume_kg": 200,
  "target_price_rub_kg": 720, "target_date": "2026-05-28",
- "client_hint": null, "confidence": 0.95}}
+ "client_hint": null, "confidence": 0.95}}]
 
 Пример сопутка: «майонез Печагин 100 кг 240 ₽» →
-{{"species": "майонез", "subspecies": null, "brand": "Печагин", "region": null,
+[{{"species": "майонез", "subspecies": null, "brand": "Печагин", "region": null,
  "weight_class": null, "processing": null, "state": null,
  "product_form": null, "package": null, "volume_kg": 100,
  "target_price_rub_kg": 240, "target_date": null,
- "client_hint": null, "confidence": 0.95}}
-
-Пример сопутка с упаковкой: «майонез Mr.Ricco в канистрах 5 кг» →
-{{"species": "майонез", "subspecies": null, "brand": "Mr.Ricco", "region": null,
- "weight_class": null, "processing": null, "state": null,
- "product_form": null, "package": "канистра 5 кг", "volume_kg": null,
- "target_price_rub_kg": null, "target_date": null,
- "client_hint": null, "confidence": 0.90}}
+ "client_hint": null, "confidence": 0.95}}]
 """
 
 
@@ -311,31 +322,60 @@ def _merge_request_objs(objs: list) -> Optional[dict]:
     return merged
 
 
-def _extract_json_obj(raw: str) -> Optional[dict]:
-    """Достаёт dict из ответа LLM. Терпим к ```json-ограде и к массиву объектов."""
+def _group_request_objs(objs: list) -> list:
+    """Массив объектов LLM → список заявок.
+
+    Разные товары (разный вид/разделка/навеска/упаковка/цена) — разные заявки.
+    Один и тот же товар для нескольких клиентов — сливаем в одну (объёмы +,
+    клиенты через запятую). Порядок первого появления сохраняем.
+    """
+    def _key(o: dict) -> tuple:
+        def n(v):
+            return v.strip().lower() if isinstance(v, str) else v
+        return (
+            n(o.get("species")), n(o.get("subspecies")), n(o.get("brand")),
+            n(o.get("region")), n(o.get("weight_class")), n(o.get("processing")),
+            n(o.get("state")), n(o.get("product_form")), n(o.get("package")),
+            o.get("target_price_rub_kg"), o.get("target_date"),
+        )
+
+    order: list = []
+    buckets: dict = {}
+    for o in objs:
+        if not isinstance(o, dict):
+            continue
+        k = _key(o)
+        if k not in buckets:
+            buckets[k] = []
+            order.append(k)
+        buckets[k].append(o)
+    merged = [_merge_request_objs(buckets[k]) for k in order]
+    return [m for m in merged if m]
+
+
+def _extract_json_objs(raw: str) -> list:
+    """Достаёт список dict-заявок из ответа LLM. Терпим к ```json-ограде,
+    к массиву и к одиночному объекту (легаси-формат)."""
     s = raw.strip()
     if s.startswith("```"):
         s = re.sub(r"^```(?:json)?\s*", "", s)
         s = re.sub(r"\s*```$", "", s).strip()
-    # Прямой разбор (объект или массив)
-    for candidate in (s, None):
-        if candidate is None:
-            break
-        try:
-            obj = json.loads(candidate)
-        except json.JSONDecodeError:
-            break
+    # Прямой разбор (массив или объект)
+    try:
+        obj = json.loads(s)
         if isinstance(obj, list):
-            return _merge_request_objs(obj)
+            return _group_request_objs(obj)
         if isinstance(obj, dict):
-            return obj
+            return [obj]
+    except json.JSONDecodeError:
+        pass
     # Фолбэк: массив [...] целиком, затем одиночный объект {...}
     arr = re.search(r"\[.*\]", s, re.DOTALL)
     if arr:
         try:
             obj = json.loads(arr.group(0))
             if isinstance(obj, list):
-                return _merge_request_objs(obj)
+                return _group_request_objs(obj)
         except json.JSONDecodeError:
             pass
     one = re.search(r"\{.*?\}", s, re.DOTALL)
@@ -343,45 +383,14 @@ def _extract_json_obj(raw: str) -> Optional[dict]:
         try:
             obj = json.loads(one.group(0))
             if isinstance(obj, dict):
-                return obj
+                return [obj]
         except json.JSONDecodeError:
             pass
-    return None
+    return []
 
 
-async def parse_request_text(text: str, today: Optional[date] = None) -> ParsedRequest:
-    """Дёргает Claude Haiku 4.5 + валидирует ENUM."""
-    from anthropic import AsyncAnthropic
-
-    today = today or date.today()
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY не задан")
-    client = AsyncAnthropic(api_key=api_key)
-
-    dows = ["понедельник", "вторник", "среда", "четверг",
-            "пятница", "суббота", "воскресенье"]
-    system = SYSTEM_PROMPT.format(
-        today=today.isoformat(), today_dow=dows[today.weekday()]
-    )
-
-    msg = await client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=512,
-        system=[{"type": "text", "text": system,
-                 "cache_control": {"type": "ephemeral"}}],
-        messages=[{"role": "user", "content": text.strip()}],
-    )
-    raw = msg.content[0].text.strip()
-    data = _extract_json_obj(raw)
-    if data is None:
-        return ParsedRequest(
-            species=None, subspecies=None, brand=None, region=None, weight_class=None,
-            processing=None, state=None, product_form=None, package=None,
-            volume_kg=None, target_price_rub_kg=None, target_date=None, client_hint=None,
-            confidence=0.0, raw_text=text,
-        )
-
+def _build_parsed(data: dict, text: str, today: date) -> ParsedRequest:
+    """Один dict от LLM → ParsedRequest с ENUM-валидацией."""
     # species: enum-валидацию НЕ применяем — для HoReCa-сопутки LLM может вернуть
     # «майонез», «кетчуп», «зелёный лук» и др., которых в enum нет. Принимаем как есть.
     species_raw = data.get("species")
@@ -426,6 +435,43 @@ async def parse_request_text(text: str, today: Optional[date] = None) -> ParsedR
         confidence=float(data.get("confidence") or 0.0),
         raw_text=text,
     )
+
+
+async def parse_request_text(text: str,
+                             today: Optional[date] = None) -> list[ParsedRequest]:
+    """Дёргает Claude Haiku 4.5 + валидирует ENUM. Возвращает СПИСОК заявок —
+    по одной на каждый отдельный товар (разные товары не сливаются)."""
+    from anthropic import AsyncAnthropic
+
+    today = today or date.today()
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY не задан")
+    client = AsyncAnthropic(api_key=api_key)
+
+    dows = ["понедельник", "вторник", "среда", "четверг",
+            "пятница", "суббота", "воскресенье"]
+    system = SYSTEM_PROMPT.format(
+        today=today.isoformat(), today_dow=dows[today.weekday()]
+    )
+
+    msg = await client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=1024,
+        system=[{"type": "text", "text": system,
+                 "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": text.strip()}],
+    )
+    raw = msg.content[0].text.strip()
+    dicts = _extract_json_objs(raw)
+    if not dicts:
+        return [ParsedRequest(
+            species=None, subspecies=None, brand=None, region=None, weight_class=None,
+            processing=None, state=None, product_form=None, package=None,
+            volume_kg=None, target_price_rub_kg=None, target_date=None, client_hint=None,
+            confidence=0.0, raw_text=text,
+        )]
+    return [_build_parsed(d, text, today) for d in dicts]
 
 
 # ─── DB ────────────────────────────────────────────────────────────────────
@@ -530,7 +576,8 @@ FISH_SPECIES = SPECIES_ENUM - {
 
 def format_preview(parsed: ParsedRequest, assigned_to: Optional[str],
                    missing_req: list[str] = None,
-                   missing_rec: list[str] = None) -> str:
+                   missing_rec: list[str] = None,
+                   title: str = "📋 *Понял заявку так:*") -> str:
     missing_req = missing_req or []
     missing_rec = missing_rec or []
 
@@ -571,7 +618,7 @@ def format_preview(parsed: ParsedRequest, assigned_to: Optional[str],
 
     # Динамическая сборка — показываем только заполненные поля.
     # Для сопутки скрываем «рыбные» поля (разделка/состояние/регион/подвид).
-    lines = ["📋 *Понял заявку так:*", ""]
+    lines = [title, ""]
     lines.append(_fmt_field("Вид", parsed.species))
     if parsed.brand:
         lines.append(_fmt_field("Бренд", parsed.brand))
@@ -602,6 +649,27 @@ def format_preview(parsed: ParsedRequest, assigned_to: Optional[str],
         + f"\n\n🛒 Закупщик: *{assignee_disp}*"
         + confidence_warn
     )
+
+
+def format_multi_preview(drafts: list) -> tuple[str, bool]:
+    """drafts: список (ParsedRequest, assigned_to). Возвращает (текст превью,
+    any_missing_required). При одной позиции — обычное превью, при нескольких —
+    заголовок «N позиций» + блок на каждую."""
+    if len(drafts) == 1:
+        parsed, assigned_to = drafts[0]
+        mr, mrec = validate_request(parsed)
+        return format_preview(parsed, assigned_to, mr, mrec), bool(mr)
+
+    parts = [f"📋 *В заявке {len(drafts)} позиции — заведу каждую отдельно:*"]
+    any_missing = False
+    for i, (parsed, assigned_to) in enumerate(drafts, 1):
+        mr, mrec = validate_request(parsed)
+        any_missing = any_missing or bool(mr)
+        parts.append(
+            format_preview(parsed, assigned_to, mr, mrec,
+                           title=f"*Позиция {i}:*")
+        )
+    return "\n\n".join(parts), any_missing
 
 
 def format_assignee_notification(request_id: int, parsed: ParsedRequest,

@@ -253,15 +253,13 @@ async def handle_request_callback(update: Update, context: ContextTypes.DEFAULT_
     user = query.from_user
     action = query.data
 
-    draft = _draft_requests.get(user.id)
-    if draft is None:
+    drafts = _draft_requests.get(user.id)
+    if not drafts:
         await query.message.reply_text(
             "⚠️ Черновик заявки не найден (возможно, бот перезапускался). "
             "Создай заявку заново через меню.",
         )
         return
-
-    parsed, assigned_to = draft
 
     if action == "req_cancel":
         _draft_requests.pop(user.id, None)
@@ -275,9 +273,13 @@ async def handle_request_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if action == "req_amend":
         _user_awaiting[user.id] = "request_text_amend"
-        # Считаем что не хватает — покажем менеджеру конкретно.
+        # Считаем что не хватает по всем позициям — покажем менеджеру конкретно.
         from request_handler import validate_request
-        missing_req, missing_rec = validate_request(parsed)
+        missing_req, missing_rec = [], []
+        for parsed, _a in drafts:
+            mr, mrec = validate_request(parsed)
+            missing_req += [m for m in mr if m not in missing_req]
+            missing_rec += [m for m in mrec if m not in missing_rec]
         gaps_line = ""
         if missing_req:
             gaps_line = f"\n\n*Не хватает обязательного:* {', '.join(missing_req)}."
@@ -298,11 +300,14 @@ async def handle_request_callback(update: Update, context: ContextTypes.DEFAULT_
             insert_request, format_assignee_notification,
             validate_request, ASSIGNEE_TG, UNCLASSIFIED_NOTIFY_TG,
         )
-        # Защита: пересчитать обязательные на момент confirm.
-        missing_req, _ = validate_request(parsed)
-        if missing_req:
+        # Защита: пересчитать обязательные на момент confirm по всем позициям.
+        all_missing = []
+        for parsed, _a in drafts:
+            mr, _ = validate_request(parsed)
+            all_missing += [m for m in mr if m not in all_missing]
+        if all_missing:
             await query.message.reply_text(
-                f"❌ Всё ещё не хватает обязательного: {', '.join(missing_req)}.\n"
+                f"❌ Всё ещё не хватает обязательного: {', '.join(all_missing)}.\n"
                 "Жми «➕ Дополнить» и допиши.",
             )
             return
@@ -310,43 +315,60 @@ async def handle_request_callback(update: Update, context: ContextTypes.DEFAULT_
         _draft_requests.pop(user.id, None)
         _user_awaiting.pop(user.id, None)
 
-        try:
-            request_id = insert_request(
-                db, parsed, user.id, user.full_name or "", assigned_to,
-            )
-        except Exception as e:
-            logger.exception(f"insert_request failed: {e}")
-            await query.message.reply_text(f"⚠️ Не удалось сохранить заявку: {e}")
-            return
-
-        # Кому слать TG: если assigned_to=None — обоим закупщикам + Виктору.
-        if assigned_to is None:
-            recipients = list(UNCLASSIFIED_NOTIFY_TG)
-        else:
-            recipients = [ASSIGNEE_TG.get(assigned_to)]
-        recipients = [r for r in recipients if r]
-
-        notif = format_assignee_notification(request_id, parsed, user.full_name or "")
-        for chat_id in recipients:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id, text=notif,
-                    parse_mode="Markdown", disable_web_page_preview=True,
-                )
-            except Exception as e:
-                logger.error(f"send to assignee {chat_id} failed: {e}")
-
-        assignee_disp = {
+        assignee_disp_map = {
             "belyakova": "Александре Беляковой",
             "kristina":  "Кристине Павленко",
             "victor":    "Виктору",
             None:        "обоим закупщикам + Виктору (не определён вид)",
-        }.get(assigned_to)
+        }
+
+        created = []   # (request_id, assigned_to)
+        for parsed, assigned_to in drafts:
+            try:
+                request_id = insert_request(
+                    db, parsed, user.id, user.full_name or "", assigned_to,
+                )
+            except Exception as e:
+                logger.exception(f"insert_request failed: {e}")
+                await query.message.reply_text(
+                    f"⚠️ Не удалось сохранить заявку ({parsed.species or '?'}): {e}"
+                )
+                continue
+
+            # Кому слать TG: если assigned_to=None — обоим закупщикам + Виктору.
+            if assigned_to is None:
+                recipients = list(UNCLASSIFIED_NOTIFY_TG)
+            else:
+                recipients = [ASSIGNEE_TG.get(assigned_to)]
+            recipients = [r for r in recipients if r]
+
+            notif = format_assignee_notification(request_id, parsed, user.full_name or "")
+            for chat_id in recipients:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id, text=notif,
+                        parse_mode="Markdown", disable_web_page_preview=True,
+                    )
+                except Exception as e:
+                    logger.error(f"send to assignee {chat_id} failed: {e}")
+            created.append((request_id, assigned_to))
+
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(
-            f"✅ Заявка №{request_id} создана и ушла {assignee_disp}.",
-            reply_markup=_user_menu_keyboard()
-        )
+        if not created:
+            await query.message.reply_text(
+                "⚠️ Ни одной заявки сохранить не удалось.",
+                reply_markup=_user_menu_keyboard()
+            )
+            return
+        if len(created) == 1:
+            rid, a = created[0]
+            summary = f"✅ Заявка №{rid} создана и ушла {assignee_disp_map.get(a)}."
+        else:
+            lines = "\n".join(
+                f"• №{rid} → {assignee_disp_map.get(a)}" for rid, a in created
+            )
+            summary = f"✅ Создано заявок: {len(created)}\n{lines}"
+        await query.message.reply_text(summary, reply_markup=_user_menu_keyboard())
 
 
 async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -546,7 +568,7 @@ _wazzup_notified: set = set()
 
 _pending_links: dict = {}
 _user_awaiting: dict = {}  # user_id → "photo" | "contract" | "reconciliation" | "request_text"
-_draft_requests: dict = {}  # user_id → (ParsedRequest, assigned_to). Phase 3.2.
+_draft_requests: dict = {}  # user_id → list[(ParsedRequest, assigned_to)]. Phase 3.2.
 _pending_price_comments: dict = {}  # manager_user_id → {alert_id, order_id, mgr_name, alert_type?, approver_chat_id?}
 _pending_approver_input: dict = {}  # approver_chat_id → {alert_id, order_name, client_name, manager_name, manager_user_id}
 
@@ -1497,16 +1519,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_chat_action("typing")
             try:
                 from request_handler import (
-                    parse_request_text, route_request, format_preview, validate_request,
+                    parse_request_text, route_request, format_multi_preview,
                 )
                 # Amend — соединяем с предыдущим raw_text, чтобы LLM видел всё вместе.
                 if awaiting == "request_text_amend":
                     prev = _draft_requests.get(user.id)
-                    base_text = prev[0].raw_text if prev else ""
+                    base_text = prev[0][0].raw_text if prev else ""
                     combined = (base_text + "\n" + text).strip() if base_text else text
                 else:
                     combined = text
-                parsed = await parse_request_text(combined)
+                parsed_list = await parse_request_text(combined)
             except Exception as e:
                 logger.exception(f"request_text parse failed: {e}")
                 await message.reply_text(
@@ -1514,13 +1536,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
                 return
-            assigned_to = route_request(parsed.species)
-            _draft_requests[user.id] = (parsed, assigned_to)
-            missing_req, missing_rec = validate_request(parsed)
-            preview = format_preview(parsed, assigned_to, missing_req, missing_rec)
+            drafts = [(p, route_request(p.species)) for p in parsed_list]
+            _draft_requests[user.id] = drafts
+            preview, any_missing = format_multi_preview(drafts)
 
             # Без обязательных полей — нет «Подтвердить», только «Дополнить»+«Отменить».
-            if missing_req:
+            if any_missing:
                 kb = InlineKeyboardMarkup([[
                     InlineKeyboardButton("➕ Дополнить", callback_data="req_amend"),
                     InlineKeyboardButton("❌ Отменить",  callback_data="req_cancel"),
