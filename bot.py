@@ -5213,6 +5213,59 @@ async def handle_price_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode="Markdown"
             )
 
+async def handle_doc_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Согласование документов (письма/договоры) из приложения quiz-game.
+    Callbacks: doc_approve:{id} | doc_reject:{id}.
+    Таблица documents в общей f2b-postgres. План: 2026-07-01-документы-договоры-и-telegram-согласование.md, Фаза 2.
+    """
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    try:
+        action, sid = data.split(":", 1)
+        doc_id = int(sid)
+    except (ValueError, TypeError):
+        return
+
+    doc = db.get_document(doc_id)
+    if not doc:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text(f"⚠️ Документ №{doc_id} не найден в базе.")
+        return
+
+    if doc.get("status") != "pending":
+        await query.answer(f"Уже обработан: {doc.get('status')}", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    new_status = "approved" if action == "doc_approve" else "rejected"
+    db.decide_document(doc_id, new_status)
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    cp = doc.get("counterparty_name") or "—"
+    dtype = "договор" if doc.get("doc_type") == "contract" else "письмо"
+    if new_status == "approved":
+        await query.message.reply_text(
+            f"✅ Одобрено — {dtype} №{doc_id} ({cp}).\n"
+            f"Подписанный PDF доступен в приложении (архив, у создателя — сразу к скачиванию).",
+        )
+    else:
+        await query.message.reply_text(
+            f"❌ Отклонено — {dtype} №{doc_id} ({cp}). Документ не выпущен.",
+        )
+
+
 async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обрабатывает нажатия на кнопки объединённого алерта «На согласовании / ЗА ЛИМИТОМ».
@@ -7087,6 +7140,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_approval_callback, pattern="^appr_"))
+    app.add_handler(CallbackQueryHandler(handle_doc_approval_callback, pattern="^doc_(approve|reject):"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing|wazzup_later)"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))

@@ -493,6 +493,21 @@ class Database:
             (manager_name, manager_user_id, result_text)
         )
 
+    # ─── Документооборот (согласование писем/договоров, план 2026-07-01) ────
+    def get_document(self, doc_id: int) -> Optional[Dict]:
+        """Документ на согласовании. Таблица documents создаётся приложением quiz-game
+        в той же f2b-postgres."""
+        return self._fetchone("SELECT * FROM documents WHERE id = %s", (doc_id,))
+
+    def decide_document(self, doc_id: int, status: str) -> Optional[Dict]:
+        """Идемпотентный флип pending → approved/rejected. Возвращает строку после апдейта.
+        Обновляет только если статус ещё pending (защита от двойного клика)."""
+        self._execute(
+            "UPDATE documents SET status=%s, decided_at=NOW() WHERE id=%s AND status='pending'",
+            (status, doc_id),
+        )
+        return self._fetchone("SELECT * FROM documents WHERE id = %s", (doc_id,))
+
     # ─── Автоподстановка ppm_initial (план 2026-05-20-автоподстановка) ────
     def mark_bot_self_write(self, order_id: str, field: str, value: str):
         self._execute(
