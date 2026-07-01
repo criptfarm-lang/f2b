@@ -551,21 +551,25 @@ def _build_approval_text(
     order_name: str, order_sum: float, state_name: str,
     client_name: str, manager_name: str,
     credit: dict, contract: dict, overdue: dict, cashflow: dict, price: dict,
-    site: dict, contacts: dict,
+    site: dict, contacts: dict, upd_debt: dict = None,
     payment_planned_date: str = "",
 ) -> str:
     """
     Шаблон алерта. Порядок строк (по убыванию важности):
-      Лимит → Договор → Просрочка → ДДС → Сайт → Контакты → Цена (внизу — длинный список).
-    all-green → одна сводная строка; иначе — 7 строк светофора.
+      Лимит → Договор → Просрочка → ДДС → УПД → Сайт → Контакты → Цена (внизу — длинный список).
+    all-green → одна сводная строка; иначе — строки светофора.
     """
     from datetime import datetime, timezone, timedelta
     now_msk = datetime.now(timezone(timedelta(hours=3)))
     sent_at = now_msk.strftime("%H:%M")
 
+    if upd_debt is None:
+        upd_debt = {"color": "green", "count": 0, "sum": 0}
+
     payment_color = "green" if payment_planned_date else "red"
     colors = [credit["color"], contract["color"], overdue["color"], cashflow["color"],
-              price["color"], site["color"], contacts["color"], payment_color]
+              price["color"], site["color"], contacts["color"], payment_color,
+              upd_debt["color"]]
     all_green = all(c == "green" for c in colors)
 
     header = (
@@ -579,10 +583,10 @@ def _build_approval_text(
         if credit.get("limit", 0) > 0:
             limit_pct = int(credit["effective_debt"] / credit["limit"] * 100)
         body = (
-            f"\n🟢 Все 8 проверок ОК "
+            f"\n🟢 Все 9 проверок ОК "
             f"(лимит {limit_pct}% · договор · ДДС {cashflow.get('n_days', 0)}д · "
             f"долг {_fmt_money(credit.get('current_debt', 0))} _на {sent_at}_ · "
-            f"сайт · контакты · цена · оплата {payment_planned_date})\n"
+            f"УПД · сайт · контакты · цена · оплата {payment_planned_date})\n"
         )
         return header + body
 
@@ -643,6 +647,19 @@ def _build_approval_text(
     explain = cashflow.get("explain", "")
     lines.append(f"{_icon(cashflow['color'])} *ДДС:* {explain}")
 
+    # 4a. Долг по УПД — есть отгрузка(и) клиента в статусе «Долг по УПД» → 🔴.
+    # Источник — статус отгрузки в МС (бухгалтерия ставит вручную), не payedSum.
+    if upd_debt["color"] == "red":
+        n = upd_debt.get("count", 0)
+        word = "отгрузка" if n == 1 else "отгрузки" if 2 <= n <= 4 else "отгрузок"
+        s = upd_debt.get("sum", 0) or 0
+        tail = f" / {_fmt_money(s)} ₽" if s > 0 else ""
+        lines.append(f"🔴 *Долг по УПД:* {n} {word}{tail}")
+    elif upd_debt["color"] == "yellow":
+        lines.append(f"🟡 *Долг по УПД:* не проверено")
+    else:
+        lines.append(f"🟢 *Долг по УПД:* нет")
+
     # 5. Сайт
     if site["color"] == "green":
         lines.append(f"🟢 *Сайт:* {site['raw_value'][:60]}")
@@ -699,6 +716,7 @@ async def check_approval_needed(order_href: str, bot, db):
             compute_overdue_color, compute_cashflow_color,
             compute_price_color,
             compute_site_color, compute_contacts_color,
+            compute_upd_debt_color,
         )
 
         # 1. Загружаем заказ с атрибутами и расширениями
@@ -739,20 +757,21 @@ async def check_approval_needed(order_href: str, bot, db):
         # 2. Атрибуты counterparty (1 GET, передаётся в 3 sync helper'а)
         cp_attrs = await load_counterparty_attrs(agent_id)
 
-        # 3. Параллельно: cashflow, overdue, price (+ timeout 20с с fallback)
+        # 3. Параллельно: cashflow, overdue, price, upd_debt (+ timeout 20с с fallback)
         try:
-            cashflow, overdue, price = await asyncio.wait_for(
+            cashflow, overdue, price, upd_debt = await asyncio.wait_for(
                 asyncio.gather(
                     compute_cashflow_color(agent_id),
                     compute_overdue_color(agent_id),
                     compute_price_color(order_href),
+                    compute_upd_debt_color(agent_id),
                     return_exceptions=True,
                 ),
                 timeout=20.0,
             )
         except asyncio.TimeoutError:
             logger.warning(f"check_approval_needed: timeout для {order_name}")
-            cashflow = overdue = price = None
+            cashflow = overdue = price = upd_debt = None
 
         # Нормализуем результаты (Exception/None → yellow с пометкой)
         def _norm(v, default):
@@ -765,6 +784,7 @@ async def check_approval_needed(order_href: str, bot, db):
                                     "payments_sum": 0, "current_debt": 0.0})
         overdue = _norm(overdue, {"color": "yellow", "days": 0, "debt": 0})
         price = _norm(price, {"color": "yellow", "items": []})
+        upd_debt = _norm(upd_debt, {"color": "yellow", "count": 0, "sum": 0})
 
         # 4. Sync helper'ы.
         # current_debt берём из /report (cashflow), а НЕ из overdue.debt — overdue
@@ -784,6 +804,7 @@ async def check_approval_needed(order_href: str, bot, db):
             "price": price["color"],
             "site": site["color"],
             "contacts": contacts["color"],
+            "upd_debt": upd_debt["color"],
         }
         # Дата планируемой оплаты — то что выставил webhook-autofill за 60с до
         # этого алерта. Берём из attributes заказа, форматируем DD.MM.YYYY.
@@ -803,7 +824,7 @@ async def check_approval_needed(order_href: str, bot, db):
             order_name=order_name, order_sum=order_sum, state_name=state_name,
             client_name=agent_name, manager_name=manager_name,
             credit=credit, contract=contract, overdue=overdue, cashflow=cashflow,
-            price=price, site=site, contacts=contacts,
+            price=price, site=site, contacts=contacts, upd_debt=upd_debt,
             payment_planned_date=ppm_str,
         )
 

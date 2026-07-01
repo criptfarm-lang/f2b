@@ -4369,6 +4369,10 @@ ATTR_CP_DAYS_DELAY       = "6ce27a3b-633f-11f1-0a80-034000364b18"  # long
 # UUID кастомного атрибута customerorder (Дата плановой оплаты)
 ATTR_CO_PAYMENT_PLANNED = "327940fd-b54e-11f0-0a80-0066000d5578"  # time
 
+# UUID статуса отгрузки (demand) «Долг по УПД» — блок светофора «УПД».
+# Есть хотя бы одна отгрузка клиента в этом статусе → 🔴.
+DEMAND_STATE_UPD_DEBT = "1ee3c376-cea7-11f0-0a80-064c004cdffd"
+
 # Регулярки валидации
 _RE_SITE_HAS_LATIN = re.compile(r"[a-zA-Z]{3,}")
 _RE_PHONE_RU       = re.compile(r"^[78]\d{10}$")
@@ -4657,6 +4661,59 @@ async def compute_overdue_color(agent_id: str) -> dict:
     debt = real_overdue
     color = "red" if (debt > 0 and max_days > OVERDUE_THRESHOLD_DAYS) else "green"
     return {"color": color, "days": max_days, "debt": debt}
+
+
+async def compute_upd_debt_color(agent_id: str) -> dict:
+    """Блок светофора «УПД». Есть отгрузка клиента в статусе «Долг по УПД» → 🔴.
+
+    Источник правды — именно статус отгрузки (demand) в МС, а не payedSum:
+    бухгалтерия проставляет «Долг по УПД» вручную. Отгрузка может быть в этом
+    статусе даже при payedSum==sum (ещё не переведена в «Оплачен (долг по УПД)»)
+    — на цвет влияет наличие статуса, не остаток.
+
+    Запрос точечный: filter=agent;state=«Долг по УПД» (server-side).
+    Возврат: {"color", "count", "sum"} где sum — суммарный неоплаченный остаток
+    (для справки в тексте алерта).
+    """
+    import aiohttp
+
+    cp_href = f"{MS_BASE}/entity/counterparty/{agent_id}"
+    state_href = f"{MS_BASE}/entity/demand/metadata/states/{DEMAND_STATE_UPD_DEBT}"
+    filt = f"agent={cp_href};state={state_href}"
+
+    rows: list = []
+    offset = 0
+    try:
+        async with aiohttp.ClientSession() as session:
+            while True:
+                async with session.get(
+                    f"{MS_BASE}/entity/demand",
+                    headers=get_headers(),
+                    params={"filter": filt, "limit": 100, "offset": offset},
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"compute_upd_debt_color: demand {resp.status}")
+                        return {"color": "yellow", "count": 0, "sum": 0}
+                    data = await resp.json()
+                batch = data.get("rows", []) or []
+                rows.extend(batch)
+                if len(batch) < 100:
+                    break
+                offset += 100
+    except Exception as e:
+        logger.error(f"compute_upd_debt_color({agent_id[:8]}): {e}", exc_info=True)
+        return {"color": "yellow", "count": 0, "sum": 0}
+
+    if not rows:
+        return {"color": "green", "count": 0, "sum": 0}
+
+    unpaid_total = 0.0
+    for d in rows:
+        total = (d.get("sum", 0) or 0) / 100
+        payed = (d.get("payedSum", 0) or 0) / 100
+        unpaid_total += max(0.0, round(total - payed, 2))
+    return {"color": "red", "count": len(rows), "sum": round(unpaid_total, 2)}
 
 
 # Кеш текущего сальдо контрагента (используется внутри compute_cashflow_color
