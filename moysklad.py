@@ -2097,6 +2097,35 @@ async def audit_ppm_initial_changes(today_rows: list, yesterday_rows: list) -> l
     return candidates
 
 
+async def agent_ids_with_tag_live(manager_tag: str) -> set:
+    """ЖИВОЙ набор agent_id контрагентов с точным тегом менеджера (текущее состояние МС).
+    Нужен, чтобы привязка клиент→менеджер всегда была актуальной, даже если тег сменили
+    после последнего снимка. Пустой set = МС недоступен (вызывающий делает fallback)."""
+    import aiohttp
+    ids: set = set()
+    if not manager_tag:
+        return ids
+    try:
+        async with aiohttp.ClientSession() as session:
+            offset = 0
+            while True:
+                async with session.get(f"{MS_BASE}/entity/counterparty", headers=get_headers(),
+                                       params={"filter": f"tags={manager_tag}", "limit": 1000, "offset": offset}) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+                    rows = data.get("rows", [])
+                    for c in rows:
+                        if c.get("id"):
+                            ids.add(c["id"])
+                    if len(rows) < 1000:
+                        break
+                    offset += 1000
+    except Exception as e:
+        logger.warning(f"agent_ids_with_tag_live({manager_tag}): {e}")
+    return ids
+
+
 async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: bool = True) -> list:
     """Список просроченных заказов конкретного менеджера для TG-дайджеста.
 
@@ -2139,14 +2168,23 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
     else:
         rows = await pdz_take_snapshot()
 
+    # Привязку клиент→менеджер берём по ЖИВЫМ тегам МС, а не по замороженному в снимке
+    # manager_tag: теги периодически меняют, и без этого чужой клиент «залипает» у старого
+    # менеджера. Пустой live_ids (МС недоступен) → fallback на снимок.
+    live_ids = await agent_ids_with_tag_live(manager_tag)
+
     # Собираем все неоплаченные заказы менеджера, разбивая на «просрочка»
     # и «в сроке» — нужно для per-contractor FIFO-фильтра ниже.
     by_agent_unpaid: dict = {}  # aid → {balance, agent_name, overdue: [...], in_сroк_unpaid_total}
     skipped_balance_ok = 0
     for r in rows:
-        row_tag = (r.get("manager_tag") or "").lower()
-        if row_tag != tag_lower:
-            continue
+        if live_ids:
+            if (r.get("agent_id") or "") not in live_ids:
+                continue
+        else:
+            row_tag = (r.get("manager_tag") or "").lower()
+            if row_tag != tag_lower:
+                continue
         ppm_new = _to_date(r.get("ppm_new"))
         ppm_initial = _to_date(r.get("ppm_initial"))
         status, effective, days_overdue = _pdz_classify(ppm_initial, ppm_new, today)
