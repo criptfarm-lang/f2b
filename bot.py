@@ -8019,8 +8019,11 @@ def main():
         if not manager_tag:
             return web.json_response({"error": "tag required"}, status=400)
         try:
-            from moysklad import pdz_overdue_for_manager, PDZ_PENALTY_EXCLUDE
+            from moysklad import (pdz_overdue_for_manager, PDZ_PENALTY_EXCLUDE,
+                                   PDZ_PENALTY_EXCLUDE_TAG, agent_ids_with_tag_live)
             items = await pdz_overdue_for_manager(manager_tag, db=db, group_by_agent=True)
+            # Живой набор клиентов с тегом «суд» — они автоматически вне штрафа.
+            court_ids = await agent_ids_with_tag_live(PDZ_PENALTY_EXCLUDE_TAG)
             pdz_list = [{
                 "name":             x.get("agent_name") or "—",
                 "days_overdue":     int(x.get("max_days_overdue") or 0),
@@ -8028,8 +8031,9 @@ def main():
                 "orders_count":     int(x.get("orders_count") or 0),
                 "breaks_count":     int(x.get("breaks_count") or 0),
                 "ms_url":           x.get("ms_url_first_order"),
-                # Исключён из штрафа (суд/особые отношения) — на дашборде блёкло, не в расчёт.
-                "penalty_excluded": (x.get("agent_id") or "") in PDZ_PENALTY_EXCLUDE,
+                # Вне штрафа: тег «суд» (живой) ИЛИ точечный список — блёкло, не в расчёт.
+                "penalty_excluded": ((x.get("agent_id") or "") in court_ids
+                                     or (x.get("agent_id") or "") in PDZ_PENALTY_EXCLUDE),
             } for x in items]
             return web.json_response({"manager_tag": manager_tag, "pdz_list": pdz_list})
         except Exception as e:
