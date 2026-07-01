@@ -478,6 +478,32 @@ class Database:
                 days INT,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )""",
+            # ── Сверка «Наш ас-т» (план 2026-07-01-кнопка-наш-ас-т, Фаза B) ──
+            # Результаты: отгрузили ли клиенту запрошенную позицию после нажатия
+            # кнопки «🐟 Наш ас-т». Считает бот, вкладка в дашборде закупок читает.
+            # Схема procurement + assortment_requests уже созданы .sql-миграцией.
+            """CREATE TABLE IF NOT EXISTS procurement.assortment_hit_results (
+                id                    BIGSERIAL PRIMARY KEY,
+                assortment_request_id BIGINT NOT NULL
+                    REFERENCES procurement.assortment_requests(id) ON DELETE CASCADE,
+                contact_name          TEXT,
+                species_normalized    TEXT,
+                sku_or_description     TEXT,
+                clicked_at            TIMESTAMPTZ,
+                amo_company_name      TEXT,
+                inn                   TEXT,
+                ms_counterparty       TEXT,
+                match_confidence      TEXT NOT NULL DEFAULT 'unmatched',
+                shipped               BOOLEAN NOT NULL DEFAULT FALSE,
+                shipped_qty           NUMERIC,
+                shipped_sum           NUMERIC,
+                first_shipment_date   DATE,
+                period_from           DATE NOT NULL,
+                period_to             DATE NOT NULL,
+                computed_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (assortment_request_id, period_from, period_to)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_assortment_hit_results_period ON procurement.assortment_hit_results (period_from, period_to, computed_at DESC)",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:

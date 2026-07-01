@@ -3893,6 +3893,58 @@ async def cmd_pdz_breaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cmd_assortment_hits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/assortment_hits [YYYY-MM]` — сверка «Наш ас-т» за месяц.
+
+    По нажатиям кнопки «🐟 Наш ас-т» проверяет: отгрузили ли клиенту
+    запрошенную позицию после нажатия (amoCRM компания → ИНН → отгрузки МС).
+    Без аргумента — текущий месяц по сегодня. Доступ — только собственник.
+    План 2026-07-01-кнопка-наш-ас-т-запрос-номенклатуры.md (Фаза B).
+    """
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    if not update.message:
+        return
+
+    from datetime import date as _date
+    import calendar as _cal
+    import assortment_hits
+
+    arg = (context.args[0].strip() if context.args else "")
+    today = _date.today()
+    try:
+        if arg:
+            y, m = arg.split("-")
+            y, m = int(y), int(m)
+            period_from = _date(y, m, 1)
+            last_day = _cal.monthrange(y, m)[1]
+            period_to = _date(y, m, last_day)
+            # Не заглядываем в будущее для текущего месяца
+            if period_to > today:
+                period_to = today
+        else:
+            period_from = today.replace(day=1)
+            period_to = today
+    except Exception:
+        await update.message.reply_text("Формат: /assortment_hits 2026-06")
+        return
+
+    await update.message.reply_text("⏳ Считаю сверку «Наш ас-т»…")
+    try:
+        results = await assortment_hits.compute_assortment_hits(db, period_from, period_to)
+    except Exception as e:
+        logger.error(f"cmd_assortment_hits: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка сверки: {type(e).__name__}: {e}")
+        return
+
+    text = assortment_hits.format_hits_report(results, period_from, period_to)
+    for i in range(0, len(text), 3800):
+        await update.message.reply_text(
+            text[i:i + 3800], parse_mode="Markdown", disable_web_page_preview=True
+        )
+
+
 async def cmd_snimi_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/snimi_stop <agent_id | часть_имени>` — снять стоп-флаг (Фаза 6).
 
@@ -7285,6 +7337,8 @@ def main():
                 )
 
     app.add_handler(CallbackQueryHandler(handle_wzc_callback, pattern="^wzc:"))
+    # Сверка «Наш ас-т» за месяц (только собственник) — Фаза B плана 2026-07-01.
+    app.add_handler(CommandHandler("assortment_hits", cmd_assortment_hits))
 
     # ─── DashaMail weekly: «Запланировать» из cron-уведомления ──────────────
     async def handle_dashamail_callback(update, context):
