@@ -317,9 +317,10 @@ async def _send_request_alert(
     kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ В работу", callback_data=f"wzc:ok:{mid}"),
-            InlineKeyboardButton("🐟 Наш ас-т", callback_data=f"wzc:our:{mid}"),
+            InlineKeyboardButton("🔎 Контроль", callback_data=f"wzc:ctl:{mid}"),
         ],
         [
+            InlineKeyboardButton("🐟 Наш ас-т", callback_data=f"wzc:our:{mid}"),
             InlineKeyboardButton("👎 Ложный", callback_data=f"wzc:fp:{mid}"),
         ],
     ])

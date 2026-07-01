@@ -7202,11 +7202,12 @@ def main():
             _, action, message_id = q.data.split(":", 2)
         except ValueError:
             return
-        if action == "our":
-            # «🐟 Наш ас-т» = это наш ассортимент, обработка закупщиком не нужна.
+        if action == "ctl":
+            # «🔎 Контроль» = наш ассортимент, берём на контроль отгрузки.
             # Помечаем строку статусом our_assortment; в конце месяца пайплайн
             # сверки (compute_assortment_hits) проверит, отгрузили ли клиенту
-            # запрошенную позицию после нажатия. См. план
+            # запрошенную позицию после нажатия. Результат — на вкладке
+            # «Контроль» в дашборде закупок. См. план
             # plans/2026-07-01-кнопка-наш-ас-т-запрос-номенклатуры.md.
             ar = db._fetchone(
                 """SELECT status, converted_request_id
@@ -7217,7 +7218,7 @@ def main():
             if ar and ar["status"] == "converted":
                 await q.edit_message_text(
                     q.message.text
-                    + f"\n\n📋 Уже создана заявка #{ar['converted_request_id']} — «Наш ас-т» не применён.",
+                    + f"\n\n📋 Уже создана заявка #{ar['converted_request_id']} — «Контроль» не применён.",
                     parse_mode=None,
                 )
                 return
@@ -7228,8 +7229,8 @@ def main():
                    WHERE wazzup_message_id = %s""",
                 (q.from_user.full_name or "owner", message_id),
             )
-            # Классификатор сработал верно (реальный запрос по номенклатуре),
-            # просто закупка не нужна → feedback='confirmed' для re-train.
+            # Классификатор сработал верно (реальный запрос по номенклатуре)
+            # → feedback='confirmed' для re-train.
             db._execute(
                 """UPDATE wazzup_classifications
                    SET feedback = 'confirmed'
@@ -7237,9 +7238,34 @@ def main():
                 (message_id,),
             )
             await q.edit_message_text(
-                q.message.text + "\n\n🐟 Наш ассортимент — учтём в сверке отгрузок.",
+                q.message.text + "\n\n🔎 Взято на контроль — сверим отгрузку.",
                 parse_mode=None,
             )
+            return
+        if action == "our":
+            # «🐟 Наш ас-т» = это наш ассортимент, ничего делать не нужно —
+            # просто отбрасываем (как «Ложный») и удаляем сообщение из бота.
+            # Классификатор сработал верно → feedback='confirmed' для re-train.
+            db._execute(
+                """UPDATE procurement.assortment_requests
+                   SET status='dismissed', status_changed_at=NOW(),
+                       status_changed_by=%s
+                   WHERE wazzup_message_id = %s""",
+                (q.from_user.full_name or "owner", message_id),
+            )
+            db._execute(
+                """UPDATE wazzup_classifications
+                   SET feedback = 'confirmed'
+                   WHERE message_id = %s""",
+                (message_id,),
+            )
+            try:
+                await q.message.delete()
+            except Exception:
+                await q.edit_message_text(
+                    q.message.text + "\n\n🐟 Наш ассортимент — отброшено.",
+                    parse_mode=None,
+                )
             return
         if action == "fp":
             # Ложно-позитивный → пишем feedback для re-train

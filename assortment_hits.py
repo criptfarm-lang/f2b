@@ -266,15 +266,15 @@ async def compute_assortment_hits(db, period_from: date, period_to: date) -> lis
 def format_hits_report(results: list, period_from: date, period_to: date) -> str:
     """Текстовый отчёт для команды /assortment_hits в TG."""
     if not results:
-        return (f"🐟 *Наш ас-т* за {period_from:%d.%m}–{period_to:%d.%m}\n\n"
-                "Нет нажатий кнопки «Наш ас-т» за период.")
+        return (f"🔎 *Контроль* за {period_from:%d.%m}–{period_to:%d.%m}\n\n"
+                "Нет нажатий кнопки «Контроль» за период.")
 
     shipped = [r for r in results if r["shipped"]]
     not_shipped = [r for r in results if not r["shipped"]
                    and r["match_confidence"] != "unmatched"]
     unmatched = [r for r in results if r["match_confidence"] == "unmatched"]
 
-    lines = [f"🐟 *Наш ас-т* за {period_from:%d.%m}–{period_to:%d.%m}",
+    lines = [f"🔎 *Контроль* за {period_from:%d.%m}–{period_to:%d.%m}",
              f"Всего: {len(results)} · отгрузили: {len(shipped)} · "
              f"не отгрузили: {len(not_shipped)} · не сматчено: {len(unmatched)}", ""]
 
