@@ -3349,6 +3349,37 @@ async def get_counterparty_debt(counterparty_id: str) -> dict:
         logger.error(f"get_counterparty_debt: {e}", exc_info=True)
         return {}
 
+async def set_counterparty_contract_number(agent_id: str, number: str) -> bool:
+    """Пишет «№ договора» (ATTR_CP_CONTRACT_NUMBER) в карточку контрагента МС.
+    Используется при одобрении договора из приложения (план 2026-07-01, Фаза 3)."""
+    import aiohttp
+    url = f"{MS_BASE}/entity/counterparty/{agent_id}"
+    payload = {
+        "attributes": [
+            {
+                "meta": {
+                    "href": f"{MS_BASE}/entity/counterparty/metadata/attributes/{ATTR_CP_CONTRACT_NUMBER}",
+                    "type": "attributemetadata",
+                    "mediaType": "application/json",
+                },
+                "value": number,
+            }
+        ]
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(url, headers=get_headers(), json=payload) as resp:
+                if resp.status in (200, 201):
+                    logger.info(f"№ договора {number} записан в карточку МС {agent_id}")
+                    return True
+                text = await resp.text()
+                logger.error(f"set_counterparty_contract_number {agent_id}: {resp.status} {text[:200]}")
+                return False
+    except Exception as e:
+        logger.error(f"set_counterparty_contract_number {agent_id}: {e}")
+        return False
+
+
 async def set_order_state(order_id: str, state_id: str) -> bool:
     """Меняет статус заказа покупателя."""
     import aiohttp

@@ -5294,24 +5294,70 @@ async def handle_doc_approval_callback(update: Update, context: ContextTypes.DEF
             pass
         return
 
-    new_status = "approved" if action == "doc_approve" else "rejected"
-    db.decide_document(doc_id, new_status)
+    is_contract = doc.get("doc_type") == "contract"
+    cp = doc.get("counterparty_name") or "—"
+    dtype = "договор" if is_contract else "письмо"
+
+    if action == "doc_reject":
+        db.decide_document(doc_id, "rejected")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text(f"❌ Отклонено — {dtype} №{doc_id} ({cp}). Документ не выпущен.")
+        return
+
+    # ── Одобрение ────────────────────────────────────────────────────────────
+    contract_number = None
+    ms_ok = False
+    if is_contract:
+        # Присваиваем № (ДДММГГ + /N), пишем в documents, в реестр contracts и в карточку МС
+        from contract_generator import get_contract_number
+        from datetime import datetime as _dt
+        payload = doc.get("payload") or {}
+        if isinstance(payload, str):
+            import json as _json
+            payload = _json.loads(payload)
+        buyer_name = payload.get("buyer_name") or cp
+        try:
+            contract_number = get_contract_number(_dt.now(), db)
+        except Exception as e:
+            logger.error(f"doc approve: get_contract_number fail: {e}")
+            contract_number = _dt.now().strftime("%d%m%y")
+        # Атомарно: статус + номер (только из pending)
+        db._execute(
+            "UPDATE documents SET status='approved', decided_at=NOW(), contract_number=%s WHERE id=%s AND status='pending'",
+            (contract_number, doc_id),
+        )
+        try:
+            db.save_contract(contract_number, buyer_name, "Эф-согласование", buyer_data=payload)
+        except Exception as e:
+            logger.error(f"doc approve: save_contract fail: {e}")
+        agent_id = doc.get("counterparty_id")
+        if agent_id:
+            try:
+                import moysklad
+                ms_ok = await moysklad.set_counterparty_contract_number(agent_id, contract_number)
+            except Exception as e:
+                logger.error(f"doc approve: set МС number fail: {e}")
+    else:
+        db.decide_document(doc_id, "approved")
 
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-    cp = doc.get("counterparty_name") or "—"
-    dtype = "договор" if doc.get("doc_type") == "contract" else "письмо"
-    if new_status == "approved":
+    if is_contract:
+        ms_note = "№ записан в карточку МС." if ms_ok else "⚠️ № в карточку МС записать не удалось — проверь вручную."
         await query.message.reply_text(
-            f"✅ Одобрено — {dtype} №{doc_id} ({cp}).\n"
-            f"Подписанный PDF доступен в приложении (архив, у создателя — сразу к скачиванию).",
+            f"✅ Одобрено — договор №{doc_id} ({cp}). Присвоен № {contract_number}. {ms_note}\n"
+            f"Подписанный PDF доступен в приложении (архив).",
         )
     else:
         await query.message.reply_text(
-            f"❌ Отклонено — {dtype} №{doc_id} ({cp}). Документ не выпущен.",
+            f"✅ Одобрено — письмо №{doc_id} ({cp}).\n"
+            f"Подписанный PDF доступен в приложении (архив, у создателя — сразу к скачиванию).",
         )
 
 
