@@ -956,6 +956,7 @@ async def pdz_send_owner_pending_job(app: Application, db) -> dict:
     from moysklad import (
         PDZ_MANAGER_TAG_MAP,
         pdz_unprocessed_for_owner,
+        agent_ids_with_tag_live,
         fmt_money,
     )
 
@@ -970,7 +971,12 @@ async def pdz_send_owner_pending_job(app: Application, db) -> dict:
     owner_id = int(owner_raw)
 
     try:
-        by_tag = pdz_unprocessed_for_owner(db)
+        # Живой agent→менеджер map по текущим тегам МС (привязка не залипает при смене тега).
+        live_map = {}
+        for _mtag in PDZ_MANAGER_TAG_MAP:
+            for _aid in await agent_ids_with_tag_live(_mtag):
+                live_map[_aid] = _mtag
+        by_tag = pdz_unprocessed_for_owner(db, live_map=live_map or None)
     except Exception as e:
         logger.error(f"pdz_send_owner_pending_job: {e}", exc_info=True)
         try:

@@ -2448,7 +2448,7 @@ def pdz_send_manager_digest_text(items: list, manager_name: str = None) -> list:
     return ["\n".join(c) for c in chunks if c]
 
 
-def pdz_unprocessed_for_owner(db) -> dict:
+def pdz_unprocessed_for_owner(db, live_map=None) -> dict:
     """Для пинга собственнику в 16:05 МСК. Группирует «необработанных» клиентов
     по тегу менеджера.
 
@@ -2474,7 +2474,13 @@ def pdz_unprocessed_for_owner(db) -> dict:
     # tag → agent_id → {agent_name, agent_balance, overdue: [], in_сroк_unpaid_total}
     by_tag_agent: dict = {}
     for r in rows:
-        row_tag = (r.get("manager_tag") or "").lower()
+        aid = r.get("agent_id") or ""
+        # Привязка к менеджеру — по ЖИВЫМ тегам МС (live_map), а не по замороженному
+        # в снимке manager_tag. Fallback на снимок, если live_map не передан (МС недоступен).
+        if live_map:
+            row_tag = (live_map.get(aid) or "").lower()
+        else:
+            row_tag = (r.get("manager_tag") or "").lower()
         if not row_tag or row_tag not in PDZ_MANAGER_TAG_MAP:
             continue
         ppm_new = _to_date(r.get("ppm_new"))
