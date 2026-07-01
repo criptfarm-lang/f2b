@@ -8019,15 +8019,17 @@ def main():
         if not manager_tag:
             return web.json_response({"error": "tag required"}, status=400)
         try:
-            from moysklad import pdz_overdue_for_manager
+            from moysklad import pdz_overdue_for_manager, PDZ_PENALTY_EXCLUDE
             items = await pdz_overdue_for_manager(manager_tag, db=db, group_by_agent=True)
             pdz_list = [{
-                "name":           x.get("agent_name") or "—",
-                "days_overdue":   int(x.get("max_days_overdue") or 0),
-                "amount_rub":     round(float(x.get("total_unpaid") or 0), 2),
-                "orders_count":   int(x.get("orders_count") or 0),
-                "breaks_count":   int(x.get("breaks_count") or 0),
-                "ms_url":         x.get("ms_url_first_order"),
+                "name":             x.get("agent_name") or "—",
+                "days_overdue":     int(x.get("max_days_overdue") or 0),
+                "amount_rub":       round(float(x.get("total_unpaid") or 0), 2),
+                "orders_count":     int(x.get("orders_count") or 0),
+                "breaks_count":     int(x.get("breaks_count") or 0),
+                "ms_url":           x.get("ms_url_first_order"),
+                # Исключён из штрафа (суд/особые отношения) — на дашборде блёкло, не в расчёт.
+                "penalty_excluded": (x.get("agent_id") or "") in PDZ_PENALTY_EXCLUDE,
             } for x in items]
             return web.json_response({"manager_tag": manager_tag, "pdz_list": pdz_list})
         except Exception as e:
