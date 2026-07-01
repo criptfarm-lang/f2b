@@ -3917,15 +3917,12 @@ async def cmd_assortment_hits(update: Update, context: ContextTypes.DEFAULT_TYPE
         if arg:
             y, m = arg.split("-")
             y, m = int(y), int(m)
-            period_from = _date(y, m, 1)
-            last_day = _cal.monthrange(y, m)[1]
-            period_to = _date(y, m, last_day)
-            # Не заглядываем в будущее для текущего месяца
-            if period_to > today:
-                period_to = today
         else:
-            period_from = today.replace(day=1)
-            period_to = today
+            y, m = today.year, today.month
+        period_from = _date(y, m, 1)
+        # period_to = конец месяца всегда (стабильный ключ upsert; МС вернёт
+        # отгрузки только по сегодня, будущий верхний предел безвреден).
+        period_to = _date(y, m, _cal.monthrange(y, m)[1])
     except Exception:
         await update.message.reply_text("Формат: /assortment_hits 2026-06")
         return
@@ -8011,6 +8008,29 @@ def main():
             logger.error(f"handle_pdz_manager_json: {e}", exc_info=True)
             return web.json_response({"error": str(e)}, status=500)
 
+    async def handle_pdz_take_snapshot(request):
+        """Триггер снимка ПДЗ извне (надёжный крон f2b-publisher каждые 30 мин).
+        In-process AsyncIOScheduler бота теряет tick при пересборках Amvera —
+        внешний триггер гарантирует ежедневный снимок. Идемпотентно (ON CONFLICT)."""
+        embed_secret = os.getenv("DASHBOARD_PDZ_SECRET", "UY-2J7VujDgbFVEg26WJvqCpS1qY_5pm8x56qZ-O_uE")
+        if request.query.get("secret", "") != embed_secret:
+            return web.json_response({"error": "forbidden"}, status=403)
+        try:
+            from moysklad import pdz_take_snapshot
+            rows = await pdz_take_snapshot()
+            inserted = db.save_pdz_snapshot(rows)
+            try:
+                from scheduler import MSK as _MSK
+                db.set_pdz_job_last_run("pdz_snapshot_1245", datetime.now(_MSK).date())
+            except Exception:
+                pass
+            snap_date = rows[0].get("snap_date") if rows else None
+            logger.info(f"handle_pdz_take_snapshot: вставлено {inserted} строк, snap_date={snap_date}")
+            return web.json_response({"ok": True, "inserted": inserted, "snap_date": str(snap_date)})
+        except Exception as e:
+            logger.error(f"handle_pdz_take_snapshot: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
     async def run_web():
         web_app = web.Application()
         web_app.router.add_post("/webhook/moysklad", handle_ms_webhook)
@@ -8022,6 +8042,7 @@ def main():
         web_app.router.add_get("/pdz", handle_pdz_html)
         web_app.router.add_get("/pdz/embed", handle_pdz_embed)
         web_app.router.add_get("/pdz/manager-json/{tag}", handle_pdz_manager_json)
+        web_app.router.add_post("/pdz/take-snapshot", handle_pdz_take_snapshot)
         # ─── amoCRM алармы ───────────────────────────────────────────────────
         async def handle_amo_webhook_route(request):
             await handle_amo_webhook(request, app, db)
