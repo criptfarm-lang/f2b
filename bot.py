@@ -7153,6 +7153,45 @@ def main():
             _, action, message_id = q.data.split(":", 2)
         except ValueError:
             return
+        if action == "our":
+            # «🐟 Наш ас-т» = это наш ассортимент, обработка закупщиком не нужна.
+            # Помечаем строку статусом our_assortment; в конце месяца пайплайн
+            # сверки (compute_assortment_hits) проверит, отгрузили ли клиенту
+            # запрошенную позицию после нажатия. См. план
+            # plans/2026-07-01-кнопка-наш-ас-т-запрос-номенклатуры.md.
+            ar = db._fetchone(
+                """SELECT status, converted_request_id
+                   FROM procurement.assortment_requests
+                   WHERE wazzup_message_id = %s""",
+                (message_id,),
+            )
+            if ar and ar["status"] == "converted":
+                await q.edit_message_text(
+                    q.message.text
+                    + f"\n\n📋 Уже создана заявка #{ar['converted_request_id']} — «Наш ас-т» не применён.",
+                    parse_mode=None,
+                )
+                return
+            db._execute(
+                """UPDATE procurement.assortment_requests
+                   SET status='our_assortment', status_changed_at=NOW(),
+                       status_changed_by=%s
+                   WHERE wazzup_message_id = %s""",
+                (q.from_user.full_name or "owner", message_id),
+            )
+            # Классификатор сработал верно (реальный запрос по номенклатуре),
+            # просто закупка не нужна → feedback='confirmed' для re-train.
+            db._execute(
+                """UPDATE wazzup_classifications
+                   SET feedback = 'confirmed'
+                   WHERE message_id = %s""",
+                (message_id,),
+            )
+            await q.edit_message_text(
+                q.message.text + "\n\n🐟 Наш ассортимент — учтём в сверке отгрузок.",
+                parse_mode=None,
+            )
+            return
         if action == "fp":
             # Ложно-позитивный → пишем feedback для re-train
             db._execute(
