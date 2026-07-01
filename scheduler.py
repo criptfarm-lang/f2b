@@ -15,6 +15,7 @@ from telegram.ext import Application
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.date import DateTrigger
 
 from claude_ai import generate_morning_summary
 
@@ -200,11 +201,46 @@ def setup_scheduler(app: Application, db):
     # каждый час подтверждён). market_intel_cron_job импортируется и вызывается
     # из bot.py wrapper'а.
 
+    # 2026-07-08 10:00 МСК — разовое напоминание собственнику: контроль Я.Директ
+    # после перенастройки РК 01.07 (план f2b-second-brain/plans/2026-07-01-
+    # яндекс-директ-перенастройка-рк.md). DateTrigger + guard: если дата уже
+    # прошла (перезапуск контейнера после 08.07) — джоб не добавляем.
+    _direct_reminder_dt = datetime(2026, 7, 8, 10, 0, tzinfo=MSK)
+    if _direct_reminder_dt > datetime.now(MSK):
+        scheduler.add_job(
+            direct_check_reminder,
+            DateTrigger(run_date=_direct_reminder_dt),
+            args=[app],
+            id="direct_check_reminder_20260708",
+            misfire_grace_time=3600, coalesce=True,
+        )
+
     scheduler.start()
     logger.info("✅ Планировщик запущен")
     for job in scheduler.get_jobs():
         nxt = job.next_run_time.astimezone(MSK).strftime("%Y-%m-%d %H:%M %Z") if job.next_run_time else "?"
         logger.info(f"  job={job.id} next_run={nxt}")
+
+async def direct_check_reminder(app: Application):
+    """Разовое напоминание собственнику о контроле Я.Директ (08.07.2026 10:00 МСК)."""
+    owner_raw = os.getenv("OWNER_CHAT_ID")
+    if not owner_raw:
+        logger.warning("direct_check_reminder: OWNER_CHAT_ID не задан, пропуск")
+        return
+    text = (
+        "Напоминание: контроль Я.Директ после перенастройки 01.07.\n\n"
+        "В Claude Code скажи «запусти директ анализ». Проверить:\n"
+        "– CPA ХоРеКа (тянуть к 1000–1500, стартовали с 2000)\n"
+        "– объём ХоРеКа после отсечки выходных — не задушило ли\n"
+        "– какие из 4 объявлений на кампанию выиграли (слабые отключить)\n"
+        "– общий баланс и расход"
+    )
+    try:
+        await app.bot.send_message(chat_id=int(owner_raw), text=text)
+        logger.info("direct_check_reminder: отправлено собственнику")
+    except Exception as e:
+        logger.error(f"direct_check_reminder: ошибка отправки: {e}")
+
 
 async def morning_summary(app: Application, db):
     """Отправляет утреннюю сводку в группы."""
