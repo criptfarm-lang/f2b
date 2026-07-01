@@ -7268,17 +7268,20 @@ def main():
                 )
             return
         if action == "fp":
-            # Ложно-позитивный → пишем feedback для re-train
+            # Ложно-позитивный → пишем feedback для re-train и удаляем сообщение.
             db._execute(
                 """UPDATE wazzup_classifications
                    SET feedback = 'false_positive'
                    WHERE message_id = %s""",
                 (message_id,),
             )
-            await q.edit_message_text(
-                q.message.text + "\n\n👎 Помечено как ложный — пойдёт в re-train.",
-                parse_mode=None,
-            )
+            try:
+                await q.message.delete()
+            except Exception:
+                await q.edit_message_text(
+                    q.message.text + "\n\n👎 Помечено как ложный — пойдёт в re-train.",
+                    parse_mode=None,
+                )
         elif action in ("ok", "req"):
             # «✅ В работу» = подтверждение классификатора + создание заявки
             # закупщику в одном клике. `req` — legacy-алиас для старых сообщений
