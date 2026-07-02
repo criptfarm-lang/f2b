@@ -3349,9 +3349,43 @@ async def get_counterparty_debt(counterparty_id: str) -> dict:
         logger.error(f"get_counterparty_debt: {e}", exc_info=True)
         return {}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# СТРОГИЙ ЗАПРЕТ: бот НИКОГДА не ставит галку «Договор подписан».
+# Её выставляет только человек, увидев подписанный договор глазами (в UI МС).
+# Инцидент 2026-07-02: разовый скрипт под токеном «Эф» массово (147 контрагентов,
+# 16.06.2026) проставил contract_signed=true — пришлось снимать вручную.
+# Любой PUT/POST контрагента, содержащий этот атрибут, обязан проходить проверку
+# _guard_no_contract_signed(), которая вырежет/заблокирует запись флага.
+# ─────────────────────────────────────────────────────────────────────────────
+_FORBIDDEN_CP_ATTR_CONTRACT_SIGNED = "57ad9627-696b-11f1-0a80-1340000ba884"  # boolean «Договор подписан»
+
+
+def _guard_no_contract_signed(payload: dict) -> dict:
+    """Защита: удаляет из payload контрагента любую попытку записать
+    «Договор подписан». Возвращает очищенный payload. Логирует нарушение.
+    Бот не имеет права ставить этот флаг — только человек в UI МС."""
+    attrs = (payload or {}).get("attributes")
+    if not isinstance(attrs, list):
+        return payload
+    cleaned = []
+    for a in attrs:
+        href = (a.get("meta") or {}).get("href", "") if isinstance(a, dict) else ""
+        aid = a.get("id", "") if isinstance(a, dict) else ""
+        if _FORBIDDEN_CP_ATTR_CONTRACT_SIGNED in str(href) or aid == _FORBIDDEN_CP_ATTR_CONTRACT_SIGNED:
+            logger.error(
+                "ЗАПРЕТ: попытка записать «Договор подписан» ботом заблокирована. "
+                "Этот флаг ставит только человек в UI МС."
+            )
+            continue
+        cleaned.append(a)
+    payload["attributes"] = cleaned
+    return payload
+
+
 async def set_counterparty_contract_number(agent_id: str, number: str) -> bool:
     """Пишет «№ договора» (ATTR_CP_CONTRACT_NUMBER) в карточку контрагента МС.
-    Используется при одобрении договора из приложения (план 2026-07-01, Фаза 3)."""
+    Используется при одобрении договора из приложения (план 2026-07-01, Фаза 3).
+    НЕ трогает «Договор подписан» — это делает только человек."""
     import aiohttp
     url = f"{MS_BASE}/entity/counterparty/{agent_id}"
     payload = {
@@ -3366,6 +3400,7 @@ async def set_counterparty_contract_number(agent_id: str, number: str) -> bool:
             }
         ]
     }
+    payload = _guard_no_contract_signed(payload)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.put(url, headers=get_headers(), json=payload) as resp:
