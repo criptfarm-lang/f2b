@@ -82,11 +82,16 @@ def setup_scheduler(app: Application, db):
     # каждые 30 мин — светофор техопераций (новая операция / «Анализ сделан»)
     # → Виктору и Маланчуку. План: светофор-техопераций-эф (Фаза 2, read-only).
     from processing_svetofor import poll_job as processing_svetofor_poll
+    # next_run_time=now+60s + misfire_grace_time + coalesce: без них AsyncIOScheduler
+    # дропал 30-мин тик как misfire (event loop занят long-poll'ом getUpdates) → джоба
+    # ни разу не исполнялась. Тот же баг/фикс, что у refresh_op_report_cache (см. ниже).
     scheduler.add_job(
         processing_svetofor_poll,
         IntervalTrigger(minutes=30, timezone=MSK),
         args=[app, db],
         id="processing_svetofor_poll",
+        next_run_time=datetime.now(MSK) + timedelta(seconds=60),
+        misfire_grace_time=3600, coalesce=True,
     )
 
     # 13:55 и 14:00 МСК — снимок состояния заказов для ПДЗ-автоматики
