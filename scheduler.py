@@ -79,20 +79,10 @@ def setup_scheduler(app: Application, db):
         id="sync_managers"
     )
 
-    # каждые 30 мин — светофор техопераций (новая операция / «Анализ сделан»)
-    # → Виктору и Маланчуку. План: светофор-техопераций-эф (Фаза 2, read-only).
-    from processing_svetofor import poll_job as processing_svetofor_poll
-    # next_run_time=now+60s + misfire_grace_time + coalesce: без них AsyncIOScheduler
-    # дропал 30-мин тик как misfire (event loop занят long-poll'ом getUpdates) → джоба
-    # ни разу не исполнялась. Тот же баг/фикс, что у refresh_op_report_cache (см. ниже).
-    scheduler.add_job(
-        processing_svetofor_poll,
-        IntervalTrigger(minutes=30, timezone=MSK),
-        args=[app, db],
-        id="processing_svetofor_poll",
-        next_run_time=datetime.now(MSK) + timedelta(seconds=60),
-        misfire_grace_time=3600, coalesce=True,
-    )
+    # Светофор техопераций (каждые 30 мин) — ПЕРЕНЕСЁН в PTB JobQueue (bot.py,
+    # _processing_svetofor_wrapper) 2026-07-03. В этом AsyncIOScheduler джоба ни
+    # разу не исполнялась: interval-тик дропался (тот же баг, что market_intel/
+    # payment_planned, вынесенные в JobQueue ранее). План: светофор-техопераций-эф.
 
     # 13:55 и 14:00 МСК — снимок состояния заказов для ПДЗ-автоматики
     # (план 2026-05-20, Фаза 2). Два запуска: до банк-cut-off (13:55) и

@@ -7639,6 +7639,20 @@ def main():
 
     app.job_queue.run_repeating(_wazzup_classifier_job, interval=900, first=120)
 
+    # Светофор техопераций — каждые 30 мин. Перенесён из AsyncIOScheduler
+    # (scheduler.py) в PTB JobQueue 2026-07-03: в AsyncIOScheduler джоба ни разу
+    # не исполнялась (тик дропался, тот же баг, что market_intel/payment_planned).
+    # План: светофор-техопераций-эф. first=60 → сразу сид после старта.
+    from processing_svetofor import poll_job as _processing_svetofor_poll
+
+    async def _processing_svetofor_wrapper(context):
+        try:
+            await _processing_svetofor_poll(app, db)
+        except Exception as e:
+            logger.error(f"processing_svetofor job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_processing_svetofor_wrapper, interval=1800, first=60)
+
     # ────────────────────────────────────────────────────────────────────
     # Wazzup classifier — дневная сводка собственнику 17:00 МСК.
     # Счётчик за день + топ-5 срочных. Если 0 — «0 запросов, всё тихо».
