@@ -7235,6 +7235,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_approval_callback, pattern="^appr_"))
+    from processing_svetofor import handle_svetofor_callback
+    app.add_handler(CallbackQueryHandler(handle_svetofor_callback, pattern="^svf:"))
     app.add_handler(CallbackQueryHandler(handle_doc_approval_callback, pattern="^doc_(approve|reject):"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing|wazzup_later)"))

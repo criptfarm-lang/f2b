@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 import httpx
 import psycopg2
 import psycopg2.extras
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +255,99 @@ def render(snap: dict) -> str:
     return "\n".join(lines)
 
 
+# ── Фаза 3: кнопки (только Виктору) ──────────────────────────────────────────
+ACTION_STATE = {"ok": "Проверено", "vy": "Проверить выход", "rz": "Разобраться"}
+_states_cache: dict[str, str] = {}
+
+
+async def _states_meta() -> dict[str, str]:
+    """{name: href state} техопераций (кеш метаданных)."""
+    if not _states_cache:
+        d = await _ms_get("/entity/processing/metadata")
+        for s in d.get("states") or []:
+            href = (s.get("meta") or {}).get("href")
+            if s.get("name") and href:
+                _states_cache[s["name"]] = href
+    return _states_cache
+
+
+async def _patch_state(pid: str, state_name: str):
+    href = (await _states_meta()).get(state_name)
+    if not href:
+        raise RuntimeError(f"нет state '{state_name}' в метаданных processing")
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.put(
+            f"{MS_BASE}/entity/processing/{pid}", headers=get_headers(),
+            json={"state": {"meta": {"href": href, "type": "state",
+                                     "mediaType": "application/json"}}})
+        r.raise_for_status()
+
+
+def keyboard(pid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Проверено", callback_data=f"svf:ok:{pid}"),
+        InlineKeyboardButton("Проверить выход", callback_data=f"svf:vy:{pid}"),
+        InlineKeyboardButton("Разобраться", callback_data=f"svf:rz:{pid}"),
+    ]])
+
+
+def _dec(x):
+    from decimal import Decimal
+    return None if x is None else Decimal(str(x))
+
+
+async def _upsert_snapshot(pid, name, moment, state):
+    """При «Проверено» записываем снимок в норму (view processing_stats)."""
+    snap = await compute(pid, name, moment, state)
+    if snap is None:
+        return
+    with _db().cursor() as cur:
+        cur.execute("""
+            insert into production.processing_snapshots
+              (processing_id,name,moment,out_sku_code,out_sku_name,out_qty,out_multi,
+               fish_type,fish_qty,cost_per_kg,yield_pct,check_status,computed_at)
+            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+            on conflict (processing_id) do update set
+               check_status=excluded.check_status, cost_per_kg=excluded.cost_per_kg,
+               yield_pct=excluded.yield_pct, out_qty=excluded.out_qty,
+               out_multi=excluded.out_multi, fish_type=excluded.fish_type,
+               fish_qty=excluded.fish_qty, computed_at=now()
+        """, (pid, name, datetime.strptime(moment, "%Y-%m-%d %H:%M:%S.%f"),
+              snap["out_sku_code"], snap["out_sku_name"], _dec(snap["out_qty"]), snap["out_multi"],
+              snap["fish_type"], _dec(snap["fish_qty"]), _dec(snap["cost_per_kg"]),
+              _dec(snap["yield_pct"]), state))
+
+
+async def handle_svetofor_callback(update, context):
+    """Callback кнопок светофора (pattern ^svf:). Только Виктор."""
+    q = update.callback_query
+    try:
+        _, action, pid = (q.data or "").split(":", 2)
+    except ValueError:
+        await q.answer()
+        return
+    owner = (os.getenv("OWNER_CHAT_ID") or "").strip()
+    if owner.isdigit() and update.effective_user and update.effective_user.id != int(owner):
+        await q.answer("Нет прав")
+        return
+    state_name = ACTION_STATE.get(action)
+    if not state_name:
+        await q.answer()
+        return
+    try:
+        await _patch_state(pid, state_name)
+        if action == "ok":
+            doc = await _ms_get(f"/entity/processing/{pid}", {"expand": "state"})
+            await _upsert_snapshot(pid, doc.get("name"), doc["moment"], "Проверено")
+        _log_upsert(pid, None, state_name, analiz=False)
+        await q.answer(f"Статус: {state_name}")
+        base = q.message.text or ""
+        await q.edit_message_text(f"{base}\n\n→ отмечено: {state_name}", reply_markup=None)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"svetofor callback {action} {pid}: {e}")
+        await q.answer(f"Ошибка: {e}", show_alert=True)
+
+
 # ── детект + отправка ────────────────────────────────────────────────────────
 def _recipients() -> list[int]:
     ids = []
@@ -277,6 +371,7 @@ def _log_upsert(pid, name, state, analiz: bool):
               (processing_id,name,last_state,first_sent_at,analiz_sent_at,updated_at)
             values (%s,%s,%s,now(),case when %s then now() else null end,now())
             on conflict (processing_id) do update set
+              name=coalesce(excluded.name, production.processing_svetofor_log.name),
               last_state=excluded.last_state,
               analiz_sent_at=coalesce(production.processing_svetofor_log.analiz_sent_at,
                              case when %s then now() else null end),
@@ -321,6 +416,8 @@ async def poll_job(app, db=None):
         return
 
     recipients = _recipients()
+    owner = (os.getenv("OWNER_CHAT_ID") or "").strip()
+    owner_id = int(owner) if owner.isdigit() else None
     sent = 0
     for r in rows:
         pid = r["id"]
@@ -339,7 +436,8 @@ async def poll_job(app, db=None):
                 continue
             text = render(snap)
             for chat_id in recipients:
-                await app.bot.send_message(chat_id=chat_id, text=text)
+                kb = keyboard(pid) if chat_id == owner_id else None  # кнопки только Виктору
+                await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
             _log_upsert(pid, r.get("name"), state, analiz=(state == ANALIZ_STATE))
             sent += 1
             logger.info(f"svetofor: №{r.get('name')} [{reason}] отправлен ({len(recipients)} получат.)")
