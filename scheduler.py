@@ -79,6 +79,16 @@ def setup_scheduler(app: Application, db):
         id="sync_managers"
     )
 
+    # каждые 30 мин — светофор техопераций (новая операция / «Анализ сделан»)
+    # → Виктору и Маланчуку. План: светофор-техопераций-эф (Фаза 2, read-only).
+    from processing_svetofor import poll_job as processing_svetofor_poll
+    scheduler.add_job(
+        processing_svetofor_poll,
+        IntervalTrigger(minutes=30, timezone=MSK),
+        args=[app, db],
+        id="processing_svetofor_poll",
+    )
+
     # 13:55 и 14:00 МСК — снимок состояния заказов для ПДЗ-автоматики
     # (план 2026-05-20, Фаза 2). Два запуска: до банк-cut-off (13:55) и
     # после разнесения банка (14:00). Логика срывов сравнивает 14:00-снимки.
