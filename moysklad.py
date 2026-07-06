@@ -4946,6 +4946,16 @@ async def fetch_coverage_residual_for_window(
         logger.warning(f"fetch_coverage_residual[{agent_id[:8]}] payments: {e}")
         return None
 
+    # «Покрытие кэшфлоу» физически возможно ТОЛЬКО если за окно были приходы.
+    # Без приходов (payments_sum == 0) residual ≤ 0 означал бы лишь «весь долг
+    # возник ВНУТРИ окна» (новый клиент, до T−N долга не было) — а не «оплачено».
+    # Такой клиент имеет РЕАЛЬНУЮ просрочку и должен остаться в дайджесте/штрафе.
+    # Кейс ООО «ХИНКАЛЬНАЯ МЕТРОПОЛИС» 2026-07-06: долг 94к, 0 приходов, первая
+    # отгрузка ровно на границе T−45 → opening≈0 → residual≈0 → ошибочно
+    # скрывался как «покрытый». Возвращаем реальный долг (>0 = не покрыто).
+    if payments_sum <= 0:
+        return round(debt_today, 2)
+
     demands_sum = 0.0
     try:
         agent_href = f"{MS_BASE}/entity/counterparty/{agent_id}"
