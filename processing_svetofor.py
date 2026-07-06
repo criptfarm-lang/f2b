@@ -228,7 +228,7 @@ def render(snap: dict) -> str:
     moment = datetime.strptime(snap["moment"], "%Y-%m-%d %H:%M:%S.%f").strftime("%d.%m")
 
     lines = [f"{_overall(c_cost, c_yld)} Техоперация №{snap['name']} · {moment}",
-             f"{sku_name} ({snap['out_sku_code']}) · сырьё {snap['fish_type']}", ""]
+             f"{sku_name} ({snap['out_sku_code']}) · готовая продукция {snap['fish_type']}", ""]
 
     if cost is None:
         lines.append("Себестоимость: н/д (битая себест. выбытия — проверь)"
