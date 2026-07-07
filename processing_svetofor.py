@@ -243,7 +243,11 @@ def render(snap: dict) -> str:
     norm = _norm_row(snap["out_sku_code"], snap["fish_type"])
     cost = snap["cost_per_kg"]
     yld = snap["yield_pct"]
-    cost_broken = cost is not None and cost < COST_FLOOR
+    # «Битая себест. выбытия» (near-zero списание партии) — реальный риск ТОЛЬКО
+    # для филе ПБГ/ПСГ (норма 1200–1600 ₽/кг). Дешёвые продукты (суповой набор,
+    # фарш из обрези ~27 ₽/кг) законно ниже COST_FLOOR — не флагаем, показываем как есть.
+    cost_broken = (cost is not None and cost < COST_FLOOR
+                   and snap["fish_type"] in ("ПБГ", "ПСГ"))
     yield_broken = yld is not None and not (YIELD_MIN <= yld <= YIELD_MAX)
     if cost_broken:
         cost = None
