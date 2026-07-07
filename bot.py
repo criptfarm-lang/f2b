@@ -7758,6 +7758,35 @@ def main():
 
     app.job_queue.run_repeating(_wazzup_freshness_check, interval=3600, first=600)
 
+    # ────────────────────────────────────────────────────────────────────
+    # Авто-пересчёт «Контроль» (assortment hits). Кнопка «🔎 Контроль» в
+    # карточке запроса пишет status='our_assortment', но вкладку «Контроль»
+    # в дашборде закупок наполняет только пересчёт (compute_assortment_hits).
+    # Раньше он был только ручной командой /assortment_hits, которую по факту
+    # не запускали → вкладка вечно «нет данных» несмотря на нажатия.
+    # Теперь считаем автоматически текущий месяц: first=120 (сид сразу после
+    # деплоя) + каждые 3 часа (отгрузки клиенту появляются в течение дня).
+    # План 2026-07-01-кнопка-наш-ас-т-запрос-номенклатуры.md («осталось: cron»).
+    # ────────────────────────────────────────────────────────────────────
+    async def _assortment_hits_recompute(context):
+        from datetime import date as _date
+        import calendar as _cal
+        import assortment_hits
+        try:
+            today = _date.today()
+            period_from = _date(today.year, today.month, 1)
+            period_to = _date(today.year, today.month,
+                              _cal.monthrange(today.year, today.month)[1])
+            res = await assortment_hits.compute_assortment_hits(
+                db, period_from, period_to)
+            logger.info(f"assortment_hits recompute: {len(res)} rows "
+                        f"for {period_from:%Y-%m}")
+        except Exception as e:
+            logger.error(f"_assortment_hits_recompute: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(
+        _assortment_hits_recompute, interval=3 * 3600, first=120)
+
     # Запускаем webhook-сервер и polling параллельно
     import aiohttp.web as web
 
