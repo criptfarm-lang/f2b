@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 
 import httpx
@@ -121,24 +122,56 @@ def _classify_fish(name: str) -> str | None:
     return "ПБГ" if "ПБГ" in up else ("ПСГ" if "ПСГ" in up else None)
 
 
-async def _positions(pid: str, kind: str) -> list[dict]:
-    d = await _ms_get(f"/entity/processing/{pid}/{kind}", {"expand": "assortment", "limit": 1000})
+# Вес в наименовании: "500 гр.", "250 г", "0,5 кг", "1 кг" → кг
+_WEIGHT_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(кг|гр|г)\b", re.IGNORECASE)
+
+
+def _is_piece(assortment: dict) -> bool:
+    """Штучная позиция (uom = шт), а не весовая (кг)."""
+    nm = ((assortment.get("uom") or {}).get("name") or "").lower()
+    return "шт" in nm
+
+
+def _unit_kg(assortment: dict) -> float | None:
+    """Вес одной штуки в кг: сперва из наименования, иначе из поля weight МС."""
+    m = _WEIGHT_RE.search(assortment.get("name") or "")
+    if m:
+        val = float(m.group(1).replace(",", "."))
+        return val if m.group(2).lower() == "кг" else val / 1000.0
+    w = assortment.get("weight")
+    return float(w) if w and float(w) > 0 else None
+
+
+def _out_kg(assortment: dict, qty: float) -> float | None:
+    """Объём выпуска позиции в кг. Весовая — как есть; штучная — qty × вес штуки."""
+    if not _is_piece(assortment):
+        return qty
+    uk = _unit_kg(assortment)
+    return qty * uk if uk else None
+
+
+async def _positions(pid: str, kind: str, expand: str = "assortment") -> list[dict]:
+    d = await _ms_get(f"/entity/processing/{pid}/{kind}", {"expand": expand, "limit": 1000})
     return d.get("rows") or []
 
 
 async def compute(pid: str, name: str, moment: str, state: str | None) -> dict | None:
-    prods = await _positions(pid, "products")
+    prods = await _positions(pid, "products", expand="assortment.uom")
     if not prods:
         return None
     mats = await _positions(pid, "materials")
 
-    out_pos = [((p.get("assortment") or {}).get("code"),
-                (p.get("assortment") or {}).get("name"),
-                float(p.get("quantity") or 0)) for p in prods]
-    out_qty = sum(q for _, _, q in out_pos)
+    # (код, наименование, qty в базовой ед., объём в кг). Для штучных qty×вес; None — не перевести.
+    out_pos = []
+    for p in prods:
+        a = p.get("assortment") or {}
+        qty = float(p.get("quantity") or 0)
+        out_pos.append((a.get("code"), a.get("name"), qty, _out_kg(a, qty)))
     out_multi = len(out_pos) > 1
-    main = max(out_pos, key=lambda t: t[2])
-    out_sku_code, out_sku_name, _ = main
+    main = max(out_pos, key=lambda t: (t[3] if t[3] is not None else t[2]))
+    out_sku_code, out_sku_name = main[0], main[1]
+    # если хоть одну штучную позицию не перевели в кг — не считаем ₽/кг и выход (не врём)
+    out_qty = None if any(kg is None for *_, kg in out_pos) else sum(kg for *_, kg in out_pos)
 
     mat_rows, fish = [], None
     for m in mats:
@@ -155,7 +188,7 @@ async def compute(pid: str, name: str, moment: str, state: str | None) -> dict |
         fish_name, fish_qty, fish_type, yield_pct = None, None, "NONE", None
     else:
         fish_name, fish_qty, fish_type = fish
-        yield_pct = round(out_qty / fish_qty * 100, 2) if fish_qty else None
+        yield_pct = round(out_qty / fish_qty * 100, 2) if (fish_qty and out_qty) else None
 
     perunit = await _day_turnover(moment[:10])
     cost_total, missing = 0.0, 0
@@ -227,31 +260,34 @@ def render(snap: dict) -> str:
     sku_name = (snap["out_sku_name"] or "").split(",")[0]
     moment = datetime.strptime(snap["moment"], "%Y-%m-%d %H:%M:%S.%f").strftime("%d.%m")
 
-    lines = [f"{_overall(c_cost, c_yld)} Техоперация №{snap['name']} · {moment}",
-             f"{sku_name} ({snap['out_sku_code']}) · готовая продукция {snap['fish_type']}", ""]
-
     if cost is None:
-        lines.append("Себестоимость: н/д (битая себест. выбытия — проверь)"
+        cost_line = ("Себестоимость: н/д (битая себест. выбытия — проверь)"
                      if cost_broken else "Себестоимость: н/д")
     elif med_cost is None:
-        lines.append(f"Себестоимость: {cost:.0f} ₽/кг  ⚪ нет нормы")
+        cost_line = f"Себестоимость: {cost:.0f} ₽/кг  ⚪ нет нормы"
     else:
         thin = " · мало данных" if n_cost and n_cost <= 2 else ""
-        lines.append(f"Себестоимость: {cost:.0f} ₽/кг  {c_cost} "
+        cost_line = (f"Себестоимость: {cost:.0f} ₽/кг  {c_cost} "
                      f"{_pct(cost, med_cost):+.1f}% к норме {med_cost:.0f} (n={n_cost}){thin}")
 
     if yld is None:
-        lines.append(f"Выход: {snap['yield_pct']:.0f}% ⚪ вне диапазона — проверь состав"
-                     if yield_broken else "Выход: н/д")
+        yld_line = (f"Выход: {snap['yield_pct']:.0f}% ⚪ вне диапазона — проверь состав"
+                    if yield_broken else "Выход: н/д")
     elif med_yld is None:
-        lines.append(f"Выход: {yld:.1f}%  ⚪ нет нормы")
+        yld_line = f"Выход: {yld:.1f}%  ⚪ нет нормы"
     else:
         thin = " · мало данных" if n_yld and n_yld <= 2 else ""
-        lines.append(f"Выход: {yld:.1f}%  {c_yld} "
-                     f"{_pct(yld, med_yld):+.1f}% к норме {med_yld:.1f}% (n={n_yld}){thin}")
+        yld_line = (f"Выход: {yld:.1f}%  {c_yld} "
+                    f"{_pct(yld, med_yld):+.1f}% к норме {med_yld:.1f}% (n={n_yld}){thin}")
+
+    lines = [f"{_overall(c_cost, c_yld)} Техоперация №{snap['name']} · {moment}",
+             f"{sku_name} ({snap['out_sku_code']})",
+             yld_line,
+             "",
+             cost_line]
 
     if snap.get("check_status"):
-        lines += ["", f"статус в МС: {snap['check_status']}"]
+        lines += ["", "", f"статус в МС: {snap['check_status']}"]
     return "\n".join(lines)
 
 
