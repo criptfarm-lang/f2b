@@ -374,18 +374,28 @@ async def handle_svetofor_callback(update, context):
     if not state_name:
         await q.answer()
         return
+    # Ack СРАЗУ: PUT статуса + пересчёт снимка («Проверено» тянет оборот дня при
+    # холодном кеше) могут занять >15с, иначе Telegram показывает «Timed out».
+    # Результат отдаём правкой сообщения, а не toast'ом.
+    await q.answer("Отмечаю…")
     try:
         await _patch_state(pid, state_name)
         if action == "ok":
             doc = await _ms_get(f"/entity/processing/{pid}", {"expand": "state"})
             await _upsert_snapshot(pid, doc.get("name"), doc["moment"], "Проверено")
         _log_upsert(pid, None, state_name, analiz=False)
-        await q.answer(f"Статус: {state_name}")
         base = q.message.text or ""
         await q.edit_message_text(f"{base}\n\n→ отмечено: {state_name}", reply_markup=None)
     except Exception as e:  # noqa: BLE001
         logger.error(f"svetofor callback {action} {pid}: {e}")
-        await q.answer(f"Ошибка: {e}", show_alert=True)
+        # callback уже отвечен — кнопки оставляем для повтора, ошибку отдельным сообщением
+        try:
+            await context.bot.send_message(
+                chat_id=q.message.chat_id,
+                text=f"⚠️ Светофор: не удалось отметить «{state_name}» — {e}. "
+                     f"Кнопки на месте, попробуй ещё раз.")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ── детект + отправка ────────────────────────────────────────────────────────
