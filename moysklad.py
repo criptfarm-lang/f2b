@@ -1665,6 +1665,22 @@ async def pdz_take_snapshot() -> list:
                 if "розничный покупатель" in agent_name.lower():
                     continue
 
+                # Защита от битой «Дата планируемой оплаты»: если она РАНЬШЕ даты
+                # создания заказа — это невозможно (оплату нельзя запланировать до
+                # заказа), обычно старая дата скопирована с прошлого заказа. Такой
+                # ppm даёт фантомную просрочку (кейс ИП Коротаев 02802: план-оплаты
+                # 2026-04-23 при отгрузке 2026-06-30 → 75 фантомных дней; ВОСТОК-
+                # ЗАПАД 02723 → 48 дней). Пропускаем заказ — легитимную просрочку
+                # не теряем (у неё ppm_initial ≥ даты заказа). Логируем для правки
+                # данных в МойСкладе (писать в МС нельзя — только сигнал).
+                order_moment = _parse_ms_date(order.get("moment"))
+                if order_moment and ppm_initial < order_moment:
+                    logger.warning(
+                        f"pdz_take_snapshot: битая план-оплата у {order.get('name')} "
+                        f"({agent_name}): ppm={ppm_initial} < заказ={order_moment} — пропуск"
+                    )
+                    continue
+
                 manager_tag = None
                 for t in agent_tags:
                     if isinstance(t, str) and t.lower() in PDZ_MANAGER_TAG_MAP:
