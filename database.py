@@ -498,12 +498,15 @@ class Database:
                 shipped_qty           NUMERIC,
                 shipped_sum           NUMERIC,
                 first_shipment_date   DATE,
+                amocrm_contact_id     BIGINT,
                 period_from           DATE NOT NULL,
                 period_to             DATE NOT NULL,
                 computed_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE (assortment_request_id, period_from, period_to)
             )""",
             "CREATE INDEX IF NOT EXISTS idx_assortment_hit_results_period ON procurement.assortment_hit_results (period_from, period_to, computed_at DESC)",
+            # ссылка на карточку контакта amoCRM (диалог) — добавлено 2026-07-08
+            "ALTER TABLE procurement.assortment_hit_results ADD COLUMN IF NOT EXISTS amocrm_contact_id BIGINT",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:

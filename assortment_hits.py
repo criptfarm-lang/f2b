@@ -90,20 +90,32 @@ async def resolve_client(name: str) -> dict:
     Голое имя (один значимый токен, напр. «Катерина», «Алик») НЕ матчим —
     слишком много однофамильцев, лучше unmatched, чем чужой клиент.
     """
-    empty = {"inn": None, "company_name": None, "confidence": "unmatched"}
+    empty = {"inn": None, "company_name": None, "confidence": "unmatched",
+             "contact_id": None}
     if not name or name.strip() in ("", "?"):
         return empty
 
     tokens = _meaningful_tokens(name)
     ambiguous = len(tokens) <= 1  # только имя/ник — недостаточно специфично
 
-    # A) Реальная связь контакт → компания
+    contacts = await amocrm.find_contact_by_name(name)
+
+    # Лучший контакт для ссылки на диалог: точное совпадение имени, иначе первый.
+    nl = name.strip().lower()
+    best = next((c for c in contacts
+                 if (c.get("name") or "").strip().lower() == nl), None)
+    contact_id = (best or (contacts[0] if contacts else {})).get("id")
+
     inn_less_company = None
+
+    def _res(inn, co_name, conf):
+        return {"inn": inn, "company_name": co_name, "confidence": conf,
+                "contact_id": contact_id}
+
     if not ambiguous:
-        contacts = await amocrm.find_contact_by_name(name)
+        # A) Компания, напрямую привязанная к контакту
         for ct in contacts:
-            emb = ct.get("_embedded") or {}
-            for co_ref in (emb.get("companies") or []):
+            for co_ref in ((ct.get("_embedded") or {}).get("companies") or []):
                 co_id = co_ref.get("id")
                 if not co_id:
                     continue
@@ -112,36 +124,49 @@ async def resolve_client(name: str) -> dict:
                     continue
                 inn = _parse_inn(co)
                 if inn:
-                    return {"inn": inn, "company_name": co.get("name"),
-                            "confidence": "matched"}
+                    return _res(inn, co.get("name"), "matched")
                 if inn_less_company is None:
                     inn_less_company = co.get("name")
 
-    # B) Контакт привязан к компании-дублю без ИНН → ищем «брата» с ИНН
+        # A2) Через сделки контакта → компания сделки (реальная бизнес-связь).
+        #     Часто клиент привязан к фирме именно через сделку, а не напрямую
+        #     (напр. «Светлана масло ПТК Пенза» → сделка «ПТК Пенза» → ООО ПТК).
+        for ct in contacts:
+            leads = await amocrm.get_leads_by_contact(ct.get("id"))
+            for lref in (leads or [])[:15]:
+                lead = await amocrm.amo_get(f"/leads/{lref.get('id')}",
+                                            params={"with": "companies"})
+                for co_ref in (((lead or {}).get("_embedded") or {})
+                               .get("companies") or []):
+                    co = await amocrm.amo_get(f"/companies/{co_ref.get('id')}")
+                    if not co:
+                        continue
+                    inn = _parse_inn(co)
+                    if inn:
+                        return _res(inn, co.get("name"), "matched")
+                    if inn_less_company is None:
+                        inn_less_company = co.get("name")
+
+    # B) Компания-дубль без ИНН → ищем «брата» с ИНН по названию
     if inn_less_company:
         for co in await amocrm.find_company_by_name(inn_less_company):
             if amocrm.normalize_name(co.get("name") or "") == \
                     amocrm.normalize_name(inn_less_company):
                 inn = _parse_inn(co)
                 if inn:
-                    return {"inn": inn, "company_name": co.get("name"),
-                            "confidence": "matched"}
+                    return _res(inn, co.get("name"), "matched")
 
-    # C) Поиск по слову-названию фирмы из имени, со строгой верификацией.
-    #    Только если реальной связи контакт→компания не нашлось (иначе мы уже
-    #    знаем правильную компанию, пусть и без ИНН — не подменяем её гаданием).
-    #    Первый токен = имя человека, его НЕ ищем (иначе цепляем ИП-однофамильцев).
+    # C) Поиск по слову-названию фирмы из имени (последний резерв, только если
+    #    связи контакт→компания не нашлось; первый токен = имя, его не ищем).
     if not ambiguous and inn_less_company is None:
         for tok in tokens[1:]:
             for co in await amocrm.find_company_by_name(tok):
                 if _looks_like_company(co.get("name") or "", tok):
                     inn = _parse_inn(co)
                     if inn:
-                        return {"inn": inn, "company_name": co.get("name"),
-                                "confidence": "low"}
+                        return _res(inn, co.get("name"), "low")
 
-    return {"inn": None, "company_name": inn_less_company,
-            "confidence": "unmatched"}
+    return _res(None, inn_less_company, "unmatched")
 
 
 # ─── МойСклад: отгрузки по ИНН за окно ────────────────────────────────────────
@@ -282,8 +307,9 @@ async def compute_assortment_hits(db, period_from: date, period_to: date) -> lis
                (assortment_request_id, contact_name, species_normalized,
                 sku_or_description, clicked_at, amo_company_name, inn,
                 ms_counterparty, match_confidence, shipped, shipped_qty,
-                shipped_sum, first_shipment_date, period_from, period_to, computed_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                shipped_sum, first_shipment_date, amocrm_contact_id,
+                period_from, period_to, computed_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                ON CONFLICT (assortment_request_id, period_from, period_to)
                DO UPDATE SET
                    contact_name=EXCLUDED.contact_name,
@@ -298,11 +324,12 @@ async def compute_assortment_hits(db, period_from: date, period_to: date) -> lis
                    shipped_qty=EXCLUDED.shipped_qty,
                    shipped_sum=EXCLUDED.shipped_sum,
                    first_shipment_date=EXCLUDED.first_shipment_date,
+                   amocrm_contact_id=EXCLUDED.amocrm_contact_id,
                    computed_at=NOW()""",
             (r["id"], r["contact_name"], r["species_normalized"],
              r["sku_or_description"], clicked, res["company_name"], inn,
              ms_name, res["confidence"], shipped, qty or None, ssum or None,
-             first_date, period_from, period_to),
+             first_date, res.get("contact_id"), period_from, period_to),
         )
 
         results.append({
@@ -318,6 +345,7 @@ async def compute_assortment_hits(db, period_from: date, period_to: date) -> lis
             "shipped_qty": qty,
             "shipped_sum": ssum,
             "first_shipment_date": first_date,
+            "amocrm_contact_id": res.get("contact_id"),
         })
 
     return results

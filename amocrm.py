@@ -97,11 +97,13 @@ async def find_company_by_name(name: str) -> list:
 # ─── Сделки ──────────────────────────────────────────────────────────────────
 
 async def get_leads_by_contact(contact_id: int) -> list:
-    """Получает сделки контакта."""
-    result = await amo_get(f"/contacts/{contact_id}/leads")
+    """Сделки контакта: [{id, _links}, ...].
+    Эндпоинта /contacts/{id}/leads в API v4 НЕТ (404) — тянем через
+    /contacts/{id}?with=leads и отдаём refs из _embedded.leads."""
+    result = await amo_get(f"/contacts/{contact_id}", params={"with": "leads"})
     if not result:
         return []
-    return result.get("_embedded", {}).get("leads", [])
+    return (result.get("_embedded") or {}).get("leads") or []
 
 
 async def get_lead(lead_id: int) -> Optional[dict]:
