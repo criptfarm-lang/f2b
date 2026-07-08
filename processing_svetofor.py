@@ -170,10 +170,14 @@ async def compute(pid: str, name: str, moment: str, state: str | None) -> dict |
     out_multi = len(out_pos) > 1
     main = max(out_pos, key=lambda t: (t[3] if t[3] is not None else t[2]))
     out_sku_code, out_sku_name = main[0], main[1]
+    # Метрики (выход, ₽/кг) считаем на ОСНОВНОЙ выпуск (main_kg), а не на сумму всех
+    # продуктов: к филе часто идёт побочный выпуск (суп.набор/фарш), он раздувал выход
+    # и занижал ₽/кг. out_qty (сумма) остаётся только для снимка.
+    main_kg = main[3]
     # если хоть одну штучную позицию не перевели в кг — не считаем ₽/кг и выход (не врём)
     out_qty = None if any(kg is None for *_, kg in out_pos) else sum(kg for *_, kg in out_pos)
 
-    mat_rows, fish = [], None
+    mat_rows, fish_rows = [], []
     for m in mats:
         a = m.get("assortment") or {}
         href = (a.get("meta") or {}).get("href")
@@ -181,14 +185,18 @@ async def compute(pid: str, name: str, moment: str, state: str | None) -> dict |
         if href:
             mat_rows.append((href, qty))
         ft = _classify_fish(a.get("name"))
-        if ft and (fish is None or qty > fish[1]):
-            fish = (a.get("name"), qty, ft)
+        if ft:
+            fish_rows.append((a.get("name"), qty, ft))
 
-    if fish is None:
+    if not fish_rows:
         fish_name, fish_qty, fish_type, yield_pct = None, None, "NONE", None
     else:
-        fish_name, fish_qty, fish_type = fish
-        yield_pct = round(out_qty / fish_qty * 100, 2) if (fish_qty and out_qty) else None
+        # Одна рыба часто разбита на НЕСКОЛЬКО строк (размерки, напр. ПСГ 4-5 + 5-6) —
+        # для выхода СУММИРУЕМ все строки того же типа, а не берём одну самую большую.
+        main_fish = max(fish_rows, key=lambda t: t[1])
+        fish_name, fish_type = main_fish[0], main_fish[2]
+        fish_qty = sum(q for _, q, t in fish_rows if t == fish_type)
+        yield_pct = round(main_kg / fish_qty * 100, 2) if (fish_qty and main_kg) else None
 
     perunit = await _day_turnover(moment[:10])
     cost_total, missing = 0.0, 0
@@ -198,7 +206,7 @@ async def compute(pid: str, name: str, moment: str, state: str | None) -> dict |
             missing += 1
         else:
             cost_total += pu * q
-    cost_per_kg = round(cost_total / out_qty, 2) if (out_qty and missing == 0) else None
+    cost_per_kg = round(cost_total / main_kg, 2) if (main_kg and missing == 0) else None
 
     return {
         "name": name, "moment": moment, "check_status": state,
@@ -261,7 +269,7 @@ def render(snap: dict) -> str:
 
     c_cost = _color_cost(cost, med_cost)
     c_yld = _color_yield(yld, med_yld)
-    sku_name = (snap["out_sku_name"] or "").split(",")[0]
+    sku_name = snap["out_sku_name"] or ""   # полное имя готовой продукции, без обрезки по запятой
     moment = datetime.strptime(snap["moment"], "%Y-%m-%d %H:%M:%S.%f").strftime("%d.%m")
 
     if cost is None:
