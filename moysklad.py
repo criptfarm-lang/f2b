@@ -2136,6 +2136,87 @@ async def agent_ids_with_tag_live(manager_tag: str) -> set:
     return ids
 
 
+async def _overdue_by_demand_fifo(agent_id: str, today, delay: Optional[int] = None) -> Optional[tuple]:
+    """ПРАВИЛЬНЫЙ день-каунт просрочки: по ОТГРУЗКАМ (demand) + FIFO-разнесению
+    приходов, без `customerorder.payed_sum` и `ppm` (оба ненадёжны: payed_sum
+    стухает при неразнесённых платежах, ppm копируется/пустует).
+
+    Логика: платежи гасят отгрузки oldest-first; срок каждой отгрузки =
+    дата отгрузки + Дней отсрочки (из договора); день-каунт = старейшая реально
+    неоплаченная ПРОСРОЧЕННАЯ отгрузка.
+
+    Возврат:
+      - (max_days, overdue_amount, ms_url) — если есть просрочка
+      - (0, 0.0, None) — реально просрочки нет (клиент выпадает из ПДЗ)
+      - None — запрос к МС упал → вызывающий откатывается на старую логику
+    Кейсы ОПЛОТ 159→21, Хованский 149→57, ВОСТОК-ЗАПАД 48→0. См.
+    project_f2b_pdz_penalty_days_inflated + feedback_payment_planned_base_is_delivery.
+    """
+    from datetime import timedelta
+    agent_href = f"{MS_BASE}/entity/counterparty/{agent_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Дней отсрочки из карточки контрагента
+            if delay is None:
+                delay = 0
+                async with session.get(f"{MS_BASE}/entity/counterparty/{agent_id}?expand=attributes",
+                                        headers=get_headers()) as r:
+                    if r.status == 200:
+                        cp = await r.json()
+                        for a in cp.get("attributes", []) or []:
+                            if a.get("name") == "Дней отсрочки" and isinstance(a.get("value"), (int, float)):
+                                delay = int(a["value"]); break
+            # Все отгрузки asc
+            demands = []; offset = 0
+            while True:
+                async with session.get(f"{MS_BASE}/entity/demand", headers=get_headers(),
+                        params={"filter": f"agent={agent_href}", "limit": 100, "offset": offset,
+                                "order": "moment,asc"}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+                rows = data.get("rows", []) or []
+                for x in rows:
+                    demands.append([_to_date(x.get("moment")), (x.get("sum", 0) or 0) / 100, x.get("id")])
+                if len(rows) < 100:
+                    break
+                offset += 100
+            # Сумма приходов
+            pay = 0.0; offset = 0
+            while True:
+                async with session.get(f"{MS_BASE}/entity/paymentin", headers=get_headers(),
+                        params={"filter": f"agent={agent_href}", "limit": 100, "offset": offset}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+                rows = data.get("rows", []) or []
+                pay += sum((p.get("sum", 0) or 0) / 100 for p in rows)
+                if len(rows) < 100:
+                    break
+                offset += 100
+    except Exception as e:
+        logger.warning(f"_overdue_by_demand_fifo({agent_id[:8]}): {e}")
+        return None
+
+    # FIFO: платежи гасят отгрузки oldest-first
+    remaining = pay
+    for row in demands:
+        paid_here = min(remaining, row[1]); row.append(row[1] - paid_here); remaining -= paid_here
+    overdue = []
+    for dt, amt, did, unpaid in demands:
+        if unpaid > 1 and dt:
+            due = dt + timedelta(days=delay)
+            if due < today:
+                overdue.append(((today - due).days, round(unpaid, 2), did))
+    if not overdue:
+        return (0, 0.0, None, 0)
+    overdue.sort(reverse=True)
+    max_days = overdue[0][0]
+    ov_amt = round(sum(o[1] for o in overdue), 2)
+    url = f"https://online.moysklad.ru/app/#demand/edit?id={overdue[0][2]}"
+    return (max_days, ov_amt, url, len(overdue))
+
+
 async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: bool = True) -> list:
     """Список просроченных заказов конкретного менеджера для TG-дайджеста.
 
@@ -2330,28 +2411,39 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
     grouped: list = []
     for aid, data in by_agent.items():
         agent_orders = data["orders"]
-        # total_unpaid = real_overdue по FIFO (|balance| − in_сроке), fallback
-        # на сумму по заказам если balance запроса упал.
         total_unpaid = agent_real_overdue.get(
             aid, round(sum(x["unpaid_sum"] for x in agent_orders), 2)
         )
-        # LIFO-распределение: real_overdue падает на самые свежие просрочки.
-        # Старые мартовские/апрельские «закрываются» свежими платежами —
-        # max_days, orders_count и ссылка идут по covered (а не по всем
-        # неоплаченным). Кейс ДЖИФУДСЕРВИСЕС 2026-05-29.
-        covered = _pdz_lifo_cover(agent_orders, total_unpaid)
-        if not covered:
-            covered = agent_orders  # балансовый fallback (никогда не должен сработать)
-        oldest_in_covered = min(covered, key=lambda x: x["effective_due_date"])
-        max_days = max(x["days_overdue"] for x in covered)
+        # ПРАВИЛЬНЫЙ день-каунт (2026-07-08): по отгрузкам (demand) + FIFO приходов,
+        # срок = дата отгрузки + Дней отсрочки. Устраняет весь класс завышения дней,
+        # который давали `payed_sum`/`ppm` заказа (ОПЛОТ 159→21, Хованский 149→57,
+        # ВОСТОК-ЗАПАД 48→0). См. project_f2b_pdz_penalty_days_inflated.
+        fifo = await _overdue_by_demand_fifo(aid, today)
+        if fifo is not None:
+            f_days, f_amt, f_url, f_cnt = fifo
+            if f_days == 0 and not f_url:
+                # реально просрочки нет (весь долг в срок / оплачен FIFO) → пропуск
+                continue
+            max_days = f_days
+            total_unpaid = f_amt if f_amt > 0 else total_unpaid
+            first_url = f_url
+            orders_count = f_cnt
+        else:
+            # МС demand/paymentin недоступны → фолбэк на старую LIFO-логику.
+            covered = _pdz_lifo_cover(agent_orders, total_unpaid)
+            if not covered:
+                covered = agent_orders
+            max_days = max(x["days_overdue"] for x in covered)
+            first_url = min(covered, key=lambda x: x["effective_due_date"])["ms_url"]
+            orders_count = len(covered)
         grouped.append({
             "agent_id": aid,
             "agent_name": data["agent_name"],
             "agent_balance": data["agent_balance"],
             "total_unpaid": total_unpaid,
             "max_days_overdue": max_days,
-            "orders_count": len(covered),
-            "ms_url_first_order": oldest_in_covered["ms_url"],
+            "orders_count": orders_count,
+            "ms_url_first_order": first_url,
         })
 
     # Обогащение счётчиком срывов за 90 дней (Фаза 4.5).
