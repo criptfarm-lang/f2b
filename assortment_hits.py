@@ -45,42 +45,102 @@ def _parse_inn(company: dict) -> Optional[str]:
     return None
 
 
+_ORG_RE = re.compile(r"\b(ООО|ОАО|ЗАО|АО|ПАО|НКО|ИП)\b", re.IGNORECASE)
+
+
+def _meaningful_tokens(name: str) -> list:
+    """Слова ≥4 букв, без орг-форм (ООО/ИП...). Порядок сохранён."""
+    parts = re.split(r'[\s,"«»]+', (name or "").strip())
+    return [p for p in parts if len(p) >= 4 and not _ORG_RE.fullmatch(p)]
+
+
+def _looks_like_company(co_name: str, token: str) -> bool:
+    """Найденная по токену компания правдоподобно ЕСТЬ фирма `token`,
+    а не случайный однофамилец. Токен должен быть отдельным словом в
+    названии, а само название — «брендовым» (есть орг-форма или это не
+    трёхсловное ФИО)."""
+    n = (co_name or "").upper()
+    t = token.upper()
+    core = _ORG_RE.sub("", n)
+    core = re.sub(r'["\'«»\-]', " ", core)
+    words = [w for w in core.split() if w]
+    if t not in words:
+        return False
+    has_org = bool(_ORG_RE.search(n))
+    is_fio = (len(words) == 3 and not has_org)  # Фамилия Имя Отчество
+    return has_org or (not is_fio and len(words) <= 3)
+
+
 async def resolve_client(name: str) -> dict:
     """
-    Имя клиента → {inn, company_name, confidence}.
+    Имя клиента (contact_name из Wazzup, часто «Имя Фирма») → {inn,
+    company_name, confidence}.
     confidence:
-      matched   — компания найдена по названию + ИНН достан
-      low       — ИНН достан через контакт → его компанию (нечёткий путь)
-      unmatched — ИНН не найден, отгрузку проверить нельзя
+      matched   — компания найдена (по связи контакта или по названию) + ИНН
+      low       — ИНН достан по слову-названию фирмы из имени (нечёткий путь)
+      unmatched — ИНН не найден / имя слишком неоднозначное (голое имя)
+
+    Стратегия (после разбора 2026-07-08, см. memory
+    reference_f2b_assortment_hits_auto_recompute):
+      A. реальная связь контакт→компания в amoCRM (надёжнее нечёткого поиска);
+      B. если контакт привязан к дублю компании без ИНН — ищем «брата» с ИНН
+         по тому же названию;
+      C. поиск по слову-названию фирмы из имени со строгой верификацией
+         `_looks_like_company` (защита от ложных матчей на общее имя).
+    Голое имя (один значимый токен, напр. «Катерина», «Алик») НЕ матчим —
+    слишком много однофамильцев, лучше unmatched, чем чужой клиент.
     """
     empty = {"inn": None, "company_name": None, "confidence": "unmatched"}
     if not name or name.strip() in ("", "?"):
         return empty
 
-    # 1) Прямой поиск компании по имени
-    companies = await amocrm.find_company_by_name(name)
-    for co in companies:
-        inn = _parse_inn(co)
-        if inn:
-            return {"inn": inn, "company_name": co.get("name"), "confidence": "matched"}
+    tokens = _meaningful_tokens(name)
+    ambiguous = len(tokens) <= 1  # только имя/ник — недостаточно специфично
 
-    # 2) Через контакт → его компанию
-    contacts = await amocrm.find_contact_by_name(name)
-    for ct in contacts:
-        emb = ct.get("_embedded") or {}
-        for co_ref in (emb.get("companies") or []):
-            co_id = co_ref.get("id")
-            if not co_id:
-                continue
-            co = await amocrm.amo_get(f"/companies/{co_id}")
-            if co:
+    # A) Реальная связь контакт → компания
+    inn_less_company = None
+    if not ambiguous:
+        contacts = await amocrm.find_contact_by_name(name)
+        for ct in contacts:
+            emb = ct.get("_embedded") or {}
+            for co_ref in (emb.get("companies") or []):
+                co_id = co_ref.get("id")
+                if not co_id:
+                    continue
+                co = await amocrm.amo_get(f"/companies/{co_id}")
+                if not co:
+                    continue
                 inn = _parse_inn(co)
                 if inn:
                     return {"inn": inn, "company_name": co.get("name"),
-                            "confidence": "low"}
+                            "confidence": "matched"}
+                if inn_less_company is None:
+                    inn_less_company = co.get("name")
 
-    return {"inn": None,
-            "company_name": (companies[0].get("name") if companies else None),
+    # B) Контакт привязан к компании-дублю без ИНН → ищем «брата» с ИНН
+    if inn_less_company:
+        for co in await amocrm.find_company_by_name(inn_less_company):
+            if amocrm.normalize_name(co.get("name") or "") == \
+                    amocrm.normalize_name(inn_less_company):
+                inn = _parse_inn(co)
+                if inn:
+                    return {"inn": inn, "company_name": co.get("name"),
+                            "confidence": "matched"}
+
+    # C) Поиск по слову-названию фирмы из имени, со строгой верификацией.
+    #    Только если реальной связи контакт→компания не нашлось (иначе мы уже
+    #    знаем правильную компанию, пусть и без ИНН — не подменяем её гаданием).
+    #    Первый токен = имя человека, его НЕ ищем (иначе цепляем ИП-однофамильцев).
+    if not ambiguous and inn_less_company is None:
+        for tok in tokens[1:]:
+            for co in await amocrm.find_company_by_name(tok):
+                if _looks_like_company(co.get("name") or "", tok):
+                    inn = _parse_inn(co)
+                    if inn:
+                        return {"inn": inn, "company_name": co.get("name"),
+                                "confidence": "low"}
+
+    return {"inn": None, "company_name": inn_less_company,
             "confidence": "unmatched"}
 
 
