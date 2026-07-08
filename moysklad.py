@@ -5421,14 +5421,26 @@ async def payment_planned_autofill_tick(
         for order in orders:
             result["processed"] += 1
 
-            already_filled = False
+            # Текущее значение «Даты планируемой оплаты» (если заполнено).
+            current_ppm = None
             for a in order.get("attributes", []) or []:
                 if a.get("name") == _PPM_INITIAL_ATTR_NAME and a.get("value"):
-                    already_filled = True
+                    current_ppm = a.get("value")
                     break
-            if already_filled:
+            # База (План.дата отгрузки) — нужна и для проверки «битости» ppm.
+            base_d10 = (order.get("deliveryPlannedMoment") or order.get("moment") or "")[:10]
+            # Skip только если поле заполнено И НЕ битое (ppm >= даты отгрузки).
+            # Битые (ppm < отгрузки) обычно приезжают при копировании заказа со
+            # старой датой; менеджер правит отгрузку, но старая дата оплаты
+            # остаётся и даёт фантомную просрочку — такие ПЕРЕсчитываем.
+            if current_ppm and base_d10 and current_ppm[:10] >= base_d10:
                 result["skipped_filled"] += 1
                 continue
+            if current_ppm:
+                logger.info(
+                    f"autofill_tick: пересчёт битой ppm у {order.get('name')} "
+                    f"(было {current_ppm[:10]} < отгрузка {base_d10})"
+                )
 
             agent = order.get("agent") or {}
             agent_id_ = agent.get("id")
