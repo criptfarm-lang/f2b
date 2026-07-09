@@ -3524,7 +3524,6 @@ async def cmd_pdz_snapshot_test(update: Update, context: ContextTypes.DEFAULT_TY
                 f"• `{r.get('order_name','?')}` · {r.get('agent_name','?')} · "
                 f"тег={r.get('manager_tag') or '—'} · "
                 f"исх={r.get('ppm_initial')} · нов={r.get('ppm_new') or '—'} · "
-                f"reason={r.get('reason_id') or '—'} · "
                 f"{r.get('payed_sum')}/{r.get('total_sum')} · "
                 f"balance={bal_str}"
             )

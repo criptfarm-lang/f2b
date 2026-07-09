@@ -1580,8 +1580,7 @@ async def pdz_take_snapshot() -> list:
 
     Тянет все заказы (пагинация по 100, expand=agent,attributes), для каждого
     собирает: исходную дату оплаты (ppm_initial), новую дату оплаты (ppm_new),
-    id причины переноса (reason_id, из customentity), менеджера (по тегу
-    контрагента), payed_sum/total_sum (в рублях, не копейках).
+    менеджера (по тегу контрагента), payed_sum/total_sum (в рублях, не копейках).
 
     Заказы без `ppm_initial` (старые до введения поля) пропускаются.
     Розничный покупатель исключается.
@@ -1629,23 +1628,12 @@ async def pdz_take_snapshot() -> list:
                 # = вложенный объект с meta.href и id.
                 ppm_initial_raw = None
                 ppm_new_raw = None
-                reason_id = None
                 for attr in order.get("attributes", []) or []:
                     name = attr.get("name")
                     if name == "Дата планируемой оплаты":
                         ppm_initial_raw = attr.get("value")
                     elif name == "НОВАЯ дата оплаты":
                         ppm_new_raw = attr.get("value")
-                    elif name == "Причина переноса":
-                        v = attr.get("value")
-                        if isinstance(v, dict):
-                            # customentity: бери id напрямую, иначе вытаскивай
-                            # из meta.href последний сегмент
-                            reason_id = v.get("id")
-                            if not reason_id:
-                                href = (v.get("meta") or {}).get("href") or ""
-                                if href:
-                                    reason_id = href.rstrip("/").split("/")[-1] or None
 
                 ppm_initial = _parse_ms_date(ppm_initial_raw)
                 if not ppm_initial:
@@ -1683,7 +1671,6 @@ async def pdz_take_snapshot() -> list:
                     "manager_tag": manager_tag,
                     "ppm_initial": ppm_initial,
                     "ppm_new": ppm_new,
-                    "reason_id": reason_id,
                     "payed_sum": payed_sum,
                     "total_sum": total_sum,
                     "agent_balance": None,  # обогащается ниже
@@ -1995,7 +1982,6 @@ def compute_promise_events(today_rows: list, yesterday_rows: list) -> list:
             "event_type": event_type,
             "old_ppm_new": old_ppm,
             "new_ppm_new": new_ppm,
-            "reason_id": new_row.get("reason_id"),
         })
 
     return events

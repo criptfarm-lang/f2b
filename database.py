@@ -384,7 +384,6 @@ class Database:
                 manager_tag TEXT,
                 ppm_initial DATE,
                 ppm_new DATE,
-                reason_id TEXT,
                 payed_sum NUMERIC(14,2),
                 total_sum NUMERIC(14,2)
             )""",
@@ -416,8 +415,7 @@ class Database:
                 manager_tag TEXT,
                 event_type TEXT NOT NULL,
                 old_ppm_new DATE,
-                new_ppm_new DATE,
-                reason_id TEXT
+                new_ppm_new DATE
             )""",
             "CREATE INDEX IF NOT EXISTS idx_promise_log_agent_time ON promise_log (agent_id, occurred_at)",
             "CREATE INDEX IF NOT EXISTS idx_promise_log_order_time ON promise_log (order_id, occurred_at)",
@@ -650,7 +648,7 @@ class Database:
         """Batch insert строк снимка состояния заказов.
 
         Каждый row — dict с ключами: snap_date, order_id, order_name,
-        agent_id, agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
+        agent_id, agent_name, manager_tag, ppm_initial, ppm_new,
         payed_sum, total_sum, agent_balance (опционально, может быть None).
         Возвращает число вставленных записей.
         """
@@ -667,7 +665,6 @@ class Database:
                 r.get("manager_tag"),
                 r.get("ppm_initial"),
                 r.get("ppm_new"),
-                r.get("reason_id"),
                 r.get("payed_sum"),
                 r.get("total_sum"),
                 r.get("agent_balance"),
@@ -683,9 +680,9 @@ class Database:
             cur.executemany(
                 """INSERT INTO pdz_snapshots
                    (snap_date, order_id, order_name, agent_id, agent_name,
-                    manager_tag, ppm_initial, ppm_new, reason_id, payed_sum,
+                    manager_tag, ppm_initial, ppm_new, payed_sum,
                     total_sum, agent_balance, coverage_residual_45d)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (snap_date, order_id) DO UPDATE SET
                      snap_at = EXCLUDED.snap_at,
                      order_name = EXCLUDED.order_name,
@@ -694,7 +691,6 @@ class Database:
                      manager_tag = EXCLUDED.manager_tag,
                      ppm_initial = EXCLUDED.ppm_initial,
                      ppm_new = EXCLUDED.ppm_new,
-                     reason_id = EXCLUDED.reason_id,
                      payed_sum = EXCLUDED.payed_sum,
                      total_sum = EXCLUDED.total_sum,
                      agent_balance = EXCLUDED.agent_balance,
@@ -709,7 +705,7 @@ class Database:
         """Возвращает все строки снимка за указанную дату (для отладки)."""
         return self._fetchall(
             """SELECT id, snap_at, snap_date, order_id, order_name, agent_id,
-                      agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
+                      agent_name, manager_tag, ppm_initial, ppm_new,
                       payed_sum, total_sum, agent_balance, coverage_residual_45d
                FROM pdz_snapshots
                WHERE snap_date = %s
@@ -731,7 +727,7 @@ class Database:
         return self._fetchall(
             """SELECT DISTINCT ON (order_id)
                       id, snap_at, snap_date, order_id, order_name, agent_id,
-                      agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
+                      agent_name, manager_tag, ppm_initial, ppm_new,
                       payed_sum, total_sum, agent_balance, coverage_residual_45d
                FROM pdz_snapshots
                WHERE snap_date = %s
@@ -764,7 +760,7 @@ class Database:
             """
             SELECT DISTINCT ON (order_id)
                    id, snap_at, snap_date, order_id, order_name, agent_id,
-                   agent_name, manager_tag, ppm_initial, ppm_new, reason_id,
+                   agent_name, manager_tag, ppm_initial, ppm_new,
                    payed_sum, total_sum, agent_balance, coverage_residual_45d
             FROM pdz_snapshots
             WHERE snap_date = %s
@@ -777,8 +773,8 @@ class Database:
         """Batch insert событий в promise_log.
 
         Каждый event — dict с ключами: order_id, order_name, agent_id, agent_name,
-        manager_tag, event_type ('set'|'moved'|'broken'), old_ppm_new, new_ppm_new,
-        reason_id. Возвращает число вставленных записей.
+        manager_tag, event_type ('set'|'moved'|'broken'), old_ppm_new, new_ppm_new.
+        Возвращает число вставленных записей.
         """
         if not events:
             return 0
@@ -793,7 +789,6 @@ class Database:
                 e.get("event_type"),
                 e.get("old_ppm_new"),
                 e.get("new_ppm_new"),
-                e.get("reason_id"),
             )
             for e in events
         ]
@@ -801,8 +796,8 @@ class Database:
             cur.executemany(
                 """INSERT INTO promise_log
                    (order_id, order_name, agent_id, agent_name, manager_tag,
-                    event_type, old_ppm_new, new_ppm_new, reason_id)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    event_type, old_ppm_new, new_ppm_new)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                 params,
             )
             self.conn.commit()
