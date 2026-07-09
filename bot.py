@@ -7236,6 +7236,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_approval_callback, pattern="^appr_"))
     from processing_svetofor import handle_svetofor_callback
     app.add_handler(CallbackQueryHandler(handle_svetofor_callback, pattern="^svf:"))
+    from supply_svetofor import handle_supply_approval_callback
+    app.add_handler(CallbackQueryHandler(handle_supply_approval_callback, pattern="^sappr:"))
     app.add_handler(CallbackQueryHandler(handle_doc_approval_callback, pattern="^doc_(approve|reject):"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing|wazzup_later)"))
@@ -7651,6 +7653,21 @@ def main():
             logger.error(f"processing_svetofor job wrapper: {e}", exc_info=True)
 
     app.job_queue.run_repeating(_processing_svetofor_wrapper, interval=1800, first=60)
+
+    # ────────────────────────────────────────────────────────────────────
+    # Светофор Заказа поставщику — polling каждые 10 мин (webhook по
+    # purchaseorder МС не шлёт). План: 2026-07-09-светофор-заказа-поставщику.
+    # first=90 → сид лога вскоре после старта (без рассылки на первом прогоне).
+    # ────────────────────────────────────────────────────────────────────
+    from supply_svetofor import poll_job as _supply_svetofor_poll
+
+    async def _supply_svetofor_wrapper(context):
+        try:
+            await _supply_svetofor_poll(app, db)
+        except Exception as e:
+            logger.error(f"supply_svetofor job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_supply_svetofor_wrapper, interval=600, first=90)
 
     # ────────────────────────────────────────────────────────────────────
     # Wazzup classifier — дневная сводка собственнику 17:00 МСК.

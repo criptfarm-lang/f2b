@@ -5345,6 +5345,201 @@ def compute_contacts_color(cp_attrs: dict) -> dict:
     }
 
 
+# ============================================================================
+# Светофор Заказа поставщику (purchaseorder).
+# План: plans/2026-07-09-светофор-заказа-поставщику.md. Фаза 1 — расчётные функции.
+# Все id получены разведкой Фазы 0 (2026-07-09), сверены с живыми данными МС.
+# ============================================================================
+
+# UUID статусов purchaseorder. ВНИМАНИЕ: это НЕ customerorder-статусы (те —
+# 005f34bf… / 005f3651…). У purchaseorder свой workflow с другими UUID.
+SUPPLY_STATE_ON_APPROVAL = "9a57eebc-a5df-11f0-0a80-163f00106cea"  # «На согласовании»
+SUPPLY_STATE_AGREED      = "9a57f37d-a5df-11f0-0a80-163f00106ceb"  # «Согласован»
+
+# Кастомный атрибут purchaseorder «План. дата оплаты» (type=time).
+# План. дата приёмки — нативное поле deliveryPlannedMoment (не атрибут).
+ATTR_PO_PAYMENT_PLANNED = "c8ccd232-a5df-11f0-0a80-099a0010cdbb"
+
+# Склады для двускладового остатка охлаждёнки.
+STORE_MAIN_ID       = "0044d71e-9a9a-11f0-0a80-03a90002743d"  # Основной склад
+STORE_PRODUCTION_ID = "7f3534c1-9dca-11f0-0a80-0510000585d3"  # Производство
+
+
+def is_chilled_position(product_name: str) -> bool:
+    """Охлаждёнка = токен «ОХЛ» в названии позиции (решение Виктора, Фаза 0).
+    У сырья в ЗП («Лосось атл. ПСГ ОХЛ …») папка — СЫРЬЕ, без слова «Охлажден»,
+    поэтому детектим именно по имени, а не по группе товара."""
+    return "охл" in (product_name or "").lower()
+
+
+async def compute_supply_turnover_color(product_id: str, product_name: str,
+                                        order_qty: float, window_days: int = 60) -> dict:
+    """
+    Блок «Оборот» светофора ЗП. Дни запаса = (остаток + кол-во в заказе) / суточный расход.
+
+    Суточный расход = outcome из /report/turnover/all (полное выбытие: продажи +
+    межскладские перемещения + потребление в переработке + списания), НЕ demand —
+    правило F2B (memory feedback_stock_turnover_use_outflow_not_sales). Позиции ЗП —
+    сырьё, которое уходит в производство, а не продаётся, поэтому demand дал бы 0.
+
+    Остаток: Основной склад; для охлаждёнки (токен «ОХЛ») + склад Производство.
+    Цвета: 🟢 ≤30 дн · 🟡 30–60 · 🔴 >60. Расхода за окно нет → ⚪ (не делим на ноль).
+    Возвращает {color, days, stock, per_day, outcome, chilled}.
+    """
+    from datetime import timedelta
+    chilled = is_chilled_position(product_name)
+    product_href = f"{MS_BASE}/entity/product/{product_id}"
+    stock = 0.0
+    outcome_qty = 0.0
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 1. Остаток по складам (Основной [+ Производство для охлаждёнки]).
+            async with session.get(
+                f"{MS_BASE}/report/stock/bystore",
+                headers=get_headers(),
+                params={"filter": f"product={product_href}"},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    for row in data.get("rows", []):
+                        for s in row.get("stockByStore", []):
+                            sid = (s.get("meta", {}).get("href", "") or "").rstrip("/").split("/")[-1]
+                            if sid == STORE_MAIN_ID:
+                                stock += s.get("stock", 0) or 0
+                            elif chilled and sid == STORE_PRODUCTION_ID:
+                                stock += s.get("stock", 0) or 0
+            # 2. Расход (outcome) за окно.
+            now = _now_msk()
+            frm = (now - timedelta(days=window_days)).strftime("%Y-%m-%d 00:00:00")
+            to  = now.strftime("%Y-%m-%d 23:59:59")
+            async with session.get(
+                f"{MS_BASE}/report/turnover/all",
+                headers=get_headers(),
+                params={"momentFrom": frm, "momentTo": to, "filter": f"product={product_href}"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    for row in data.get("rows", []):
+                        outcome_qty += (row.get("outcome", {}) or {}).get("quantity", 0) or 0
+    except Exception as e:
+        logger.error(f"compute_supply_turnover_color: {e}")
+        return {"color": "white", "days": None, "stock": 0.0, "per_day": 0.0,
+                "outcome": 0.0, "chilled": chilled}
+
+    per_day = outcome_qty / window_days if window_days else 0
+    if per_day <= 0:
+        return {"color": "white", "days": None, "stock": stock, "per_day": 0.0,
+                "outcome": outcome_qty, "chilled": chilled}
+    days = (stock + (order_qty or 0)) / per_day
+    color = "green" if days <= 30 else "yellow" if days <= 60 else "red"
+    return {"color": color, "days": days, "stock": stock, "per_day": per_day,
+            "outcome": outcome_qty, "chilled": chilled}
+
+
+async def compute_supply_price_color(product_id: str, order_price: float,
+                                     max_scan: int = 200) -> dict:
+    """
+    Блок «Цена» светофора ЗП. Сравнивает цену в заказе с ценой ПОСЛЕДНЕГО поступления
+    этого SKU (supply, любой поставщик). Дороже 🔴 · дешевле 🟢 · вровень 🟡.
+    Поступления сканируем от новых к старым (max_scan штук), берём первую позицию с
+    этим product_id. Не нашли — {color:'yellow', found:False} («нет данных о поступлении»).
+    order_price — в рублях (в вызывающем коде цена уже /100).
+    Возвращает {color, order_price, last_price, diff_rub, diff_pct, found}.
+    """
+    last_price = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            offset = 0
+            while offset < max_scan and last_price is None:
+                async with session.get(
+                    f"{MS_BASE}/entity/supply",
+                    headers=get_headers(),
+                    params={"limit": 25, "offset": offset, "order": "moment,desc",
+                            "expand": "positions.assortment"},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as r:
+                    if r.status != 200:
+                        break
+                    data = await r.json()
+                rows = data.get("rows", [])
+                for o in rows:
+                    for p in (o.get("positions", {}) or {}).get("rows", []):
+                        if (p.get("assortment", {}) or {}).get("id") == product_id:
+                            last_price = (p.get("price", 0) or 0) / 100
+                            break
+                    if last_price is not None:
+                        break
+                if len(rows) < 25:
+                    break
+                offset += 25
+    except Exception as e:
+        logger.error(f"compute_supply_price_color: {e}")
+        return {"color": "yellow", "order_price": order_price, "last_price": None,
+                "diff_rub": 0.0, "diff_pct": 0.0, "found": False}
+
+    if last_price is None or last_price <= 0:
+        return {"color": "yellow", "order_price": order_price, "last_price": None,
+                "diff_rub": 0.0, "diff_pct": 0.0, "found": False}
+    diff_rub = order_price - last_price
+    diff_pct = diff_rub / last_price * 100 if last_price else 0
+    if diff_rub > 0:
+        color = "red"      # подорожало
+    elif diff_rub < 0:
+        color = "green"    # подешевело
+    else:
+        color = "yellow"   # вровень
+    return {"color": color, "order_price": order_price, "last_price": last_price,
+            "diff_rub": diff_rub, "diff_pct": diff_pct, "found": True}
+
+
+async def compute_supplier_contacts_color(agent_id: str) -> dict:
+    """
+    Блок «Карточка поставщика». Та же логика, что «Контакты» у покупателя:
+    валидный max-телефон ИЛИ telegram → 🟢, иначе 🔴 (без жёлтого).
+    Реюз load_counterparty_attrs + compute_contacts_color.
+    """
+    cp_attrs = await load_counterparty_attrs(agent_id)
+    return compute_contacts_color(cp_attrs)
+
+
+def compute_supply_dates(order: dict) -> dict:
+    """
+    Блок «Даты» светофора ЗП. Берёт План. дату приёмки (нативное deliveryPlannedMoment)
+    и План. дату оплаты (кастом-атрибут ATTR_PO_PAYMENT_PLANNED). Оплата РАНЬШЕ приёмки
+    → предоплата 🔴; оплата в день приёмки или позже → отсрочка 🟢. Обе даты возвращаем.
+    order — JSON заказа с expand=attributes.
+    Возвращает {color, kind, receipt_str, payment_str}.
+    """
+    from datetime import datetime
+
+    def _parse(raw):
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(
+                str(raw).replace(" ", "T").replace(".000", "").replace("Z", "")
+            ).date()
+        except Exception:
+            return None
+
+    receipt = _parse(order.get("deliveryPlannedMoment"))
+    payment = _parse(_extract_attr_value(order.get("attributes", []) or [], ATTR_PO_PAYMENT_PLANNED))
+    receipt_str = receipt.strftime("%d.%m.%Y") if receipt else "—"
+    payment_str = payment.strftime("%d.%m.%Y") if payment else "—"
+
+    if receipt is None or payment is None:
+        # Нет одной из дат — цвет не присваиваем (нейтрально), показываем что есть.
+        return {"color": "yellow", "kind": "нет данных",
+                "receipt_str": receipt_str, "payment_str": payment_str}
+    if payment < receipt:
+        return {"color": "red", "kind": "предоплата",
+                "receipt_str": receipt_str, "payment_str": payment_str}
+    return {"color": "green", "kind": "отсрочка",
+            "receipt_str": receipt_str, "payment_str": payment_str}
+
+
 # ─── Автоподстановка «Дата планируемой оплаты» ─────────────────────────────
 # План 2026-05-20-автоподстановка-исходной-даты-оплаты.md.
 # Архитектура: cron-polling каждые 10 мин (не webhook+PATCH), Dolibarr-стиль
