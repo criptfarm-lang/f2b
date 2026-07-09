@@ -56,6 +56,10 @@ create table if not exists public.supply_svetofor_log (
     alerted_at timestamptz default now(),
     updated_at timestamptz default now()
 );
+create table if not exists public.supply_svetofor_state (
+    id        int primary key default 1,
+    seeded_at timestamptz
+);
 """
 
 # ── DB (свой коннект, autocommit — как в processing_svetofor) ────────────────
@@ -77,6 +81,25 @@ def _log_get_all() -> dict[str, dict]:
     with _db().cursor() as cur:
         cur.execute("select order_id, sum_hash, last_state from public.supply_svetofor_log")
         return {str(r["order_id"]): r for r in cur.fetchall()}
+
+
+def _is_seeded() -> bool:
+    """Инициализирован ли светофор (первичный сид уже прошёл). Маркер не зависит
+    от того, пуст ли лог — иначе при пустом логе первый реальный заказ был бы
+    молча засижен вместо алерта."""
+    with _db().cursor() as cur:
+        cur.execute("select seeded_at from public.supply_svetofor_state where id=1")
+        row = cur.fetchone()
+        return bool(row and row.get("seeded_at"))
+
+
+def _mark_seeded():
+    with _db().cursor() as cur:
+        cur.execute("""
+            insert into public.supply_svetofor_state (id, seeded_at)
+            values (1, now())
+            on conflict (id) do update set seeded_at = now()
+        """)
 
 
 def _log_upsert(order_id: str, order_name: str, state: str, sum_hash: int):
@@ -368,20 +391,21 @@ async def poll_job(app, db=None):
         logger.error(f"supply_svetofor poll: ошибка МС: {e}")
         return
 
-    log = _log_get_all()
-
     # Только товарные заказы — логистику/услуги пропускаем полностью.
     orders = [o for o in orders if _has_goods(o)]
 
-    # Защита от «потопа»: первый прогон только помечает текущие заказы как виденные.
-    if not log and orders:
+    # Защита от «потопа» на ПЕРВОМ прогоне после деплоя: помечаем текущий бэклог
+    # заказов как виденный (без рассылки) и ставим маркер seeded. Дальше маркер
+    # не даёт этой ветке срабатывать при временно пустом логе.
+    if not _is_seeded():
         for o in orders:
-            oid = o.get("id")
-            _log_upsert(oid, o.get("name"), SUPPLY_STATE_ON_APPROVAL,
+            _log_upsert(o.get("id"), o.get("name"), SUPPLY_STATE_ON_APPROVAL,
                         round((o.get("sum", 0) or 0) / 100))
+        _mark_seeded()
         logger.info(f"supply_svetofor: первичный сид — {len(orders)} заказов, рассылки нет")
         return
 
+    log = _log_get_all()
     sent = 0
     for o in orders:
         oid = o.get("id")
