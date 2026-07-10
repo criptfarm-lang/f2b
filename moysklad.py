@@ -5364,6 +5364,46 @@ ATTR_PO_PAYMENT_PLANNED = "c8ccd232-a5df-11f0-0a80-099a0010cdbb"
 STORE_MAIN_ID       = "0044d71e-9a9a-11f0-0a80-03a90002743d"  # Основной склад
 STORE_PRODUCTION_ID = "7f3534c1-9dca-11f0-0a80-0510000585d3"  # Производство
 
+# Доп.атрибуты counterparty для инфо-блока «Карточка поставщика» (без цвета —
+# решение Виктора 2026-07-10: просто показываем поля, оценка глазами).
+ATTR_CP_CONTACT_PERSON = "4418db7e-a11d-11f0-0a80-13da002f00bb"  # Контактное лицо
+ATTR_CP_WHATSAPP       = "1505270f-34d7-11f1-0a80-1489000ec44b"  # WhatsApp
+ATTR_CP_SIGNER_ROLE    = "2dc8fc48-7533-11f1-0a80-19c4000b858b"  # Должность подписанта
+ATTR_CP_SIGNER_NAME    = "2dc90076-7533-11f1-0a80-19c4000b858c"  # ФИО Подписанта
+
+
+async def load_supplier_card(agent_id: str) -> dict:
+    """Поля карточки поставщика для инфо-блока алерта ЗП (один GET counterparty).
+    Без валидации/цвета — сырые значения для показа Виктору."""
+    url = f"{MS_BASE}/entity/counterparty/{agent_id}"
+    empty = {"contact_person": "", "max": "", "telegram": "", "whatsapp": "",
+             "site": "", "contract_signed": False, "contract_number": "",
+             "signer_role": "", "signer_name": ""}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=get_headers(),
+                                   params={"expand": "attributes"},
+                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"load_supplier_card: {resp.status} для {agent_id}")
+                    return empty
+                cp = await resp.json()
+    except Exception as e:
+        logger.error(f"load_supplier_card: {e}")
+        return empty
+    attrs = cp.get("attributes", []) or []
+    return {
+        "contact_person":  (_extract_attr_value(attrs, ATTR_CP_CONTACT_PERSON) or "").strip(),
+        "max":             (_extract_attr_value(attrs, ATTR_CP_MAX) or "").strip(),
+        "telegram":        (_extract_attr_value(attrs, ATTR_CP_TELEGRAM) or "").strip(),
+        "whatsapp":        (_extract_attr_value(attrs, ATTR_CP_WHATSAPP) or "").strip(),
+        "site":            (_extract_attr_value(attrs, ATTR_CP_SITE) or "").strip(),
+        "contract_signed": bool(_extract_attr_value(attrs, ATTR_CP_CONTRACT_SIGNED)),
+        "contract_number": (_extract_attr_value(attrs, ATTR_CP_CONTRACT_NUMBER) or "").strip(),
+        "signer_role":     (_extract_attr_value(attrs, ATTR_CP_SIGNER_ROLE) or "").strip(),
+        "signer_name":     (_extract_attr_value(attrs, ATTR_CP_SIGNER_NAME) or "").strip(),
+    }
+
 
 def is_chilled_position(product_name: str) -> bool:
     """Охлаждёнка = токен «ОХЛ» в названии позиции (решение Виктора, Фаза 0).

@@ -35,7 +35,7 @@ from moysklad import (
     is_chilled_position,
     compute_supply_turnover_color,
     compute_supply_price_color,
-    compute_supplier_contacts_color,
+    load_supplier_card,
     compute_supply_dates,
 )
 
@@ -220,15 +220,42 @@ async def _compute_position_blocks(order: dict) -> list[dict]:
     return results
 
 
+def _build_supplier_card_lines(card: dict) -> list[str]:
+    """Инфо-блок «Карточка поставщика» — без цвета (решение Виктора 2026-07-10).
+    Показываем поля как есть, чтобы оценить полноту глазами."""
+    def _v(x):
+        return x if x else "—"
+    contacts = []
+    if card.get("max"):      contacts.append(f"Max {card['max']}")
+    if card.get("telegram"): contacts.append(f"TG {card['telegram']}")
+    if card.get("whatsapp"): contacts.append(f"WA {card['whatsapp']}")
+    contacts_str = " · ".join(contacts) if contacts else "—"
+
+    dogovor = "подписан" if card.get("contract_signed") else "не подписан"
+    if card.get("contract_number"):
+        dogovor += f" · № {card['contract_number']}"
+    signer = " · ".join(p for p in [card.get("signer_name"), card.get("signer_role")] if p) or "—"
+
+    return [
+        "\n*Карточка поставщика:*",
+        f"   Контакт: {contacts_str}",
+        f"   Контактное лицо: {_v(card.get('contact_person'))}",
+        f"   Сайт: {_v((card.get('site') or '')[:60] + ('…' if len(card.get('site') or '') > 60 else ''))}",
+        f"   Договор: {dogovor}",
+        f"   Подписант: {signer}",
+    ]
+
+
 def _build_supply_alert_text(order: dict, pos_blocks: list[dict],
-                             contacts: dict, dates: dict) -> str:
+                             card: dict, dates: dict) -> str:
     now_msk = datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M")
     order_name = order.get("name", "")
     agent = order.get("agent") or {}
     agent_name = agent.get("name", "—")
     order_sum = (order.get("sum", 0) or 0) / 100
 
-    block_colors = [contacts["color"], dates["color"]]
+    # Общий цвет — по Оборот/Цена/Даты. «Карточка» — инфо-блок без цвета (решение Виктора).
+    block_colors = [dates["color"]]
     for b in pos_blocks:
         block_colors += [b["turn"]["color"], b["price_block"]["color"]]
     overall = _worst(block_colors)
@@ -244,19 +271,9 @@ def _build_supply_alert_text(order: dict, pos_blocks: list[dict],
         f"{_icon(dates['color'])} *Даты:* приёмка {dates['receipt_str']} → "
         f"оплата {dates['payment_str']} · {dates['kind']}"
     )
-    # Карточка поставщика
-    if contacts["color"] == "green":
-        parts = []
-        if contacts.get("max_valid"):
-            parts.append(f"Max {contacts.get('max')}")
-        if contacts.get("tg_valid"):
-            parts.append(f"TG {contacts.get('telegram')}")
-        lines.append(f"🟢 *Карточка:* " + " · ".join(parts))
-    else:
-        lines.append(
-            f"🔴 *Карточка:* нет контакта "
-            f"(Max={contacts.get('max') or '—'} / TG={contacts.get('telegram') or '—'})"
-        )
+
+    # Карточка поставщика — без цвета, просто показываем поля для оценки глазами.
+    lines += _build_supplier_card_lines(card)
 
     # Позиции
     if not pos_blocks:
@@ -358,12 +375,13 @@ async def check_supply_approval_needed(order: dict, app) -> bool:
     agent = order.get("agent") or {}
     agent_id = agent.get("id") or agent.get("meta", {}).get("href", "").split("/")[-1]
 
-    contacts = (await compute_supplier_contacts_color(agent_id)) if agent_id else \
-        {"color": "red", "max": "", "telegram": "", "max_valid": False, "tg_valid": False}
+    card = (await load_supplier_card(agent_id)) if agent_id else \
+        {"contact_person": "", "max": "", "telegram": "", "whatsapp": "", "site": "",
+         "contract_signed": False, "contract_number": "", "signer_role": "", "signer_name": ""}
     dates = compute_supply_dates(order)
     pos_blocks = await _compute_position_blocks(order)
 
-    text = _build_supply_alert_text(order, pos_blocks, contacts, dates)
+    text = _build_supply_alert_text(order, pos_blocks, card, dates)
 
     recipients = _recipients()
     if not recipients:
