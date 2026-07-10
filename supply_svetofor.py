@@ -370,14 +370,29 @@ async def check_supply_approval_needed(order: dict, app) -> bool:
         logger.error("supply_svetofor: OWNER_CHAT_ID не задан")
         return False
     kb = keyboard(order_id)
+    delivered = 0
     for chat_id in recipients:
         try:
             await app.bot.send_message(chat_id=chat_id, text=text,
                                        parse_mode="Markdown", reply_markup=kb)
+            delivered += 1
         except Exception as e:
-            logger.error(f"supply_svetofor: send to {chat_id} failed: {e}")
-    logger.info(f"supply_svetofor: алерт по {order_name} отправлен ({len(recipients)} получат.)")
-    return True
+            # Markdown мог сломаться на «грязном» имени товара/поставщика из МС —
+            # пробуем добить обычным текстом (без parse_mode), чтобы алерт всё же дошёл.
+            logger.warning(f"supply_svetofor: Markdown send to {chat_id} failed ({e}); retry plain")
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+                delivered += 1
+            except Exception as e2:
+                logger.error(f"supply_svetofor: plain send to {chat_id} failed: {e2}")
+    # Возвращаем True ТОЛЬКО если реально доставили хотя бы одному получателю —
+    # иначе poll_job не пишет лог и повторит на следующем тике (self-heal против
+    # транзиентных сбоев Telegram/сети).
+    if delivered:
+        logger.info(f"supply_svetofor: алерт по {order_name} доставлен ({delivered}/{len(recipients)})")
+        return True
+    logger.error(f"supply_svetofor: алерт по {order_name} НЕ доставлен — повтор на следующем тике")
+    return False
 
 
 async def poll_job(app, db=None):
