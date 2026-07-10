@@ -6,7 +6,7 @@
 Виктору (OWNER_CHAT_ID) алерт из 4 блоков:
   • Оборот   — дни запаса = (остаток + кол-во в заказе) / суточный расход (outcome).
   • Цена     — цена в заказе vs цена последнего поступления SKU.
-  • Карточка  — контакты поставщика (max/telegram) 🟢/🔴.
+  • Карточка  — полнота карточки поставщика (контакт/лицо/сайт/договор/подписант) 🟢/🔴 по полям.
   • Даты     — план. приёмка vs план. оплата → предоплата 🔴 / отсрочка 🟢.
 
 Триггер — polling через PTB JobQueue (webhook по purchaseorder МС не шлёт — итог
@@ -221,29 +221,39 @@ async def _compute_position_blocks(order: dict) -> list[dict]:
 
 
 def _build_supplier_card_lines(card: dict) -> list[str]:
-    """Инфо-блок «Карточка поставщика» — без цвета (решение Виктора 2026-07-10).
-    Показываем поля как есть, чтобы оценить полноту глазами."""
-    def _v(x):
-        return x if x else "—"
+    """Инфо-блок «Карточка поставщика» со светофорами по полям (решение Виктора
+    2026-07-10). 🟢 поле заполнено / 🔴 пусто; для договора 🟢 подписан / 🔴 нет.
+    Заголовок блока — общий светофор: 🟢 только если все поля зелёные, иначе 🔴."""
     contacts = []
     if card.get("max"):      contacts.append(f"Max {card['max']}")
     if card.get("telegram"): contacts.append(f"TG {card['telegram']}")
     if card.get("whatsapp"): contacts.append(f"WA {card['whatsapp']}")
     contacts_str = " · ".join(contacts) if contacts else "—"
 
-    dogovor = "подписан" if card.get("contract_signed") else "не подписан"
+    person = (card.get("contact_person") or "").strip()
+    site = (card.get("site") or "").strip()
+    site_str = (site[:60] + "…") if len(site) > 60 else (site or "—")
+
+    signed = bool(card.get("contract_signed"))
+    dogovor = "подписан" if signed else "не подписан"
     if card.get("contract_number"):
         dogovor += f" · № {card['contract_number']}"
+    signer_name = (card.get("signer_name") or "").strip()
     signer = " · ".join(p for p in [card.get("signer_name"), card.get("signer_role")] if p) or "—"
 
-    return [
-        "\n*Карточка поставщика:*",
-        f"   Контакт: {contacts_str}",
-        f"   Контактное лицо: {_v(card.get('contact_person'))}",
-        f"   Сайт: {_v((card.get('site') or '')[:60] + ('…' if len(card.get('site') or '') > 60 else ''))}",
-        f"   Договор: {dogovor}",
-        f"   Подписант: {signer}",
+    # (заполнено?, лейбл, значение)
+    fields = [
+        (bool(contacts),      "Контакт",         contacts_str),
+        (bool(person),        "Контактное лицо", person or "—"),
+        (bool(site),          "Сайт",            site_str),
+        (signed,              "Договор",         dogovor),
+        (bool(signer_name),   "Подписант",       signer),
     ]
+    all_ok = all(ok for ok, _, _ in fields)
+    lines = [f"\n{_icon('green' if all_ok else 'red')} *Карточка поставщика:*"]
+    for ok, label, value in fields:
+        lines.append(f"   {_icon('green' if ok else 'red')} {label}: {value}")
+    return lines
 
 
 def _build_supply_alert_text(order: dict, pos_blocks: list[dict],
@@ -268,7 +278,7 @@ def _build_supply_alert_text(order: dict, pos_blocks: list[dict],
         f"оплата {dates['payment_str']} · {dates['kind']}"
     )
 
-    # Карточка поставщика — без цвета, просто показываем поля для оценки глазами.
+    # Карточка поставщика — светофоры по полям (🟢 заполнено / 🔴 пусто).
     lines += _build_supplier_card_lines(card)
 
     # Позиции
