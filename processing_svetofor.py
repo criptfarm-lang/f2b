@@ -18,6 +18,7 @@ plans/2026-07-03-светофор-техопераций-эф.md — Фаза 2 
 """
 from __future__ import annotations
 
+import html
 import logging
 import os
 import re
@@ -247,7 +248,7 @@ def _norm_row(sku_code, fish_type):
         return cur.fetchone()
 
 
-def render(snap: dict) -> str:
+def render(snap: dict) -> tuple[str, str | None]:
     norm = _norm_row(snap["out_sku_code"], snap["fish_type"])
     cost = snap["cost_per_kg"]
     yld = snap["yield_pct"]
@@ -300,7 +301,16 @@ def render(snap: dict) -> str:
 
     if snap.get("check_status"):
         lines += ["", "", f"статус в МС: {snap['check_status']}"]
-    return "\n".join(lines)
+
+    body = "\n".join(lines)
+    # Комментарий техоперации (поле description МС) — под чертой курсивом.
+    # Курсив требует HTML parse_mode → экранируем весь текст.
+    comment = (snap.get("comment") or "").strip()
+    if not comment:
+        return body, None
+    return (f"{html.escape(body, quote=False)}\n"
+            f"──────────\n"
+            f"<i>{html.escape(comment, quote=False)}</i>"), "HTML"
 
 
 # ── Фаза 3: кнопки (только Виктору) ──────────────────────────────────────────
@@ -492,10 +502,12 @@ async def poll_job(app, db=None):
             if snap is None:
                 _log_upsert(pid, r.get("name"), state, analiz=(state == ANALIZ_STATE))
                 continue
-            text = render(snap)
+            snap["comment"] = r.get("description")  # комментарий техоперации → под чертой курсивом
+            text, parse_mode = render(snap)
             for chat_id in recipients:
                 kb = keyboard(pid) if chat_id == owner_id else None  # кнопки только Виктору
-                await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+                await app.bot.send_message(chat_id=chat_id, text=text,
+                                           reply_markup=kb, parse_mode=parse_mode)
             _log_upsert(pid, r.get("name"), state, analiz=(state == ANALIZ_STATE))
             sent += 1
             logger.info(f"svetofor: №{r.get('name')} [{reason}] отправлен ({len(recipients)} получат.)")
