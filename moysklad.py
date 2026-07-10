@@ -5439,24 +5439,31 @@ async def compute_supply_turnover_color(product_id: str, product_name: str,
 
 
 async def compute_supply_price_color(product_id: str, order_price: float,
-                                     max_scan: int = 200) -> dict:
+                                     window_days: int = 365, max_pages: int = 25) -> dict:
     """
     Блок «Цена» светофора ЗП. Сравнивает цену в заказе с ценой ПОСЛЕДНЕГО поступления
     этого SKU (supply, любой поставщик). Дороже 🔴 · дешевле 🟢 · вровень 🟡.
-    Поступления сканируем от новых к старым (max_scan штук), берём первую позицию с
-    этим product_id. Не нашли — {color:'yellow', found:False} («нет данных о поступлении»).
-    order_price — в рублях (в вызывающем коде цена уже /100).
+
+    Сканируем поступления от новых к старым за окно window_days (по фильтру moment>=),
+    останавливаемся на первом совпадении product_id. Окно годовое, потому что редкие
+    SKU (напр. привлечённый сыр — закупка ~раз в месяц) уходят глубже мелкой отсечки:
+    поступлений в базе ~1364, 200 назад = всего ~40 дней (баг 2026-07-10 — сыр 28.05
+    не находился). max_pages ограничивает худший случай (SKU без поступлений).
+    Не нашли — {color:'yellow', found:False}. order_price — в рублях.
     Возвращает {color, order_price, last_price, diff_rub, diff_pct, found}.
     """
+    from datetime import timedelta
     last_price = None
+    since = (_now_msk() - timedelta(days=window_days)).strftime("%Y-%m-%d 00:00:00")
     try:
         async with aiohttp.ClientSession() as session:
-            offset = 0
-            while offset < max_scan and last_price is None:
+            page = 0
+            while page < max_pages and last_price is None:
                 async with session.get(
                     f"{MS_BASE}/entity/supply",
                     headers=get_headers(),
-                    params={"limit": 25, "offset": offset, "order": "moment,desc",
+                    params={"limit": 100, "offset": page * 100, "order": "moment,desc",
+                            "filter": f"moment>={since}",
                             "expand": "positions.assortment"},
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as r:
@@ -5471,9 +5478,12 @@ async def compute_supply_price_color(product_id: str, order_price: float,
                             break
                     if last_price is not None:
                         break
-                if len(rows) < 25:
+                if len(rows) < 100:
                     break
-                offset += 25
+                page += 1
+            if last_price is None and page >= max_pages:
+                logger.warning(f"compute_supply_price_color: скан упёрся в max_pages={max_pages} "
+                               f"для {product_id} — поступление не найдено (возможно, глубже окна)")
     except Exception as e:
         logger.error(f"compute_supply_price_color: {e}")
         return {"color": "yellow", "order_price": order_price, "last_price": None,
