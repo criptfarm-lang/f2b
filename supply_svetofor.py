@@ -254,14 +254,10 @@ def _build_supply_alert_text(order: dict, pos_blocks: list[dict],
     agent_name = agent.get("name", "—")
     order_sum = (order.get("sum", 0) or 0) / 100
 
-    # Общий цвет — по Оборот/Цена/Даты. «Карточка» — инфо-блок без цвета (решение Виктора).
-    block_colors = [dates["color"]]
-    for b in pos_blocks:
-        block_colors += [b["turn"]["color"], b["price_block"]["color"]]
-    overall = _worst(block_colors)
-
+    # Общий светофор у сделки убран (решение Виктора 2026-07-10) — цвет остаётся
+    # только у пунктов (Даты/Оборот/Цена).
     header = (
-        f"{_icon(overall)} Заказ поставщику *{order_name}* · {_fmt_money(order_sum)} ₽\n"
+        f"Заказ поставщику *{order_name}* · {_fmt_money(order_sum)} ₽\n"
         f"🏭 {agent_name} · 🕐 {now_msk}\n"
     )
 
