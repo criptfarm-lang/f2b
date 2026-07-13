@@ -5345,6 +5345,31 @@ def compute_contacts_color(cp_attrs: dict) -> dict:
     }
 
 
+# Мусор в поле «Адрес доставки»: телефоны и не-адресный текст.
+_RE_ADDR_PHONE = re.compile(r"\+?\d[\d\s\-()]{9,}\d")
+_RE_ADDR_NOISE = re.compile(
+    r"(?i)(\bресторан|\bкафе\b|\bбар\b|\bтк\b|\bтц\b|\bбц\b|\bклуб\b|\bотел|"
+    r"\bгостиниц|\bконтакт|\bдоставк|\bсозвон|\bперезвон|\bзвонить|\bтел\.?\b|"
+    r"@|https?:|\bэтаж|\bпомещ|\bкомнат|\bкаб\.?\b|\bм\.\s*[А-ЯЁ][а-яё]{3,})"
+)
+
+
+def compute_address_color(shipment_address: str | None) -> dict:
+    """Блок светофора: «Адрес доставки».
+      🟢 — заполнен и чистый (только адрес).
+      🔴 — пусто ИЛИ есть телефоны / названия заведений / контактные лица /
+           этажи-помещения / метро.
+    Цель: адрес должен корректно геокодиться для логистики (мост МС→Wialon Logistics).
+    Возвращает {color, addr, reason}.
+    """
+    addr = (shipment_address or "").strip()
+    if not addr:
+        return {"color": "red", "addr": "", "reason": "не заполнен"}
+    if _RE_ADDR_PHONE.search(addr) or _RE_ADDR_NOISE.search(addr):
+        return {"color": "red", "addr": addr, "reason": "есть лишнее (телефон/заметки)"}
+    return {"color": "green", "addr": addr, "reason": ""}
+
+
 # ============================================================================
 # Светофор Заказа поставщику (purchaseorder).
 # План: plans/2026-07-09-светофор-заказа-поставщику.md. Фаза 1 — расчётные функции.

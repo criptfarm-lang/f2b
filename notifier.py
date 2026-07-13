@@ -552,11 +552,12 @@ def _build_approval_text(
     client_name: str, manager_name: str,
     credit: dict, contract: dict, overdue: dict, cashflow: dict, price: dict,
     site: dict, contacts: dict, upd_debt: dict = None,
+    address: dict = None,
     payment_planned_date: str = "",
 ) -> str:
     """
     Шаблон алерта. Порядок строк (по убыванию важности):
-      Лимит → Договор → Просрочка → ДДС → УПД → Сайт → Контакты → Цена (внизу — длинный список).
+      Лимит → Договор → Просрочка → ДДС → УПД → Сайт → Контакты → Адрес → Цена.
     all-green → одна сводная строка; иначе — строки светофора.
     """
     from datetime import datetime, timezone, timedelta
@@ -565,11 +566,13 @@ def _build_approval_text(
 
     if upd_debt is None:
         upd_debt = {"color": "green", "count": 0, "sum": 0}
+    if address is None:
+        address = {"color": "green", "addr": "", "reason": ""}
 
     payment_color = "green" if payment_planned_date else "red"
     colors = [credit["color"], contract["color"], overdue["color"], cashflow["color"],
               price["color"], site["color"], contacts["color"], payment_color,
-              upd_debt["color"]]
+              upd_debt["color"], address["color"]]
     all_green = all(c == "green" for c in colors)
 
     header = (
@@ -583,10 +586,10 @@ def _build_approval_text(
         if credit.get("limit", 0) > 0:
             limit_pct = int(credit["effective_debt"] / credit["limit"] * 100)
         body = (
-            f"\n🟢 Все 9 проверок ОК "
+            f"\n🟢 Все 10 проверок ОК "
             f"(лимит {limit_pct}% · договор · ДДС {cashflow.get('n_days', 0)}д · "
             f"долг {_fmt_money(credit.get('current_debt', 0))} _на {sent_at}_ · "
-            f"УПД · сайт · контакты · цена · оплата {payment_planned_date})\n"
+            f"УПД · сайт · контакты · адрес · цена · оплата {payment_planned_date})\n"
         )
         return header + body
 
@@ -679,6 +682,17 @@ def _build_approval_text(
     else:
         lines.append(f"🔴 *Контакты:* Max={mx or '—'} / TG={tg or '—'}")
 
+    # 6a. Адрес доставки — заполнен и чистый (только адрес, без телефонов/заметок)?
+    # Нужно, чтобы адрес геокодился для логистики (мост МС→Wialon Logistics).
+    if address["color"] == "green":
+        lines.append(f"🟢 *Адрес:* {address['addr'][:60]}")
+    else:
+        reason = address.get("reason", "")
+        if address.get("addr"):
+            lines.append(f"🔴 *Адрес:* {reason} — {address['addr'][:55]}")
+        else:
+            lines.append(f"🔴 *Адрес:* {reason}")
+
     # 7. Цена — внизу, длинный список не мешает читать остальные строки
     items = price.get("items", [])
     if items:
@@ -716,7 +730,7 @@ async def check_approval_needed(order_href: str, bot, db):
             compute_overdue_color, compute_cashflow_color,
             compute_price_color,
             compute_site_color, compute_contacts_color,
-            compute_upd_debt_color,
+            compute_upd_debt_color, compute_address_color,
         )
 
         # 1. Загружаем заказ с атрибутами и расширениями
@@ -794,6 +808,7 @@ async def check_approval_needed(order_href: str, bot, db):
         contract = compute_contract_color(cp_attrs)
         site = compute_site_color(cp_attrs)
         contacts = compute_contacts_color(cp_attrs)
+        address = compute_address_color(order.get("shipmentAddress"))
 
         # 5. Сборка текста + colors_json для confirmation flow
         colors_json = {
@@ -805,6 +820,7 @@ async def check_approval_needed(order_href: str, bot, db):
             "site": site["color"],
             "contacts": contacts["color"],
             "upd_debt": upd_debt["color"],
+            "address": address["color"],
         }
         # Дата планируемой оплаты — то что выставил webhook-autofill за 60с до
         # этого алерта. Берём из attributes заказа, форматируем DD.MM.YYYY.
@@ -825,6 +841,7 @@ async def check_approval_needed(order_href: str, bot, db):
             client_name=agent_name, manager_name=manager_name,
             credit=credit, contract=contract, overdue=overdue, cashflow=cashflow,
             price=price, site=site, contacts=contacts, upd_debt=upd_debt,
+            address=address,
             payment_planned_date=ppm_str,
         )
 
