@@ -551,6 +551,145 @@ async def _alert_claim(context, row):
     await _send_alert(context, recipients, text, photo_file_id=row.get("claim_photo_file_id"))
 
 
+# ─── Лист отгрузок дня с QR (стопгэп до реестра, план Фаза 5) ────────────────
+
+async def _fetch_shipments_for_list() -> list:
+    """Отгрузки за сегодня + данные заказа (окно/места/комментарий) одним запросом
+    (expand=agent,customerOrder инлайнит атрибуты заказа)."""
+    lo, hi, _ = _msk_today_bounds()
+    headers = get_headers()
+    out = []
+    offset = 0
+    async with aiohttp.ClientSession() as session:
+        while True:
+            params = {
+                "filter": f"moment>={lo};moment<={hi}",
+                "expand": "agent,customerOrder",
+                "order": "moment,asc",
+                "limit": 100, "offset": offset,
+            }
+            async with session.get(f"{MS_BASE}/entity/demand", headers=headers, params=params) as r:
+                if r.status != 200:
+                    logger.warning("_fetch_shipments_for_list: HTTP %s", r.status)
+                    break
+                data = await r.json()
+            rows = data.get("rows", [])
+            for x in rows:
+                ag = x.get("agent") or {}
+                co = x.get("customerOrder") or {}
+                wfrom = wto = places = None
+                for a in co.get("attributes", []) or []:
+                    n = a.get("name")
+                    if n == "Окно доставки с (время)":
+                        wfrom = a.get("value")
+                    elif n == "Окно доставки до (время)":
+                        wto = a.get("value")
+                    elif n == "Количество мест":
+                        places = a.get("value")
+                out.append({
+                    "demand_id": x.get("id"),
+                    "demand_name": x.get("name"),
+                    "agent_name": ag.get("name") if isinstance(ag, dict) else None,
+                    "address": x.get("shipmentAddress"),
+                    "sum_rub": (x.get("sum", 0) or 0) / 100,
+                    "window_from": wfrom, "window_to": wto,
+                    "places": places, "comment": co.get("description"),
+                })
+            if len(rows) < 100:
+                break
+            offset += 100
+    return out
+
+
+def _time_hm(v):
+    if not v:
+        return None
+    try:
+        return v.split(" ")[1][:5]
+    except Exception:
+        return None
+
+
+def _build_shipment_list_pdf(shipments, bot_username, date_str) -> bytes:
+    from contract_generator import FONT_NORMAL, FONT_BOLD
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.graphics.barcode.qr import QrCodeWidget
+    from reportlab.graphics.shapes import Drawing
+
+    def qr_flow(data, size=24 * mm):
+        qr = QrCodeWidget(data)
+        b = qr.getBounds()
+        w = b[2] - b[0]
+        h = b[3] - b[1]
+        d = Drawing(size, size, transform=[size / w, 0, 0, size / h, 0, 0])
+        d.add(qr)
+        return d
+
+    body = ParagraphStyle("b", fontName=FONT_NORMAL, fontSize=9, leading=12)
+    title = ParagraphStyle("t", fontName=FONT_BOLD, fontSize=14, leading=18, spaceAfter=8)
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=14 * mm, bottomMargin=12 * mm,
+                            leftMargin=12 * mm, rightMargin=12 * mm)
+    flow = [Paragraph(f"Лист отгрузок — {date_str} ({len(shipments)})", title)]
+    rows = []
+    for i, s in enumerate(shipments, 1):
+        wf, wt = _time_hm(s.get("window_from")), _time_hm(s.get("window_to"))
+        win = f"Окно: {wf}–{wt}   " if (wf and wt) else ""
+        places = f"Мест: {s.get('places')}" if s.get("places") not in (None, "") else ""
+        comment = (s.get("comment") or "").strip().replace("\n", " ")
+        if len(comment) > 90:
+            comment = comment[:90] + "…"
+        info = (f"<b>{i}. {s.get('agent_name') or '?'}</b>  (№ {s.get('demand_name') or '?'})<br/>"
+                f"{s.get('address') or '—'}<br/>{win}{places}")
+        if comment:
+            info += f"<br/><font size=8 color='#555555'>{comment}</font>"
+        link = f"https://t.me/{bot_username}?start=chk_{s['demand_id']}"
+        rows.append([Paragraph(info, body), qr_flow(link)])
+    t = Table(rows, colWidths=[150 * mm, 26 * mm])
+    t.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LINEBELOW", (0, 0), (-1, -2), 0.4, colors.HexColor("#cccccc")),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    flow.append(t)
+    doc.build(flow)
+    return buf.getvalue()
+
+
+async def cmd_shipment_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat or chat.type != "private":
+        return
+    if not (_is_driver(user.id) or user.id == _owner_chat_id() or user.id == _logist_chat_id()):
+        await update.message.reply_text("⛔ Лист отгрузок доступен логисту и водителям.")
+        return
+    await update.message.reply_text("Собираю лист отгрузок за сегодня…")
+    try:
+        shipments = await _fetch_shipments_for_list()
+        if not shipments:
+            await update.message.reply_text("На сегодня отгрузок нет.")
+            return
+        me = await context.bot.get_me()
+        _, _, snap = _msk_today_bounds()
+        pdf = _build_shipment_list_pdf(shipments, me.username, snap.strftime("%d.%m.%Y"))
+        await context.bot.send_document(
+            chat_id=user.id, document=io.BytesIO(pdf),
+            filename=f"shipments_{snap.isoformat()}.pdf",
+            caption=(f"Лист отгрузок за {snap.strftime('%d.%m.%Y')} — {len(shipments)} точек.\n"
+                     "QR по каждой отгрузке → скан открывает сдачу груза."),
+        )
+    except Exception as e:
+        logger.exception("cmd_shipment_list: %s", e)
+        await update.message.reply_text("Не удалось собрать лист. Попробуй позже.")
+
+
 # ─── Фильтры для текста/фото претензии ──────────────────────────────────────
 
 class _ClaimTextFilter(filters.MessageFilter):
@@ -589,6 +728,10 @@ def register(app: Application, db):
     # /рейс (кириллица → через Regex) + ASCII-alias /reis
     app.add_handler(CommandHandler("reis", cmd_reis))
     app.add_handler(MessageHandler(filters.Regex(r"^/рейс(@\w+)?(\s|$)"), cmd_reis))
+
+    # /лист — лист отгрузок дня с QR (для логиста/склада/водителей) + alias /shipmentlist
+    app.add_handler(CommandHandler("shipmentlist", cmd_shipment_list))
+    app.add_handler(MessageHandler(filters.Regex(r"^/лист(@\w+)?(\s|$)"), cmd_shipment_list))
 
     app.add_handler(CallbackQueryHandler(cb_page, pattern=r"^drv:pg:"))
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^drv:pick:"))
