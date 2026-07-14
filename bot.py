@@ -170,6 +170,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=_user_menu_keyboard(include_task_button=is_author)
     )
 
+# Генерация договоров переехала из бота в дашборд менеджера (2026-07-14).
+# Все входы в боте («Эф, договор X», кнопка «Сформировать договор»,
+# /reissue_contract, /refresh_contract) отвечают этой заглушкой.
+CONTRACT_MOVED_MSG = (
+    "📄 Договоры теперь оформляются в *дашборде менеджера*.\n\n"
+    "Открой свой дашборд → кнопка *«Сервисы»* → вкладка *«Документы»* — "
+    "там собирается договор поставки по контрагенту из МойСклад."
+)
+
+
 def _user_menu_keyboard(include_task_button: bool = False) -> InlineKeyboardMarkup:
     """Общее меню для всех пользователей.
 
@@ -180,9 +190,8 @@ def _user_menu_keyboard(include_task_button: bool = False) -> InlineKeyboardMark
         [
             InlineKeyboardButton("📸 Запросить фото товара", callback_data="user_photo"),
         ],
-        [
-            InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
-        ],
+        # Генерация договоров переехала в дашборд менеджера → «Сервисы» → «Документы»
+        # (2026-07-14). Кнопка убрана, callback user_contract отвечает CONTRACT_MOVED_MSG.
         [
             InlineKeyboardButton("📊 Отчёт ОП", callback_data="user_op_report"),
         ],
@@ -217,12 +226,8 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
         _user_awaiting[query.from_user.id] = "photo"
 
     elif action == "user_contract":
-        await query.message.reply_text(
-            "📄 Напиши название компании — сформирую договор поставки.\n"
-            "Например: _Атмосфера_ или _ИТФИШ_",
-            parse_mode="Markdown"
-        )
-        _user_awaiting[query.from_user.id] = "contract"
+        # Договоры переехали в дашборд менеджера (2026-07-14) — не ставим awaiting.
+        await query.message.reply_text(CONTRACT_MOVED_MSG, parse_mode="Markdown")
 
     elif action == "user_op_report":
         await cmd_op_report(update, context)
@@ -420,9 +425,7 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("📸 Фото товара", callback_data="user_photo"),
         ],
-        [
-            InlineKeyboardButton("📄 Сформировать договор", callback_data="user_contract"),
-        ],
+        # Договоры переехали в дашборд менеджера → «Сервисы» → «Документы» (2026-07-14).
         [
             InlineKeyboardButton("📊 Отчёт ОП", callback_data="menu_evening"),
         ],
@@ -1616,6 +1619,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         elif awaiting == "contract":
+            # Договоры переехали в дашборд менеджера (2026-07-14) — глушим в боте.
+            await message.reply_text(CONTRACT_MOVED_MSG, parse_mode="Markdown")
+            await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+            return
             await message.reply_chat_action("typing")
             buyer_query = text
             from moysklad import get_counterparty_requisites
@@ -2594,6 +2601,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif action == "generate_contract":
+        # Договоры переехали в дашборд менеджера (2026-07-14) — глушим генерацию в боте.
+        await message.reply_text(CONTRACT_MOVED_MSG, parse_mode="Markdown")
+        return
+
         buyer_query = params.get("buyer", "")
         await message.reply_chat_action("typing")
 
@@ -4363,6 +4374,9 @@ async def cmd_refresh_history(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def cmd_reissue_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/reissue_contract [название компании] — перегенерировать договор с теми же номером и датой."""
+    # Договоры переехали в дашборд менеджера (2026-07-14) — глушим и переиздание в боте.
+    await update.message.reply_text(CONTRACT_MOVED_MSG, parse_mode="Markdown")
+    return
     user = update.effective_user
     manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
     allowed_ids = manager_ids + [OWNER_CHAT_ID]
@@ -4454,6 +4468,9 @@ async def cmd_reissue_contract(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/refresh_contract [название компании] — обновить реквизиты из МойСклад и переиздать договор с тем же номером и датой."""
+    # Договоры переехали в дашборд менеджера (2026-07-14) — глушим и переиздание в боте.
+    await update.message.reply_text(CONTRACT_MOVED_MSG, parse_mode="Markdown")
+    return
     user = update.effective_user
     manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
     allowed_ids = manager_ids + [OWNER_CHAT_ID]
