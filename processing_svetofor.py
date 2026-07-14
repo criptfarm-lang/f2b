@@ -119,8 +119,29 @@ async def _day_turnover(day: str) -> dict[str, float]:
 
 
 def _classify_fish(name: str) -> str | None:
+    """Тип сырья по наименованию — только для метки нормы (не для поиска рыбы).
+    ПБГ/ПСГ — разделка филе; Н/Р — целая рыба (копчение). None — не распознали."""
     up = (name or "").upper()
-    return "ПБГ" if "ПБГ" in up else ("ПСГ" if "ПСГ" in up else None)
+    if "ПБГ" in up:
+        return "ПБГ"
+    if "ПСГ" in up:
+        return "ПСГ"
+    if "Н/Р" in up:
+        return "Н/Р"
+    return None
+
+
+SYRYE_ROOT = "СЫРЬЕ"  # корневая папка сырья в МС (выход считаем от позиций из неё)
+
+
+def _in_syrye(assortment: dict) -> bool:
+    """Позиция относится к папке СЫРЬЕ (или её подгруппе). pathName берём с товара,
+    а для модификации (variant) — с родительского product (expand=assortment.product)."""
+    p = assortment.get("pathName")
+    if p is None:
+        p = (assortment.get("product") or {}).get("pathName")
+    p = p or ""
+    return p == SYRYE_ROOT or p.startswith(SYRYE_ROOT + "/")
 
 
 # Вес в наименовании: "500 гр.", "250 г", "0,5 кг", "1 кг" → кг
@@ -160,7 +181,7 @@ async def compute(pid: str, name: str, moment: str, state: str | None) -> dict |
     prods = await _positions(pid, "products", expand="assortment.uom")
     if not prods:
         return None
-    mats = await _positions(pid, "materials")
+    mats = await _positions(pid, "materials", expand="assortment.product")
 
     # (код, наименование, qty в базовой ед., объём в кг). Для штучных qty×вес; None — не перевести.
     out_pos = []
@@ -178,25 +199,27 @@ async def compute(pid: str, name: str, moment: str, state: str | None) -> dict |
     # если хоть одну штучную позицию не перевели в кг — не считаем ₽/кг и выход (не врём)
     out_qty = None if any(kg is None for *_, kg in out_pos) else sum(kg for *_, kg in out_pos)
 
-    mat_rows, fish_rows = [], []
+    # Знаменатель выхода — позиции из папки СЫРЬЕ (решение собственника): любой вид
+    # рыбы-сырья (ПБГ/ПСГ филейное, н/р для копчения) лежит в этой папке. Так надёжнее
+    # токенов в наименовании — копчёные операции из целой рыбы «н/р» теперь считаются.
+    mat_rows, syrye_rows = [], []
     for m in mats:
         a = m.get("assortment") or {}
         href = (a.get("meta") or {}).get("href")
         qty = float(m.get("quantity") or 0)
         if href:
             mat_rows.append((href, qty))
-        ft = _classify_fish(a.get("name"))
-        if ft:
-            fish_rows.append((a.get("name"), qty, ft))
+        if _in_syrye(a):
+            syrye_rows.append((a.get("name"), qty))
 
-    if not fish_rows:
+    if not syrye_rows:
         fish_name, fish_qty, fish_type, yield_pct = None, None, "NONE", None
     else:
-        # Одна рыба часто разбита на НЕСКОЛЬКО строк (размерки, напр. ПСГ 4-5 + 5-6) —
-        # для выхода СУММИРУЕМ все строки того же типа, а не берём одну самую большую.
-        main_fish = max(fish_rows, key=lambda t: t[1])
-        fish_name, fish_type = main_fish[0], main_fish[2]
-        fish_qty = sum(q for _, q, t in fish_rows if t == fish_type)
+        # Сырьё часто разбито на НЕСКОЛЬКО строк (размерки, напр. ПСГ 4-5 + 5-6) —
+        # для выхода СУММИРУЕМ все позиции из СЫРЬЯ. Тип нормы — по доминирующей строке.
+        fish_qty = sum(q for _, q in syrye_rows)
+        fish_name = max(syrye_rows, key=lambda t: t[1])[0]
+        fish_type = _classify_fish(fish_name) or "СЫРЬЁ"
         yield_pct = round(main_kg / fish_qty * 100, 2) if (fish_qty and main_kg) else None
 
     perunit = await _day_turnover(moment[:10])
