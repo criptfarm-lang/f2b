@@ -7574,6 +7574,15 @@ def main():
         pattern=r"^task_cand:",
     ))
 
+    # ─── Чеклист водителя (/рейс) — план 2026-07-14 ──────────────────────────
+    # Регистрируем ДО catch-all handle_message, чтобы текст/фото претензии
+    # ловились активным фильтром, а не общим обработчиком.
+    try:
+        import driver_checklist
+        driver_checklist.register(app, db)
+    except Exception as e:
+        logger.error(f"driver_checklist.register упал: {e}")
+
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
 

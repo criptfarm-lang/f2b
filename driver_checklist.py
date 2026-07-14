@@ -1,0 +1,564 @@
+"""
+Чеклист водителя на точке доставки (Telegram, бот «Эф»).
+
+План: F2B второй мозг/plans/2026-07-14-чеклист-водителя-приёмка-на-точке.md
+Память: project_f2b_driver_checklist
+
+Поток (MVP):
+  /рейс → список отгрузок дня (кнопки, пагинация) → «Прибыл» на точке →
+  чеклист: [деньги, если розничная касса и не образец] → документ → сдано/претензия.
+  «Нет» на деньгах/документе и претензия → сигнал логисту (Белякова).
+  Претензия → текст + фото → алерт логисту + собственнику + ответственному менеджеру.
+
+Состояние чеклиста живёт в Postgres (public.delivery_checklist), НЕ в памяти —
+чтобы переживать обрывы связи и рестарт процесса. Результат НЕ пишется в МойСклад
+(read-only), а питает клиентский трекинг FISHек.
+"""
+
+import os
+import logging
+from datetime import datetime, timezone, timedelta
+
+import aiohttp
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters,
+)
+
+from moysklad import MS_BASE, get_headers, PDZ_MANAGER_TG_IDS
+
+logger = logging.getLogger(__name__)
+
+_MSK = timezone(timedelta(hours=3))
+
+# Порог образца: если максимальная цена позиции ≤ 1 ₽ — это образец (маркер собственника).
+_SAMPLE_MAX_PRICE_RUB = 1.0
+# Розничная касса: имя контрагента начинается с этой строки.
+_RETAIL_PREFIX = "Розничный покупатель"
+# Сколько точек на странице списка.
+_PAGE_SIZE = 8
+
+
+# ─── Конфиг получателей (env, с дефолтами) ──────────────────────────────────
+
+def _owner_chat_id() -> int:
+    return int(os.getenv("OWNER_CHAT_ID", "0") or 0)
+
+
+def _logist_chat_id() -> int:
+    # Логист = Александра Белякова (решение собственника 2026-07-14).
+    return int(os.getenv("LOGIST_CHAT_ID", "8267564735") or 0)
+
+
+def _driver_chat_ids() -> set:
+    """Whitelist водителей. env DRIVER_CHAT_IDS через запятую. Владелец — всегда (для теста)."""
+    ids = set()
+    raw = os.getenv("DRIVER_CHAT_IDS", "")
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    owner = _owner_chat_id()
+    if owner:
+        ids.add(owner)
+    return ids
+
+
+def _is_driver(chat_id: int) -> bool:
+    return chat_id in _driver_chat_ids()
+
+
+# ─── Схема БД ────────────────────────────────────────────────────────────────
+
+def ensure_schema(db):
+    """Создаёт таблицу чеклиста (идемпотентно). Вызывать один раз при старте."""
+    db._execute("""
+        CREATE TABLE IF NOT EXISTS delivery_checklist (
+            demand_id        TEXT PRIMARY KEY,
+            demand_name      TEXT,
+            agent_id         TEXT,
+            agent_name       TEXT,
+            address          TEXT,
+            sum_rub          NUMERIC,
+            is_retail        BOOLEAN,
+            is_sample        BOOLEAN,
+            money_required   BOOLEAN,
+            manager_tag      TEXT,
+            driver_chat_id   BIGINT,
+            snap_date        DATE,
+            stage            TEXT,
+            money_received   BOOLEAN,
+            doc_signed       BOOLEAN,
+            accepted_ok      BOOLEAN,
+            claim_text       TEXT,
+            claim_photo_file_id TEXT,
+            status           TEXT,
+            arrived_at       TIMESTAMPTZ DEFAULT now(),
+            completed_at     TIMESTAMPTZ,
+            updated_at       TIMESTAMPTZ DEFAULT now()
+        )
+    """)
+    logger.info("delivery_checklist: схема готова")
+
+
+def _get_row(db, demand_id: str):
+    return db._fetchone(
+        "SELECT * FROM delivery_checklist WHERE demand_id = %s", (demand_id,)
+    )
+
+
+def _set_fields(db, demand_id: str, **fields):
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = %s" for k in fields)
+    params = list(fields.values()) + [demand_id]
+    db._execute(
+        f"UPDATE delivery_checklist SET {cols}, updated_at = now() WHERE demand_id = %s",
+        params,
+    )
+
+
+# ─── МойСклад (read-only) ────────────────────────────────────────────────────
+
+def _msk_today_bounds():
+    now = datetime.now(_MSK)
+    d = now.strftime("%Y-%m-%d")
+    return f"{d} 00:00:00", f"{d} 23:59:59", now.date()
+
+
+async def _fetch_today_demands() -> list:
+    """Отгрузки за сегодня (МСК): [{id, name, agent_name, address, sum_rub}]."""
+    lo, hi, _ = _msk_today_bounds()
+    headers = get_headers()
+    out = []
+    offset = 0
+    async with aiohttp.ClientSession() as session:
+        while True:
+            params = {
+                "filter": f"moment>={lo};moment<={hi}",
+                "expand": "agent",
+                "order": "moment,asc",
+                "limit": 100,
+                "offset": offset,
+            }
+            async with session.get(f"{MS_BASE}/entity/demand", headers=headers, params=params) as r:
+                if r.status != 200:
+                    logger.warning("_fetch_today_demands: HTTP %s", r.status)
+                    break
+                data = await r.json()
+            rows = data.get("rows", [])
+            for x in rows:
+                ag = x.get("agent") or {}
+                out.append({
+                    "id": x.get("id"),
+                    "name": x.get("name"),
+                    "agent_name": ag.get("name") if isinstance(ag, dict) else None,
+                    "agent_id": (ag.get("id") if isinstance(ag, dict) else None),
+                    "address": x.get("shipmentAddress"),
+                    "sum_rub": (x.get("sum", 0) or 0) / 100,
+                })
+            if len(rows) < 100:
+                break
+            offset += 100
+    return out
+
+
+async def _fetch_demand_detail(demand_id: str) -> dict:
+    """Один demand + позиции: считает is_sample и собирает состав."""
+    headers = get_headers()
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{MS_BASE}/entity/demand/{demand_id}",
+            headers=headers, params={"expand": "agent"},
+        ) as r:
+            if r.status != 200:
+                return {}
+            d = await r.json()
+        async with session.get(
+            f"{MS_BASE}/entity/demand/{demand_id}/positions",
+            headers=headers, params={"expand": "assortment", "limit": 100},
+        ) as r:
+            pos = (await r.json()).get("rows", []) if r.status == 200 else []
+
+    ag = d.get("agent") or {}
+    prices = [(p.get("price", 0) or 0) / 100 for p in pos]
+    lines = []
+    for p in pos:
+        nm = (p.get("assortment") or {}).get("name", "?")
+        qty = p.get("quantity", 0) or 0
+        pr = (p.get("price", 0) or 0) / 100
+        lines.append(f"• {nm} — {qty:g} × {pr:,.0f}".replace(",", " "))
+    return {
+        "agent_id": ag.get("id"),
+        "agent_name": ag.get("name"),
+        "address": d.get("shipmentAddress"),
+        "sum_rub": (d.get("sum", 0) or 0) / 100,
+        "name": d.get("name"),
+        "max_price_rub": max(prices) if prices else 0,
+        "positions_text": "\n".join(lines),
+    }
+
+
+async def _fetch_agent_tags(agent_id: str) -> list:
+    if not agent_id:
+        return []
+    headers = get_headers()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{MS_BASE}/entity/counterparty/{agent_id}", headers=headers) as r:
+                if r.status == 200:
+                    return (await r.json()).get("tags", []) or []
+    except Exception as e:
+        logger.warning("_fetch_agent_tags: %s", e)
+    return []
+
+
+# ─── Хелперы ─────────────────────────────────────────────────────────────────
+
+def _is_retail(agent_name: str) -> bool:
+    return bool(agent_name) and agent_name.strip().startswith(_RETAIL_PREFIX)
+
+
+def _fmt_rub(v) -> str:
+    return f"{float(v or 0):,.0f}".replace(",", " ") + " ₽"
+
+
+async def _resolve_manager_chat(agent_id: str) -> tuple:
+    """Возвращает (tag, chat_id|None) ответственного менеджера по тегам контрагента."""
+    tags = await _fetch_agent_tags(agent_id)
+    for t in tags:
+        key = (t or "").strip().lower()
+        if key in PDZ_MANAGER_TG_IDS:
+            return t, PDZ_MANAGER_TG_IDS[key]
+    return None, None
+
+
+async def _send_alert(context, chat_ids, text, photo_file_id=None):
+    seen = set()
+    for cid in chat_ids:
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            if photo_file_id:
+                await context.bot.send_photo(chat_id=cid, photo=photo_file_id, caption=text, parse_mode="Markdown")
+            else:
+                await context.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("_send_alert → %s: %s", cid, e)
+
+
+# ─── Экран: список точек ─────────────────────────────────────────────────────
+
+async def cmd_reis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat or chat.type != "private":
+        return
+    if not _is_driver(user.id):
+        await update.message.reply_text("⛔ Команда доступна водителям развозки.")
+        return
+    await _render_points(update.message.reply_text, page=0)
+
+
+async def _render_points(send, page: int):
+    demands = await _fetch_today_demands()
+    if not demands:
+        await send("На сегодня отгрузок нет.")
+        return
+    total = len(demands)
+    pages = (total + _PAGE_SIZE - 1) // _PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    chunk = demands[page * _PAGE_SIZE:(page + 1) * _PAGE_SIZE]
+
+    buttons = []
+    for d in chunk:
+        title = (d["agent_name"] or d["name"] or "?")[:45]
+        buttons.append([InlineKeyboardButton(f"📍 {title}", callback_data=f"drv:pick:{d['id']}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("« Назад", callback_data=f"drv:pg:{page-1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Далее »", callback_data=f"drv:pg:{page+1}"))
+    if nav:
+        buttons.append(nav)
+
+    text = f"🚚 Точки на сегодня ({total}). Стр. {page+1}/{pages}.\nВыбери точку, куда приехал:"
+    await send(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def cb_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    page = int(q.data.split(":")[2])
+    await _render_points(lambda *a, **k: q.edit_message_text(*a, **k), page=page)
+
+
+# ─── Экран: карточка точки ───────────────────────────────────────────────────
+
+async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    demand_id = q.data.split(":", 2)[2]
+
+    row = _get_row(context.bot_data["db"], demand_id)
+    if row and row.get("status"):
+        await q.edit_message_text(f"✅ Точка уже закрыта: {row.get('agent_name')} — {row['status']}.")
+        return
+
+    det = await _fetch_demand_detail(demand_id)
+    if not det:
+        await q.edit_message_text("Не удалось загрузить отгрузку. Попробуй ещё раз.")
+        return
+
+    lines = [
+        f"*{det.get('agent_name') or '?'}*",
+        f"Отгрузка № {det.get('name') or '?'}",
+        f"Адрес: {det.get('address') or '—'}",
+        f"Сумма: {_fmt_rub(det.get('sum_rub'))}",
+    ]
+    if det.get("positions_text"):
+        lines.append("\n" + det["positions_text"])
+    kb = [[InlineKeyboardButton("📍 Прибыл — начать приёмку", callback_data=f"drv:arrive:{demand_id}")],
+          [InlineKeyboardButton("« К списку", callback_data="drv:pg:0")]]
+    await q.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+
+# ─── Чеклист ─────────────────────────────────────────────────────────────────
+
+async def cb_arrive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    demand_id = q.data.split(":", 2)[2]
+    db = context.bot_data["db"]
+    driver_id = q.from_user.id
+
+    det = await _fetch_demand_detail(demand_id)
+    if not det:
+        await q.edit_message_text("Не удалось загрузить отгрузку.")
+        return
+
+    is_retail = _is_retail(det.get("agent_name"))
+    is_sample = det.get("max_price_rub", 0) <= _SAMPLE_MAX_PRICE_RUB
+    money_required = is_retail and (not is_sample) and det.get("sum_rub", 0) > 0
+    mtag, _mchat = await _resolve_manager_chat(det.get("agent_id"))
+    _, _, snap = _msk_today_bounds()
+
+    # upsert
+    db._execute("""
+        INSERT INTO delivery_checklist
+          (demand_id, demand_name, agent_id, agent_name, address, sum_rub,
+           is_retail, is_sample, money_required, manager_tag, driver_chat_id,
+           snap_date, stage, arrived_at, updated_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now(), now())
+        ON CONFLICT (demand_id) DO UPDATE SET
+           driver_chat_id = EXCLUDED.driver_chat_id,
+           money_required = EXCLUDED.money_required,
+           stage = EXCLUDED.stage,
+           updated_at = now()
+    """, (
+        demand_id, det.get("name"), det.get("agent_id"), det.get("agent_name"),
+        det.get("address"), det.get("sum_rub"), is_retail, is_sample, money_required,
+        mtag, driver_id, snap, "money" if money_required else "doc",
+    ))
+
+    if money_required:
+        await _ask_money(q, demand_id, det.get("sum_rub"))
+    else:
+        await _ask_doc(q, demand_id)
+
+
+async def _ask_money(q, demand_id, sum_rub):
+    kb = [[InlineKeyboardButton("✅ Да", callback_data=f"drv:money:yes:{demand_id}"),
+           InlineKeyboardButton("❌ Нет", callback_data=f"drv:money:no:{demand_id}")]]
+    await q.edit_message_text(
+        f"💵 Деньги приняты? ({_fmt_rub(sum_rub)})",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+async def _ask_doc(q, demand_id):
+    kb = [[InlineKeyboardButton("✅ Да", callback_data=f"drv:doc:yes:{demand_id}"),
+           InlineKeyboardButton("❌ Нет", callback_data=f"drv:doc:no:{demand_id}")]]
+    await q.edit_message_text("✍️ Документ подписан?", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def _ask_accept(q, demand_id):
+    kb = [[InlineKeyboardButton("✅ Сдано", callback_data=f"drv:acc:ok:{demand_id}")],
+          [InlineKeyboardButton("⚠️ Есть претензия", callback_data=f"drv:acc:claim:{demand_id}")]]
+    await q.edit_message_text("📦 Сдано без претензий?", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def cb_money(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, _, val, demand_id = q.data.split(":", 3)
+    db = context.bot_data["db"]
+    received = (val == "yes")
+    _set_fields(db, demand_id, money_received=received, stage="doc")
+    if not received:
+        row = _get_row(db, demand_id)
+        await _signal_logist(context, row, "💵 деньги НЕ приняты")
+    await _ask_doc(q, demand_id)
+
+
+async def cb_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, _, val, demand_id = q.data.split(":", 3)
+    db = context.bot_data["db"]
+    signed = (val == "yes")
+    _set_fields(db, demand_id, doc_signed=signed, stage="accept")
+    if not signed:
+        row = _get_row(db, demand_id)
+        await _signal_logist(context, row, "✍️ документ НЕ подписан")
+    await _ask_accept(q, demand_id)
+
+
+async def cb_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, _, val, demand_id = q.data.split(":", 3)
+    db = context.bot_data["db"]
+    if val == "ok":
+        _set_fields(db, demand_id, accepted_ok=True, status="сдан",
+                    stage="done", completed_at=datetime.now(_MSK))
+        await q.edit_message_text("✅ Точка закрыта: сдано без претензий. Спасибо!")
+    else:
+        _set_fields(db, demand_id, accepted_ok=False, stage="claim_text")
+        await q.edit_message_text("⚠️ Опиши претензию одним сообщением (текст).")
+
+
+# ─── Ветка «претензия»: текст → фото → алерт ────────────────────────────────
+
+def _driver_awaiting(db, chat_id, stage):
+    return db._fetchone(
+        "SELECT demand_id FROM delivery_checklist "
+        "WHERE driver_chat_id = %s AND stage = %s ORDER BY updated_at DESC LIMIT 1",
+        (chat_id, stage),
+    )
+
+
+async def handle_claim_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.bot_data["db"]
+    row = _driver_awaiting(db, update.effective_user.id, "claim_text")
+    if not row:
+        return
+    demand_id = row["demand_id"]
+    _set_fields(db, demand_id, claim_text=(update.message.text or "").strip(), stage="claim_photo")
+    kb = [[InlineKeyboardButton("Без фото", callback_data=f"drv:claimnophoto:{demand_id}")]]
+    await update.message.reply_text("📷 Пришли фото претензии (или «Без фото»).",
+                                    reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def handle_claim_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.bot_data["db"]
+    row = _driver_awaiting(db, update.effective_user.id, "claim_photo")
+    if not row:
+        return
+    demand_id = row["demand_id"]
+    file_id = update.message.photo[-1].file_id
+    _set_fields(db, demand_id, claim_photo_file_id=file_id)
+    await _finish_claim(context, demand_id, update.message.reply_text)
+
+
+async def cb_claim_nophoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    demand_id = q.data.split(":", 2)[2]
+    await _finish_claim(context, demand_id, q.edit_message_text)
+
+
+async def _finish_claim(context, demand_id, reply):
+    db = context.bot_data["db"]
+    _set_fields(db, demand_id, status="сдан с проблемой", stage="done",
+                completed_at=datetime.now(_MSK))
+    row = _get_row(db, demand_id)
+    await _alert_claim(context, row)
+    await reply("⚠️ Претензия зафиксирована. Логист и менеджер уведомлены. Спасибо!")
+
+
+# ─── Алерты ──────────────────────────────────────────────────────────────────
+
+def _point_head(row) -> str:
+    return (f"*{row.get('agent_name') or '?'}*\n"
+            f"Отгрузка № {row.get('demand_name') or '?'}\n"
+            f"Адрес: {row.get('address') or '—'}")
+
+
+async def _signal_logist(context, row, reason: str):
+    if not row:
+        return
+    text = f"🚚 Приёмка — сигнал\n{_point_head(row)}\n\n⚠️ {reason}"
+    await _send_alert(context, [_logist_chat_id()], text)
+
+
+async def _alert_claim(context, row):
+    if not row:
+        return
+    tag = (row.get("manager_tag") or "").strip().lower()
+    mgr_chat = PDZ_MANAGER_TG_IDS.get(tag)
+    text = (f"⚠️ ПРЕТЕНЗИЯ на доставке\n{_point_head(row)}\n\n"
+            f"Описание: {row.get('claim_text') or '—'}")
+    if row.get("manager_tag"):
+        text += f"\nМенеджер: {row.get('manager_tag')}"
+    recipients = [_logist_chat_id(), _owner_chat_id(), mgr_chat]
+    await _send_alert(context, recipients, text, photo_file_id=row.get("claim_photo_file_id"))
+
+
+# ─── Фильтры для текста/фото претензии ──────────────────────────────────────
+
+class _ClaimTextFilter(filters.MessageFilter):
+    def __init__(self, db):
+        super().__init__()
+        self._db = db
+
+    def filter(self, message):
+        u = getattr(message, "from_user", None)
+        c = getattr(message, "chat", None)
+        if not u or not c or c.type != "private":
+            return False
+        return bool(_driver_awaiting(self._db, u.id, "claim_text"))
+
+
+class _ClaimPhotoFilter(filters.MessageFilter):
+    def __init__(self, db):
+        super().__init__()
+        self._db = db
+
+    def filter(self, message):
+        u = getattr(message, "from_user", None)
+        c = getattr(message, "chat", None)
+        if not u or not c or c.type != "private":
+            return False
+        return bool(_driver_awaiting(self._db, u.id, "claim_photo"))
+
+
+# ─── Регистрация ─────────────────────────────────────────────────────────────
+
+def register(app: Application, db):
+    """Подключить чеклист водителя. Вызывать в main() ДО catch-all handle_message."""
+    ensure_schema(db)
+    app.bot_data["db"] = db
+
+    # /рейс (кириллица → через Regex) + ASCII-alias /reis
+    app.add_handler(CommandHandler("reis", cmd_reis))
+    app.add_handler(MessageHandler(filters.Regex(r"^/рейс(@\w+)?(\s|$)"), cmd_reis))
+
+    app.add_handler(CallbackQueryHandler(cb_page, pattern=r"^drv:pg:"))
+    app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^drv:pick:"))
+    app.add_handler(CallbackQueryHandler(cb_arrive, pattern=r"^drv:arrive:"))
+    app.add_handler(CallbackQueryHandler(cb_money, pattern=r"^drv:money:"))
+    app.add_handler(CallbackQueryHandler(cb_doc, pattern=r"^drv:doc:"))
+    app.add_handler(CallbackQueryHandler(cb_accept, pattern=r"^drv:acc:"))
+    app.add_handler(CallbackQueryHandler(cb_claim_nophoto, pattern=r"^drv:claimnophoto:"))
+
+    # Текст/фото претензии — ДО общего handle_message
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & _ClaimTextFilter(db), handle_claim_text))
+    app.add_handler(MessageHandler(
+        filters.PHOTO & _ClaimPhotoFilter(db), handle_claim_photo))
+
+    logger.info("driver_checklist: хендлеры зарегистрированы")
