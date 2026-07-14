@@ -177,6 +177,29 @@ async def _positions(pid: str, kind: str, expand: str = "assortment") -> list[di
     return d.get("rows") or []
 
 
+# Рентабельность считаем от ЖИВОЙ карточки ГП (тип «Цена опт» → рент. ОПТ, «Цена продажи»
+# → рент. ХОР), а не от снимка цены внутри техоперации: светофор приходит на «Анализ
+# сделан» и должен отражать текущую цену продажи, а не ту, что была при выпуске.
+PRICE_OPT = "Цена опт"
+PRICE_HOR = "Цена продажи"
+
+
+async def _card_prices(sku_code: str | None) -> dict[str, float]:
+    """{имя_типа_цены: ₽} по актуальной карточке ГП. Пусто, если код не найден."""
+    if not sku_code:
+        return {}
+    d = await _ms_get("/entity/product", {"filter": f"code={sku_code}", "limit": 1})
+    rows = d.get("rows") or []
+    if not rows:
+        return {}
+    out: dict[str, float] = {}
+    for sp in rows[0].get("salePrices") or []:
+        nm = (sp.get("priceType") or {}).get("name")
+        if nm:
+            out[nm] = (sp.get("value") or 0) / 100.0
+    return out
+
+
 async def compute(pid: str, name: str, moment: str, state: str | None) -> dict | None:
     prods = await _positions(pid, "products", expand="assortment.uom")
     if not prods:
@@ -238,6 +261,7 @@ async def compute(pid: str, name: str, moment: str, state: str | None) -> dict |
         "out_qty": out_qty, "out_multi": out_multi,
         "fish_type": fish_type, "fish_qty": fish_qty,
         "cost_per_kg": cost_per_kg, "yield_pct": yield_pct,
+        "card_prices": await _card_prices(out_sku_code),
     }
 
 
@@ -321,6 +345,15 @@ def render(snap: dict) -> tuple[str, str | None]:
              yld_line,
              "",
              cost_line]
+
+    # Рентабельность к цене продажи (как в отчёте МС «Прибыльность»):
+    # (цена − себест) / цена. Только при достоверной себестоимости.
+    card_prices = snap.get("card_prices") or {}
+    for label, ptype in (("ОПТ", PRICE_OPT), ("ХОР", PRICE_HOR)):
+        price = card_prices.get(ptype)
+        if price and cost:
+            r = (price - cost) / price * 100
+            lines.append(f"Рентабельность {label}: {r:.1f}% (цена {price:.0f} / себест {cost:.0f})")
 
     if snap.get("check_status"):
         lines += ["", "", f"статус в МС: {snap['check_status']}"]
