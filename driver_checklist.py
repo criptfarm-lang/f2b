@@ -317,7 +317,7 @@ async def _render_card(send, demand_id: str, db, with_back: bool = True):
     if det.get("positions_text"):
         lines.append("\n" + det["positions_text"])
     rows = [
-        [InlineKeyboardButton("📍 Прибыл — начать приёмку", callback_data=f"drv:arrive:{demand_id}")],
+        [InlineKeyboardButton("📍 Прибыл — начать сдачу", callback_data=f"drv:arrive:{demand_id}")],
         [InlineKeyboardButton("🔳 QR точки", callback_data=f"drv:qr:{demand_id}")],
     ]
     if with_back:
@@ -339,7 +339,7 @@ async def open_from_deeplink(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not user or not chat or chat.type != "private":
         return
     if not _is_driver(user.id):
-        await update.message.reply_text("⛔ Приёмка доступна водителям развозки.")
+        await update.message.reply_text("⛔ Сдача груза доступна водителям развозки.")
         return
     await _render_card(update.message.reply_text, demand_id, context.bot_data["db"], with_back=False)
 
@@ -362,7 +362,7 @@ async def cb_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         png = _qr_png(link)
         await context.bot.send_photo(
             chat_id=q.from_user.id, photo=io.BytesIO(png),
-            caption=f"QR точки. Скан любой камерой → откроется приёмка.\n{link}",
+            caption=f"QR точки. Скан любой камерой → откроется сдача груза.\n{link}",
         )
     except Exception as e:
         logger.warning("cb_qr: %s", e)
@@ -534,7 +534,7 @@ def _point_head(row) -> str:
 async def _signal_logist(context, row, reason: str):
     if not row:
         return
-    text = f"🚚 Приёмка — сигнал\n{_point_head(row)}\n\n⚠️ {reason}"
+    text = f"🚚 Сдача груза — сигнал\n{_point_head(row)}\n\n⚠️ {reason}"
     await _send_alert(context, [_logist_chat_id()], text)
 
 
