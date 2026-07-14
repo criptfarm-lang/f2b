@@ -7670,6 +7670,21 @@ def main():
     app.job_queue.run_repeating(_supply_svetofor_wrapper, interval=600, first=90)
 
     # ────────────────────────────────────────────────────────────────────
+    # Пинг зависших лидов на «Неразобранном» воронки ПРИВЛЕЧЕНИЕ — каждые 30 мин.
+    # Личка ответственному при возрасте ≥5ч в статусе, окно 09-20 МСК, повтор ≤3ч.
+    # PTB JobQueue (не AsyncIOScheduler). План: 2026-07-14-пинг-зависших-лидов-неразобранное.
+    # ────────────────────────────────────────────────────────────────────
+    from stuck_leads import poll_job as _stuck_leads_poll
+
+    async def _stuck_leads_wrapper(context):
+        try:
+            await _stuck_leads_poll(app, db)
+        except Exception as e:
+            logger.error(f"stuck_leads job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_stuck_leads_wrapper, interval=1800, first=120)
+
+    # ────────────────────────────────────────────────────────────────────
     # Wazzup classifier — дневная сводка собственнику 17:00 МСК.
     # Счётчик за день + топ-5 срочных. Если 0 — «0 запросов, всё тихо».
     # ────────────────────────────────────────────────────────────────────

@@ -291,6 +291,14 @@ class Database:
             "ALTER TABLE manager_chats ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT FALSE",
             "ALTER TABLE manager_chats ADD COLUMN IF NOT EXISTS request_count INT DEFAULT 0",
             "ALTER TABLE manager_chats ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT NOW()",
+            "ALTER TABLE manager_chats ADD COLUMN IF NOT EXISTS amo_user_id BIGINT",
+            # Состояние пингов зависших лидов на «Неразобранном» (stuck_leads.py)
+            """CREATE TABLE IF NOT EXISTS lead_stuck_pings (
+                lead_id BIGINT PRIMARY KEY,
+                stage_entered_at TIMESTAMPTZ,
+                last_ping_at TIMESTAMPTZ,
+                pings_count INT DEFAULT 0
+            )""",
             """CREATE TABLE IF NOT EXISTS aging_alerts (
                 counterparty_id TEXT PRIMARY KEY,
                 name TEXT,
