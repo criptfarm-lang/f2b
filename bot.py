@@ -5922,6 +5922,53 @@ async def cmd_fishki_remind_stop(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text("🛑 Stop-флаг выставлен. Текущая рассылка завершится.")
 
 
+async def _send_long(message, text: str):
+    """Отправить длинный текст, разбивая по лимиту Telegram (4096)."""
+    limit = 3800
+    if len(text) <= limit:
+        await message.reply_text(text, parse_mode="Markdown")
+        return
+    chunk, ln = [], 0
+    for line in text.split("\n"):
+        if ln + len(line) + 1 > limit and chunk:
+            await message.reply_text("\n".join(chunk), parse_mode="Markdown")
+            chunk, ln = [], 0
+        chunk.append(line)
+        ln += len(line) + 1
+    if chunk:
+        await message.reply_text("\n".join(chunk), parse_mode="Markdown")
+
+
+async def cmd_digest_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/digest_today [часы] — анализ переписок за сутки (по умолч.) / за N часов.
+
+    Обезличивает диалоги, классифицирует сигналы через Claude, шлёт дайджест.
+    Только собственник.
+    """
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    hours = 24
+    if context.args:
+        try:
+            hours = max(1, min(168, int(context.args[0])))
+        except ValueError:
+            pass
+    await update.message.reply_text(f"🔍 Анализирую переписки за {hours} ч…")
+    try:
+        from chat_digest import analyze, save_signals, render_digest
+        signals = await analyze(db, hours=hours)
+        try:
+            save_signals(db, signals)
+        except Exception as e:
+            logger.warning(f"chat_digest: save_signals: {e}")
+        label = "за сутки" if hours == 24 else f"за {hours} ч"
+        await _send_long(update.message, render_digest(signals, label))
+    except Exception as e:
+        logger.error(f"cmd_digest_today: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка анализа: {e}")
+
+
 async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/notifier_status — заказы за сегодня которым не ушла рассылка."""
     user = update.effective_user
@@ -7225,6 +7272,7 @@ def main():
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
     app.add_handler(CommandHandler("ms_attributes", cmd_ms_attributes))
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
+    app.add_handler(CommandHandler("digest_today", cmd_digest_today))
     app.add_handler(CommandHandler("fishki_remind_dry", cmd_fishki_remind_dry))
     app.add_handler(CommandHandler("fishki_remind_send", cmd_fishki_remind_send))
     app.add_handler(CommandHandler("fishki_remind_stop", cmd_fishki_remind_stop))
@@ -7738,6 +7786,37 @@ def main():
     app.job_queue.run_daily(
         _wazzup_daily_summary,
         time=_dt_time(hour=14, minute=0, tzinfo=_tz_for_job.utc),
+    )
+
+    # Анализ переписок — ежедневный дайджест проблемных сигналов Виктору.
+    # 08:00 МСК = 05:00 UTC. План: 2026-04-29-анализ-переписок-фундамент.
+    async def _chat_digest_job(context):
+        try:
+            from chat_digest import analyze, save_signals, render_digest
+            signals = await analyze(db, hours=24)
+            try:
+                save_signals(db, signals)
+            except Exception as e:
+                logger.warning(f"chat_digest job: save_signals: {e}")
+            text = render_digest(signals, "за сутки")
+            # доставка Виктору (чанкинг по лимиту Telegram)
+            limit = 3800
+            parts, chunk, ln = [], [], 0
+            for line in text.split("\n"):
+                if ln + len(line) + 1 > limit and chunk:
+                    parts.append("\n".join(chunk)); chunk, ln = [], 0
+                chunk.append(line); ln += len(line) + 1
+            if chunk:
+                parts.append("\n".join(chunk))
+            for p in parts:
+                await app.bot.send_message(OWNER_CHAT_ID, p, parse_mode="Markdown")
+            logger.info(f"chat_digest job: {len(signals)} сигналов отправлено")
+        except Exception as e:
+            logger.error(f"chat_digest job: {e}", exc_info=True)
+
+    app.job_queue.run_daily(
+        _chat_digest_job,
+        time=_dt_time(hour=5, minute=0, tzinfo=_tz_for_job.utc),
     )
 
     # ────────────────────────────────────────────────────────────────────
