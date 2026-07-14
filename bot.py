@@ -162,6 +162,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user and chat_id == user.id:
         db.save_manager_chat_id(user.id, user.full_name)
         logger.info(f"cmd_start: сохранён chat_id={chat_id} name={user.full_name}")
+    # Диплинк из QR реестра: /start chk_<demand_id> → сразу карточка точки (приёмка)
+    if context.args and context.args[0].startswith("chk_"):
+        try:
+            import driver_checklist
+            await driver_checklist.open_from_deeplink(update, context, context.args[0][4:])
+        except Exception as e:
+            logger.error(f"driver_checklist deeplink упал: {e}")
+            await update.message.reply_text("Не удалось открыть точку по QR.")
+        return
     is_author = user is not None and _is_task_author(user.id)
     await update.message.reply_text(
         f"👋 Привет, *{user.full_name if user else 'друг'}*! Я Эф — ассистент F2B PRO.\n\n"

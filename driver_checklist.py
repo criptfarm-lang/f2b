@@ -16,6 +16,7 @@
 """
 
 import os
+import io
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -298,21 +299,15 @@ async def cb_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Экран: карточка точки ───────────────────────────────────────────────────
 
-async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    demand_id = q.data.split(":", 2)[2]
-
-    row = _get_row(context.bot_data["db"], demand_id)
+async def _render_card(send, demand_id: str, db, with_back: bool = True):
+    row = _get_row(db, demand_id)
     if row and row.get("status"):
-        await q.edit_message_text(f"✅ Точка уже закрыта: {row.get('agent_name')} — {row['status']}.")
+        await send(f"✅ Точка уже закрыта: {row.get('agent_name')} — {row['status']}.")
         return
-
     det = await _fetch_demand_detail(demand_id)
     if not det:
-        await q.edit_message_text("Не удалось загрузить отгрузку. Попробуй ещё раз.")
+        await send("Не удалось загрузить отгрузку. Попробуй ещё раз.")
         return
-
     lines = [
         f"*{det.get('agent_name') or '?'}*",
         f"Отгрузка № {det.get('name') or '?'}",
@@ -321,9 +316,57 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     if det.get("positions_text"):
         lines.append("\n" + det["positions_text"])
-    kb = [[InlineKeyboardButton("📍 Прибыл — начать приёмку", callback_data=f"drv:arrive:{demand_id}")],
-          [InlineKeyboardButton("« К списку", callback_data="drv:pg:0")]]
-    await q.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    rows = [
+        [InlineKeyboardButton("📍 Прибыл — начать приёмку", callback_data=f"drv:arrive:{demand_id}")],
+        [InlineKeyboardButton("🔳 QR точки", callback_data=f"drv:qr:{demand_id}")],
+    ]
+    if with_back:
+        rows.append([InlineKeyboardButton("« К списку", callback_data="drv:pg:0")])
+    await send("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    demand_id = q.data.split(":", 2)[2]
+    await _render_card(q.edit_message_text, demand_id, context.bot_data["db"])
+
+
+async def open_from_deeplink(update: Update, context: ContextTypes.DEFAULT_TYPE, demand_id: str):
+    """Вход по QR-диплинку: /start chk_<demand_id> → карточка точки сразу, без списка."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat or chat.type != "private":
+        return
+    if not _is_driver(user.id):
+        await update.message.reply_text("⛔ Приёмка доступна водителям развозки.")
+        return
+    await _render_card(update.message.reply_text, demand_id, context.bot_data["db"], with_back=False)
+
+
+def _qr_png(data: str) -> bytes:
+    import qrcode
+    img = qrcode.make(data)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def cb_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    demand_id = q.data.split(":", 2)[2]
+    me = await context.bot.get_me()
+    link = f"https://t.me/{me.username}?start=chk_{demand_id}"
+    try:
+        png = _qr_png(link)
+        await context.bot.send_photo(
+            chat_id=q.from_user.id, photo=io.BytesIO(png),
+            caption=f"QR точки. Скан любой камерой → откроется приёмка.\n{link}",
+        )
+    except Exception as e:
+        logger.warning("cb_qr: %s", e)
+        await context.bot.send_message(chat_id=q.from_user.id, text=f"Ссылка точки:\n{link}")
 
 
 # ─── Чеклист ─────────────────────────────────────────────────────────────────
@@ -549,6 +592,7 @@ def register(app: Application, db):
 
     app.add_handler(CallbackQueryHandler(cb_page, pattern=r"^drv:pg:"))
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^drv:pick:"))
+    app.add_handler(CallbackQueryHandler(cb_qr, pattern=r"^drv:qr:"))
     app.add_handler(CallbackQueryHandler(cb_arrive, pattern=r"^drv:arrive:"))
     app.add_handler(CallbackQueryHandler(cb_money, pattern=r"^drv:money:"))
     app.add_handler(CallbackQueryHandler(cb_doc, pattern=r"^drv:doc:"))
