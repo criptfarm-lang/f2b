@@ -16,7 +16,7 @@ import html
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
-from moysklad import PDZ_GRACE_DAYS, _pdz_classify
+from moysklad import PDZ_GRACE_DAYS, _pdz_classify, _row_fifo
 
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -142,6 +142,7 @@ def build_pdz_payload(db) -> dict:
             "agent_name": r.get("agent_name") or "—",
             "manager_tag": r.get("manager_tag") or "",
             "agent_balance": balance,
+            "overdue_fifo": _row_fifo(r),
             "overdue": [],
             "in_сroк_unpaid_total": 0.0,
             "work_total": 0,
@@ -176,33 +177,44 @@ def build_pdz_payload(db) -> dict:
         real_overdue = max(0.0, round(bal_abs - in_сroк, 2))
         if real_overdue < 0.01:
             continue  # FIFO-перекрытие
-        # LIFO: распределяем real_overdue от свежих просрочек (мин days_overdue)
-        # к старым. Старые мартовские/апрельские «закрываются» свежими
-        # платежами — days_overdue считается по самому старому из covered.
-        # Кейс ДЖИФУДСЕРВИСЕС 2026-05-29.
-        sorted_lifo = sorted(data["overdue"], key=lambda x: x["days_overdue"])
-        covered: list = []
-        remaining = real_overdue
-        for o in sorted_lifo:
-            if remaining <= 0.01:
-                break
-            take = min(remaining, float(o.get("unpaid") or 0))
-            if take <= 0:
-                continue
-            covered.append({**o, "unpaid": round(take, 2)})
-            remaining -= take
-        if not covered:
-            covered = data["overdue"]
-        oldest_in_covered = max(covered, key=lambda x: x["days_overdue"])
+        # День-каунт/сумма/url — из demand-FIFO снимка (единый источник правды,
+        # 2026-07-14). Заменил LIFO по payedSum. cashflow-45 gate здесь не было.
+        fifo = data.get("overdue_fifo")
+        if fifo is not None:
+            f_days, f_amt, f_url, f_cnt = fifo
+            if f_days == 0 and not f_url:
+                continue  # реально просрочки нет → пропуск
+            days_overdue_val = f_days
+            total_unpaid_val = f_amt if f_amt > 0 else real_overdue
+            ms_url_val = f_url
+        else:
+            # МС был недоступен в снимке → фолбэк на старый LIFO по payedSum.
+            sorted_lifo = sorted(data["overdue"], key=lambda x: x["days_overdue"])
+            covered: list = []
+            remaining = real_overdue
+            for o in sorted_lifo:
+                if remaining <= 0.01:
+                    break
+                take = min(remaining, float(o.get("unpaid") or 0))
+                if take <= 0:
+                    continue
+                covered.append({**o, "unpaid": round(take, 2)})
+                remaining -= take
+            if not covered:
+                covered = data["overdue"]
+            oldest_in_covered = max(covered, key=lambda x: x["days_overdue"])
+            days_overdue_val = oldest_in_covered["days_overdue"]
+            total_unpaid_val = real_overdue
+            ms_url_val = _ms_url(oldest_in_covered["order_id"])
         debtors.append({
             "agent_id": aid,
             "agent_name": data["agent_name"],
             "manager_tag": data["manager_tag"],
             "orders_count": data["work_total"],          # всего заказов клиента с просроч. ppm_initial
             "orders_touched": data["work_touched"],      # из них с заполн. «Новой датой оплаты»
-            "days_overdue": oldest_in_covered["days_overdue"],
-            "total_unpaid": real_overdue,
-            "ms_url": _ms_url(oldest_in_covered["order_id"]),
+            "days_overdue": days_overdue_val,
+            "total_unpaid": total_unpaid_val,
+            "ms_url": ms_url_val,
         })
 
     # Обогащение срывами за 90 дней

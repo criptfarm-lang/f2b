@@ -1751,66 +1751,79 @@ async def pdz_take_snapshot() -> list:
                 f"контрагентов; balance>=0 (не должны): {non_debtors}; запросы упали: {failed}"
             )
 
-            # ── Обогащение coverage_residual_45d (страховка от ложных PDZ) ──
-            # Для каждого должника считаем «непокрытый остаток начального долга»
-            # за окно 45 дней через /entity/demand + /entity/paymentin + /entity/cashin.
-            # Если residual ≤ 0 → за окно клиент полностью закрыл то, что висело
-            # на T-45 (приходы покрыли начальный). Формальные просрочки до T-45
-            # = ложный сигнал (бухгалтерия криво разнесла оплаты).
-            # См. plans/2026-06-08-pdz-fix-cashflow-coverage.md.
+            # ── Обогащение demand-FIFO (единый источник правды по просрочке) ──
+            # Для каждого должника считаем день-каунт и сумму просрочки по
+            # ОТГРУЗКАМ + FIFO приходов (_overdue_by_demand_fifo): срок каждой
+            # отгрузки = дата отгрузки + Дней отсрочки, приходы гасят oldest-first.
+            # Заменяет прежний cashflow-45 residual (ложные негативы у активных
+            # клиентов: residual = долг − отгрузки_45д уходил в минус при высоком
+            # обороте и прятал реальную просрочку — кейс СЫРОВАРНЯ МЕТРОПОЛИС
+            # 2026-07-14). Результат читают все потребители (дайджест/owner/html).
+            # См. plans/2026-07-14-pdz-unify-demand-fifo.md.
             today_msk = snap_date  # snap_date уже МСК (строка 1542)
 
             debtor_ids = [
                 aid for aid, b in balance_map.items()
                 if b is not None and b < 0
             ]
-            residual_map: dict = {}
+            fifo_map: dict = {}  # aid → (days, amount, url, count) | None
             logger.info(
-                f"pdz_take_snapshot: считаю coverage_residual_45d для {len(debtor_ids)} должников"
+                f"pdz_take_snapshot: считаю demand-FIFO просрочку для {len(debtor_ids)} должников"
             )
 
-            async def _fetch_residual(aid: str):
+            async def _fetch_overdue_fifo(aid: str):
                 bal = balance_map.get(aid)
                 if bal is None or bal >= 0:
                     return aid, None
-                debt = -bal  # bal < 0 → клиент должен нам
                 try:
-                    val = await fetch_coverage_residual_for_window(
-                        aid, debt_today=debt, today=today_msk,
-                        window_days=PDZ_CASHFLOW_WINDOW_DAYS,
-                    )
+                    val = await _overdue_by_demand_fifo(aid, today_msk)
                 except Exception as ex_o:
                     logger.warning(
-                        f"pdz_take_snapshot residual {aid[:8]} {type(ex_o).__name__}: {ex_o}"
+                        f"pdz_take_snapshot fifo {aid[:8]} {type(ex_o).__name__}: {ex_o}"
                     )
                     val = None
                 return aid, val
 
-            BATCH_RESIDUAL = 2
-            for i in range(0, len(debtor_ids), BATCH_RESIDUAL):
-                chunk = debtor_ids[i:i + BATCH_RESIDUAL]
+            BATCH_FIFO = 2
+            for i in range(0, len(debtor_ids), BATCH_FIFO):
+                chunk = debtor_ids[i:i + BATCH_FIFO]
                 results = await asyncio.gather(
-                    *(_fetch_residual(aid) for aid in chunk),
+                    *(_fetch_overdue_fifo(aid) for aid in chunk),
                     return_exceptions=False,
                 )
                 for aid, val in results:
-                    residual_map[aid] = val
-                if i + BATCH_RESIDUAL < len(debtor_ids):
+                    fifo_map[aid] = val
+                if i + BATCH_FIFO < len(debtor_ids):
                     await asyncio.sleep(0.2)
 
-            # Раскладываем residual по строкам (None для не-должников и для упавших).
+            # Раскладываем fifo по строкам. None (МС упал) → все поля None →
+            # потребитель откатится на старый LIFO. (0,0.0,None,0) = просрочки
+            # реально нет → days=0/amount=0 → потребитель скроет клиента.
+            # coverage_residual_45d больше не считаем — пишем None (столбец не трогаем).
             for r in rows:
-                r["coverage_residual_45d"] = residual_map.get(r.get("agent_id"))
+                fv = fifo_map.get(r.get("agent_id"))
+                r["coverage_residual_45d"] = None
+                if fv is None:
+                    r["overdue_fifo_days"] = None
+                    r["overdue_fifo_amount"] = None
+                    r["overdue_fifo_url"] = None
+                    r["overdue_fifo_count"] = None
+                else:
+                    f_days, f_amt, f_url, f_cnt = fv
+                    r["overdue_fifo_days"] = int(f_days)
+                    r["overdue_fifo_amount"] = round(float(f_amt), 2)
+                    r["overdue_fifo_url"] = f_url
+                    r["overdue_fifo_count"] = int(f_cnt)
 
-            covered_count = sum(
-                1 for v in residual_map.values() if v is not None and v <= 0
+            overdue_cnt = sum(
+                1 for v in fifo_map.values()
+                if v is not None and v[3] and v[3] > 0
             )
-            failed_residual = sum(1 for v in residual_map.values() if v is None)
+            failed_fifo = sum(1 for v in fifo_map.values() if v is None)
             logger.info(
-                f"pdz_take_snapshot: coverage_residual_45d посчитан для "
-                f"{len(residual_map) - failed_residual}/{len(residual_map)} должников; "
-                f"residual≤0 (за {PDZ_CASHFLOW_WINDOW_DAYS}д закрыли начальное): {covered_count}; "
-                f"запросы упали: {failed_residual}"
+                f"pdz_take_snapshot: demand-FIFO посчитан для "
+                f"{len(fifo_map) - failed_fifo}/{len(fifo_map)} должников; "
+                f"с реальной просрочкой: {overdue_cnt}; запросы упали: {failed_fifo}"
             )
 
             logger.info(f"pdz_take_snapshot: {len(rows)} строк готово к записи (с ppm_initial, не розница)")
@@ -2203,6 +2216,26 @@ async def _overdue_by_demand_fifo(agent_id: str, today, delay: Optional[int] = N
     return (max_days, ov_amt, url, len(overdue))
 
 
+def _row_fifo(r: dict):
+    """Достаёт результат demand-FIFO, сохранённый в строке снимка
+    (pdz_take_snapshot), в формате `_overdue_by_demand_fifo`:
+      - (days, amount, url, count) — есть данные (в т.ч. days=0/url=None = «нет просрочки»);
+      - None — в снимке не посчитано (МС был недоступен) → потребитель откатывается
+        на старый LIFO по payedSum.
+    """
+    days = r.get("overdue_fifo_days")
+    if days is None:
+        return None
+    amt_raw = r.get("overdue_fifo_amount")
+    cnt_raw = r.get("overdue_fifo_count")
+    return (
+        int(days),
+        float(amt_raw) if amt_raw is not None else 0.0,
+        r.get("overdue_fifo_url"),
+        int(cnt_raw) if cnt_raw is not None else 0,
+    )
+
+
 async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: bool = True) -> list:
     """Список просроченных заказов конкретного менеджера для TG-дайджеста.
 
@@ -2273,15 +2306,13 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
             continue
         bal_raw = r.get("agent_balance")
         agent_balance = float(bal_raw) if bal_raw is not None else None
-        residual_raw = r.get("coverage_residual_45d")
-        coverage_residual_45d = float(residual_raw) if residual_raw is not None else None
         aid = r.get("agent_id") or ""
 
         bucket = by_agent_unpaid.setdefault(aid, {
             "agent_id": aid,
             "agent_name": r.get("agent_name"),
             "balance": agent_balance,
-            "coverage_residual_45d": coverage_residual_45d,
+            "overdue_fifo": _row_fifo(r),
             "overdue": [],
             "in_сroк_unpaid_total": 0.0,
         })
@@ -2312,13 +2343,13 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
     orders: list = []
     skipped_fifo_covered = 0
     skipped_balance_unknown = 0
-    skipped_cashflow_covered = 0
     # Параллельно с orders храним per-agent real_overdue, чтобы в grouped
     # показывать сумму = «реальная просрочка» (после вычета новых в-срок отгрузок
     # из общего долга контрагента), а не «сумма по всем неоплаченным заказам».
     # Иначе у крупных клиентов сумма раздувается в 3-4 раза за счёт хвостов
     # по `payedSum`, по которым приходы есть, но бухгалтерия не разнесла.
     agent_real_overdue: dict = {}
+    agent_fifo: dict = {}  # aid → (days, amount, url, count) | None (стор. в снимке)
     for aid, data in by_agent_unpaid.items():
         if not data["overdue"]:
             continue
@@ -2340,20 +2371,8 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
             # просрочка только из-за неразнесённой оплаты).
             skipped_balance_ok += 1
             continue
-        # Страховка взаиморасчётами за 45 дней (2026-06-08). Если за окно
-        # клиент полностью закрыл то, что висело на T-45 (residual ≤ 0) —
-        # формальные просрочки иллюзорны (бухгалтерия криво разнесла оплаты,
-        # balance показывает остаток уже по НОВЫМ отгрузкам). См. кейс
-        # ООО «ЧЕСТНАЯ РЫБА» 2026-06-05 + plans/2026-06-08-pdz-fix-cashflow-coverage.md.
-        # residual=None → запрос упал, fallback на FIFO (не скрываем).
-        residual = data.get("coverage_residual_45d")
-        if residual is not None and residual <= 0:
-            skipped_cashflow_covered += 1
-            logger.info(
-                f"pdz_overdue_for_manager({manager_tag}): {data['agent_name']!r} "
-                f"скрыт по cashflow-45 — residual={residual:.2f} ≤ 0"
-            )
-            continue
+        # cashflow-45 gate снят 2026-07-14 (ложные негативы у активных клиентов).
+        # Решает demand-FIFO из снимка: показываем/прячем по нему в grouping ниже.
         bal_abs = abs(bal)
         in_сroк = data["in_сroк_unpaid_total"]
         real_overdue = max(0.0, round(bal_abs - in_сroк, 2))
@@ -2366,15 +2385,15 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
             )
             continue
         agent_real_overdue[aid] = real_overdue
+        agent_fifo[aid] = data.get("overdue_fifo")
         orders.extend(data["overdue"])
 
-    if skipped_balance_ok or skipped_fifo_covered or skipped_balance_unknown or skipped_cashflow_covered:
+    if skipped_balance_ok or skipped_fifo_covered or skipped_balance_unknown:
         logger.info(
             f"pdz_overdue_for_manager({manager_tag}): пропущено "
             f"{skipped_balance_ok} с balance>=0, "
             f"{skipped_fifo_covered} с FIFO-перекрытием, "
-            f"{skipped_balance_unknown} с balance=None, "
-            f"{skipped_cashflow_covered} с cashflow-45 покрытием"
+            f"{skipped_balance_unknown} с balance=None"
         )
 
     if not group_by_agent:
@@ -2400,11 +2419,12 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
         total_unpaid = agent_real_overdue.get(
             aid, round(sum(x["unpaid_sum"] for x in agent_orders), 2)
         )
-        # ПРАВИЛЬНЫЙ день-каунт (2026-07-08): по отгрузкам (demand) + FIFO приходов,
-        # срок = дата отгрузки + Дней отсрочки. Устраняет весь класс завышения дней,
-        # который давали `payed_sum`/`ppm` заказа (ОПЛОТ 159→21, Хованский 149→57,
-        # ВОСТОК-ЗАПАД 48→0). См. project_f2b_pdz_penalty_days_inflated.
-        fifo = await _overdue_by_demand_fifo(aid, today)
+        # ПРАВИЛЬНЫЙ день-каунт: по отгрузкам (demand) + FIFO приходов, срок =
+        # дата отгрузки + Дней отсрочки. Устраняет завышение дней от `payed_sum`/
+        # `ppm` заказа (ОПЛОТ 159→21, Хованский 149→57). Считается в снимке
+        # (pdz_take_snapshot), читаем готовое поле — не дёргаем МС на чтении.
+        # См. project_f2b_pdz_penalty_days_inflated + plans/2026-07-14-pdz-unify-demand-fifo.md.
+        fifo = agent_fifo.get(aid)
         if fifo is not None:
             f_days, f_amt, f_url, f_cnt = fifo
             if f_days == 0 and not f_url:
@@ -2582,15 +2602,13 @@ def pdz_unprocessed_for_owner(db, live_map=None) -> dict:
             continue
         bal_raw = r.get("agent_balance")
         agent_balance = float(bal_raw) if bal_raw is not None else None
-        residual_raw = r.get("coverage_residual_45d")
-        coverage_residual_45d = float(residual_raw) if residual_raw is not None else None
         aid = r.get("agent_id") or ""
 
         bucket = by_tag_agent.setdefault(row_tag, {}).setdefault(aid, {
             "agent_id": aid,
             "agent_name": r.get("agent_name"),
             "agent_balance": agent_balance,
-            "coverage_residual_45d": coverage_residual_45d,
+            "overdue_fifo": _row_fifo(r),
             "overdue": [],
             "in_сroк_unpaid_total": 0.0,
         })
@@ -2619,7 +2637,7 @@ def pdz_unprocessed_for_owner(db, live_map=None) -> dict:
 
     # Шаг 2: применить FIFO-фильтр (как в pdz_overdue_for_manager).
     # balance=None → skip; balance>=0 → skip; real_overdue<0.01 → skip.
-    # coverage_residual_45d ≤ 0 → skip (страховка взаиморасчётами, 2026-06-08).
+    # cashflow-45 gate снят 2026-07-14 — решает demand-FIFO из снимка.
     by_tag: dict = {}
     agent_real_overdue: dict = {}  # aid → real_overdue
     for tag, agents in by_tag_agent.items():
@@ -2631,9 +2649,6 @@ def pdz_unprocessed_for_owner(db, live_map=None) -> dict:
                 continue  # balance не подтянулся — не показываем (см. 1593622)
             if bal >= 0:
                 continue
-            residual = data.get("coverage_residual_45d")
-            if residual is not None and residual <= 0:
-                continue  # за 45 дней клиент закрыл начальное → не алертим
             bal_abs = abs(bal)
             in_сroк = data["in_сroк_unpaid_total"]
             real_overdue = max(0.0, round(bal_abs - in_сroк, 2))
@@ -2643,7 +2658,7 @@ def pdz_unprocessed_for_owner(db, live_map=None) -> dict:
             by_tag.setdefault(tag, {})[aid] = data
 
     # Сводим order→agent в формат как у pdz_overdue_for_manager.
-    # total_unpaid = real_overdue по FIFO (не сумма по payedSum).
+    # День-каунт/сумма/url — из demand-FIFO снимка (единый источник правды).
     result: dict = {}
     all_ids: list = []
     for tag, agents in by_tag.items():
@@ -2653,21 +2668,31 @@ def pdz_unprocessed_for_owner(db, live_map=None) -> dict:
             total_unpaid = agent_real_overdue.get(
                 aid, round(sum(x["unpaid_sum"] for x in orders), 2)
             )
-            # LIFO: real_overdue падает на свежие просрочки, старые считаются
-            # покрытыми платежами (см. кейс ДЖИФУДСЕРВИСЕС 2026-05-29).
-            covered = _pdz_lifo_cover(orders, total_unpaid)
-            if not covered:
-                covered = orders
-            oldest_in_covered = min(covered, key=lambda x: x["effective_due_date"])
-            max_days = max(x["days_overdue"] for x in covered)
+            fifo = data.get("overdue_fifo")
+            if fifo is not None:
+                f_days, f_amt, f_url, f_cnt = fifo
+                if f_days == 0 and not f_url:
+                    continue  # реально просрочки нет → пропуск
+                max_days = f_days
+                total_unpaid = f_amt if f_amt > 0 else total_unpaid
+                first_url = f_url
+                orders_count = f_cnt
+            else:
+                # МС был недоступен в снимке → фолбэк на старый LIFO по payedSum.
+                covered = _pdz_lifo_cover(orders, total_unpaid)
+                if not covered:
+                    covered = orders
+                max_days = max(x["days_overdue"] for x in covered)
+                first_url = min(covered, key=lambda x: x["effective_due_date"])["ms_url"]
+                orders_count = len(covered)
             grouped.append({
                 "agent_id": data["agent_id"],
                 "agent_name": data["agent_name"],
                 "agent_balance": data["agent_balance"],
                 "total_unpaid": total_unpaid,
                 "max_days_overdue": max_days,
-                "orders_count": len(covered),
-                "ms_url_first_order": oldest_in_covered["ms_url"],
+                "orders_count": orders_count,
+                "ms_url_first_order": first_url,
             })
             if data.get("agent_id"):
                 all_ids.append(data["agent_id"])
@@ -4839,22 +4864,22 @@ async def compute_overdue_color(agent_id: str) -> dict:
     if real_overdue < 0.01 or not overdue_orders:
         return {"color": "green", "days": 0, "debt": 0}
 
-    # Cashflow-страховка 45 дней: если приходы за окно покрыли opening,
-    # формальная просрочка иллюзорна (бухгалтерия криво разнесла оплаты).
-    try:
-        residual = await fetch_coverage_residual_for_window(
-            agent_id, debt_today=debt_today
-        )
-    except Exception as e:
-        logger.warning(f"compute_overdue_color: coverage_residual_45d failed: {e}")
-        residual = None
-    if residual is not None and residual <= 0:
-        return {"color": "green", "days": 0, "debt": 0}
+    # День-каунт/сумма — по demand-FIFO (отгрузки + FIFO приходов), единый
+    # источник правды. Заменил cashflow-45 gate + LIFO по payedSum (2026-07-14).
+    # Светофор real-time (заказ свежий, снимка нет) → считаем вживую.
+    fifo = await _overdue_by_demand_fifo(agent_id, today)
+    if fifo is not None:
+        f_days, f_amt, f_url, f_cnt = fifo
+        if f_days == 0 and not f_url:
+            return {"color": "green", "days": 0, "debt": 0}
+        debt = f_amt if f_amt > 0 else real_overdue
+        color = "red" if (debt > 0 and f_days > OVERDUE_THRESHOLD_DAYS) else "green"
+        return {"color": color, "days": f_days, "debt": debt}
 
+    # МС demand/paymentin недоступны → фолбэк на старый LIFO по payedSum.
     covered = _pdz_lifo_cover(overdue_orders, real_overdue)
     if not covered:
         return {"color": "green", "days": 0, "debt": 0}
-
     max_days = max(c["days_overdue"] for c in covered)
     debt = real_overdue
     color = "red" if (debt > 0 and max_days > OVERDUE_THRESHOLD_DAYS) else "green"

@@ -408,6 +408,16 @@ class Database:
             # (бухгалтерия криво разнесла оплаты, balance отражает остаток уже
             # по НОВЫМ отгрузкам в окне). См. plans/2026-06-08-pdz-fix-cashflow-coverage.md.
             "ALTER TABLE pdz_snapshots ADD COLUMN IF NOT EXISTS coverage_residual_45d NUMERIC(14,2)",
+            # 2026-07-14: единый день-каунт/сумма просрочки по отгрузкам + FIFO
+            # приходов (_overdue_by_demand_fifo). Считается один раз в снимке,
+            # читается всеми потребителями (дайджест/owner/html). Заменяет
+            # cashflow-45 gate + LIFO по payedSum. None = МС был недоступен в
+            # момент снимка → потребитель откатывается на старый LIFO.
+            # См. plans/2026-07-14-pdz-unify-demand-fifo.md.
+            "ALTER TABLE pdz_snapshots ADD COLUMN IF NOT EXISTS overdue_fifo_days INT",
+            "ALTER TABLE pdz_snapshots ADD COLUMN IF NOT EXISTS overdue_fifo_amount NUMERIC(14,2)",
+            "ALTER TABLE pdz_snapshots ADD COLUMN IF NOT EXISTS overdue_fifo_url TEXT",
+            "ALTER TABLE pdz_snapshots ADD COLUMN IF NOT EXISTS overdue_fifo_count INT",
             # 2026-06-11: UNIQUE индекс против дублей. Раньше при 3 запусках
             # cron в день копилось ×3 = 53к дублей в БД (на 23к уникальных).
             # save_pdz_snapshot теперь использует ON CONFLICT DO UPDATE.
@@ -677,6 +687,10 @@ class Database:
                 r.get("total_sum"),
                 r.get("agent_balance"),
                 r.get("coverage_residual_45d"),
+                r.get("overdue_fifo_days"),
+                r.get("overdue_fifo_amount"),
+                r.get("overdue_fifo_url"),
+                r.get("overdue_fifo_count"),
             )
             for r in rows
         ]
@@ -689,8 +703,10 @@ class Database:
                 """INSERT INTO pdz_snapshots
                    (snap_date, order_id, order_name, agent_id, agent_name,
                     manager_tag, ppm_initial, ppm_new, payed_sum,
-                    total_sum, agent_balance, coverage_residual_45d)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    total_sum, agent_balance, coverage_residual_45d,
+                    overdue_fifo_days, overdue_fifo_amount, overdue_fifo_url,
+                    overdue_fifo_count)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (snap_date, order_id) DO UPDATE SET
                      snap_at = EXCLUDED.snap_at,
                      order_name = EXCLUDED.order_name,
@@ -702,7 +718,11 @@ class Database:
                      payed_sum = EXCLUDED.payed_sum,
                      total_sum = EXCLUDED.total_sum,
                      agent_balance = EXCLUDED.agent_balance,
-                     coverage_residual_45d = EXCLUDED.coverage_residual_45d
+                     coverage_residual_45d = EXCLUDED.coverage_residual_45d,
+                     overdue_fifo_days = EXCLUDED.overdue_fifo_days,
+                     overdue_fifo_amount = EXCLUDED.overdue_fifo_amount,
+                     overdue_fifo_url = EXCLUDED.overdue_fifo_url,
+                     overdue_fifo_count = EXCLUDED.overdue_fifo_count
                 """,
                 params,
             )
@@ -714,7 +734,9 @@ class Database:
         return self._fetchall(
             """SELECT id, snap_at, snap_date, order_id, order_name, agent_id,
                       agent_name, manager_tag, ppm_initial, ppm_new,
-                      payed_sum, total_sum, agent_balance, coverage_residual_45d
+                      payed_sum, total_sum, agent_balance, coverage_residual_45d,
+                      overdue_fifo_days, overdue_fifo_amount, overdue_fifo_url,
+                      overdue_fifo_count
                FROM pdz_snapshots
                WHERE snap_date = %s
                ORDER BY snap_at DESC, id ASC""",
@@ -736,7 +758,9 @@ class Database:
             """SELECT DISTINCT ON (order_id)
                       id, snap_at, snap_date, order_id, order_name, agent_id,
                       agent_name, manager_tag, ppm_initial, ppm_new,
-                      payed_sum, total_sum, agent_balance, coverage_residual_45d
+                      payed_sum, total_sum, agent_balance, coverage_residual_45d,
+                      overdue_fifo_days, overdue_fifo_amount, overdue_fifo_url,
+                      overdue_fifo_count
                FROM pdz_snapshots
                WHERE snap_date = %s
                ORDER BY order_id, snap_at DESC""",
@@ -769,7 +793,9 @@ class Database:
             SELECT DISTINCT ON (order_id)
                    id, snap_at, snap_date, order_id, order_name, agent_id,
                    agent_name, manager_tag, ppm_initial, ppm_new,
-                   payed_sum, total_sum, agent_balance, coverage_residual_45d
+                   payed_sum, total_sum, agent_balance, coverage_residual_45d,
+                   overdue_fifo_days, overdue_fifo_amount, overdue_fifo_url,
+                   overdue_fifo_count
             FROM pdz_snapshots
             WHERE snap_date = %s
             ORDER BY order_id, snap_at DESC, id DESC
