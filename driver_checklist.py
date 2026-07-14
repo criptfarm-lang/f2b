@@ -332,14 +332,60 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _render_card(q.edit_message_text, demand_id, context.bot_data["db"])
 
 
-async def open_from_deeplink(update: Update, context: ContextTypes.DEFAULT_TYPE, demand_id: str):
-    """Вход по QR-диплинку: /start chk_<demand_id> → карточка точки сразу, без списка."""
+import re as _re
+_UUID_RE = _re.compile(r"^[0-9a-fA-F-]{36}$")
+
+
+async def _resolve_deeplink_payload(payload: str):
+    """QR может кодировать что угодно: id отгрузки, id заказа или номер документа.
+    Возвращает demand_id для карточки сдачи (или None)."""
+    payload = (payload or "").strip()
+    if not payload:
+        return None
+    headers = get_headers()
+    async with aiohttp.ClientSession() as session:
+        if _UUID_RE.match(payload):
+            # 1) это id отгрузки?
+            async with session.get(f"{MS_BASE}/entity/demand/{payload}", headers=headers) as r:
+                if r.status == 200:
+                    return payload
+            # 2) это id заказа → берём его отгрузку
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder/{payload}", headers=headers
+            ) as r:
+                if r.status == 200:
+                    o = await r.json()
+                    for dm in o.get("demands", []) or []:
+                        href = (dm.get("meta") or {}).get("href", "")
+                        if href:
+                            return href.rstrip("/").split("/")[-1]
+            return None
+        # 3) это номер документа → ищем отгрузку по имени (свежую)
+        import urllib.parse as _up
+        f = _up.quote(f"name={payload}")
+        async with session.get(
+            f"{MS_BASE}/entity/demand?filter={f}&order=moment,desc&limit=1", headers=headers
+        ) as r:
+            if r.status == 200:
+                rows = (await r.json()).get("rows", [])
+                if rows:
+                    return rows[0].get("id")
+    return None
+
+
+async def open_from_deeplink(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: str):
+    """Вход по QR-диплинку: /start chk_<id|номер> → карточка сдачи сразу, без списка.
+    payload — id отгрузки, id заказа или номер документа (резолвим к отгрузке)."""
     user = update.effective_user
     chat = update.effective_chat
     if not user or not chat or chat.type != "private":
         return
     if not _is_driver(user.id):
         await update.message.reply_text("⛔ Сдача груза доступна водителям развозки.")
+        return
+    demand_id = await _resolve_deeplink_payload(payload)
+    if not demand_id:
+        await update.message.reply_text("Не удалось найти отгрузку по коду. Открой список: /рейс")
         return
     await _render_card(update.message.reply_text, demand_id, context.bot_data["db"], with_back=False)
 
