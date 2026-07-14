@@ -225,7 +225,7 @@ async def compute(pid: str, name: str, moment: str, state: str | None) -> dict |
     # Знаменатель выхода — позиции из папки СЫРЬЕ (решение собственника): любой вид
     # рыбы-сырья (ПБГ/ПСГ филейное, н/р для копчения) лежит в этой папке. Так надёжнее
     # токенов в наименовании — копчёные операции из целой рыбы «н/р» теперь считаются.
-    mat_rows, syrye_rows = [], []
+    mat_rows, syrye_rows, syrye_outside = [], [], []
     for m in mats:
         a = m.get("assortment") or {}
         href = (a.get("meta") or {}).get("href")
@@ -234,14 +234,20 @@ async def compute(pid: str, name: str, moment: str, state: str | None) -> dict |
             mat_rows.append((href, qty))
         if _in_syrye(a):
             syrye_rows.append((a.get("name"), qty))
+        elif _classify_fish(a.get("name")) and not _is_piece(a):
+            # Рыба-сырьё ВНЕ папки СЫРЬЕ: продаваемый SKU (напр. 71011 ПСГ 5-6 кг живёт
+            # в ГОТОВОЙ ПРОДУКЦИИ), но в разделке это сырьё. Засчитываем в знаменатель
+            # выхода по токену ПБГ/ПСГ/Н/Р (весовая) и помечаем в карточке.
+            syrye_outside.append((a.get("name"), qty))
 
-    if not syrye_rows:
+    # Знаменатель выхода = папка СЫРЬЕ ∪ рыба-по-токену вне неё (продаваемые SKU типа
+    # 71011, идущие в разделку). Сырьё часто разбито на строки-размерки — СУММИРУЕМ все.
+    all_raw = syrye_rows + syrye_outside
+    if not all_raw:
         fish_name, fish_qty, fish_type, yield_pct = None, None, "NONE", None
     else:
-        # Сырьё часто разбито на НЕСКОЛЬКО строк (размерки, напр. ПСГ 4-5 + 5-6) —
-        # для выхода СУММИРУЕМ все позиции из СЫРЬЯ. Тип нормы — по доминирующей строке.
-        fish_qty = sum(q for _, q in syrye_rows)
-        fish_name = max(syrye_rows, key=lambda t: t[1])[0]
+        fish_qty = sum(q for _, q in all_raw)
+        fish_name = max(all_raw, key=lambda t: t[1])[0]  # тип нормы — по доминирующей строке
         fish_type = _classify_fish(fish_name) or "СЫРЬЁ"
         yield_pct = round(main_kg / fish_qty * 100, 2) if (fish_qty and main_kg) else None
 
@@ -261,6 +267,7 @@ async def compute(pid: str, name: str, moment: str, state: str | None) -> dict |
         "out_qty": out_qty, "out_multi": out_multi,
         "fish_type": fish_type, "fish_qty": fish_qty,
         "cost_per_kg": cost_per_kg, "yield_pct": yield_pct,
+        "syrye_outside": syrye_outside,
         "card_prices": await _card_prices(out_sku_code),
     }
 
@@ -342,9 +349,14 @@ def render(snap: dict) -> tuple[str, str | None]:
 
     lines = [f"{_overall(c_cost, c_yld)} Техоперация №{snap['name']} · {moment}",
              f"{sku_name} ({snap['out_sku_code']})",
-             yld_line,
-             "",
-             cost_line]
+             yld_line]
+    # Рыба-сырьё вне папки СЫРЬЕ: засчитана в выход по токену — помечаем, чтобы было
+    # видно, что зачёт по fallback, а не по папке.
+    outside = snap.get("syrye_outside") or []
+    if outside:
+        names = ", ".join(f"{n} ({f'{q:g}'.replace('.', ',')} кг)" for n, q in outside)
+        lines.append(f"ℹ учтено в выходе по токену (вне папки СЫРЬЕ): {names}")
+    lines += ["", cost_line]
 
     # Рентабельность к цене продажи (как в отчёте МС «Прибыльность»):
     # (цена − себест) / цена. Только при достоверной себестоимости.
