@@ -94,8 +94,27 @@ async def fetch_routes() -> dict:
 
 # ─── МойСклад: мест/комментарий по № заказа ──────────────────────────────────
 
+# Теги-фамилии менеджеров ОП → отображаемое имя (для колонки «Ответственный»).
+_MANAGER_TAG_NAMES = {
+    "скляр": "Скляр Инесса",
+    "мерзлякова": "Мерзлякова Елена",
+    "баласанян": "Баласанян Карина",
+    "коликов": "Коликов",
+    "дьяченко": "Дьяченко Ирина",
+}
+
+
+def _fmt_weight(w) -> str:
+    """5.415 → '5.415', 12.0 → '12'. Товар считается в кг, вес = сумма количеств позиций."""
+    if not w:
+        return ""
+    return f"{w:.3f}".rstrip("0").rstrip(".")
+
+
 async def _ms_extra_by_order(order_numbers) -> dict:
-    """{order_no: {places, comment}} — из заказов МС по номеру."""
+    """{order_no: {places, comment, weight, manager, phone, zdraste}} — из заказов МС по номеру.
+    weight — суммарный вес (кг = сумма количеств позиций); manager — из тега контрагента;
+    phone/zdraste — из карточки контрагента (телефон и флаг-тег «здрасте»)."""
     out = {}
     if not order_numbers:
         return out
@@ -105,7 +124,8 @@ async def _ms_extra_by_order(order_numbers) -> dict:
         for no in order_numbers:
             try:
                 f = urllib.parse.quote(f"name={no}")
-                url = f"{MS_BASE}/entity/customerorder?filter={f}&limit=1"
+                url = (f"{MS_BASE}/entity/customerorder?filter={f}"
+                       f"&expand=positions.assortment,agent&limit=1")
                 async with session.get(url, headers=headers) as r:
                     rows = (await r.json()).get("rows", []) if r.status == 200 else []
                 if not rows:
@@ -115,7 +135,22 @@ async def _ms_extra_by_order(order_numbers) -> dict:
                 for a in co.get("attributes", []) or []:
                     if a.get("name") == "Количество мест":
                         places = a.get("value")
-                out[no] = {"places": places, "comment": (co.get("description") or "").strip()}
+                # вес = сумма количеств позиций (рыба/морепродукты продаются в кг)
+                weight = 0.0
+                for p in (co.get("positions") or {}).get("rows", []):
+                    weight += p.get("quantity") or 0
+                # менеджер / телефон / «здрасте» из контрагента
+                agent = co.get("agent") or {}
+                tags = [str(t).strip().lower() for t in (agent.get("tags") or [])]
+                manager = next((_MANAGER_TAG_NAMES[t] for t in tags if t in _MANAGER_TAG_NAMES), "")
+                out[no] = {
+                    "places": places,
+                    "comment": (co.get("description") or "").strip(),
+                    "weight": weight,
+                    "manager": manager,
+                    "phone": (agent.get("phone") or "").strip(),
+                    "zdraste": "здрасте" in tags,
+                }
             except Exception as e:
                 logger.warning("_ms_extra_by_order %s: %s", no, e)
     return out
@@ -175,26 +210,38 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
             continue
 
         header = [Paragraph(x, ParagraphStyle("hd", fontName=FONT_BOLD, fontSize=8, leading=10))
-                  for x in ["#", "План", "Окно", "Клиент / адрес", "Мест", "QR"]]
+                  for x in ["#", "План", "Окно", "Клиент / адрес", "Вес / Мест", "QR"]]
         rows = [header]
         for idx, s in enumerate(stops, 1):
             ex = ms_extra.get(s["order_no"], {})
             places = ex.get("places")
             places = str(places) if places not in (None, "") else "—"
+            wt = _fmt_weight(ex.get("weight"))
+            wcell = (f"<b>{wt} кг</b><br/>" if wt else "") + f"{places} мест"
             info = (f"<b>{s['client'][:40]}</b> (№{s['order_no']})<br/>{(s['address'] or '')[:70]}")
+            # Ответственный + телефон (из карточки контрагента)
+            resp = ex.get("manager") or ""
+            phone = ex.get("phone") or s.get("phone") or ""
+            meta_line = " · ".join(x for x in (
+                (f"Отв: {resp}" if resp else ""),
+                (f"тел: {phone}" if phone else ""),
+                ("Здрасте" if ex.get("zdraste") else ""),
+            ) if x)
+            if meta_line:
+                info += f"<br/><font size=7 color='#444444'>{meta_line[:80]}</font>"
             cm = (ex.get("comment") or "").replace("\n", " ")
             if cm:
-                info += f"<br/><font size=7 color='#666666'>{cm[:70]}</font>"
+                info += f"<br/><font size=7 color='#888888'>{cm[:70]}</font>"
             link = f"https://t.me/{bot_username}?start=chk_{s['order_no']}"
             rows.append([
                 Paragraph(str(idx), cell),
                 Paragraph(_hm(s["vt"]), cell),
                 Paragraph(f"{_hm(s['tf'])}–{_hm(s['tt'])}", cell),
                 Paragraph(info, cell),
-                Paragraph(places, cell),
+                Paragraph(wcell, cell),
                 qr_flow(link),
             ])
-        t = Table(rows, colWidths=[7 * mm, 15 * mm, 22 * mm, 111 * mm, 14 * mm, 21 * mm])
+        t = Table(rows, colWidths=[7 * mm, 15 * mm, 22 * mm, 99 * mm, 26 * mm, 21 * mm])
         t.setStyle(TableStyle([
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#cccccc")),
@@ -212,8 +259,12 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
             s = stops[idx - 1]
             ex = ms_extra.get(s["order_no"], {})
             pl = ex.get("places")
-            pl = f" — {pl} мест" if pl not in (None, "") else ""
-            loading.append(f"{idx}. {s['client'][:38]} (№{s['order_no']}){pl}")
+            wt = _fmt_weight(ex.get("weight"))
+            bits = " — " + ", ".join(x for x in (
+                (f"{wt} кг" if wt else ""),
+                (f"{pl} мест" if pl not in (None, "") else ""),
+            ) if x) if (wt or pl not in (None, "")) else ""
+            loading.append(f"{idx}. {s['client'][:38]} (№{s['order_no']}){bits}")
         flow.append(Paragraph("<br/>".join(loading), small))
     doc.build(flow)
     return buf.getvalue()
