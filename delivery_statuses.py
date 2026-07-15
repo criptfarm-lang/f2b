@@ -90,6 +90,7 @@ def ensure_schema(db):
         )
     """)
     db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS delay_mgr_alerted BOOLEAN DEFAULT FALSE")
+    db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS write_fail_target TEXT")
     db._execute("""
         CREATE TABLE IF NOT EXISTS unit_dwell (
             unit_id     BIGINT PRIMARY KEY,
@@ -377,10 +378,19 @@ async def run_check(db, bot=None, preview=False) -> list:
                 if target == cur:
                     continue
                 lines.append(f"{name} №{order_no} {s['client'][:24]}: {cur} → {target}")
+                wrote_ok = None   # None — не писали (сухой режим); True/False — итог PUT
                 if write:
                     meta = states.get(target)
-                    if meta and await _ms_set_state(session, info["demand_id"], meta):
-                        _st_upsert(db, order_no, ms_status=target, demand_id=info["demand_id"], unit_id=uid)
+                    wrote_ok = bool(meta) and await _ms_set_state(session, info["demand_id"], meta)
+                    if wrote_ok:
+                        _st_upsert(db, order_no, ms_status=target, write_fail_target=None,
+                                   demand_id=info["demand_id"], unit_id=uid)
+                    else:
+                        logger.warning("МС-запись №%s %s→%s не прошла (meta=%s)", order_no, cur, target, bool(meta))
+                        if bot and st.get("write_fail_target") != target:
+                            await _write_fail_alert(bot, name, order_no, s.get("client"), cur, target, bool(meta))
+                            _st_upsert(db, order_no, write_fail_target=target,
+                                       demand_id=info["demand_id"], unit_id=uid)
                 # Алерты по опозданию в РЕАЛЬНОЕ окно
                 if target == "Задержка в пути" and bot and not preview:
                     tt = s.get("tt") or 0
@@ -388,7 +398,8 @@ async def run_check(db, bot=None, preview=False) -> list:
                     # владелец + логист (Белякова) + партнёр (Маланчук)
                     if not st.get("delay_alerted"):
                         await _delay_alert(bot, name, s,
-                                           [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()])
+                                           [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()],
+                                           status_written=wrote_ok)
                         _st_upsert(db, order_no, delay_alerted=True,
                                    demand_id=info["demand_id"], unit_id=uid)
                     # опоздание > 60 мин: дополнительно менеджер
@@ -479,6 +490,22 @@ async def _risk_alert(bot, unit_name, risk):
             logger.warning("_risk_alert → %s: %s", cid, e)
 
 
+async def _write_fail_alert(bot, unit_name, order_no, client, cur, target, has_meta):
+    """Статус в МС не записался (PUT не 200 или статуса нет в метаданных). Сигнал владельцу+логисту."""
+    reason = "PUT отклонён МойСкладом (не 200)" if has_meta else f"статуса «{target}» нет в метаданных МС"
+    text = (f"🛑 Статус в МойСклад НЕ записан\n{unit_name} №{order_no} {client or ''}\n"
+            f"{cur} → {target}: {reason}.\nПроверьте отгрузку вручную.")
+    seen = set()
+    for cid in [_owner_chat_id(), _logist_chat_id()]:
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.warning("_write_fail_alert → %s: %s", cid, e)
+
+
 async def _lag_alert(bot, unit_name, lag_min, behind, now_ts):
     """Машина системно отстаёт от плана (даже при плавающих окнах) — день под угрозой."""
     def line(s):
@@ -525,7 +552,7 @@ async def _fetch_routes_via(session, sid):
     return routes
 
 
-async def _delay_alert(bot, unit_name, stop, recipients, over60=False):
+async def _delay_alert(bot, unit_name, stop, recipients, over60=False, status_written=True):
     vt = stop.get("vt")
     plan = datetime.fromtimestamp(vt, _MSK).strftime("%H:%M") if vt else "—"
     if over60:
@@ -536,6 +563,8 @@ async def _delay_alert(bot, unit_name, stop, recipients, over60=False):
         text = (f"⏱ ЗАДЕРЖКА в пути\n{unit_name}\n"
                 f"{stop['client']} (№{stop['order_no']})\n"
                 f"План прибытия {plan} + 30 мин — машина ещё не на точке.")
+    if status_written is False:
+        text += "\n⚠️ Статус «Задержка в пути» в МойСклад выставить НЕ удалось — проверьте отгрузку вручную."
     seen = set()
     for cid in recipients:
         if not cid or cid in seen:
