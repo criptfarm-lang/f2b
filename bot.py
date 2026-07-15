@@ -7591,6 +7591,11 @@ def main():
         driver_checklist.register(app, db)
     except Exception as e:
         logger.error(f"driver_checklist.register упал: {e}")
+    try:
+        import route_registry
+        route_registry.register(app)
+    except Exception as e:
+        logger.error(f"route_registry.register упал: {e}")
 
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
