@@ -52,14 +52,24 @@ def _logist_chat_id() -> int:
     return int(os.getenv("LOGIST_CHAT_ID", "8267564735") or 0)
 
 
+_DB = None  # ссылка на БД для whitelist водителей (ставится в register)
+
+
 def _driver_chat_ids() -> set:
-    """Whitelist водителей. env DRIVER_CHAT_IDS через запятую. Владелец — всегда (для теста)."""
+    """Whitelist водителей: таблица `drivers` (active) + env DRIVER_CHAT_IDS + владелец.
+    Основной способ завести водителя — строка в `drivers` (без ребилда). env — легаси/бэкап."""
     ids = set()
     raw = os.getenv("DRIVER_CHAT_IDS", "")
     for part in raw.split(","):
         part = part.strip()
         if part.isdigit():
             ids.add(int(part))
+    if _DB is not None:
+        try:
+            for r in (_DB._fetchall("SELECT chat_id FROM drivers WHERE active") or []):
+                ids.add(int(r["chat_id"]))
+        except Exception as e:
+            logger.warning("drivers whitelist read: %s", e)
     owner = _owner_chat_id()
     if owner:
         ids.add(owner)
@@ -98,6 +108,14 @@ def ensure_schema(db):
             arrived_at       TIMESTAMPTZ DEFAULT now(),
             completed_at     TIMESTAMPTZ,
             updated_at       TIMESTAMPTZ DEFAULT now()
+        )
+    """)
+    db._execute("""
+        CREATE TABLE IF NOT EXISTS drivers (
+            chat_id   BIGINT PRIMARY KEY,
+            name      TEXT,
+            active    BOOLEAN DEFAULT TRUE,
+            added_at  TIMESTAMPTZ DEFAULT now()
         )
     """)
     logger.info("delivery_checklist: схема готова")
@@ -789,6 +807,8 @@ class _ClaimPhotoFilter(filters.MessageFilter):
 
 def register(app: Application, db):
     """Подключить чеклист водителя. Вызывать в main() ДО catch-all handle_message."""
+    global _DB
+    _DB = db
     ensure_schema(db)
     app.bot_data["db"] = db
 
