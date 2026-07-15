@@ -142,12 +142,19 @@ async def _ms_resolve(session, order_no) -> dict:
     if not demands:
         return None
     dem = demands[0]
-    tags = (o.get("agent") or {}).get("tags", []) or []
+    agent = o.get("agent") or {}
     return {
         "demand_id": dem.get("id"),
         "state_name": (dem.get("state") or {}).get("name"),
-        "agent_tags": tags,
+        "agent_tags": agent.get("tags", []) or [],
+        "agent_name": agent.get("name"),
+        "sum": dem.get("sum") or 0,
+        "payedSum": dem.get("payedSum") or 0,
     }
+
+
+def _is_retail(name) -> bool:
+    return bool(name) and name.strip().startswith("Розничный покупатель")
 
 
 async def _ms_set_state(session, demand_id, state_meta) -> bool:
@@ -266,6 +273,18 @@ async def run_check(db, bot=None, preview=False) -> list:
                 machine.append({"s": s, "arrived": arrived, "real_window": real_window})
                 target = _target_status(left_base=left_base, arrived=arrived, tt=s.get("tt"),
                                         now_ts=now_ts, chk_status=chk_status, real_window=real_window)
+                # Розничная касса: после «Сдан» + полная оплата → «Оплачен» (наличные привязаны
+                # к заказу, payedSum достоверен только для розницы; банк-клиентов не трогаем).
+                if (cur == "Сдан" and _is_retail(info.get("agent_name"))
+                        and (info.get("sum") or 0) > 0
+                        and (info.get("payedSum") or 0) >= (info.get("sum") or 0)):
+                    lines.append(f"{name} №{order_no} {(info.get('agent_name') or '')[:20]}: Сдан → Оплачен")
+                    if write:
+                        meta = states.get("Оплачен")
+                        if meta and await _ms_set_state(session, info["demand_id"], meta):
+                            _st_upsert(db, order_no, ms_status="Оплачен",
+                                       demand_id=info["demand_id"], unit_id=uid)
+                    continue
                 # трогаем только логистические статусы; ручные/бухгалтерские/терминальные — нет
                 if not target or cur not in MANAGED:
                     continue
@@ -324,19 +343,26 @@ def _compute_risk(machine, now_ts):
             continue
         if now_ts < tt and (vt + lag_sec) > tt:
             at_risk.append(s)
-    return {"lag_min": int(lag_sec / 60), "at_risk": at_risk}
+    return {"lag_min": int(lag_sec / 60), "lag_sec": lag_sec, "at_risk": at_risk}
 
 
 async def _risk_alert(bot, unit_name, risk):
-    def win(s):
-        tf, tt = s.get("tf"), s.get("tt")
+    lag_sec = risk.get("lag_sec", 0)
+
+    def line(s):
+        tf, tt, vt = s.get("tf"), s.get("tt"), s.get("vt")
+        win = "—"
         if tf and tt:
-            return (datetime.fromtimestamp(tf, _MSK).strftime("%H:%M") + "–"
-                    + datetime.fromtimestamp(tt, _MSK).strftime("%H:%M"))
-        return "—"
-    rows = "\n".join(f"• {s['client'][:32]} (№{s['order_no']}) окно {win(s)}" for s in risk["at_risk"])
+            win = (datetime.fromtimestamp(tf, _MSK).strftime("%H:%M") + "–"
+                   + datetime.fromtimestamp(tt, _MSK).strftime("%H:%M"))
+        plan = datetime.fromtimestamp(vt, _MSK).strftime("%H:%M") if vt else "—"
+        proj = datetime.fromtimestamp(vt + lag_sec, _MSK).strftime("%H:%M") if vt else "—"
+        return (f"• {s['client'][:30]} (№{s['order_no']}) окно {win}\n"
+                f"   план {plan} → ожидается ~{proj} (+{int(lag_sec / 60)} мин)")
+    rows = "\n".join(line(s) for s in risk["at_risk"])
     text = (f"⚠️ РИСК смещения графика\n{unit_name}\n"
-            f"Машина отстаёт ~{risk['lag_min']} мин от плана. Это не опоздание, но под угрозой окна:\n{rows}")
+            f"Машина отстаёт ~{risk['lag_min']} мин от плана — не опоздание, но сдвигает следующие точки.\n"
+            f"Под угрозой окна:\n{rows}")
     seen = set()
     for cid in [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()]:
         if not cid or cid in seen:
