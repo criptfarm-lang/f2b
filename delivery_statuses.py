@@ -37,6 +37,8 @@ R_BASE_M = 500       # «В пути» — удаление транспорта
 R_STOP_M = 300       # радиус «прибыл на точку»
 DELAY_BUFFER_MIN = 30
 RISK_LAG_MIN = 20          # отставание, при котором предупреждаем о риске смещения окон
+IDLE_MIN = 60              # простой: машина стоит на месте ≥ этого → тревога логисту
+IDLE_RADIUS_M = 150        # «на месте»: не отходит дальше этого от точки стоянки
 DELIVERY_HOURS = (7, 21)   # МСК, в эти часы крон активен
 JOB_INTERVAL_SEC = 600
 
@@ -86,6 +88,16 @@ def ensure_schema(db):
         )
     """)
     db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS delay_mgr_alerted BOOLEAN DEFAULT FALSE")
+    db._execute("""
+        CREATE TABLE IF NOT EXISTS unit_dwell (
+            unit_id     BIGINT PRIMARY KEY,
+            lat         DOUBLE PRECISION,
+            lon         DOUBLE PRECISION,
+            since_ts    BIGINT,
+            alerted     BOOLEAN DEFAULT FALSE,
+            updated_at  TIMESTAMPTZ DEFAULT now()
+        )
+    """)
 
 
 def _st_get(db, order_no):
@@ -103,6 +115,76 @@ def _st_upsert(db, order_no, **f):
         sets = ", ".join(f"{k}=%s" for k in f)
         db._execute(f"UPDATE route_status_state SET {sets}, updated_at=now() WHERE order_no=%s",
                     list(f.values()) + [order_no])
+
+
+# ─── Простой машины (dwell watchdog) ─────────────────────────────────────────
+
+def _dwell_get(db, uid):
+    return db._fetchone("SELECT * FROM unit_dwell WHERE unit_id=%s", (uid,))
+
+
+def _dwell_set(db, uid, lat, lon, since_ts, alerted):
+    if _dwell_get(db, uid) is None:
+        db._execute("INSERT INTO unit_dwell (unit_id,lat,lon,since_ts,alerted) VALUES (%s,%s,%s,%s,%s)",
+                    (uid, lat, lon, since_ts, alerted))
+    else:
+        db._execute("UPDATE unit_dwell SET lat=%s,lon=%s,since_ts=%s,alerted=%s,updated_at=now() WHERE unit_id=%s",
+                    (lat, lon, since_ts, alerted, uid))
+
+
+def _near_base(lat, lon) -> bool:
+    return _haversine(lat, lon, BASE_LAT, BASE_LON) <= R_BASE_M
+
+
+def _near_any_client(lat, lon, stops) -> bool:
+    for s in stops:
+        if s.get("lat") and s.get("lon") and _haversine(lat, lon, s["lat"], s["lon"]) <= R_STOP_M:
+            return True
+    return False
+
+
+def _check_idle(db, uid, name, pos, stops, now_ts, preview):
+    """Сторож простоя: машина стоит на месте ≥ IDLE_MIN, не на базе и не у клиента → тревога.
+    Возвращает строку-описание, если простой обнаружен (для превью/лога), иначе None."""
+    if not pos or not pos.get("lat"):
+        return None
+    lat, lon = pos["lat"], pos["lon"]
+    row = _dwell_get(db, uid) or {}
+    anchored = row.get("since_ts") and row.get("lat") is not None \
+        and _haversine(lat, lon, row["lat"], row["lon"]) <= IDLE_RADIUS_M
+    if not anchored:
+        # машина сдвинулась (или первое наблюдение) — новый якорь, счётчик с нуля
+        if not preview:
+            _dwell_set(db, uid, lat, lon, now_ts, False)
+        return None
+    since = row["since_ts"]
+    idle_min = int((now_ts - since) / 60)
+    on_base = _near_base(lat, lon)
+    on_client = _near_any_client(lat, lon, stops)
+    if idle_min >= IDLE_MIN and not on_base and not on_client:
+        line = (f"{name}: ПРОСТОЙ ~{idle_min} мин на месте (не база, не клиент) "
+                f"[{lat:.4f},{lon:.4f}]")
+        fire = (not preview) and (not row.get("alerted"))
+        return {"line": line, "fire": fire, "since": since, "idle_min": idle_min,
+                "lat": lat, "lon": lon, "anchor": (row["lat"], row["lon"])}
+    return None
+
+
+async def _idle_alert(bot, unit_name, info):
+    since = datetime.fromtimestamp(info["since"], _MSK).strftime("%H:%M")
+    link = f"https://yandex.ru/maps/?pt={info['lon']:.5f},{info['lat']:.5f}&z=17&l=map"
+    text = (f"🅿️ ПРОСТОЙ машины\n{unit_name}\n"
+            f"Стоит на месте ~{info['idle_min']} мин (с {since}) — не база и не адрес клиента.\n"
+            f"Точка: {info['lat']:.4f},{info['lon']:.4f}\n{link}")
+    seen = set()
+    for cid in [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()]:
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.warning("_idle_alert → %s: %s", cid, e)
 
 
 # ─── Wialon позиции ──────────────────────────────────────────────────────────
@@ -324,6 +406,14 @@ async def run_check(db, bot=None, preview=False) -> list:
                     if not (_st_get(db, rkey) or {}).get("delay_alerted"):
                         await _risk_alert(bot, name, risk)
                         _st_upsert(db, rkey, delay_alerted=True, unit_id=uid)
+
+            # ── Простой машины (стоит на месте ≥ IDLE_MIN, не база и не клиент) ──
+            idle = _check_idle(db, uid, name, pos, stops, now_ts, preview)
+            if idle:
+                lines.append(idle["line"])
+                if idle["fire"] and bot:
+                    await _idle_alert(bot, name, idle)
+                    _dwell_set(db, uid, idle["anchor"][0], idle["anchor"][1], idle["since"], True)
     return lines
 
 
