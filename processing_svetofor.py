@@ -134,13 +134,18 @@ def _classify_fish(name: str) -> str | None:
 SYRYE_ROOT = "СЫРЬЕ"  # корневая папка сырья в МС (выход считаем от позиций из неё)
 
 
-def _in_syrye(assortment: dict) -> bool:
-    """Позиция относится к папке СЫРЬЕ (или её подгруппе). pathName берём с товара,
-    а для модификации (variant) — с родительского product (expand=assortment.product)."""
+def _folder(assortment: dict) -> str:
+    """Папка позиции (pathName). Для модификации (variant) — с родит. product."""
     p = assortment.get("pathName")
     if p is None:
         p = (assortment.get("product") or {}).get("pathName")
-    p = p or ""
+    return p or ""
+
+
+def _in_syrye(assortment: dict) -> bool:
+    """Позиция относится к папке СЫРЬЕ (или её подгруппе). pathName берём с товара,
+    а для модификации (variant) — с родительского product (expand=assortment.product)."""
+    p = _folder(assortment)
     return p == SYRYE_ROOT or p.startswith(SYRYE_ROOT + "/")
 
 
@@ -206,21 +211,24 @@ async def compute(pid: str, name: str, moment: str, state: str | None) -> dict |
         return None
     mats = await _positions(pid, "materials", expand="assortment.product")
 
-    # (код, наименование, qty в базовой ед., объём в кг). Для штучных qty×вес; None — не перевести.
+    # (код, наименование, qty в базовой ед., объём в кг, папка). Для штучных qty×вес; None — не перевести.
     out_pos = []
     for p in prods:
         a = p.get("assortment") or {}
         qty = float(p.get("quantity") or 0)
-        out_pos.append((a.get("code"), a.get("name"), qty, _out_kg(a, qty)))
+        out_pos.append((a.get("code"), a.get("name"), qty, _out_kg(a, qty), _folder(a)))
     out_multi = len(out_pos) > 1
     main = max(out_pos, key=lambda t: (t[3] if t[3] is not None else t[2]))
-    out_sku_code, out_sku_name = main[0], main[1]
-    # Метрики (выход, ₽/кг) считаем на ОСНОВНОЙ выпуск (main_kg), а не на сумму всех
-    # продуктов: к филе часто идёт побочный выпуск (суп.набор/фарш), он раздувал выход
-    # и занижал ₽/кг. out_qty (сумма) остаётся только для снимка.
-    main_kg = main[3]
-    # если хоть одну штучную позицию не перевели в кг — не считаем ₽/кг и выход (не врём)
-    out_qty = None if any(kg is None for *_, kg in out_pos) else sum(kg for *_, kg in out_pos)
+    out_sku_code, out_sku_name, main_folder = main[0], main[1], main[4]
+    # Метрики (выход, ₽/кг) считаем на СО-ПРОДУКТЫ основного выпуска — все продукты из
+    # ТОЙ ЖЕ папки, что и основной (кусок+ломтики одной филе → 'ГОТОВАЯ ПРОДУКЦИЯ/КУСОК,
+    # ЛОМТИК, СТЕЙК'). Побочный выпуск (суп.набор/фарш → '…/ПРОЧЕЕ ПРОИЗВОДСТВО') лежит
+    # в ДРУГОЙ папке и в числитель не идёт — иначе он раздувал бы выход и занижал ₽/кг.
+    # out_qty (сумма всех продуктов) остаётся только для снимка.
+    coprod = [t for t in out_pos if t[4] == main_folder]
+    # если хоть один со-продукт не перевели в кг (штучное без веса) — не врём: main_kg=None
+    main_kg = None if any(t[3] is None for t in coprod) else sum(t[3] for t in coprod)
+    out_qty = None if any(t[3] is None for t in out_pos) else sum(t[3] for t in out_pos)
 
     # Знаменатель выхода — позиции из папки СЫРЬЕ (решение собственника): любой вид
     # рыбы-сырья (ПБГ/ПСГ филейное, н/р для копчения) лежит в этой папке. Так надёжнее
