@@ -33,13 +33,16 @@ _MSK = timezone(timedelta(hours=3))
 
 # База (загрузка утром) — Ильинский, Раменское
 BASE_LAT, BASE_LON = 55.6323, 38.1038
-R_BASE_M = 700       # радиус геозоны базы
+R_BASE_M = 500       # «В пути» — удаление транспорта на 500 м от склада (спека собственника)
 R_STOP_M = 300       # радиус «прибыл на точку»
 DELAY_BUFFER_MIN = 30
 DELIVERY_HOURS = (7, 21)   # МСК, в эти часы крон активен
 JOB_INTERVAL_SEC = 600
 
-TERMINAL = {"Сдан", "Сдан с проблемой"}
+# Статусы, которые авто-движок ИМЕЕТ ПРАВО менять (логистические, в процессе развоза).
+# Всё остальное — ручное/бухгалтерское (Отгружен ставит оператор; УПД подписан / Долг /
+# Оплачен — оператор; Сдан / Сдан с проблемой / Едет возврат — терминальные) — НЕ трогаем.
+MANAGED = {"Отгружен", "В пути", "Задержка в пути"}
 
 
 def _write_enabled() -> bool:
@@ -212,7 +215,8 @@ async def run_check(db, bot=None, preview=False) -> list:
                 chk_status = (chk or {}).get("status")
                 target = _target_status(left_base=left_base, arrived=arrived, vt=s.get("vt"),
                                         now_ts=now_ts, chk_status=chk_status)
-                if not target or cur in TERMINAL:
+                # трогаем только логистические статусы; ручные/бухгалтерские/терминальные — нет
+                if not target or cur not in MANAGED:
                     continue
                 if cur == "Задержка в пути" and target == "В пути":
                     continue  # не понижаем
