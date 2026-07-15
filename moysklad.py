@@ -2205,7 +2205,11 @@ async def _overdue_by_demand_fifo(agent_id: str, today, delay: Optional[int] = N
     for dt, amt, did, unpaid in demands:
         if unpaid > 1 and dt:
             due = dt + timedelta(days=delay)
-            if due < today:
+            # grace-окно PDZ_GRACE_DAYS (банковский день/деньги в пути): отгрузка
+            # считается просроченной только когда today > due + GRACE — иначе она
+            # ещё в лаге и не идёт в счётчик (как в _pdz_classify). Без этого
+            # свежая отгрузка на 1-3 дня после срока ложно раздувала число просрочек.
+            if due + timedelta(days=PDZ_GRACE_DAYS) < today:
                 overdue.append(((today - due).days, round(unpaid, 2), did))
     if not overdue:
         return (0, 0.0, None, 0)
