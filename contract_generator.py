@@ -24,6 +24,52 @@ from reportlab.platypus import (
 from reportlab.lib import colors
 
 import glob
+import re as _re_mod
+
+
+# Орг.-правовые формы: полное написание → сокращение (для реквизитов и подписи;
+# в преамбуле остаётся полное юр.название).
+_LEGAL_FORM_ABBR = [
+    ("ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ", "ООО"),
+    ("ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "ПАО"),
+    ("ЗАКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "ЗАО"),
+    ("ОТКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "ОАО"),
+    ("НЕПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "АО"),
+    ("АКЦИОНЕРНОЕ ОБЩЕСТВО", "АО"),
+    ("ИНДИВИДУАЛЬНЫЙ ПРЕДПРИНИМАТЕЛЬ", "ИП"),
+]
+
+
+def _abbr_legal_form(name: str) -> str:
+    """«ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ "МАММИНА"» → «ООО "МАММИНА"»."""
+    if not name:
+        return name
+    out = name.strip()
+    for full, short in _LEGAL_FORM_ABBR:
+        out = _re_mod.sub(_re_mod.escape(full), short, out, flags=_re_mod.IGNORECASE)
+    return out.strip()
+
+
+def _fio_short(name: str) -> str:
+    """«Иванов Иван Иванович» → «Иванов И.И.» (как «/Маланчук А.В./» у поставщика)."""
+    parts = (name or "").split()
+    if len(parts) >= 3:
+        return f"{parts[0]} {parts[1][0]}.{parts[2][0]}."
+    if len(parts) == 2:
+        return f"{parts[0]} {parts[1][0]}."
+    return name or ""
+
+
+def _wrap_two(s: str, limit: int = 38):
+    """Перенос длинной строки на 2 части по границе слова (не посреди слова)."""
+    s = s or ""
+    if len(s) <= limit:
+        return [s]
+    cut = s.rfind(" ", 0, limit + 1)
+    if cut <= 0:
+        cut = limit
+    return [s[:cut].strip(), s[cut:].strip()]
+
 
 # Автопоиск шрифтов DejaVu
 def _find_font(name):
@@ -325,7 +371,7 @@ def generate_contract_pdf(data: dict) -> bytes:
     # ── Реквизиты сторон ─────────────────────────────────────────────────────
     supplier_lines = [
         [Paragraph("<b>ПОСТАВЩИК:</b>", small_bold), Paragraph("<b>ПОКУПАТЕЛЬ:</b>", small_bold)],
-        [Paragraph("<b>АО «ФИШ ТУ БИЗНЕС»</b>", small_bold), Paragraph(f"<b>{data['buyer_name']}</b>", small_bold)],
+        [Paragraph("<b>АО «ФИШ ТУ БИЗНЕС»</b>", small_bold), Paragraph(f"<b>{_abbr_legal_form(data['buyer_name'])}</b>", small_bold)],
         [Paragraph("ИНН: 9713025854", small), Paragraph(f"ИНН: {data.get('buyer_inn','')}", small)],
         [Paragraph("КПП: 771301001", small), Paragraph(f"ОГРН: {data.get('buyer_ogrn','')}", small)],
         [Paragraph("ОГРН: 1257700150553", small), Paragraph(f"Юр. адрес: {data.get('buyer_address','')}", small)],
@@ -410,7 +456,7 @@ def generate_contract_pdf(data: dict) -> bytes:
             canvas_obj.setFont(fb, 8)
             canvas_obj.drawString(rx, base_y, "ПОКУПАТЕЛЬ:")
             canvas_obj.setFont(fn, 8)
-            bname = data.get("buyer_name", "")
+            bname = _abbr_legal_form(data.get("buyer_name", ""))
             # Извлекаем должность из buyer_representative (первые слова до ФИО)
             buyer_position = "Генеральный директор"  # fallback
             rep_raw = data.get("buyer_representative", "")
@@ -439,16 +485,16 @@ def generate_contract_pdf(data: dict) -> bytes:
                         "индивидуального предпринимателя": "Индивидуальный предприниматель",
                     }
                     buyer_position = POS_MAP.get(pos_str.lower(), pos_str.capitalize())
-            if len(bname) > 38:
-                canvas_obj.drawString(rx, base_y - 5*mm, bname[:38])
-                canvas_obj.drawString(rx, base_y - 10*mm, bname[38:])
+            name_lines = _wrap_two(bname, 38)
+            canvas_obj.drawString(rx, base_y - 5*mm, name_lines[0])
+            if len(name_lines) > 1:
+                canvas_obj.drawString(rx, base_y - 10*mm, name_lines[1])
                 canvas_obj.drawString(rx, base_y - 15*mm, buyer_position)
             else:
-                canvas_obj.drawString(rx, base_y - 5*mm, bname)
                 canvas_obj.drawString(rx, base_y - 10*mm, buyer_position)
             canvas_obj.line(rx, base_y - 16*mm, rx + 60*mm, base_y - 16*mm)
             canvas_obj.setFont(fb, 8)
-            canvas_obj.drawString(rx, base_y - 22*mm, f"/{buyer_director or data.get('buyer_director_name', '')}/")
+            canvas_obj.drawString(rx, base_y - 22*mm, f"/{_fio_short(buyer_director or data.get('buyer_director_name', ''))}/")
 
         canvas_obj.restoreState()
 
