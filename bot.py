@@ -7458,8 +7458,45 @@ def main():
                         f'{{"assortment_request_id": {ar["id"]}, "source": "wazzup_classifier"}}',
                     ),
                 )
+                # TG-уведомление закупщику о поступлении новой заявки (без кнопок,
+                # просто уведомление). Роутинг по виду как в манагер-флоу:
+                # классифицированная → ответственному, неопределённая → обоим+Виктору.
+                # Раньше Wazzup-путь создавал заявку молча («увидит в дашборде»).
+                try:
+                    from request_handler import (
+                        route_request, ASSIGNEE_TG, UNCLASSIFIED_NOTIFY_TG,
+                    )
+                    owner = route_request(ar["species_normalized"])
+                    buyer_chats = (list(UNCLASSIFIED_NOTIFY_TG) if owner is None
+                                   else [ASSIGNEE_TG.get(owner)])
+                    buyer_chats = [c for c in buyer_chats if c]
+                    base_url = os.getenv(
+                        "PROCUREMENT_APP_URL",
+                        "https://f2b-procurement-victor03.amvera.io",
+                    )
+                    species_disp = ar["species_normalized"] or "вид не определён"
+                    client_disp = f"\nКлиент: {ar['contact_name']}" if ar["contact_name"] else ""
+                    snippet = (ar["raw_text"] or "").strip()
+                    if len(snippet) > 300:
+                        snippet = snippet[:300] + "…"
+                    notif_text = (
+                        f"🆕 Новая заявка №{rid} ({species_disp})"
+                        f"{client_disp}\n\n"
+                        f"{snippet}\n\n"
+                        f"Открыть: {base_url}/requests/{rid}"
+                    )
+                    for chat_id in buyer_chats:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=chat_id, text=notif_text,
+                                disable_web_page_preview=True,
+                            )
+                        except Exception as e:
+                            logger.error(f"wzc buyer notify {chat_id} failed: {e}")
+                except Exception as e:
+                    logger.error(f"wzc buyer notification block failed: {e}")
                 await q.edit_message_text(
-                    q.message.text + f"\n\n✅ Заявка #{rid} создана, закупщик увидит в дашборде.",
+                    q.message.text + f"\n\n✅ Заявка #{rid} создана, закупщик уведомлён.",
                     parse_mode=None,
                 )
             except Exception as e:
