@@ -5788,24 +5788,9 @@ async def _build_report_data() -> dict:
         facts[mgr_name]["new_clients"] = len(new_client_names.get(mgr_name, []))
         facts[mgr_name]["lost_clients"] = len(lost_client_names.get(mgr_name, []))
 
-    # Ссылки на персональные дашборды мотивации (quiz-game).
-    # mgr_name (Карина Баласанян) → {url, tag}. Используется в отчёте ОП
-    # на вкладке менеджера как кнопка «→ Дашборд мотивации».
-    # Уточнено собственником 2026-06-09.
-    motivation_links = {}
-    try:
-        tok_rows = db._fetchall(
-            "SELECT manager_tag, token FROM manager_dashboard_tokens", None
-        )
-        tag_to_token = {r["manager_tag"]: r["token"] for r in tok_rows}
-        for tag, mgr_name in TAGS.items():
-            tok = tag_to_token.get(tag)
-            if tok:
-                motivation_links[mgr_name] = (
-                    f"https://f2b-fishki-victor03.amvera.io/manager/{tag}/dashboard?token={tok}"
-                )
-    except Exception as e:
-        logger.warning(f"_build_report_data: motivation_links не подгружен: {e}")
+    # Кнопка «Дашборд мотивации» с токен-ссылкой убрана из отчёта ОП 2026-07-15:
+    # дашборды переехали на вход по логину/паролю (/manager/login), ссылки-с-токеном
+    # больше не раздаём. План: plans/2026-07-15-логин-пароль-для-дашбордов-менеджеров.md.
 
     return {
         "date": today.strftime("%d.%m.%Y"),
@@ -5818,7 +5803,6 @@ async def _build_report_data() -> dict:
         "new_client_names": new_client_names,
         "lost_client_names": lost_client_names,
         "mgr_history": mgr_history,
-        "motivation_links": motivation_links,
     }
 
 
