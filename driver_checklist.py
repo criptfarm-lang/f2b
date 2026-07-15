@@ -360,7 +360,7 @@ async def _resolve_deeplink_payload(payload: str):
                         if href:
                             return href.rstrip("/").split("/")[-1]
             return None
-        # 3) это номер документа → ищем отгрузку по имени (свежую)
+        # 3) это номер документа. Сначала как номер ОТГРУЗКИ, потом как номер ЗАКАЗА → его отгрузка.
         import urllib.parse as _up
         f = _up.quote(f"name={payload}")
         async with session.get(
@@ -370,6 +370,17 @@ async def _resolve_deeplink_payload(payload: str):
                 rows = (await r.json()).get("rows", [])
                 if rows:
                     return rows[0].get("id")
+        # номер заказа (реестр кодирует № заказа) → берём его отгрузку
+        async with session.get(
+            f"{MS_BASE}/entity/customerorder?filter={f}&limit=1", headers=headers
+        ) as r:
+            if r.status == 200:
+                rows = (await r.json()).get("rows", [])
+                if rows:
+                    for dm in rows[0].get("demands", []) or []:
+                        href = (dm.get("meta") or {}).get("href", "")
+                        if href:
+                            return href.rstrip("/").split("/")[-1]
     return None
 
 
