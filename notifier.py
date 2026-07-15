@@ -34,6 +34,22 @@ MONTHS_RU = [
     "июля", "августа", "сентября", "октября", "ноября", "декабря"
 ]
 
+# ─── Алерт «крупный заказ готовой продукции» ────────────────────────────────
+# План: plans/2026-07-15-алерт-крупный-заказ-готовая-продукция.md
+# Группа товаров собственного производства в МойСклад (по pathName-префиксу).
+BULK_GROUP_PREFIX = "ГОТОВАЯ ПРОДУКЦИЯ"
+# Пороги по одной позиции: в кг ≥ 300, в штуках ≥ 200.
+BULK_THRESHOLD_KG = 300
+BULK_THRESHOLD_PCS = 200
+
+
+def _bulk_alert_chat_id() -> int | None:
+    """Кому шлём алерт о крупном заказе.
+    BULK_ORDER_ALERT_CHAT_ID (env) → иначе PARTNER_CHAT_ID (Маланчук)."""
+    raw = os.getenv("BULK_ORDER_ALERT_CHAT_ID", "").strip() or \
+          os.getenv("PARTNER_CHAT_ID", "").strip()
+    return int(raw) if raw.lstrip("-").isdigit() else None
+
 
 async def _is_company_excluded(company_name: str) -> bool:
     """Проверяет находится ли компания в списке исключений квиза.
@@ -487,6 +503,135 @@ async def check_order_agreed(order_href: str, bot, db):
 
     except Exception as e:
         logger.error(f"notifier.check_order_agreed: {e}", exc_info=True)
+
+
+async def _load_bulk_positions(order_id: str, headers: dict) -> list[dict]:
+    """Позиции заказа с раскрытием товара и единицы измерения.
+
+    Возвращает список dict: {name, qty, uom, path} — только те, что нужны
+    для проверки порога крупного заказа. uom берётся из assortment.uom.name;
+    для вариантов (нет uom на самом variant) — из родительского product.
+    """
+    import aiohttp
+    rows_out: list[dict] = []
+    prod_uom_cache: dict[str, str] = {}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder/{order_id}/positions",
+                headers=headers,
+                params={"expand": "assortment.uom,assortment.product.uom", "limit": "100"},
+            ) as r:
+                if r.status != 200:
+                    logger.warning(f"_load_bulk_positions: status {r.status}")
+                    return []
+                data = await r.json()
+
+            for pos in data.get("rows", []):
+                a = pos.get("assortment", {}) or {}
+                name = a.get("name", "?")
+                path = a.get("pathName") or ""
+                qty = pos.get("quantity", 0) or 0
+
+                uom = a.get("uom") or {}
+                uom_name = uom.get("name") if isinstance(uom, dict) else None
+                # variant → uom родительского product
+                if not uom_name:
+                    prod = a.get("product") or {}
+                    puom = prod.get("uom") if isinstance(prod, dict) else None
+                    if isinstance(puom, dict):
+                        uom_name = puom.get("name")
+
+                rows_out.append({
+                    "name": name, "qty": qty,
+                    "uom": (uom_name or "").strip(), "path": path,
+                })
+    except Exception as e:
+        logger.warning(f"_load_bulk_positions: {e}")
+        return []
+    return rows_out
+
+
+def _bulk_positions_over_threshold(positions: list[dict]) -> list[dict]:
+    """Отбирает позиции из группы готовой продукции, превысившие порог.
+
+    кг: qty ≥ BULK_THRESHOLD_KG; шт: qty ≥ BULK_THRESHOLD_PCS.
+    """
+    hits = []
+    for p in positions:
+        path = p.get("path") or ""
+        if not (path == BULK_GROUP_PREFIX or path.startswith(BULK_GROUP_PREFIX + "/")):
+            continue
+        uom = (p.get("uom") or "").lower()
+        qty = p.get("qty", 0) or 0
+        if uom == "кг" and qty >= BULK_THRESHOLD_KG:
+            hits.append(p)
+        elif uom == "шт" and qty >= BULK_THRESHOLD_PCS:
+            hits.append(p)
+    return hits
+
+
+async def check_bulk_production_order(order_href: str, bot, db):
+    """При согласовании заказа с крупной позицией готовой продукции — алерт Маланчуку.
+
+    Триггер: статус «Согласован» + хотя бы одна позиция из группы «ГОТОВАЯ
+    ПРОДУКЦИЯ» c qty ≥ 300 кг (или ≥ 200 шт). Дедуп — атомарный claim
+    bulk_order_notifications, один заказ = одно уведомление.
+    """
+    try:
+        from moysklad import get_headers
+        headers = get_headers()
+
+        order = await _load_order(order_href, headers)
+        if not order:
+            return
+
+        state_id = order.get("state", {}).get("meta", {}).get("href", "").split("/")[-1]
+        if state_id != MS_STATE_AGREED:
+            return
+
+        order_id = order.get("id") or order_href.split("/")[-1].split("?")[0]
+
+        positions = await _load_bulk_positions(order_id, headers)
+        hits = _bulk_positions_over_threshold(positions)
+        if not hits:
+            return
+
+        chat_id = _bulk_alert_chat_id()
+        if not chat_id:
+            logger.warning("check_bulk_production_order: не задан BULK_ORDER_ALERT_CHAT_ID/PARTNER_CHAT_ID")
+            return
+
+        # Атомарный дедуп — только первый webhook отправляет.
+        if not db.try_claim_bulk_notification(order_id):
+            logger.info(f"bulk-alert: заказ {order_id} уже уведомлялся, пропуск")
+            return
+
+        order_name = order.get("name", order_id)
+        agent_name = order.get("agent", {}).get("name", "—")
+
+        def _fmt_qty(p):
+            q = p["qty"]
+            q_str = f"{q:g}"
+            return f"  • {p['name']} — {q_str} {p['uom']}"
+
+        lines = "\n".join(_fmt_qty(p) for p in hits)
+        text = (
+            f"🏭 Крупный заказ готовой продукции\n\n"
+            f"Заказ: {order_name}\n"
+            f"Клиент: {agent_name}\n\n"
+            f"Позиции ≥ порога (кг≥{BULK_THRESHOLD_KG} / шт≥{BULK_THRESHOLD_PCS}):\n"
+            f"{lines}"
+        )
+
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+            logger.info(f"bulk-alert: заказ {order_name} → chat {chat_id}, позиций {len(hits)}")
+        except Exception as e:
+            logger.error(f"bulk-alert: отправка упала для {order_id}: {e}", exc_info=True)
+
+    except Exception as e:
+        logger.error(f"notifier.check_bulk_production_order: {e}", exc_info=True)
 
 
 async def manual_send_fishki(order_id: str, db) -> tuple[bool, str]:

@@ -163,6 +163,11 @@ class Database:
                 sent_at TIMESTAMP DEFAULT NOW()
             );
 
+            CREATE TABLE IF NOT EXISTS bulk_order_notifications (
+                order_id TEXT PRIMARY KEY,
+                sent_at TIMESTAMP DEFAULT NOW()
+            );
+
             CREATE TABLE IF NOT EXISTS report_links (
                 token TEXT PRIMARY KEY,
                 mgr_filter TEXT,
@@ -305,6 +310,10 @@ class Database:
                 alerted_at DATE DEFAULT CURRENT_DATE
             )""",
             """CREATE TABLE IF NOT EXISTS agreed_notifications (
+                order_id TEXT PRIMARY KEY,
+                sent_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS bulk_order_notifications (
                 order_id TEXT PRIMARY KEY,
                 sent_at TIMESTAMP DEFAULT NOW()
             )""",
@@ -1283,6 +1292,23 @@ class Database:
         with self.conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO agreed_notifications (order_id) VALUES (%s) "
+                "ON CONFLICT DO NOTHING RETURNING order_id",
+                (order_id,)
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row is not None
+
+    def try_claim_bulk_notification(self, order_id: str) -> bool:
+        """Атомарный claim для алерта «крупный заказ готовой продукции».
+
+        True — запись вставлена этой транзакцией, мы первые → отправляем.
+        False — запись уже была (другой webhook отметил раньше) → молчим.
+        """
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bulk_order_notifications (order_id) VALUES (%s) "
                 "ON CONFLICT DO NOTHING RETURNING order_id",
                 (order_id,)
             )

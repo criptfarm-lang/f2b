@@ -23,6 +23,7 @@ from telegram.ext import (
 
 from database import Database
 from notifier import check_order_agreed  # рассылка при согласовании — не трогать!
+from notifier import check_bulk_production_order  # алерт «крупный заказ готовой продукции»
 from scheduler import setup_scheduler, get_group_chat_id, pdz_catch_up_missed_jobs
 from claude_ai import dispatch, smart_answer, parse_product_query
 from amocrm import check_connection as amo_check  # оставляем для совместимости
@@ -8685,6 +8686,13 @@ async def process_ms_webhook(data: dict, bot):
             # атомарный claim через agreed_notifications.
             if action in ("UPDATE", "CREATE"):
                 await check_order_agreed(order_href, bot, db)
+
+            # Алерт «крупный заказ готовой продукции» (≥300 кг / ≥200 шт по
+            # одной позиции из группы ГОТОВАЯ ПРОДУКЦИЯ) → Маланчуку в личку.
+            # Notifier сам проверяет статус СОГЛАСОВАНО и делает атомарный дедуп.
+            # План: 2026-07-15-алерт-крупный-заказ-готовая-продукция.md
+            if action in ("UPDATE", "CREATE"):
+                await check_bulk_production_order(order_href, bot, db)
 
             # Объединённый алерт «На согласовании» / «ЗА ЛИМИТОМ» — собственнику
             # (план 2026-05-21, Фаза 3). Notifier сам проверяет state и делает
