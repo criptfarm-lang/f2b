@@ -146,6 +146,27 @@ async def _ms_set_state(session, demand_id, state_meta) -> bool:
         return ok
 
 
+async def write_ms_status(demand_id: str, status_name: str) -> bool:
+    """Событийная запись статуса отгрузки в МС (из чеклиста водителя — работает БЕЗ GPS,
+    в т.ч. для наёмной машины). Уважает сухой режим (DELIVERY_STATUS_WRITE)."""
+    if not demand_id:
+        return False
+    if not _write_enabled():
+        logger.info("delivery_statuses(dry): demand %s → %s (запись выкл)", demand_id, status_name)
+        return False
+    try:
+        async with aiohttp.ClientSession() as session:
+            states = await _ms_states(session)
+            meta = states.get(status_name)
+            if not meta:
+                logger.warning("write_ms_status: нет статуса %r в МС", status_name)
+                return False
+            return await _ms_set_state(session, demand_id, meta)
+    except Exception as e:
+        logger.warning("write_ms_status %s → %s: %s", demand_id, status_name, e)
+        return False
+
+
 def _manager_chat(agent_tags):
     for t in agent_tags:
         key = (t or "").strip().lower()

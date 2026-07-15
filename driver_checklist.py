@@ -514,6 +514,11 @@ async def cb_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if val == "ok":
         _set_fields(db, demand_id, accepted_ok=True, status="сдан",
                     stage="done", completed_at=datetime.now(_MSK))
+        try:
+            import delivery_statuses as _dsx
+            await _dsx.write_ms_status(demand_id, "Сдан")
+        except Exception as e:
+            logger.warning("МС статус Сдан: %s", e)
         await q.edit_message_text("✅ Точка закрыта: сдано без претензий. Спасибо!")
     else:
         _set_fields(db, demand_id, accepted_ok=False, stage="claim_text")
@@ -564,6 +569,11 @@ async def _finish_claim(context, demand_id, reply):
     db = context.bot_data["db"]
     _set_fields(db, demand_id, status="сдан с проблемой", stage="done",
                 completed_at=datetime.now(_MSK))
+    try:
+        import delivery_statuses as _dsx
+        await _dsx.write_ms_status(demand_id, "Сдан с проблемой")
+    except Exception as e:
+        logger.warning("МС статус Сдан с проблемой: %s", e)
     row = _get_row(db, demand_id)
     await _alert_claim(context, row)
     await reply("⚠️ Претензия зафиксирована. Логист и менеджер уведомлены. Спасибо!")
