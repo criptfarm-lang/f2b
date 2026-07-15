@@ -49,6 +49,18 @@ def _write_enabled() -> bool:
     return os.getenv("DELIVERY_STATUS_WRITE", "0") == "1"
 
 
+def _owner_chat_id() -> int:
+    return int(os.getenv("OWNER_CHAT_ID", "0") or 0)
+
+
+def _logist_chat_id() -> int:
+    return int(os.getenv("LOGIST_CHAT_ID", "8267564735") or 0)  # Белякова
+
+
+def _partner_chat_id() -> int:
+    return int(os.getenv("PARTNER_CHAT_ID", "772630562") or 0)  # Маланчук
+
+
 def _haversine(a_lat, a_lon, b_lat, b_lon) -> float:
     R = 6371000.0
     p1, p2 = math.radians(a_lat), math.radians(b_lat)
@@ -72,6 +84,7 @@ def ensure_schema(db):
             updated_at     TIMESTAMPTZ DEFAULT now()
         )
     """)
+    db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS delay_mgr_alerted BOOLEAN DEFAULT FALSE")
 
 
 def _st_get(db, order_no):
@@ -249,11 +262,23 @@ async def run_check(db, bot=None, preview=False) -> list:
                     meta = states.get(target)
                     if meta and await _ms_set_state(session, info["demand_id"], meta):
                         _st_upsert(db, order_no, ms_status=target, demand_id=info["demand_id"], unit_id=uid)
-                # алерт по задержке (один раз)
-                if target == "Задержка в пути" and not st.get("delay_alerted"):
-                    if bot and not preview:
-                        await _delay_alert(bot, name, s, info["agent_tags"])
-                        _st_upsert(db, order_no, delay_alerted=True, demand_id=info["demand_id"], unit_id=uid)
+                # Алерты по задержке
+                if target == "Задержка в пути" and bot and not preview:
+                    vt = s.get("vt") or 0
+                    delay_min = (now_ts - vt) / 60 if vt else 0
+                    # +30 мин: владелец + логист (Белякова) + партнёр (Маланчук)
+                    if not st.get("delay_alerted"):
+                        await _delay_alert(bot, name, s,
+                                           [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()])
+                        _st_upsert(db, order_no, delay_alerted=True,
+                                   demand_id=info["demand_id"], unit_id=uid)
+                    # +60 мин: дополнительно менеджер
+                    if delay_min >= 60 and not st.get("delay_mgr_alerted"):
+                        _tag, mgr = _manager_chat(info["agent_tags"])
+                        if mgr:
+                            await _delay_alert(bot, name, s, [mgr], over60=True)
+                        _st_upsert(db, order_no, delay_mgr_alerted=True,
+                                   demand_id=info["demand_id"], unit_id=uid)
     return lines
 
 
@@ -279,17 +304,17 @@ async def _fetch_routes_via(session, sid):
     return routes
 
 
-async def _delay_alert(bot, unit_name, stop, agent_tags):
-    import driver_checklist as dc
+async def _delay_alert(bot, unit_name, stop, recipients, over60=False):
     vt = stop.get("vt")
     plan = datetime.fromtimestamp(vt, _MSK).strftime("%H:%M") if vt else "—"
-    tag, mgr_chat = _manager_chat(agent_tags)
-    text = (f"⏱ ЗАДЕРЖКА в пути\n{unit_name}\n"
-            f"{stop['client']} (№{stop['order_no']})\n"
-            f"План прибытия {plan} + 30 мин — машина ещё не на точке.")
-    if tag:
-        text += f"\nМенеджер: {tag}"
-    recipients = [dc._logist_chat_id(), dc._owner_chat_id(), mgr_chat]
+    if over60:
+        text = (f"⏱ ЗАДЕРЖКА больше 60 мин\n{unit_name}\n"
+                f"{stop['client']} (№{stop['order_no']})\n"
+                f"План прибытия {plan} — опоздание больше часа.")
+    else:
+        text = (f"⏱ ЗАДЕРЖКА в пути\n{unit_name}\n"
+                f"{stop['client']} (№{stop['order_no']})\n"
+                f"План прибытия {plan} + 30 мин — машина ещё не на точке.")
     seen = set()
     for cid in recipients:
         if not cid or cid in seen:
