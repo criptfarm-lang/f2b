@@ -36,6 +36,7 @@ BASE_LAT, BASE_LON = 55.6323, 38.1038
 R_BASE_M = 500       # «В пути» — удаление транспорта на 500 м от склада (спека собственника)
 R_STOP_M = 300       # радиус «прибыл на точку»
 DELAY_BUFFER_MIN = 30
+RISK_LAG_MIN = 20          # отставание, при котором предупреждаем о риске смещения окон
 DELIVERY_HOURS = (7, 21)   # МСК, в эти часы крон активен
 JOB_INTERVAL_SEC = 600
 
@@ -190,8 +191,21 @@ def _manager_chat(agent_tags):
 
 # ─── Ядро: вычислить целевой статус для точки ────────────────────────────────
 
-def _target_status(*, left_base, arrived, vt, now_ts, chk_status):
-    """chk_status — статус из delivery_checklist (сдан/сдан с проблемой) или None."""
+def _has_real_window(tf, tt) -> bool:
+    """Реальное окно приёмки (клиент ждёт в интервал), а не плавающее 09:00–18:00 (дефолт моста)."""
+    if not tf or not tt:
+        return False
+    a = datetime.fromtimestamp(tf, _MSK)
+    b = datetime.fromtimestamp(tt, _MSK)
+    if (a.hour, a.minute, b.hour, b.minute) == (9, 0, 18, 0):
+        return False
+    return True
+
+
+def _target_status(*, left_base, arrived, tt, now_ts, chk_status, real_window):
+    """chk_status — статус из delivery_checklist (сдан/сдан с проблемой) или None.
+    «Задержка в пути» — ТОЛЬКО опоздание в РЕАЛЬНОЕ окно (прошёл конец окна `tt`).
+    Плавающее окно — не опоздание (см. риск смещения отдельно)."""
     if chk_status == "сдан с проблемой":
         return "Сдан с проблемой"
     if chk_status == "сдан":
@@ -200,8 +214,8 @@ def _target_status(*, left_base, arrived, vt, now_ts, chk_status):
         return None                      # ещё на базе — не трогаем «Отгружен»
     if arrived:
         return "В пути"                  # приехал, ждём чеклист
-    if vt and now_ts > vt + DELAY_BUFFER_MIN * 60:
-        return "Задержка в пути"
+    if real_window and tt and now_ts > tt:
+        return "Задержка в пути"         # реальное окно нарушено
     return "В пути"
 
 
@@ -229,6 +243,7 @@ async def run_check(db, bot=None, preview=False) -> list:
             stops = routes.get(uid) or []
             pos = positions.get(uid)
             left_base = bool(pos) and _haversine(pos["lat"], pos["lon"], BASE_LAT, BASE_LON) > R_BASE_M
+            machine = []   # для расчёта риска смещения
             for s in stops:
                 order_no = s["order_no"]
                 info = await _ms_resolve(session, order_no)
@@ -247,8 +262,10 @@ async def run_check(db, bot=None, preview=False) -> list:
                 chk = db._fetchone("SELECT status FROM delivery_checklist WHERE demand_id=%s",
                                    (info["demand_id"],))
                 chk_status = (chk or {}).get("status")
-                target = _target_status(left_base=left_base, arrived=arrived, vt=s.get("vt"),
-                                        now_ts=now_ts, chk_status=chk_status)
+                real_window = _has_real_window(s.get("tf"), s.get("tt"))
+                machine.append({"s": s, "arrived": arrived, "real_window": real_window})
+                target = _target_status(left_base=left_base, arrived=arrived, tt=s.get("tt"),
+                                        now_ts=now_ts, chk_status=chk_status, real_window=real_window)
                 # трогаем только логистические статусы; ручные/бухгалтерские/терминальные — нет
                 if not target or cur not in MANAGED:
                     continue
@@ -256,30 +273,79 @@ async def run_check(db, bot=None, preview=False) -> list:
                     continue  # не понижаем
                 if target == cur:
                     continue
-                tag = f"{name} №{order_no} {s['client'][:24]}: {cur} → {target}"
-                lines.append(tag)
+                lines.append(f"{name} №{order_no} {s['client'][:24]}: {cur} → {target}")
                 if write:
                     meta = states.get(target)
                     if meta and await _ms_set_state(session, info["demand_id"], meta):
                         _st_upsert(db, order_no, ms_status=target, demand_id=info["demand_id"], unit_id=uid)
-                # Алерты по задержке
+                # Алерты по опозданию в РЕАЛЬНОЕ окно
                 if target == "Задержка в пути" and bot and not preview:
-                    vt = s.get("vt") or 0
-                    delay_min = (now_ts - vt) / 60 if vt else 0
-                    # +30 мин: владелец + логист (Белякова) + партнёр (Маланчук)
+                    tt = s.get("tt") or 0
+                    over = (now_ts - tt) / 60 if tt else 0
+                    # владелец + логист (Белякова) + партнёр (Маланчук)
                     if not st.get("delay_alerted"):
                         await _delay_alert(bot, name, s,
                                            [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()])
                         _st_upsert(db, order_no, delay_alerted=True,
                                    demand_id=info["demand_id"], unit_id=uid)
-                    # +60 мин: дополнительно менеджер
-                    if delay_min >= 60 and not st.get("delay_mgr_alerted"):
+                    # опоздание > 60 мин: дополнительно менеджер
+                    if over >= 60 and not st.get("delay_mgr_alerted"):
                         _tag, mgr = _manager_chat(info["agent_tags"])
                         if mgr:
                             await _delay_alert(bot, name, s, [mgr], over60=True)
                         _st_upsert(db, order_no, delay_mgr_alerted=True,
                                    demand_id=info["demand_id"], unit_id=uid)
+
+            # ── Риск смещения графика (машина отстаёт → угроза окнам следующих) ──
+            risk = _compute_risk(machine, now_ts)
+            if risk["lag_min"] >= RISK_LAG_MIN and risk["at_risk"]:
+                lines.append(f"{name}: РИСК смещения ~{risk['lag_min']} мин, под угрозой окон: {len(risk['at_risk'])}")
+                if bot and not preview:
+                    rkey = f"risk:{uid}:{datetime.now(_MSK).date().isoformat()}"
+                    if not (_st_get(db, rkey) or {}).get("delay_alerted"):
+                        await _risk_alert(bot, name, risk)
+                        _st_upsert(db, rkey, delay_alerted=True, unit_id=uid)
     return lines
+
+
+def _compute_risk(machine, now_ts):
+    """lag = насколько машина отстаёт (макс. по не прибывшим точкам с прошедшим планом);
+    at_risk = будущие точки с РЕАЛЬНЫМ окном, чьё окно ещё открыто, но сдвиг его срывает."""
+    lag_sec = 0
+    for m in machine:
+        vt = m["s"].get("vt")
+        if not m["arrived"] and vt and now_ts > vt:
+            lag_sec = max(lag_sec, now_ts - vt)
+    at_risk = []
+    for m in machine:
+        s = m["s"]
+        tt, vt = s.get("tt"), s.get("vt")
+        if m["arrived"] or not m["real_window"] or not tt or not vt:
+            continue
+        if now_ts < tt and (vt + lag_sec) > tt:
+            at_risk.append(s)
+    return {"lag_min": int(lag_sec / 60), "at_risk": at_risk}
+
+
+async def _risk_alert(bot, unit_name, risk):
+    def win(s):
+        tf, tt = s.get("tf"), s.get("tt")
+        if tf and tt:
+            return (datetime.fromtimestamp(tf, _MSK).strftime("%H:%M") + "–"
+                    + datetime.fromtimestamp(tt, _MSK).strftime("%H:%M"))
+        return "—"
+    rows = "\n".join(f"• {s['client'][:32]} (№{s['order_no']}) окно {win(s)}" for s in risk["at_risk"])
+    text = (f"⚠️ РИСК смещения графика\n{unit_name}\n"
+            f"Машина отстаёт ~{risk['lag_min']} мин от плана. Это не опоздание, но под угрозой окна:\n{rows}")
+    seen = set()
+    for cid in [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()]:
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.warning("_risk_alert → %s: %s", cid, e)
 
 
 async def _fetch_routes_via(session, sid):
@@ -296,6 +362,7 @@ async def _fetch_routes_via(session, sid):
         r = p.get("r") or {}
         routes[uid].append({
             "seq": r.get("i"), "vt": r.get("vt"),
+            "tf": o.get("tf"), "tt": o.get("tt"),
             "client": p.get("n") or "?", "order_no": o.get("n"),
             "lat": o.get("y"), "lon": o.get("x"),
         })
