@@ -37,6 +37,8 @@ R_BASE_M = 500       # «В пути» — удаление транспорта
 R_STOP_M = 300       # радиус «прибыл на точку»
 DELAY_BUFFER_MIN = 30
 RISK_LAG_MIN = 20          # отставание, при котором предупреждаем о риске смещения окон
+LAG_ALERT_MIN = 120        # отставание от плана ≥ этого (даже при плавающих окнах) → тревога
+LAG_ALERT_POINTS = 2       # ...и хотя бы столько непосещённых точек позади плана
 IDLE_MIN = 60              # простой: машина стоит на месте ≥ этого → тревога логисту
 IDLE_RADIUS_M = 150        # «на месте»: не отходит дальше этого от точки стоянки
 DELIVERY_HOURS = (7, 21)   # МСК, в эти часы крон активен
@@ -407,6 +409,16 @@ async def run_check(db, bot=None, preview=False) -> list:
                         await _risk_alert(bot, name, risk)
                         _st_upsert(db, rkey, delay_alerted=True, unit_id=uid)
 
+            # ── Отставание от плана ≥2ч по ≥2 точкам (ловит коллапс дня и при плавающих окнах) ──
+            behind = risk.get("behind") or []
+            if risk["lag_min"] >= LAG_ALERT_MIN and len(behind) >= LAG_ALERT_POINTS:
+                lines.append(f"{name}: ОТСТАВАНИЕ ~{risk['lag_min']} мин, точек позади плана: {len(behind)}")
+                if bot and not preview:
+                    lkey = f"lag:{uid}:{datetime.now(_MSK).date().isoformat()}"
+                    if not (_st_get(db, lkey) or {}).get("delay_alerted"):
+                        await _lag_alert(bot, name, risk["lag_min"], behind, now_ts)
+                        _st_upsert(db, lkey, delay_alerted=True, unit_id=uid)
+
             # ── Простой машины (стоит на месте ≥ IDLE_MIN, не база и не клиент) ──
             idle = _check_idle(db, uid, name, pos, stops, now_ts, preview)
             if idle:
@@ -421,10 +433,12 @@ def _compute_risk(machine, now_ts):
     """lag = насколько машина отстаёт (макс. по не прибывшим точкам с прошедшим планом);
     at_risk = будущие точки с РЕАЛЬНЫМ окном, чьё окно ещё открыто, но сдвиг его срывает."""
     lag_sec = 0
+    behind = []   # непосещённые точки, чьё плановое время уже прошло (двигают отставание)
     for m in machine:
         vt = m["s"].get("vt")
         if not m["arrived"] and vt and now_ts > vt:
             lag_sec = max(lag_sec, now_ts - vt)
+            behind.append(m["s"])
     at_risk = []
     for m in machine:
         s = m["s"]
@@ -433,7 +447,8 @@ def _compute_risk(machine, now_ts):
             continue
         if now_ts < tt and (vt + lag_sec) > tt:
             at_risk.append(s)
-    return {"lag_min": int(lag_sec / 60), "lag_sec": lag_sec, "at_risk": at_risk}
+    return {"lag_min": int(lag_sec / 60), "lag_sec": lag_sec,
+            "at_risk": at_risk, "behind": behind}
 
 
 async def _risk_alert(bot, unit_name, risk):
@@ -462,6 +477,29 @@ async def _risk_alert(bot, unit_name, risk):
             await bot.send_message(chat_id=cid, text=text)
         except Exception as e:
             logger.warning("_risk_alert → %s: %s", cid, e)
+
+
+async def _lag_alert(bot, unit_name, lag_min, behind, now_ts):
+    """Машина системно отстаёт от плана (даже при плавающих окнах) — день под угрозой."""
+    def line(s):
+        vt = s.get("vt")
+        plan = datetime.fromtimestamp(vt, _MSK).strftime("%H:%M") if vt else "—"
+        over = int((now_ts - vt) / 60) if vt else 0
+        return f"• {s['client'][:30]} (№{s['order_no']}) план {plan} — просрочено ~{over} мин"
+    rows = "\n".join(line(s) for s in behind)
+    text = (f"⏳ ОТСТАВАНИЕ ОТ ГРАФИКА\n{unit_name}\n"
+            f"Машина отстаёт от плана ~{lag_min} мин (≈{lag_min // 60} ч). "
+            f"Даже с плавающими окнами день под угрозой — все точки можно не успеть.\n"
+            f"Позади плана ({len(behind)}):\n{rows}")
+    seen = set()
+    for cid in [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()]:
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.warning("_lag_alert → %s: %s", cid, e)
 
 
 async def _fetch_routes_via(session, sid):
