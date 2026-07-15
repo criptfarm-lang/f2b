@@ -30,6 +30,9 @@ MAX_DIALOGUES_PER_BATCH = 20
 CONFIDENCE_THRESHOLD = 0.7
 PROMPT_VERSION = "digest-v1"
 
+AMO_SUBDOMAIN = os.getenv("AMO_SUBDOMAIN", "victorfishtobiz")
+_LEAD_URL = "https://" + AMO_SUBDOMAIN + ".amocrm.ru/leads/detail/{}"
+
 SIGNAL_TYPES = [
     "sla_miss",
     "missed_request",
@@ -242,6 +245,60 @@ async def _classify_batch(client: AsyncAnthropic, dialogues: list[dict]) -> list
     return signals
 
 
+async def _enrich_with_amocrm(signals: list[dict]) -> None:
+    """Дорезолвить по каждому чату сделку в amoCRM и ответственного менеджера.
+
+    Менеджер в Wazzup-сообщениях часто пуст (webhook для входящих не присылает
+    crmUserId — см. wazzup_classifier), поэтому «менеджер неизв.» в дайджесте —
+    это дыра разметки, а не отсутствие менеджера. Источник правды — кто
+    ОТВЕТСТВЕННЫЙ за сделку в amoCRM. Резолвим chat_id → contact → lead →
+    responsible и заодно кладём lead_id, чтобы дайджест давал ссылку в сделку.
+
+    Мутируем сигналы на месте: проставляем `lead_id`, и если manager_name пуст —
+    заполняем именем ответственного. Резолв — один раз на чат (кэш), не на сигнал.
+    """
+    try:
+        from wazzup_classifier import (
+            _resolve_amocrm_lead_id,
+            _resolve_amocrm_responsible,
+        )
+    except Exception as e:  # модуль/зависимость недоступны — дайджест без ссылок
+        logger.info("chat_digest: amoCRM-обогащение пропущено: %s", e)
+        return
+
+    # уникальные чаты + любое известное имя контакта для fallback-резолва по имени
+    chats: dict[str, str | None] = {}
+    for s in signals:
+        cid = s.get("chat_id")
+        if not cid:
+            continue
+        if cid not in chats or (not chats[cid] and s.get("contact_name")):
+            chats[cid] = s.get("contact_name")
+
+    async def _resolve(cid: str, contact_name: str | None):
+        lead_id = await _resolve_amocrm_lead_id(cid, contact_name)
+        _, resp_name = await _resolve_amocrm_responsible(lead_id)
+        return cid, lead_id, resp_name
+
+    resolved = await asyncio.gather(
+        *[_resolve(cid, name) for cid, name in chats.items()],
+        return_exceptions=True,
+    )
+    by_chat: dict[str, tuple] = {}
+    for r in resolved:
+        if isinstance(r, Exception):
+            continue
+        cid, lead_id, resp_name = r
+        by_chat[cid] = (lead_id, resp_name)
+
+    for s in signals:
+        lead_id, resp_name = by_chat.get(s.get("chat_id"), (None, None))
+        if lead_id:
+            s["lead_id"] = lead_id
+        if not s.get("manager_name") and resp_name:
+            s["manager_name"] = resp_name
+
+
 async def analyze(db, hours: int = 24) -> list[dict]:
     """Прогнать сутки переписок → список обогащённых сигналов."""
     dialogues = fetch_dialogues(db, hours=hours)
@@ -260,6 +317,7 @@ async def analyze(db, hours: int = 24) -> list[dict]:
 
     results = await asyncio.gather(*[_run(b) for b in batches])
     signals = [s for batch in results for s in batch]
+    await _enrich_with_amocrm(signals)
     logger.info(
         "chat_digest: %d диалогов, %d батчей, %d сигналов",
         len(dialogues), len(batches), len(signals),
@@ -280,6 +338,7 @@ CREATE TABLE IF NOT EXISTS chat_signals (
     company TEXT,
     contact_name TEXT,
     confidence REAL,
+    lead_id BIGINT,
     occurred_day DATE NOT NULL DEFAULT (NOW() AT TIME ZONE 'Europe/Moscow')::date,
     semantic_key TEXT,
     prompt_version TEXT,
@@ -302,21 +361,22 @@ def save_signals(db, signals: list[dict]) -> int:
     if not signals:
         return 0
     db._execute(CREATE_SIGNALS_TABLE)
+    db._execute("ALTER TABLE chat_signals ADD COLUMN IF NOT EXISTS lead_id BIGINT")
     inserted = 0
     for s in signals:
         res = db._execute(
             """INSERT INTO chat_signals
                  (chat_id, signal_type, severity, summary, quote, manager,
-                  company, contact_name, confidence, semantic_key,
+                  company, contact_name, confidence, lead_id, semantic_key,
                   prompt_version, model_id)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (chat_id, signal_type, occurred_day, semantic_key)
                DO NOTHING""",
             (
                 s.get("chat_id"), s["type"], s.get("severity"), s.get("summary"),
                 s.get("quote"), s.get("manager_name"), s.get("company_name"),
-                s.get("contact_name"), s.get("confidence"), _semantic_key(s),
-                PROMPT_VERSION, MODEL,
+                s.get("contact_name"), s.get("confidence"), s.get("lead_id"),
+                _semantic_key(s), PROMPT_VERSION, MODEL,
             ),
         )
         # psycopg2 rowcount доступен через _execute? если нет — считаем оптимистично
@@ -357,7 +417,13 @@ def render_digest(signals: list[dict], day_label: str = "за сутки") -> st
         for s in group:
             who = s.get("company_name") or s.get("contact_name") or "клиент неизв."
             mgr = s.get("manager_name") or "менеджер неизв."
-            lines.append(f"• {who} — {mgr}")
+            head = f"{who} — {mgr}"
+            lead_id = s.get("lead_id")
+            if lead_id:
+                # markdown-ссылка → провал прямо в карточку сделки amoCRM
+                lines.append(f"• [{head}]({_LEAD_URL.format(lead_id)})")
+            else:
+                lines.append(f"• {head}")
             lines.append(f"  {s.get('summary','')}")
             if s.get("quote"):
                 lines.append(f"  _«{s['quote'][:160]}»_")
