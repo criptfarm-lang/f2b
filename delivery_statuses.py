@@ -8,8 +8,9 @@
                           • ФАКТ: конец окна уже прошёл, а машина не доехала (по GPS);
                           • ПРОГНОЗ: план точки + текущее отставание машины перепрыгивают
                             конец окна (знаем о задержке заранее, до конца окна).
-                          Персональный пуш логисту/менеджеру/собственнику — по факту;
-                          прогноз собственник видит риск-алертом «РИСК смещения».
+                          При смене статуса на «Задержка» → уведомление владелец+Белякова+
+                          Маланчук (одно на машину за прогон, список точек, прогноз ИЛИ факт).
+                          Менеджеру — отдельно, по ФАКТУ опоздания > 60 мин.
   - «Сдан»/«Сдан с проблемой» — из чеклиста водителя (событийно, см. driver_checklist).
 
 ⚠️ ЗАПИСЬ В МОЙСКЛАД. По умолчанию СУХОЙ режим (только лог): включается env
@@ -40,7 +41,6 @@ BASE_LAT, BASE_LON = 55.6323, 38.1038
 R_BASE_M = 500       # «В пути» — удаление транспорта на 500 м от склада (спека собственника)
 R_STOP_M = 300       # радиус «прибыл на точку»
 DELAY_BUFFER_MIN = 30
-RISK_LAG_MIN = 20          # отставание, при котором предупреждаем о риске смещения окон
 LAG_ALERT_MIN = 120        # отставание от плана ≥ этого (даже при плавающих окнах) → тревога
 LAG_ALERT_POINTS = 2       # ...и хотя бы столько непосещённых точек позади плана
 IDLE_MIN = 60              # простой: машина стоит на месте ≥ этого → тревога логисту
@@ -373,6 +373,7 @@ async def run_check(db, bot=None, preview=False) -> list:
             # Отставание машины считаем ПО ВСЕМ точкам — нужно для прогнозной «Задержки в пути»
             # (точка получает статус до конца окна, если план + отставание перепрыгивают окно).
             lag_sec = _machine_lag(machine, now_ts)
+            delay_flips = []   # точки, чей статус в этом прогоне стал «Задержка в пути»
 
             for rec in recs:
                 s, order_no, info = rec["s"], rec["order_no"], rec["info"]
@@ -414,35 +415,36 @@ async def run_check(db, bot=None, preview=False) -> list:
                             await _write_fail_alert(bot, name, order_no, s.get("client"), cur, target, bool(meta))
                             _st_upsert(db, order_no, write_fail_target=target,
                                        demand_id=info["demand_id"], unit_id=uid)
-                # Персональный пуш по опозданию — ТОЛЬКО по факту (конец окна прошёл).
-                # Прогнозную задержку собственник и так видит риск-алертом ниже — не дублируем.
+                # Смена статуса на «Задержка в пути» → уведомление владелец+Белякова+Маланчук.
+                # Копим по машине, шлём одним сообщением ниже. Триггер — сам факт смены статуса
+                # (прогноз ИЛИ факт), один раз на заказ (дедуп delay_alerted).
                 tt = s.get("tt") or 0
-                if target == "Задержка в пути" and now_ts > tt and bot and not preview:
-                    over = (now_ts - tt) / 60 if tt else 0
-                    # владелец + логист (Белякова) + партнёр (Маланчук)
-                    if not st.get("delay_alerted"):
-                        await _delay_alert(bot, name, s,
-                                           [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()],
-                                           status_written=wrote_ok)
-                        _st_upsert(db, order_no, delay_alerted=True,
-                                   demand_id=info["demand_id"], unit_id=uid)
-                    # опоздание > 60 мин: дополнительно менеджер
-                    if over >= 60 and not st.get("delay_mgr_alerted"):
+                if target == "Задержка в пути" and not st.get("delay_alerted"):
+                    delay_flips.append({"s": s, "order_no": order_no, "demand_id": info["demand_id"]})
+                # Опоздание > 60 мин ПО ФАКТУ — дополнительно ответственному менеджеру.
+                if (target == "Задержка в пути" and now_ts > tt and (now_ts - tt) / 60 >= 60
+                        and not st.get("delay_mgr_alerted")):
+                    if bot and not preview:
                         _tag, mgr = _manager_chat(info["agent_tags"])
                         if mgr:
                             await _delay_alert(bot, name, s, [mgr], over60=True)
                         _st_upsert(db, order_no, delay_mgr_alerted=True,
                                    demand_id=info["demand_id"], unit_id=uid)
 
-            # ── Риск смещения графика (машина отстаёт → угроза окнам следующих) ──
-            risk = _compute_risk(machine, now_ts)
-            if risk["lag_min"] >= RISK_LAG_MIN and risk["at_risk"]:
-                lines.append(f"{name}: РИСК смещения ~{risk['lag_min']} мин, под угрозой окон: {len(risk['at_risk'])}")
+            # ── Уведомление о смене статуса на «Задержка в пути» ──
+            # Владелец + Белякова + Маланчук: одно сообщение на машину за прогон, список точек.
+            if delay_flips:
+                lines.append(f"{name}: уведомление о задержке — точек: {len(delay_flips)}")
                 if bot and not preview:
-                    rkey = f"risk:{uid}:{datetime.now(_MSK).date().isoformat()}"
-                    if not (_st_get(db, rkey) or {}).get("delay_alerted"):
-                        await _risk_alert(bot, name, risk)
-                        _st_upsert(db, rkey, delay_alerted=True, unit_id=uid)
+                    await _delay_flip_alert(bot, name, [d["s"] for d in delay_flips], lag_sec, now_ts,
+                                            [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()])
+                if not preview:
+                    for d in delay_flips:
+                        _st_upsert(db, d["order_no"], delay_alerted=True,
+                                   demand_id=d["demand_id"], unit_id=uid)
+
+            # ── Отставание от плана (для лаг-алерта ниже; риск-алерт заменён уведомлением выше) ──
+            risk = _compute_risk(machine, now_ts)
 
             # ── Отставание от плана ≥2ч по ≥2 точкам (ловит коллапс дня и при плавающих окнах) ──
             behind = risk.get("behind") or []
@@ -495,32 +497,33 @@ def _compute_risk(machine, now_ts):
             "at_risk": at_risk, "behind": behind}
 
 
-async def _risk_alert(bot, unit_name, risk):
-    lag_sec = risk.get("lag_sec", 0)
+async def _delay_flip_alert(bot, unit_name, stops, lag_sec, now_ts, recipients):
+    """Уведомление владелец+Белякова+Маланчук: у этих точек статус стал «Задержка в пути»
+    (прогноз ИЛИ факт). Одно сообщение на машину за прогон."""
+    def _hm(t):
+        return datetime.fromtimestamp(t, _MSK).strftime("%H:%M") if t else "—"
 
     def line(s):
         tf, tt, vt = s.get("tf"), s.get("tt"), s.get("vt")
-        win = "—"
-        if tf and tt:
-            win = (datetime.fromtimestamp(tf, _MSK).strftime("%H:%M") + "–"
-                   + datetime.fromtimestamp(tt, _MSK).strftime("%H:%M"))
-        plan = datetime.fromtimestamp(vt, _MSK).strftime("%H:%M") if vt else "—"
-        proj = datetime.fromtimestamp(vt + lag_sec, _MSK).strftime("%H:%M") if vt else "—"
+        win = f"{_hm(tf)}–{_hm(tt)}" if tf and tt else "—"
+        proj = _hm(vt + lag_sec) if vt else "—"
+        tail = ""
+        if tt and now_ts > tt:                    # окно уже прошло (факт)
+            tail = f" — уже просрочено ~{int((now_ts - tt) / 60)} мин"
         return (f"• {s['client'][:30]} (№{s['order_no']}) окно {win}\n"
-                f"   план {plan} → ожидается ~{proj} (+{int(lag_sec / 60)} мин)")
-    rows = "\n".join(line(s) for s in risk["at_risk"])
-    text = (f"⚠️ РИСК смещения графика\n{unit_name}\n"
-            f"Машина отстаёт ~{risk['lag_min']} мин от плана — не опоздание, но сдвигает следующие точки.\n"
-            f"Под угрозой окна:\n{rows}")
+                f"   план {_hm(vt)} → ожидается ~{proj}{tail}")
+    rows = "\n".join(line(s) for s in stops)
+    text = (f"⏱ Статус → «Задержка в пути»\n{unit_name} отстаёт ~{int(lag_sec / 60)} мин от плана.\n"
+            f"Не укладываемся в окно приёмки:\n{rows}")
     seen = set()
-    for cid in [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()]:
+    for cid in recipients:
         if not cid or cid in seen:
             continue
         seen.add(cid)
         try:
             await bot.send_message(chat_id=cid, text=text)
         except Exception as e:
-            logger.warning("_risk_alert → %s: %s", cid, e)
+            logger.warning("_delay_flip_alert → %s: %s", cid, e)
 
 
 async def _write_fail_alert(bot, unit_name, order_no, client, cur, target, has_meta):
