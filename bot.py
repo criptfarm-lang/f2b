@@ -7596,6 +7596,11 @@ def main():
         route_registry.register(app)
     except Exception as e:
         logger.error(f"route_registry.register упал: {e}")
+    try:
+        import delivery_statuses
+        delivery_statuses.register(app, db)
+    except Exception as e:
+        logger.error(f"delivery_statuses.register упал: {e}")
 
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))

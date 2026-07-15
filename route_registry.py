@@ -84,6 +84,8 @@ async def fetch_routes() -> dict:
             "address": p.get("a") or "",
             "phone": p.get("p") or "",
             "order_no": o.get("n"),
+            "lat": o.get("y"),
+            "lon": o.get("x"),
         })
     for uid in routes:
         routes[uid].sort(key=lambda s: (s["seq"] if s["seq"] is not None else 999))
