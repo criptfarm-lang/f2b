@@ -4,8 +4,12 @@
 По маршруту Wialon + live-позициям машин + чеклисту водителя автоматически
 проставляет статус отгрузки в МойСклад:
   - «В пути»            — машина выехала из геозоны базы (Ильинский);
-  - «Задержка в пути»   — сейчас > план (p.r.vt) + 30 мин, а машина ещё не доехала
-                          (по GPS) → + алерт логисту/менеджеру/собственнику;
+  - «Задержка в пути»   — по РЕАЛЬНОМУ окну приёмки, в двух случаях:
+                          • ФАКТ: конец окна уже прошёл, а машина не доехала (по GPS);
+                          • ПРОГНОЗ: план точки + текущее отставание машины перепрыгивают
+                            конец окна (знаем о задержке заранее, до конца окна).
+                          Персональный пуш логисту/менеджеру/собственнику — по факту;
+                          прогноз собственник видит риск-алертом «РИСК смещения».
   - «Сдан»/«Сдан с проблемой» — из чеклиста водителя (событийно, см. driver_checklist).
 
 ⚠️ ЗАПИСЬ В МОЙСКЛАД. По умолчанию СУХОЙ режим (только лог): включается env
@@ -294,10 +298,13 @@ def _has_real_window(tf, tt) -> bool:
     return True
 
 
-def _target_status(*, left_base, arrived, tt, now_ts, chk_status, real_window):
+def _target_status(*, left_base, arrived, tt, vt, now_ts, lag_sec, chk_status, real_window):
     """chk_status — статус из delivery_checklist (сдан/сдан с проблемой) или None.
-    «Задержка в пути» — ТОЛЬКО опоздание в РЕАЛЬНОЕ окно (прошёл конец окна `tt`).
-    Плавающее окно — не опоздание (см. риск смещения отдельно)."""
+    «Задержка в пути» — по РЕАЛЬНОМУ окну, в двух случаях:
+      • ФАКТ: конец окна `tt` уже прошёл (now_ts > tt);
+      • ПРОГНОЗ: план точки `vt` + текущее отставание машины `lag_sec` перепрыгивает
+        конец окна — знаем о задержке заранее, не дожидаясь конца окна.
+    Плавающее окно (09:00–18:00, дефолт моста) — не опоздание."""
     if chk_status == "сдан с проблемой":
         return "Сдан с проблемой"
     if chk_status == "сдан":
@@ -306,8 +313,11 @@ def _target_status(*, left_base, arrived, tt, now_ts, chk_status, real_window):
         return None                      # ещё на базе — не трогаем «Отгружен»
     if arrived:
         return "В пути"                  # приехал, ждём чеклист
-    if real_window and tt and now_ts > tt:
-        return "Задержка в пути"         # реальное окно нарушено
+    if real_window and tt:
+        if now_ts > tt:
+            return "Задержка в пути"      # реальное окно нарушено (факт)
+        if vt and (vt + lag_sec) > tt:
+            return "Задержка в пути"      # прогноз прибытия за концом окна
     return "В пути"
 
 
@@ -335,13 +345,13 @@ async def run_check(db, bot=None, preview=False) -> list:
             stops = routes.get(uid) or []
             pos = positions.get(uid)
             left_base = bool(pos) and _haversine(pos["lat"], pos["lon"], BASE_LAT, BASE_LON) > R_BASE_M
-            machine = []   # для расчёта риска смещения
+            machine = []   # для расчёта отставания / риска смещения
+            recs = []      # разрешённые точки (МС + прибытие + чеклист) — решаем статус вторым проходом
             for s in stops:
                 order_no = s["order_no"]
                 info = await _ms_resolve(session, order_no)
                 if not info or not info["demand_id"]:
                     continue
-                cur = info["state_name"]
                 st = _st_get(db, order_no) or {}
                 # прибытие
                 arrived = bool(st.get("arrived"))
@@ -356,8 +366,21 @@ async def run_check(db, bot=None, preview=False) -> list:
                 chk_status = (chk or {}).get("status")
                 real_window = _has_real_window(s.get("tf"), s.get("tt"))
                 machine.append({"s": s, "arrived": arrived, "real_window": real_window})
-                target = _target_status(left_base=left_base, arrived=arrived, tt=s.get("tt"),
-                                        now_ts=now_ts, chk_status=chk_status, real_window=real_window)
+                recs.append({"s": s, "order_no": order_no, "info": info, "cur": info["state_name"],
+                             "st": st, "arrived": arrived, "chk_status": chk_status,
+                             "real_window": real_window})
+
+            # Отставание машины считаем ПО ВСЕМ точкам — нужно для прогнозной «Задержки в пути»
+            # (точка получает статус до конца окна, если план + отставание перепрыгивают окно).
+            lag_sec = _machine_lag(machine, now_ts)
+
+            for rec in recs:
+                s, order_no, info = rec["s"], rec["order_no"], rec["info"]
+                cur, st = rec["cur"], rec["st"]
+                target = _target_status(left_base=left_base, arrived=rec["arrived"],
+                                        tt=s.get("tt"), vt=s.get("vt"), now_ts=now_ts,
+                                        lag_sec=lag_sec, chk_status=rec["chk_status"],
+                                        real_window=rec["real_window"])
                 # Розничная касса: после «Сдан» + полная оплата → «Оплачен» (наличные привязаны
                 # к заказу, payedSum достоверен только для розницы; банк-клиентов не трогаем).
                 if (cur == "Сдан" and _is_retail(info.get("agent_name"))
@@ -391,9 +414,10 @@ async def run_check(db, bot=None, preview=False) -> list:
                             await _write_fail_alert(bot, name, order_no, s.get("client"), cur, target, bool(meta))
                             _st_upsert(db, order_no, write_fail_target=target,
                                        demand_id=info["demand_id"], unit_id=uid)
-                # Алерты по опозданию в РЕАЛЬНОЕ окно
-                if target == "Задержка в пути" and bot and not preview:
-                    tt = s.get("tt") or 0
+                # Персональный пуш по опозданию — ТОЛЬКО по факту (конец окна прошёл).
+                # Прогнозную задержку собственник и так видит риск-алертом ниже — не дублируем.
+                tt = s.get("tt") or 0
+                if target == "Задержка в пути" and now_ts > tt and bot and not preview:
                     over = (now_ts - tt) / 60 if tt else 0
                     # владелец + логист (Белякова) + партнёр (Маланчук)
                     if not st.get("delay_alerted"):
@@ -440,15 +464,24 @@ async def run_check(db, bot=None, preview=False) -> list:
     return lines
 
 
-def _compute_risk(machine, now_ts):
-    """lag = насколько машина отстаёт (макс. по не прибывшим точкам с прошедшим планом);
-    at_risk = будущие точки с РЕАЛЬНЫМ окном, чьё окно ещё открыто, но сдвиг его срывает."""
+def _machine_lag(machine, now_ts) -> int:
+    """Отставание машины, сек = макс. по не прибывшим точкам, чей план (`vt`) уже прошёл."""
     lag_sec = 0
-    behind = []   # непосещённые точки, чьё плановое время уже прошло (двигают отставание)
     for m in machine:
         vt = m["s"].get("vt")
         if not m["arrived"] and vt and now_ts > vt:
             lag_sec = max(lag_sec, now_ts - vt)
+    return lag_sec
+
+
+def _compute_risk(machine, now_ts):
+    """lag = насколько машина отстаёт (макс. по не прибывшим точкам с прошедшим планом);
+    at_risk = будущие точки с РЕАЛЬНЫМ окном, чьё окно ещё открыто, но сдвиг его срывает."""
+    lag_sec = _machine_lag(machine, now_ts)
+    behind = []   # непосещённые точки, чьё плановое время уже прошло (двигают отставание)
+    for m in machine:
+        vt = m["s"].get("vt")
+        if not m["arrived"] and vt and now_ts > vt:
             behind.append(m["s"])
     at_risk = []
     for m in machine:
