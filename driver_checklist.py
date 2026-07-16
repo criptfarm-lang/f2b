@@ -80,6 +80,18 @@ def _is_driver(chat_id: int) -> bool:
     return chat_id in _driver_chat_ids()
 
 
+def _driver_unit_id(chat_id: int):
+    """Юнит Wialon, закреплённый за водителем (drivers.unit_id). None → фильтра нет."""
+    if _DB is None or not chat_id:
+        return None
+    try:
+        r = _DB._fetchone("SELECT unit_id FROM drivers WHERE chat_id=%s AND active", (chat_id,))
+        return int(r["unit_id"]) if r and r.get("unit_id") else None
+    except Exception as e:
+        logger.warning("driver unit_id read: %s", e)
+        return None
+
+
 # ─── Схема БД ────────────────────────────────────────────────────────────────
 
 def ensure_schema(db):
@@ -118,6 +130,9 @@ def ensure_schema(db):
             added_at  TIMESTAMPTZ DEFAULT now()
         )
     """)
+    # unit_id — юнит Wialon (26209/26210), чтобы /рейс показывал водителю ТОЛЬКО его машину.
+    # NULL → водитель видит полный список дня (фолбэк).
+    db._execute("ALTER TABLE drivers ADD COLUMN IF NOT EXISTS unit_id BIGINT")
     logger.info("delivery_checklist: схема готова")
 
 
@@ -278,10 +293,60 @@ async def cmd_reis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_driver(user.id):
         await update.message.reply_text("⛔ Команда доступна водителям развозки.")
         return
-    await _render_points(update.message.reply_text, page=0)
+    await _render_points(update.message.reply_text, page=0, driver_id=user.id)
 
 
-async def _render_points(send, page: int):
+def _nav_row(page: int, pages: int):
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("« Назад", callback_data=f"drv:pg:{page-1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Далее »", callback_data=f"drv:pg:{page+1}"))
+    return nav
+
+
+async def _render_points(send, page: int, driver_id: int = None):
+    # Если за водителем закреплён юнит (drivers.unit_id) и на сегодня есть маршрут —
+    # показываем ТОЛЬКО его машину в порядке выгрузки. Иначе — полный список дня (фолбэк).
+    unit_id = _driver_unit_id(driver_id) if driver_id else None
+    route_stops = None
+    if unit_id:
+        try:
+            import route_registry as rr
+            routes = await rr.fetch_routes()
+            today = datetime.now(_MSK).date()
+            def _stop_today(s):
+                ref = s.get("tf") or s.get("vt") or s.get("tt")
+                if not ref:
+                    return True
+                return datetime.fromtimestamp(ref, _MSK).date() == today
+            route_stops = sorted(
+                [s for s in (routes.get(unit_id) or []) if _stop_today(s)],
+                key=lambda s: (s.get("seq") if s.get("seq") is not None else 999))
+        except Exception as e:
+            logger.warning("route filter упал, фолбэк на полный список: %s", e)
+            route_stops = None
+
+    if route_stops:
+        import route_registry as rr
+        total = len(route_stops)
+        pages = (total + _PAGE_SIZE - 1) // _PAGE_SIZE
+        page = max(0, min(page, pages - 1))
+        chunk = route_stops[page * _PAGE_SIZE:(page + 1) * _PAGE_SIZE]
+        buttons = []
+        for i, s in enumerate(chunk, start=page * _PAGE_SIZE + 1):
+            title = (s.get("client") or s.get("order_no") or "?")[:40]
+            buttons.append([InlineKeyboardButton(
+                f"📍 {i}. {title}", callback_data=f"drv:rp:{s['order_no']}")])
+        nav = _nav_row(page, pages)
+        if nav:
+            buttons.append(nav)
+        unit_name = rr.UNITS.get(unit_id, "")
+        text = (f"🚚 Твой маршрут ({unit_name}) — {total} точек, порядок выгрузки. "
+                f"Стр. {page+1}/{pages}.\nВыбери точку, куда приехал:")
+        await send(text, reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
     demands = await _fetch_today_demands()
     if not demands:
         await send("На сегодня отгрузок нет.")
@@ -296,11 +361,7 @@ async def _render_points(send, page: int):
         title = (d["agent_name"] or d["name"] or "?")[:45]
         buttons.append([InlineKeyboardButton(f"📍 {title}", callback_data=f"drv:pick:{d['id']}")])
 
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("« Назад", callback_data=f"drv:pg:{page-1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton("Далее »", callback_data=f"drv:pg:{page+1}"))
+    nav = _nav_row(page, pages)
     if nav:
         buttons.append(nav)
 
@@ -312,7 +373,8 @@ async def cb_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     page = int(q.data.split(":")[2])
-    await _render_points(lambda *a, **k: q.edit_message_text(*a, **k), page=page)
+    await _render_points(lambda *a, **k: q.edit_message_text(*a, **k),
+                         page=page, driver_id=q.from_user.id)
 
 
 # ─── Экран: карточка точки ───────────────────────────────────────────────────
@@ -347,6 +409,19 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     demand_id = q.data.split(":", 2)[2]
+    await _render_card(q.edit_message_text, demand_id, context.bot_data["db"])
+
+
+async def cb_route_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор точки из маршрута машины: callback несёт № заказа → резолвим в отгрузку."""
+    q = update.callback_query
+    await q.answer()
+    order_no = q.data.split(":", 2)[2]
+    demand_id = await _resolve_deeplink_payload(order_no)
+    if not demand_id:
+        await q.edit_message_text(
+            f"По точке №{order_no} отгрузка ещё не создана. Открой список: /рейс")
+        return
     await _render_card(q.edit_message_text, demand_id, context.bot_data["db"])
 
 
@@ -822,6 +897,7 @@ def register(app: Application, db):
 
     app.add_handler(CallbackQueryHandler(cb_page, pattern=r"^drv:pg:"))
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^drv:pick:"))
+    app.add_handler(CallbackQueryHandler(cb_route_pick, pattern=r"^drv:rp:"))
     app.add_handler(CallbackQueryHandler(cb_qr, pattern=r"^drv:qr:"))
     app.add_handler(CallbackQueryHandler(cb_arrive, pattern=r"^drv:arrive:"))
     app.add_handler(CallbackQueryHandler(cb_money, pattern=r"^drv:money:"))
