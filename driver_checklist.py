@@ -17,6 +17,7 @@
 
 import os
 import io
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -39,6 +40,11 @@ _SAMPLE_MAX_PRICE_RUB = 1.0
 _RETAIL_PREFIX = "Розничный покупатель"
 # Сколько точек на странице списка.
 _PAGE_SIZE = 8
+# Доп.поле заказа МС с пунктами-поручениями водителю (Фаза 7). Тип text, одна задача в строке.
+_CHECKLIST_ATTR_NAME = "Чек-лист водителя"
+# Максимум пунктов на точку (защита от мусорного ввода) и длина одного пункта.
+_MAX_ITEMS = 12
+_MAX_ITEM_LEN = 200
 
 
 # ─── Конфиг получателей (env, с дефолтами) ──────────────────────────────────
@@ -133,6 +139,9 @@ def ensure_schema(db):
     # unit_id — юнит Wialon (26209/26210), чтобы /рейс показывал водителю ТОЛЬКО его машину.
     # NULL → водитель видит полный список дня (фолбэк).
     db._execute("ALTER TABLE drivers ADD COLUMN IF NOT EXISTS unit_id BIGINT")
+    # custom_items — пункты чек-листа из доп.поля заказа «Чек-лист водителя» (Фаза 7).
+    # Массив [{idx, text, answer}]; answer: true/false/null (ещё не отвечено).
+    db._execute("ALTER TABLE delivery_checklist ADD COLUMN IF NOT EXISTS custom_items JSONB DEFAULT '[]'::jsonb")
     logger.info("delivery_checklist: схема готова")
 
 
@@ -204,7 +213,7 @@ async def _fetch_demand_detail(demand_id: str) -> dict:
     async with aiohttp.ClientSession() as session:
         async with session.get(
             f"{MS_BASE}/entity/demand/{demand_id}",
-            headers=headers, params={"expand": "agent"},
+            headers=headers, params={"expand": "agent,customerOrder"},
         ) as r:
             if r.status != 200:
                 return {}
@@ -223,6 +232,13 @@ async def _fetch_demand_detail(demand_id: str) -> dict:
         qty = p.get("quantity", 0) or 0
         pr = (p.get("price", 0) or 0) / 100
         lines.append(f"• {nm} — {qty:g} × {pr:,.0f}".replace(",", " "))
+    # Пункты чек-листа лежат на ЗАКАЗЕ (customerorder.attributes), не на отгрузке.
+    co = d.get("customerOrder") or {}
+    checklist_raw = None
+    for a in co.get("attributes", []) or []:
+        if a.get("name") == _CHECKLIST_ATTR_NAME:
+            checklist_raw = a.get("value")
+            break
     return {
         "agent_id": ag.get("id"),
         "agent_name": ag.get("name"),
@@ -231,6 +247,7 @@ async def _fetch_demand_detail(demand_id: str) -> dict:
         "name": d.get("name"),
         "max_price_rub": max(prices) if prices else 0,
         "positions_text": "\n".join(lines),
+        "checklist_raw": checklist_raw,
     }
 
 
@@ -252,6 +269,47 @@ async def _fetch_agent_tags(agent_id: str) -> list:
 
 def _is_retail(agent_name: str) -> bool:
     return bool(agent_name) and agent_name.strip().startswith(_RETAIL_PREFIX)
+
+
+# Ведущая нумерация пункта: «1. », «2) », «3 -» → срезаем, оставляем текст задачи.
+_NUM_PREFIX_RE = _re.compile(r"^\s*\d+\s*[.)\-]\s*")
+# Денежный пункт: для розницы деньги уже спрашиваем авто-шагом → не дублируем вопросом.
+_MONEY_RE = _re.compile(r"налич|деньг", _re.IGNORECASE)
+
+
+def _parse_checklist_items(raw, money_required: bool = False) -> list:
+    """Доп.поле «Чек-лист водителя» → список пунктов (по строке на пункт).
+    Срезает ведущую нумерацию и лишние пробелы. Для розницы (money_required)
+    отбрасывает «наличные/деньги» — их закрывает авто-шаг про деньги."""
+    items = []
+    for ln in (raw or "").splitlines():
+        t = _NUM_PREFIX_RE.sub("", ln).strip()
+        t = _re.sub(r"\s{2,}", " ", t)
+        if not t:
+            continue
+        if money_required and _MONEY_RE.search(t):
+            continue
+        items.append(t[:_MAX_ITEM_LEN])
+        if len(items) >= _MAX_ITEMS:
+            break
+    return items
+
+
+def _money_required(det) -> bool:
+    """Розничная касса, не образец, сумма > 0 → водитель забирает деньги (авто-шаг)."""
+    is_sample = (det.get("max_price_rub", 0) or 0) <= _SAMPLE_MAX_PRICE_RUB
+    return _is_retail(det.get("agent_name")) and (not is_sample) and (det.get("sum_rub", 0) or 0) > 0
+
+
+def _load_items(row) -> list:
+    """custom_items из строки БД (psycopg2 может вернуть list или str)."""
+    items = (row or {}).get("custom_items") or []
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except Exception:
+            items = []
+    return items
 
 
 def _fmt_rub(v) -> str:
@@ -405,6 +463,10 @@ async def _render_card(send, demand_id: str, db, with_back: bool = True):
     ]
     if det.get("positions_text"):
         lines.append("\n" + det["positions_text"])
+    preview = _parse_checklist_items(det.get("checklist_raw"), _money_required(det))
+    if preview:
+        lines.append("\n📋 Чек-лист водителю:")
+        lines.extend(f"• {t}" for t in preview)
     rows = [
         [InlineKeyboardButton("📍 Прибыл — начать сдачу", callback_data=f"drv:arrive:{demand_id}")],
         [InlineKeyboardButton("🔳 QR точки", callback_data=f"drv:qr:{demand_id}")],
@@ -548,22 +610,30 @@ async def cb_arrive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mtag, _mchat = await _resolve_manager_chat(det.get("agent_id"))
     _, _, snap = _msk_today_bounds()
 
+    # Пункты чек-листа из доп.поля заказа (Фаза 7). Фиксируем на момент прибытия.
+    items = [
+        {"idx": i, "text": t, "answer": None}
+        for i, t in enumerate(_parse_checklist_items(det.get("checklist_raw"), money_required))
+    ]
+    items_json = json.dumps(items, ensure_ascii=False)
+
     # upsert
     db._execute("""
         INSERT INTO delivery_checklist
           (demand_id, demand_name, agent_id, agent_name, address, sum_rub,
            is_retail, is_sample, money_required, manager_tag, driver_chat_id,
-           snap_date, stage, arrived_at, updated_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now(), now())
+           snap_date, stage, custom_items, arrived_at, updated_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now(), now())
         ON CONFLICT (demand_id) DO UPDATE SET
            driver_chat_id = EXCLUDED.driver_chat_id,
            money_required = EXCLUDED.money_required,
            stage = EXCLUDED.stage,
+           custom_items = EXCLUDED.custom_items,
            updated_at = now()
     """, (
         demand_id, det.get("name"), det.get("agent_id"), det.get("agent_name"),
         det.get("address"), det.get("sum_rub"), is_retail, is_sample, money_required,
-        mtag, driver_id, snap, "money" if money_required else "doc",
+        mtag, driver_id, snap, "money" if money_required else "doc", items_json,
     ))
 
     if money_required:
@@ -612,11 +682,67 @@ async def cb_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, _, val, demand_id = q.data.split(":", 3)
     db = context.bot_data["db"]
     signed = (val == "yes")
-    _set_fields(db, demand_id, doc_signed=signed, stage="accept")
+    _set_fields(db, demand_id, doc_signed=signed)
     if not signed:
         row = _get_row(db, demand_id)
         await _signal_logist(context, row, "✍️ документ НЕ подписан")
+    await _ask_next_item_or_accept(q, db, demand_id)
+
+
+# ─── Пункты чек-листа из заказа (Фаза 7) ─────────────────────────────────────
+
+async def _ask_item(q, demand_id, item):
+    kb = [[InlineKeyboardButton("✅ Да", callback_data=f"drv:item:yes:{item['idx']}:{demand_id}"),
+           InlineKeyboardButton("❌ Нет", callback_data=f"drv:item:no:{item['idx']}:{demand_id}")]]
+    await q.edit_message_text(
+        f"📋 {item['text']}\n\nВыполнено?",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+async def _ask_next_item_or_accept(q, db, demand_id):
+    """Первый неотвеченный пункт → вопрос; если пунктов не осталось → приёмка."""
+    row = _get_row(db, demand_id)
+    for it in _load_items(row):
+        if it.get("answer") is None:
+            _set_fields(db, demand_id, stage=f"item:{it['idx']}")
+            await _ask_item(q, demand_id, it)
+            return
+    _set_fields(db, demand_id, stage="accept")
     await _ask_accept(q, demand_id)
+
+
+async def _signal_item_not_done(context, row, text: str):
+    """«Нет» по пункту → сигнал логисту + ответственному менеджеру (по тегу)."""
+    if not row:
+        return
+    tag = (row.get("manager_tag") or "").strip().lower()
+    mgr_chat = PDZ_MANAGER_TG_IDS.get(tag)
+    msg = f"🚚 Сдача груза — пункт НЕ выполнен\n{_point_head(row)}\n\n📋 {text}"
+    if row.get("manager_tag"):
+        msg += f"\nМенеджер: {row.get('manager_tag')}"
+    await _send_alert(context, [_logist_chat_id(), mgr_chat], msg)
+
+
+async def cb_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, _, val, idx, demand_id = q.data.split(":", 4)
+    idx = int(idx)
+    db = context.bot_data["db"]
+    row = _get_row(db, demand_id)
+    items = _load_items(row)
+    done_ok = (val == "yes")
+    text = None
+    for it in items:
+        if it.get("idx") == idx:
+            it["answer"] = done_ok
+            text = it.get("text")
+            break
+    _set_fields(db, demand_id, custom_items=json.dumps(items, ensure_ascii=False))
+    if not done_ok:
+        await _signal_item_not_done(context, row, text or "(пункт)")
+    await _ask_next_item_or_accept(q, db, demand_id)
 
 
 async def cb_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -923,6 +1049,7 @@ def register(app: Application, db):
     app.add_handler(CallbackQueryHandler(cb_arrive, pattern=r"^drv:arrive:"))
     app.add_handler(CallbackQueryHandler(cb_money, pattern=r"^drv:money:"))
     app.add_handler(CallbackQueryHandler(cb_doc, pattern=r"^drv:doc:"))
+    app.add_handler(CallbackQueryHandler(cb_item, pattern=r"^drv:item:"))
     app.add_handler(CallbackQueryHandler(cb_accept, pattern=r"^drv:acc:"))
     app.add_handler(CallbackQueryHandler(cb_claim_nophoto, pattern=r"^drv:claimnophoto:"))
 
