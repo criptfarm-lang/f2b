@@ -13,11 +13,13 @@ import json
 import logging
 from datetime import datetime, date, timezone, timedelta
 
+import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           CallbackQueryHandler, ContextTypes, filters)
 
 import route_registry as rr
+from moysklad import MS_BASE, get_headers
 
 logger = logging.getLogger(__name__)
 _MSK = timezone(timedelta(hours=3))
@@ -56,6 +58,7 @@ def ensure_schema(db):
             PRIMARY KEY (snap_date, unit_id)
         )
     """)
+    db._execute("ALTER TABLE route_dispatch ADD COLUMN IF NOT EXISTS done JSONB DEFAULT '[]'::jsonb")
     logger.info("route_dispatch: схема готова")
 
 
@@ -164,6 +167,60 @@ def is_confirmed_today(unit_id) -> bool:
     except Exception as e:
         logger.warning("is_confirmed_today: %s", e)
         return False
+
+
+async def _demand_order_no(demand_id):
+    """demand → номер его заказа (customerOrder.name) — чтобы сматчить закрытую точку с маршрутом."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{MS_BASE}/entity/demand/{demand_id}?expand=customerOrder",
+                             headers=get_headers()) as r:
+                if r.status != 200:
+                    return None
+                d = await r.json()
+        return (d.get("customerOrder") or {}).get("name")
+    except Exception as e:
+        logger.warning("_demand_order_no: %s", e)
+        return None
+
+
+async def mark_done_and_refresh(context, driver_chat_id, demand_id):
+    """Точка закрыта водителем → убираем её кнопку из сообщения-списка; последняя → «завершён» (Фаза 3)."""
+    if _DB is None:
+        return
+    try:
+        today = datetime.now(_MSK).date()
+        row = _DB._fetchone(
+            "SELECT unit_id, stops, done, driver_msg_id FROM route_dispatch "
+            "WHERE snap_date=%s AND driver_chat_id=%s AND status='confirmed'",
+            (today, driver_chat_id))
+        if not row or not row.get("driver_msg_id"):
+            return
+        order_no = await _demand_order_no(demand_id)
+        if not order_no:
+            return
+        stops = row.get("stops") or []
+        done = row.get("done") or []
+        if isinstance(stops, str):
+            stops = json.loads(stops)
+        if isinstance(done, str):
+            done = json.loads(done)
+        if order_no not in [s.get("order_no") for s in stops]:
+            return  # точка не из этого маршрута
+        if order_no not in done:
+            done.append(order_no)
+        _DB._execute("UPDATE route_dispatch SET done=%s, updated_at=now() WHERE snap_date=%s AND unit_id=%s",
+                     (json.dumps(done, ensure_ascii=False), today, row["unit_id"]))
+        kb = _driver_kb(stops, done=set(done))
+        if kb is None:
+            await context.bot.edit_message_text(
+                chat_id=driver_chat_id, message_id=row["driver_msg_id"],
+                text="✅ Маршрут завершён — все точки закрыты. Спасибо!")
+        else:
+            await context.bot.edit_message_reply_markup(
+                chat_id=driver_chat_id, message_id=row["driver_msg_id"], reply_markup=kb)
+    except Exception as e:
+        logger.warning("mark_done_and_refresh: %s", e)
 
 
 async def _collect_and_send(context, target_date, to_chat):

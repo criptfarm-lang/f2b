@@ -632,6 +632,11 @@ async def cb_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _dsx.write_ms_status(demand_id, "Сдан")
         except Exception as e:
             logger.warning("МС статус Сдан: %s", e)
+        try:
+            import route_dispatch
+            await route_dispatch.mark_done_and_refresh(context, q.from_user.id, demand_id)
+        except Exception as e:
+            logger.warning("route refresh (accept): %s", e)
         await q.edit_message_text("✅ Точка закрыта: сдано без претензий. Спасибо!")
     else:
         _set_fields(db, demand_id, accepted_ok=False, stage="claim_text")
@@ -688,6 +693,13 @@ async def _finish_claim(context, demand_id, reply):
     except Exception as e:
         logger.warning("МС статус Сдан с проблемой: %s", e)
     row = _get_row(db, demand_id)
+    try:
+        import route_dispatch
+        drv = (row or {}).get("driver_chat_id")
+        if drv:
+            await route_dispatch.mark_done_and_refresh(context, int(drv), demand_id)
+    except Exception as e:
+        logger.warning("route refresh (claim): %s", e)
     await _alert_claim(context, row)
     await reply("⚠️ Претензия зафиксирована. Логист и менеджер уведомлены. Спасибо!")
 
