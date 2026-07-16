@@ -13,6 +13,13 @@
                           Менеджеру — отдельно, по ФАКТУ опоздания > 60 мин.
   - «Сдан»/«Сдан с проблемой» — из чеклиста водителя (событийно, см. driver_checklist).
 
+ВЫПОЛНЕНИЕ ТОЧКИ = СТАТУС ОТГРУЗКИ В МС (источник истины). Любой статус, кроме
+активных на маршруте (Отгружен / В пути / Задержка в пути), = доставка закрыта
+(Сдан / Сдан с проблемой / Едет возврат / УПД подписан / Долг / Оплачен). По таким
+точкам НЕ считаем отставание и НЕ шлём алерты — даже если заявка ещё висит в Wialon
+(вчерашние заявки нельзя удалить, они остаются). Так фейковое «отставание ~сутки»
+на закрытых вчерашних точках исключается по факту в МС, а не только по дате.
+
 ⚠️ ЗАПИСЬ В МОЙСКЛАД. По умолчанию СУХОЙ режим (только лог): включается env
 DELIVERY_STATUS_WRITE=1. Санкция собственника на автозапись статусов — 2026-07-15.
 
@@ -379,8 +386,14 @@ async def run_check(db, bot=None, preview=False) -> list:
                                    (info["demand_id"],))
                 chk_status = (chk or {}).get("status")
                 real_window = _has_real_window(s.get("tf"), s.get("tt"))
-                machine.append({"s": s, "arrived": arrived, "real_window": real_window})
-                recs.append({"s": s, "order_no": order_no, "info": info, "cur": info["state_name"],
+                cur = info["state_name"]
+                # Источник истины «точка выполнена» — статус отгрузки в МС. Всё, кроме активных
+                # на маршруте (Отгружен/В пути/Задержка), = доставка закрыта (Сдан / Сдан с
+                # проблемой / Едет возврат / УПД подписан / Долг / Оплачен). По таким точкам не
+                # считаем отставание и не алертим — даже если в Wialon заявка ещё висит.
+                done = bool(cur) and cur not in MANAGED
+                machine.append({"s": s, "arrived": arrived, "done": done, "real_window": real_window})
+                recs.append({"s": s, "order_no": order_no, "info": info, "cur": cur,
                              "st": st, "arrived": arrived, "chk_status": chk_status,
                              "real_window": real_window})
 
@@ -481,29 +494,31 @@ async def run_check(db, bot=None, preview=False) -> list:
 
 
 def _machine_lag(machine, now_ts) -> int:
-    """Отставание машины, сек = макс. по не прибывшим точкам, чей план (`vt`) уже прошёл."""
+    """Отставание машины, сек = макс. по НЕзакрытым точкам, чей план (`vt`) уже прошёл.
+    Закрытая (`done` по статусу МС) или прибывшая точка в отставание не идёт."""
     lag_sec = 0
     for m in machine:
         vt = m["s"].get("vt")
-        if not m["arrived"] and vt and now_ts > vt:
+        if not m["arrived"] and not m.get("done") and vt and now_ts > vt:
             lag_sec = max(lag_sec, now_ts - vt)
     return lag_sec
 
 
 def _compute_risk(machine, now_ts):
-    """lag = насколько машина отстаёт (макс. по не прибывшим точкам с прошедшим планом);
-    at_risk = будущие точки с РЕАЛЬНЫМ окном, чьё окно ещё открыто, но сдвиг его срывает."""
+    """lag = насколько машина отстаёт (макс. по незакрытым точкам с прошедшим планом);
+    at_risk = будущие точки с РЕАЛЬНЫМ окном, чьё окно ещё открыто, но сдвиг его срывает.
+    Точки, закрытые по статусу МС (`done`), в расчёт не берём."""
     lag_sec = _machine_lag(machine, now_ts)
-    behind = []   # непосещённые точки, чьё плановое время уже прошло (двигают отставание)
+    behind = []   # непосещённые НЕзакрытые точки, чьё плановое время уже прошло
     for m in machine:
         vt = m["s"].get("vt")
-        if not m["arrived"] and vt and now_ts > vt:
+        if not m["arrived"] and not m.get("done") and vt and now_ts > vt:
             behind.append(m["s"])
     at_risk = []
     for m in machine:
         s = m["s"]
         tt, vt = s.get("tt"), s.get("vt")
-        if m["arrived"] or not m["real_window"] or not tt or not vt:
+        if m["arrived"] or m.get("done") or not m["real_window"] or not tt or not vt:
             continue
         if now_ts < tt and (vt + lag_sec) > tt:
             at_risk.append(s)
