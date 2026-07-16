@@ -309,6 +309,15 @@ async def _render_points(send, page: int, driver_id: int = None):
     # Если за водителем закреплён юнит (drivers.unit_id) и на сегодня есть маршрут —
     # показываем ТОЛЬКО его машину в порядке выгрузки. Иначе — полный список дня (фолбэк).
     unit_id = _driver_unit_id(driver_id) if driver_id else None
+    # Гейт: пока логист не подтвердил маршрут этой машины на сегодня — точки не отдаём.
+    if unit_id:
+        try:
+            import route_dispatch
+            if not route_dispatch.is_confirmed_today(unit_id):
+                await send("🕓 Маршрут ещё не подтверждён логистом. Как подтвердит — точки придут сюда.")
+                return
+        except Exception as e:
+            logger.warning("gate check упал, пропускаю гейт: %s", e)
     route_stops = None
     if unit_id:
         try:

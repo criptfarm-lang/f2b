@@ -11,7 +11,7 @@ import io
 import os
 import json
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, MessageHandler,
@@ -34,6 +34,10 @@ def _owner_chat_id() -> int:
 
 def _allowed(chat_id: int) -> bool:
     return chat_id in (_logist_chat_id(), _owner_chat_id())
+
+
+def _sklad_chat_id() -> int:
+    return int(os.getenv("SKLAD_CHAT_ID", "-4750423130") or 0)  # группа «Склад»
 
 
 # ─── Схема ───────────────────────────────────────────────────────────────────
@@ -119,6 +123,49 @@ async def cb_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _collect_and_send(context, target, to_chat=q.from_user.id)
 
 
+async def _unit_package(routes, uid, target_date, bot_username):
+    """Пакет по машине на дату: {stops, pdf, driver_id, driver_name} или None (нет точек)."""
+    stops = sorted(
+        [s for s in (routes.get(uid) or []) if _stop_on_date(s, target_date)],
+        key=lambda s: (s.get("seq") if s.get("seq") is not None else 999))
+    if not stops:
+        return None
+    driver_id, driver_name = _driver_for_unit(uid)
+    ms_extra = await rr._ms_extra_by_order([s["order_no"] for s in stops])
+    pdf = rr._build_registry_pdf({uid: stops}, ms_extra, bot_username,
+                                 target_date.strftime("%d.%m.%Y"))
+    return {"stops": stops, "pdf": pdf, "driver_id": driver_id, "driver_name": driver_name}
+
+
+def _driver_kb(stops, done=None):
+    """Кнопки маршрута водителю: точка → drv:rp:<№заказа> (обрабатывает driver_checklist).
+    done — множество № заказов, уже закрытых (не показываем; Фаза 3)."""
+    done = done or set()
+    rows = []
+    for i, s in enumerate(stops, 1):
+        if s["order_no"] in done:
+            continue
+        title = (s.get("client") or s.get("order_no") or "?")[:40]
+        rows.append([InlineKeyboardButton(f"📍 {i}. {title}",
+                                          callback_data=f"drv:rp:{s['order_no']}")])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def is_confirmed_today(unit_id) -> bool:
+    """Подтверждён ли маршрут этой машины на сегодня (для гейта /рейс)."""
+    if _DB is None:
+        return False
+    try:
+        today = datetime.now(_MSK).date()
+        r = _DB._fetchone(
+            "SELECT 1 FROM route_dispatch WHERE snap_date=%s AND unit_id=%s AND status='confirmed'",
+            (today, unit_id))
+        return bool(r)
+    except Exception as e:
+        logger.warning("is_confirmed_today: %s", e)
+        return False
+
+
 async def _collect_and_send(context, target_date, to_chat):
     try:
         routes = await rr.fetch_routes()
@@ -131,20 +178,15 @@ async def _collect_and_send(context, target_date, to_chat):
     day_off = (target_date - datetime.now(_MSK).date()).days
     sent = 0
     for uid in rr.UNITS:
-        stops = sorted(
-            [s for s in (routes.get(uid) or []) if _stop_on_date(s, target_date)],
-            key=lambda s: (s.get("seq") if s.get("seq") is not None else 999))
-        if not stops:
+        pkg = await _unit_package(routes, uid, target_date, me.username)
+        if not pkg:
             continue
-        driver_id, driver_name = _driver_for_unit(uid)
-        order_numbers = [s["order_no"] for s in stops]
-        ms_extra = await rr._ms_extra_by_order(order_numbers)
-        pdf = rr._build_registry_pdf({uid: stops}, ms_extra, me.username, date_str)
+        stops = pkg["stops"]
         snap = [{"order_no": s["order_no"], "client": s.get("client"), "seq": s.get("seq")}
                 for s in stops]
-        _upsert_draft(target_date, uid, driver_id, snap)
+        _upsert_draft(target_date, uid, pkg["driver_id"], snap)
 
-        who = driver_name or "⚠️ водитель не закреплён"
+        who = pkg["driver_name"] or "⚠️ водитель не закреплён"
         lines = [f"{i}. {(s.get('client') or s.get('order_no') or '?')[:35]} ({rr._hm(s.get('vt'))})"
                  for i, s in enumerate(stops, 1)]
         caption = (f"🚚 {rr.UNITS[uid]} — водитель: {who}\n"
@@ -156,7 +198,7 @@ async def _collect_and_send(context, target_date, to_chat):
             [InlineKeyboardButton("🔄 Пересобрать", callback_data=f"rd:col:{day_off}")],
         ])
         await context.bot.send_document(
-            to_chat, document=io.BytesIO(pdf),
+            to_chat, document=io.BytesIO(pkg["pdf"]),
             filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
             caption=caption[:1024], reply_markup=kb)
         sent += 1
@@ -166,21 +208,80 @@ async def _collect_and_send(context, target_date, to_chat):
 
 
 async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Фаза 1: фиксируем подтверждение. Пуш водителю + склад — Фаза 2."""
+    """Подтверждение → status=confirmed + пуш водителю (PDF + кнопки) + PDF в склад-группу."""
     q = update.callback_query
-    await q.answer()
+    await q.answer("Отправляю…")
     parts = q.data.split(":")  # rd:conf:<date>:<uid>
-    dstr, uid = parts[2], int(parts[3])
+    target_date = date.fromisoformat(parts[2])
+    uid = int(parts[3])
+    dstr = parts[2]
+    try:
+        routes = await rr.fetch_routes()
+        me = await context.bot.get_me()
+        pkg = await _unit_package(routes, uid, target_date, me.username)
+    except Exception as e:
+        logger.exception("cb_confirm fetch: %s", e)
+        await context.bot.send_message(q.from_user.id, "Не удалось перечитать маршрут Wialon для отправки.")
+        return
+    if not pkg:
+        await context.bot.send_message(q.from_user.id, f"Маршрут {rr.UNITS.get(uid)} пуст — отправлять нечего.")
+        return
+
+    stops = pkg["stops"]
+    driver_id = pkg["driver_id"]
+    date_str = target_date.strftime("%d.%m.%Y")
+    unit_name = rr.UNITS.get(uid, str(uid))
+    snap = [{"order_no": s["order_no"], "client": s.get("client"), "seq": s.get("seq")} for s in stops]
     if _DB is not None:
         try:
             _DB._execute(
-                "UPDATE route_dispatch SET status='confirmed', confirmed_at=now(), "
-                "updated_at=now() WHERE snap_date=%s AND unit_id=%s", (dstr, uid))
+                "UPDATE route_dispatch SET status='confirmed', stops=%s, confirmed_at=now(), "
+                "updated_at=now() WHERE snap_date=%s AND unit_id=%s",
+                (json.dumps(snap, ensure_ascii=False), dstr, uid))
         except Exception as e:
-            logger.warning("cb_confirm: %s", e)
+            logger.warning("cb_confirm update: %s", e)
+
+    # 1) Пуш водителю: PDF + кнопки маршрута
+    driver_note = ""
+    if driver_id:
+        try:
+            await context.bot.send_document(
+                driver_id, io.BytesIO(pkg["pdf"]),
+                filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
+                caption=f"🚚 Твой маршрут на {date_str} — {unit_name}. Реестр во вложении.")
+            kb = _driver_kb(stops)
+            msg = await context.bot.send_message(
+                driver_id,
+                f"🚚 Маршрут на {date_str} — {len(stops)} точек (порядок выгрузки).\n"
+                "Приехал на точку — жми её, закрывай сдачу:",
+                reply_markup=kb)
+            if _DB is not None:
+                _DB._execute("UPDATE route_dispatch SET driver_msg_id=%s WHERE snap_date=%s AND unit_id=%s",
+                             (msg.message_id, dstr, uid))
+            driver_note = f"водитель {pkg['driver_name'] or driver_id}"
+        except Exception as e:
+            logger.warning("cb_confirm push driver: %s", e)
+            driver_note = "⚠️ водителю НЕ доставлено (не нажимал /start у бота?)"
+    else:
+        driver_note = f"⚠️ за {unit_name} не закреплён водитель — не отправлено"
+
+    # 2) PDF в склад-группу (лист загрузки)
+    sklad_note = ""
+    sklad = _sklad_chat_id()
+    if sklad:
+        try:
+            await context.bot.send_document(
+                sklad, io.BytesIO(pkg["pdf"]),
+                filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
+                caption=f"📦 Лист загрузки — {unit_name}, {date_str}. Грузить по порядку (первая точка к дверям).")
+            sklad_note = "склад ✓"
+        except Exception as e:
+            logger.warning("cb_confirm push sklad: %s", e)
+            sklad_note = "⚠️ склад НЕ доставлено"
+
     try:
         await q.edit_message_caption(
-            caption=(q.message.caption or "") + "\n\n✅ Подтверждено (пуш водителю — следующий срез).")
+            caption=(q.message.caption or "") + f"\n\n✅ Подтверждено → {driver_note}; {sklad_note}.")
     except Exception as e:
         logger.warning("cb_confirm edit: %s", e)
 
