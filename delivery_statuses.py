@@ -229,7 +229,7 @@ async def _route_end_alert(bot, unit_name, info):
             f"Вернулась на точку ночёвки (с {since}) — развоз на сегодня завершён.\n"
             f"Точка: {info['lat']:.4f},{info['lon']:.4f}\n{link}")
     seen = set()
-    for cid in [_owner_chat_id(), _logist_chat_id()]:
+    for cid in [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()]:
         if not cid or cid in seen:
             continue
         seen.add(cid)
