@@ -7619,6 +7619,11 @@ def main():
     except Exception as e:
         logger.error(f"route_registry.register упал: {e}")
     try:
+        import route_dispatch
+        route_dispatch.register(app, db)
+    except Exception as e:
+        logger.error(f"route_dispatch.register упал: {e}")
+    try:
         import delivery_statuses
         delivery_statuses.register(app, db)
     except Exception as e:

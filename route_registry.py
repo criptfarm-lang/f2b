@@ -198,7 +198,9 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
                             leftMargin=10 * mm, rightMargin=10 * mm)
     flow = []
     first = True
-    for uid, name in UNITS.items():
+    # Итерируем по переданным машинам (одна или обе) — позволяет собрать PDF на одну машину.
+    for uid in routes:
+        name = UNITS.get(uid, str(uid))
         stops = routes.get(uid) or []
         if not first:
             flow.append(PageBreak())
