@@ -45,12 +45,18 @@ _MSK = timezone(timedelta(hours=3))
 
 # База (загрузка утром) — Ильинский, Раменское
 BASE_LAT, BASE_LON = 55.6323, 38.1038
+
+# Точки ночёвки/гаражи водителей: простой здесь = не проблема, а «конец маршрута».
+# 26209 (В 970 СВ 797, Мага) → гараж Химки. 26210 (К 459 ХК) ночует на базе (см. _near_base).
+HOME_POINTS = {26209: (55.9033, 37.4062)}
+R_HOME_M = 300
 R_BASE_M = 500       # «В пути» — удаление транспорта на 500 м от склада (спека собственника)
 R_STOP_M = 300       # радиус «прибыл на точку»
 DELAY_BUFFER_MIN = 30
 LAG_ALERT_MIN = 120        # отставание от плана ≥ этого (даже при плавающих окнах) → тревога
 LAG_ALERT_POINTS = 2       # ...и хотя бы столько непосещённых точек позади плана
 IDLE_MIN = 60              # простой: машина стоит на месте ≥ этого → тревога логисту
+ROUTE_END_MIN = 10         # на точке ночёвки ≥ этого → фиксируем «конец маршрута» в моменте
 IDLE_RADIUS_M = 150        # «на месте»: не отходит дальше этого от точки стоянки
 DELIVERY_HOURS = (7, 21)   # МСК, в эти часы крон активен
 JOB_INTERVAL_SEC = 600
@@ -150,6 +156,11 @@ def _near_base(lat, lon) -> bool:
     return _haversine(lat, lon, BASE_LAT, BASE_LON) <= R_BASE_M
 
 
+def _near_home(uid, lat, lon) -> bool:
+    h = HOME_POINTS.get(uid)
+    return bool(h) and _haversine(lat, lon, h[0], h[1]) <= R_HOME_M
+
+
 def _near_any_client(lat, lon, stops) -> bool:
     for s in stops:
         if s.get("lat") and s.get("lon") and _haversine(lat, lon, s["lat"], s["lon"]) <= R_STOP_M:
@@ -173,14 +184,24 @@ def _check_idle(db, uid, name, pos, stops, now_ts, preview):
         return None
     since = row["since_ts"]
     idle_min = int((now_ts - since) / 60)
-    on_base = _near_base(lat, lon)
-    on_client = _near_any_client(lat, lon, stops)
-    if idle_min >= IDLE_MIN and not on_base and not on_client:
-        line = (f"{name}: ПРОСТОЙ ~{idle_min} мин на месте (не база, не клиент) "
-                f"[{lat:.4f},{lon:.4f}]")
+    if _near_base(lat, lon) or _near_any_client(lat, lon, stops):
+        return None
+    on_home = _near_home(uid, lat, lon)
+    # Дом/гараж → «конец маршрута» с коротким порогом (фиксируем время финиша в моменте);
+    # прочие точки → «ПРОСТОЙ» с длинным порогом.
+    threshold = ROUTE_END_MIN if on_home else IDLE_MIN
+    if idle_min >= threshold:
+        kind = "route_end" if on_home else "idle"
+        if kind == "route_end":
+            end_hm = datetime.fromtimestamp(since, _MSK).strftime("%H:%M")
+            line = (f"{name}: конец маршрута в {end_hm} (на точке ночёвки) "
+                    f"[{lat:.4f},{lon:.4f}]")
+        else:
+            line = (f"{name}: ПРОСТОЙ ~{idle_min} мин на месте (не база, не клиент) "
+                    f"[{lat:.4f},{lon:.4f}]")
         fire = (not preview) and (not row.get("alerted"))
         return {"line": line, "fire": fire, "since": since, "idle_min": idle_min,
-                "lat": lat, "lon": lon, "anchor": (row["lat"], row["lon"])}
+                "lat": lat, "lon": lon, "anchor": (row["lat"], row["lon"]), "kind": kind}
     return None
 
 
@@ -199,6 +220,23 @@ async def _idle_alert(bot, unit_name, info):
             await bot.send_message(chat_id=cid, text=text)
         except Exception as e:
             logger.warning("_idle_alert → %s: %s", cid, e)
+
+
+async def _route_end_alert(bot, unit_name, info):
+    since = datetime.fromtimestamp(info["since"], _MSK).strftime("%H:%M")
+    link = f"https://yandex.ru/maps/?pt={info['lon']:.5f},{info['lat']:.5f}&z=17&l=map"
+    text = (f"🏁 Конец маршрута\n{unit_name}\n"
+            f"Вернулась на точку ночёвки (с {since}) — развоз на сегодня завершён.\n"
+            f"Точка: {info['lat']:.4f},{info['lon']:.4f}\n{link}")
+    seen = set()
+    for cid in [_owner_chat_id(), _logist_chat_id()]:
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.warning("_route_end_alert → %s: %s", cid, e)
 
 
 # ─── Wialon позиции ──────────────────────────────────────────────────────────
@@ -488,7 +526,10 @@ async def run_check(db, bot=None, preview=False) -> list:
             if idle:
                 lines.append(idle["line"])
                 if idle["fire"] and bot:
-                    await _idle_alert(bot, name, idle)
+                    if idle["kind"] == "route_end":
+                        await _route_end_alert(bot, name, idle)
+                    else:
+                        await _idle_alert(bot, name, idle)
                     _dwell_set(db, uid, idle["anchor"][0], idle["anchor"][1], idle["since"], True)
     return lines
 
