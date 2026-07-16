@@ -169,6 +169,21 @@ def is_confirmed_today(unit_id) -> bool:
         return False
 
 
+def _existing_done(snap_date, unit_id):
+    """Множество уже закрытых № заказов (для сохранения прогресса при пересборе/переподтверждении)."""
+    if _DB is None:
+        return set()
+    try:
+        r = _DB._fetchone("SELECT done FROM route_dispatch WHERE snap_date=%s AND unit_id=%s",
+                          (snap_date, unit_id))
+        if r and r.get("done"):
+            d = r["done"] if isinstance(r["done"], list) else json.loads(r["done"])
+            return set(d)
+    except Exception as e:
+        logger.warning("_existing_done: %s", e)
+    return set()
+
+
 async def _demand_order_no(demand_id):
     """demand → номер его заказа (customerOrder.name) — чтобы сматчить закрытую точку с маршрутом."""
     try:
@@ -306,12 +321,19 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 driver_id, io.BytesIO(pkg["pdf"]),
                 filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
                 caption=f"🚚 Твой маршрут на {date_str} — {unit_name}. Реестр во вложении.")
-            kb = _driver_kb(stops)
-            msg = await context.bot.send_message(
-                driver_id,
-                f"🚚 Маршрут на {date_str} — {len(stops)} точек (порядок выгрузки).\n"
-                "Приехал на точку — жми её, закрывай сдачу:",
-                reply_markup=kb)
+            # Сохраняем прогресс: при пересборе/переподтверждении уже закрытые точки не показываем.
+            done_prev = _existing_done(dstr, uid)
+            kb = _driver_kb(stops, done=done_prev)
+            if kb is None:
+                msg = await context.bot.send_message(
+                    driver_id, f"🚚 Маршрут на {date_str} — {unit_name}: все точки уже закрыты. ✅")
+            else:
+                left = len([s for s in stops if s["order_no"] not in done_prev])
+                msg = await context.bot.send_message(
+                    driver_id,
+                    f"🚚 Маршрут на {date_str} — {left} из {len(stops)} точек (порядок выгрузки).\n"
+                    "Приехал на точку — жми её, закрывай сдачу:",
+                    reply_markup=kb)
             if _DB is not None:
                 _DB._execute("UPDATE route_dispatch SET driver_msg_id=%s WHERE snap_date=%s AND unit_id=%s",
                              (msg.message_id, dstr, uid))
@@ -343,12 +365,60 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("cb_confirm edit: %s", e)
 
 
+async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Свод хода развоза логисту: по каждой машине сколько точек закрыто + что осталось."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat or chat.type != "private":
+        return
+    if not _allowed(user.id):
+        await update.message.reply_text("⛔ Доступно логисту и владельцу.")
+        return
+    if _DB is None:
+        await update.message.reply_text("БД недоступна.")
+        return
+    today = datetime.now(_MSK).date()
+    rows = _DB._fetchall(
+        "SELECT unit_id, stops, done FROM route_dispatch "
+        "WHERE snap_date=%s AND status='confirmed' ORDER BY unit_id", (today,))
+    if not rows:
+        await update.message.reply_text("На сегодня подтверждённых маршрутов нет.")
+        return
+    blocks = []
+    for r in rows:
+        uid = r["unit_id"]
+        stops = r.get("stops") or []
+        done = r.get("done") or []
+        if isinstance(stops, str):
+            stops = json.loads(stops)
+        if isinstance(done, str):
+            done = json.loads(done)
+        done_set = set(done)
+        total = len(stops)
+        remaining = [s for s in stops if s.get("order_no") not in done_set]
+        ndone = total - len(remaining)
+        _, drv = _driver_for_unit(uid)
+        head = f"🚚 {rr.UNITS.get(uid, uid)} — {drv or 'без водителя'}: {ndone}/{total} закрыто"
+        if remaining:
+            rem = "\n".join(f"  • {(s.get('client') or s.get('order_no') or '?')[:35]}"
+                            for s in remaining[:12])
+            if len(remaining) > 12:
+                rem += f"\n  …и ещё {len(remaining) - 12}"
+            head += "\nОсталось:\n" + rem
+        else:
+            head += " ✅ завершён"
+        blocks.append(head)
+    await update.message.reply_text("Ход развоза на сегодня:\n\n" + "\n\n".join(blocks))
+
+
 def register(app: Application, db):
     global _DB
     _DB = db
     ensure_schema(db)
     app.add_handler(CommandHandler("routes", cmd_routes))
     app.add_handler(MessageHandler(filters.Regex(r"^/маршруты(@\w+)?(\s|$)"), cmd_routes))
+    app.add_handler(CommandHandler("progress", cmd_progress))
+    app.add_handler(MessageHandler(filters.Regex(r"^/ход(@\w+)?(\s|$)"), cmd_progress))
     app.add_handler(CallbackQueryHandler(cb_collect, pattern=r"^rd:col:"))
     app.add_handler(CallbackQueryHandler(cb_confirm, pattern=r"^rd:conf:"))
     logger.info("route_dispatch: хендлеры зарегистрированы")
