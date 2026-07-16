@@ -298,6 +298,17 @@ def _has_real_window(tf, tt) -> bool:
     return True
 
 
+def _stop_is_today(s, now_ts) -> bool:
+    """Точка относится к СЕГОДНЯШНЕМУ дню развоза. Якорь времени: vt (план маршрута) →
+    tt (конец окна) → tf (начало окна). Нет якоря — не режем (датировать нечем).
+    Защита от вчерашнего маршрута, ещё висящего в Wialon до вечерней перестройки."""
+    ref = s.get("vt") or s.get("tt") or s.get("tf")
+    if not ref:
+        return True
+    today = datetime.fromtimestamp(now_ts, _MSK).date()
+    return datetime.fromtimestamp(ref, _MSK).date() == today
+
+
 def _target_status(*, left_base, arrived, tt, vt, now_ts, lag_sec, chk_status, real_window):
     """chk_status — статус из delivery_checklist (сдан/сдан с проблемой) или None.
     «Задержка в пути» — по РЕАЛЬНОМУ окну, в двух случаях:
@@ -342,7 +353,10 @@ async def run_check(db, bot=None, preview=False) -> list:
         states = await _ms_states(session)
 
         for uid, name in rr.UNITS.items():
-            stops = routes.get(uid) or []
+            # Только СЕГОДНЯШНИЙ маршрут. Вчерашняя раскладка висит в Wialon до вечерней
+            # перестройки — её прошедший план дал бы фейковое отставание в ~сутки (лаг-алерт,
+            # прогноз «Задержки», факт по окну). Датируем точку по vt→tt→tf.
+            stops = [s for s in (routes.get(uid) or []) if _stop_is_today(s, now_ts)]
             pos = positions.get(uid)
             left_base = bool(pos) and _haversine(pos["lat"], pos["lon"], BASE_LAT, BASE_LON) > R_BASE_M
             machine = []   # для расчёта отставания / риска смещения
