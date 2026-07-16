@@ -168,6 +168,13 @@ class Database:
                 sent_at TIMESTAMP DEFAULT NOW()
             );
 
+            CREATE TABLE IF NOT EXISTS not_agreed_notifications (
+                order_id TEXT NOT NULL,
+                sum_hash BIGINT NOT NULL,
+                sent_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (order_id, sum_hash)
+            );
+
             CREATE TABLE IF NOT EXISTS report_links (
                 token TEXT PRIMARY KEY,
                 mgr_filter TEXT,
@@ -316,6 +323,12 @@ class Database:
             """CREATE TABLE IF NOT EXISTS bulk_order_notifications (
                 order_id TEXT PRIMARY KEY,
                 sent_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS not_agreed_notifications (
+                order_id TEXT NOT NULL,
+                sum_hash BIGINT NOT NULL,
+                sent_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (order_id, sum_hash)
             )""",
             """CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
@@ -1311,6 +1324,24 @@ class Database:
                 "INSERT INTO bulk_order_notifications (order_id) VALUES (%s) "
                 "ON CONFLICT DO NOTHING RETURNING order_id",
                 (order_id,)
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row is not None
+
+    def try_claim_not_agreed_notification(self, order_id: str, sum_hash: int) -> bool:
+        """Атомарный claim для алерта «заказ НЕ СОГЛАСОВАН».
+
+        Дедуп по (order_id, sum_hash): повторный алерт по тому же заказу уходит
+        только если сумма изменилась (менеджер доработал → снова не согласовали).
+        True — вставили этой транзакцией, мы первые → шлём. False — уже было → молчим.
+        """
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO not_agreed_notifications (order_id, sum_hash) VALUES (%s, %s) "
+                "ON CONFLICT DO NOTHING RETURNING order_id",
+                (order_id, sum_hash)
             )
             row = cur.fetchone()
             self.conn.commit()

@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 QUIZ_BASE_URL = os.getenv("QUIZ_BASE_URL", "")
 
 MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
+# Статус «НЕ СОГЛАСОВАН» — заказ отклонён/не прошёл согласование, менеджеру
+# нужно его доработать. Сверено с МС 2026-07-16 (GET /entity/customerorder/metadata).
+# План: 2026-07-16-алерт-заказ-не-согласован.md
+MS_STATE_NOT_AGREED = "f7e3f71d-6b0b-11f1-0a80-1a5900237f4c"
 WAZZUP_API_URL = "https://api.wazzup24.com/v3/message"
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 # UUID дополнительных полей контрагентов в МойСклад
@@ -632,6 +636,87 @@ async def check_bulk_production_order(order_href: str, bot, db):
 
     except Exception as e:
         logger.error(f"notifier.check_bulk_production_order: {e}", exc_info=True)
+
+
+async def check_order_not_agreed(order_href: str, bot, db):
+    """При переводе заказа в статус «НЕ СОГЛАСОВАН» — пинг ответственному менеджеру.
+
+    Триггер: state == MS_STATE_NOT_AGREED. Получатель — менеджер (owner заказа,
+    правило: owner заказа = реальный менеджер). Резолв tg-id как в
+    check_approval_needed (PDZ_MANAGER_TG_IDS → get_manager_chat_id). Если не
+    резолвится — уходит собственнику (OWNER_CHAT_ID) с пометкой, сигнал не теряем.
+    Дедуп — атомарный claim not_agreed_notifications по (order_id, sum_hash):
+    повторный алерт только если сумма заказа изменилась (менеджер доработал →
+    снова не согласовали). План: 2026-07-16-алерт-заказ-не-согласован.md
+    """
+    try:
+        from moysklad import get_headers, PDZ_MANAGER_TG_IDS
+        headers = get_headers()
+
+        order = await _load_order(order_href, headers)
+        if not order:
+            return
+
+        state_id = order.get("state", {}).get("meta", {}).get("href", "").split("/")[-1]
+        if state_id != MS_STATE_NOT_AGREED:
+            return
+
+        order_id = order.get("id") or order_href.split("/")[-1].split("?")[0]
+        order_name = order.get("name", order_id)
+        order_sum = (order.get("sum", 0) or 0) / 100
+        agent_name = order.get("agent", {}).get("name", "—")
+        manager_name = (order.get("owner") or {}).get("name", "")
+
+        # Резолвим tg-id менеджера (тот же приём, что в check_approval_needed).
+        mgr_user_id = 0
+        if manager_name:
+            for part in manager_name.split():
+                key = part.lower().strip(".,").rstrip()
+                if key in PDZ_MANAGER_TG_IDS:
+                    mgr_user_id = PDZ_MANAGER_TG_IDS[key]
+                    break
+            if not mgr_user_id:
+                for part in manager_name.split():
+                    cid = db.get_manager_chat_id(part)
+                    if cid:
+                        mgr_user_id = cid
+                        break
+
+        note = ""
+        chat_id = mgr_user_id
+        if not chat_id:
+            owner_raw = os.getenv("OWNER_CHAT_ID", "").strip()
+            chat_id = int(owner_raw) if owner_raw.lstrip("-").isdigit() else 0
+            note = f"\n⚠️ Не нашёл TG менеджера «{manager_name or '—'}» — отправлено вам."
+            logger.warning(
+                f"check_order_not_agreed: не нашёл tg_id для менеджера "
+                f"'{manager_name}' по заказу {order_name} → fallback OWNER_CHAT_ID"
+            )
+        if not chat_id:
+            logger.error(f"check_order_not_agreed: некому слать по {order_name} (нет менеджера и OWNER_CHAT_ID)")
+            return
+
+        # Атомарный дедуп по (order_id, sum_hash) — повтор только при смене суммы.
+        sum_hash = round(order_sum)
+        if not db.try_claim_not_agreed_notification(order_id, sum_hash):
+            logger.info(f"not-agreed: заказ {order_id} (sum_hash={sum_hash}) уже уведомлялся, пропуск")
+            return
+
+        text = (
+            f"⚠️ Заказ {order_name} — НЕ СОГЛАСОВАН\n"
+            f"🏢 {agent_name} · {_fmt_money(order_sum)} ₽\n"
+            f"Требует внимания — проверьте и доработайте."
+            f"{note}"
+        )
+
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+            logger.info(f"not-agreed: заказ {order_name} → chat {chat_id} (менеджер '{manager_name}')")
+        except Exception as e:
+            logger.error(f"not-agreed: отправка упала для {order_id}: {e}", exc_info=True)
+
+    except Exception as e:
+        logger.error(f"notifier.check_order_not_agreed: {e}", exc_info=True)
 
 
 async def manual_send_fishki(order_id: str, db) -> tuple[bool, str]:
