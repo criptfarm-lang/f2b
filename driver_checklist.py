@@ -17,6 +17,7 @@
 
 import os
 import io
+import re as _re
 import json
 import logging
 from datetime import datetime, timezone, timedelta
@@ -496,7 +497,6 @@ async def cb_route_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _render_card(q.edit_message_text, demand_id, context.bot_data["db"])
 
 
-import re as _re
 _UUID_RE = _re.compile(r"^[0-9a-fA-F-]{36}$")
 
 
