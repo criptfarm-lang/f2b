@@ -84,11 +84,52 @@ async def fetch_routes() -> dict:
             "address": p.get("a") or "",
             "phone": p.get("p") or "",
             "order_no": o.get("n"),
+            "has_cid": bool(p.get("cid")),  # cid → заявку создал мост; без cid → ручная в Логистике
             "lat": o.get("y"),
             "lon": o.get("x"),
         })
+
+    # (c) Гард дублей. Мост всегда ставит cid = id заказа МС. Если у № есть мостовая
+    # заявка (с cid) на какой-то машине, то ручные копии того же № БЕЗ cid — дубли
+    # (риск двойной доставки). Отбрасываем их, оставляя мостовую как источник правды.
+    cid_numbers = {s["order_no"] for v in routes.values() for s in v if s.get("has_cid")}
     for uid in routes:
-        routes[uid].sort(key=lambda s: (s["seq"] if s["seq"] is not None else 999))
+        kept = []
+        for s in routes[uid]:
+            if (not s.get("has_cid")) and s.get("order_no") in cid_numbers:
+                logger.warning("fetch_routes: отброшен дубль-сирота №%s на unit %s (есть мостовая копия)",
+                               s.get("order_no"), uid)
+                continue
+            kept.append(s)
+        routes[uid] = kept
+
+    # (a) Фолбэк имени клиента из МС для оставшихся точек без имени ('?') — это ручные
+    # заявки логиста без cid (мост имя проставляет всегда), не дубли.
+    unnamed = sorted({s["order_no"] for v in routes.values() for s in v
+                      if s.get("order_no") and (not s.get("client") or s["client"] == "?")})
+    if unnamed:
+        try:
+            names = await _ms_names_by_order(unnamed)
+            for v in routes.values():
+                for s in v:
+                    if (not s.get("client") or s["client"] == "?") and names.get(s.get("order_no")):
+                        s["client"] = names[s["order_no"]]
+        except Exception as e:
+            logger.warning("fetch_routes: фолбэк имён из МС упал: %s", e)
+
+    # (b) Порядок выгрузки — по времени визита vt (монотонно, надёжно), а не по seq:
+    # seq у сирот из разных раскладок коллизирует (несколько seq=0) и сбивает нумерацию.
+    # После сортировки перенумеровываем seq 0..N — канон для списка/реестра/LIFO.
+    def _order_key(s):
+        if s.get("vt") is not None:
+            return s["vt"]
+        if s.get("tf") is not None:
+            return s["tf"]
+        return 1 << 62
+    for uid in routes:
+        routes[uid].sort(key=_order_key)
+        for i, s in enumerate(routes[uid]):
+            s["seq"] = i
     return routes
 
 
@@ -109,6 +150,30 @@ def _fmt_weight(w) -> str:
     if not w:
         return ""
     return f"{w:.3f}".rstrip("0").rstrip(".")
+
+
+async def _ms_names_by_order(order_numbers) -> dict:
+    """{order_no: agent_name} — лёгкий резолв имени клиента по № заказа.
+    Нужен для точек, где имя в Wialon пустое ('?'): логист не подписал точку в Логистике."""
+    out = {}
+    if not order_numbers:
+        return out
+    headers = get_headers()
+    import urllib.parse
+    async with aiohttp.ClientSession() as session:
+        for no in order_numbers:
+            try:
+                f = urllib.parse.quote(f"name={no}")
+                url = f"{MS_BASE}/entity/customerorder?filter={f}&expand=agent&limit=1"
+                async with session.get(url, headers=headers) as r:
+                    rows = (await r.json()).get("rows", []) if r.status == 200 else []
+                if rows:
+                    nm = ((rows[0].get("agent") or {}).get("name") or "").strip()
+                    if nm:
+                        out[no] = nm
+            except Exception as e:
+                logger.warning("_ms_names_by_order %s: %s", no, e)
+    return out
 
 
 async def _ms_extra_by_order(order_numbers) -> dict:
