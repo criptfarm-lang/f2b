@@ -485,16 +485,19 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cb_route_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор точки из маршрута машины: callback несёт № заказа → резолвим в отгрузку."""
+    """Выбор точки из маршрута машины: callback несёт № заказа → резолвим в отгрузку.
+    Карточку сдачи открываем ОТДЕЛЬНЫМ сообщением, список точек не редактируем:
+    так кнопки остальных клиентов остаются на месте, а сданную убираем поштучно
+    (mark_done_and_refresh правит driver_msg_id по № заказа) — в любом порядке нажатий."""
     q = update.callback_query
     await q.answer()
     order_no = q.data.split(":", 2)[2]
     demand_id = await _resolve_deeplink_payload(order_no)
     if not demand_id:
-        await q.edit_message_text(
+        await q.message.reply_text(
             f"По точке №{order_no} отгрузка ещё не создана. Открой список: /рейс")
         return
-    await _render_card(q.edit_message_text, demand_id, context.bot_data["db"])
+    await _render_card(q.message.reply_text, demand_id, context.bot_data["db"], with_back=False)
 
 
 _UUID_RE = _re.compile(r"^[0-9a-fA-F-]{36}$")
