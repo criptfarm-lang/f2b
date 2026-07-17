@@ -7667,7 +7667,8 @@ def main():
             rows = db.get_retry_idents()
             if not rows:
                 return
-            group_chat_id = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
+            # Карточки идентификации отключены (собственник, 2026-07-17) — не пересылаем.
+            group_chat_id = 0
             if not group_chat_id:
                 return
             import uuid as _uuid3
@@ -8096,8 +8097,11 @@ def main():
                                                 continue
                         except Exception as _e:
                             logger.warning(f"Wazzup: проверка МойСклад не удалась: {_e}")
-                        group_chat_id = int(os.getenv("WAZZUP_ID_CHAT_ID", "0"))
-                        logger.info(f"Wazzup: отправляю уведомление в группу {group_chat_id}")
+                        # Карточки идентификации новых Wazzup-контактов ОТКЛЮЧЕНЫ
+                        # (решение собственника 2026-07-17: убрать эту рассылку).
+                        # Контрагенты из МС автопривязываются выше, входящие сохраняются ниже —
+                        # отключение касается только карточки-предложения «привязать для рассылок».
+                        group_chat_id = 0
                         if group_chat_id:
                             try:
                                 import uuid as _uuid2
