@@ -397,6 +397,7 @@ async def _render_points(send, page: int, driver_id: int = None):
 
     if route_stops:
         import route_registry as rr
+        import route_dispatch  # _doc_no: заметки логиста в № заказа не должны рвать callback (лимит 64 байта)
         total = len(route_stops)
         pages = (total + _PAGE_SIZE - 1) // _PAGE_SIZE
         page = max(0, min(page, pages - 1))
@@ -405,7 +406,7 @@ async def _render_points(send, page: int, driver_id: int = None):
         for i, s in enumerate(chunk, start=page * _PAGE_SIZE + 1):
             title = (s.get("client") or s.get("order_no") or "?")[:40]
             buttons.append([InlineKeyboardButton(
-                f"📍 {i}. {title}", callback_data=f"drv:rp:{s['order_no']}")])
+                f"📍 {i}. {title}", callback_data=f"drv:rp:{route_dispatch._doc_no(s.get('order_no'))}")])
         nav = _nav_row(page, pages)
         if nav:
             buttons.append(nav)

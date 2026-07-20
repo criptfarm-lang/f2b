@@ -9,6 +9,7 @@ Wialon (route_registry), по каждой машине формирует св�
 """
 import io
 import os
+import re
 import json
 import logging
 from datetime import datetime, date, timezone, timedelta
@@ -140,17 +141,33 @@ async def _unit_package(routes, uid, target_date, bot_username):
     return {"stops": stops, "pdf": pdf, "driver_id": driver_id, "driver_name": driver_name}
 
 
+_DOC_RE = re.compile(r"\d{2,}")
+
+
+def _doc_no(order_no):
+    """МС-номер документа из текста точки: первая числовая группа.
+    Логист дописывает в поле № заказа адрес/заметки («00371 (Истринский…)») —
+    их нельзя тащить в callback_data (лимит Telegram 64 байта: длинный текст
+    роняет ВСЮ клавиатуру). В callback и в матчинге done↔stops используем только
+    номер документа. Нет цифр (pickup-заметка, «Белякова») → усечь до безопасной длины."""
+    s = (order_no or "").strip()
+    m = _DOC_RE.search(s)
+    if m:
+        return m.group(0)
+    return s.encode("utf-8")[:48].decode("utf-8", "ignore")  # ≤48б → callback ≤55б < 64
+
+
 def _driver_kb(stops, done=None):
-    """Кнопки маршрута водителю: точка → drv:rp:<№заказа> (обрабатывает driver_checklist).
-    done — множество № заказов, уже закрытых (не показываем; Фаза 3)."""
+    """Кнопки маршрута водителю: точка → drv:rp:<№документа> (обрабатывает driver_checklist).
+    done — множество № документов, уже закрытых (не показываем; Фаза 3)."""
     done = done or set()
     rows = []
     for i, s in enumerate(stops, 1):
-        if s["order_no"] in done:
+        if _doc_no(s.get("order_no")) in done:
             continue
         title = (s.get("client") or s.get("order_no") or "?")[:40]
         rows.append([InlineKeyboardButton(f"📍 {i}. {title}",
-                                          callback_data=f"drv:rp:{s['order_no']}")])
+                                          callback_data=f"drv:rp:{_doc_no(s.get('order_no'))}")])
     return InlineKeyboardMarkup(rows) if rows else None
 
 
@@ -214,16 +231,17 @@ async def mark_done_and_refresh(context, driver_chat_id, demand_id):
         order_no = await _demand_order_no(demand_id)
         if not order_no:
             return
+        doc = _doc_no(order_no)
         stops = row.get("stops") or []
         done = row.get("done") or []
         if isinstance(stops, str):
             stops = json.loads(stops)
         if isinstance(done, str):
             done = json.loads(done)
-        if order_no not in [s.get("order_no") for s in stops]:
+        if doc not in [_doc_no(s.get("order_no")) for s in stops]:
             return  # точка не из этого маршрута
-        if order_no not in done:
-            done.append(order_no)
+        if doc not in done:
+            done.append(doc)
         _DB._execute("UPDATE route_dispatch SET done=%s, updated_at=now() WHERE snap_date=%s AND unit_id=%s",
                      (json.dumps(done, ensure_ascii=False), today, row["unit_id"]))
         kb = _driver_kb(stops, done=set(done))
