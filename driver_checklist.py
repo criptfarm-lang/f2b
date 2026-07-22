@@ -1036,7 +1036,6 @@ def register(app: Application, db):
     """Подключить чеклист водителя. Вызывать в main() ДО catch-all handle_message."""
     global _DB
     _DB = db
-    ensure_schema(db)
     app.bot_data["db"] = db
 
     # /рейс (кириллица → через Regex) + ASCII-alias /reis
@@ -1063,5 +1062,14 @@ def register(app: Application, db):
         filters.TEXT & ~filters.COMMAND & _ClaimTextFilter(db), handle_claim_text))
     app.add_handler(MessageHandler(
         filters.PHOTO & _ClaimPhotoFilter(db), handle_claim_photo))
+
+    # ensure_schema — ПОСЛЕ регистрации хендлеров и best-effort: транзиентный сбой БД на
+    # старте (БД не готова) НЕ должен ронять весь register и оставлять кнопки водителя
+    # мёртвыми (симптом 22.07: и Мага, и Сиро — «кнопки не нажимаются»). Таблицы и так
+    # уже существуют с прошлых стартов, CREATE IF NOT EXISTS идемпотентен.
+    try:
+        ensure_schema(db)
+    except Exception as e:
+        logger.exception("driver_checklist.ensure_schema отложено (БД не готова?): %s", e)
 
     logger.info("driver_checklist: хендлеры зарегистрированы")

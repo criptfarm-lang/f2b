@@ -483,11 +483,16 @@ async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def register(app: Application, db):
     global _DB
     _DB = db
-    ensure_schema(db)
     app.add_handler(CommandHandler("routes", cmd_routes))
     app.add_handler(MessageHandler(filters.Regex(r"^/маршруты(@\w+)?(\s|$)"), cmd_routes))
     app.add_handler(CommandHandler("progress", cmd_progress))
     app.add_handler(MessageHandler(filters.Regex(r"^/ход(@\w+)?(\s|$)"), cmd_progress))
     app.add_handler(CallbackQueryHandler(cb_collect, pattern=r"^rd:col:"))
     app.add_handler(CallbackQueryHandler(cb_confirm, pattern=r"^rd:conf:"))
+    # ensure_schema — после хендлеров и best-effort: сбой БД на старте не должен ронять
+    # register и глушить кнопки маршрута (та же защита, что в driver_checklist).
+    try:
+        ensure_schema(db)
+    except Exception as e:
+        logger.exception("route_dispatch.ensure_schema отложено (БД не готова?): %s", e)
     logger.info("route_dispatch: хендлеры зарегистрированы")

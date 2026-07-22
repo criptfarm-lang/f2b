@@ -7613,22 +7613,22 @@ def main():
         import driver_checklist
         driver_checklist.register(app, db)
     except Exception as e:
-        logger.error(f"driver_checklist.register упал: {e}")
+        logger.exception(f"driver_checklist.register упал: {e}")
     try:
         import route_registry
         route_registry.register(app)
     except Exception as e:
-        logger.error(f"route_registry.register упал: {e}")
+        logger.exception(f"route_registry.register упал: {e}")
     try:
         import route_dispatch
         route_dispatch.register(app, db)
     except Exception as e:
-        logger.error(f"route_dispatch.register упал: {e}")
+        logger.exception(f"route_dispatch.register упал: {e}")
     try:
         import delivery_statuses
         delivery_statuses.register(app, db)
     except Exception as e:
-        logger.error(f"delivery_statuses.register упал: {e}")
+        logger.exception(f"delivery_statuses.register упал: {e}")
 
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
