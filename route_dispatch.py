@@ -43,6 +43,51 @@ def _sklad_chat_id() -> int:
     return int(os.getenv("SKLAD_CHAT_ID", "-4750423130") or 0)  # группа «Склад»
 
 
+# ─── Кубатура / вместимость машин ────────────────────────────────────────────
+# Готовая продукция + мелкая привлечёнка едут в одинаковых гофрокоробах 600×250×200 мм.
+# Объём машины = сумма «Количество мест» по точкам × объём короба. Согласовано 2026-07-22.
+_BOX_VOLUME_M3 = 0.6 * 0.25 * 0.2  # 0.03 м³ на одно «место»
+_CAP_BOXES = {26210: 190, 26209: 165}  # К459 Porter (~5.7 м³) / В970 KIA (~4.95 м³)
+
+
+def _total_boxes(stops, ms_extra):
+    """Сумма «Количество мест» по точкам маршрута. Возвращает (boxes, n_missing);
+    n_missing — сколько точек с незаполненным полем мест (их объём не учтён)."""
+    total = missing = 0
+    for s in stops:
+        ex = ms_extra.get(s["order_no"]) or {}
+        pl = ex.get("places")
+        try:
+            n = int(pl) if pl not in (None, "") else 0
+        except (ValueError, TypeError):
+            n = 0
+        if n <= 0:
+            missing += 1
+        total += n
+    return total, missing
+
+
+def _volume_note(uid, stops, ms_extra) -> str:
+    """Заметка по объёму загрузки машины — в САМО сообщение (не в реестр-PDF),
+    видят все: логист, водитель, склад. Предупреждает о перегрузе."""
+    boxes, missing = _total_boxes(stops, ms_extra)
+    vol = round(boxes * _BOX_VOLUME_M3, 1)
+    cap_boxes = _CAP_BOXES.get(uid)
+    if not cap_boxes:
+        note = f"📦 Объём: ~{vol} м³ ({boxes} мест)"
+    else:
+        cap_vol = round(cap_boxes * _BOX_VOLUME_M3, 1)
+        if boxes > cap_boxes:
+            note = (f"📦 ⚠️ ПЕРЕГРУЗ: ~{vol} м³ / лимит {cap_vol} м³ "
+                    f"({boxes} из {cap_boxes} мест) — не влезает, сними точки")
+        else:
+            pct = round(boxes / cap_boxes * 100)
+            note = f"📦 Объём: ~{vol} м³ / {cap_vol} м³ ({boxes}/{cap_boxes} мест, {pct}%)"
+    if missing:
+        note += f"\n⚠️ у {missing} точ. не заполнено «Количество мест» — объём занижен"
+    return note
+
+
 # ─── Схема ───────────────────────────────────────────────────────────────────
 
 def ensure_schema(db):
@@ -138,7 +183,8 @@ async def _unit_package(routes, uid, target_date, bot_username):
     ms_extra = await rr._ms_extra_by_order([s["order_no"] for s in stops])
     pdf = rr._build_registry_pdf({uid: stops}, ms_extra, bot_username,
                                  target_date.strftime("%d.%m.%Y"))
-    return {"stops": stops, "pdf": pdf, "driver_id": driver_id, "driver_name": driver_name}
+    return {"stops": stops, "pdf": pdf, "driver_id": driver_id, "driver_name": driver_name,
+            "ms_extra": ms_extra}
 
 
 _DOC_RE = re.compile(r"\d{2,}")
@@ -277,9 +323,11 @@ async def _collect_and_send(context, target_date, to_chat):
         _upsert_draft(target_date, uid, pkg["driver_id"], snap)
 
         who = pkg["driver_name"] or "⚠️ водитель не закреплён"
+        note = _volume_note(uid, stops, pkg["ms_extra"])
         lines = [f"{i}. {(s.get('client') or s.get('order_no') or '?')[:35]} ({rr._hm(s.get('vt'))})"
                  for i, s in enumerate(stops, 1)]
         caption = (f"🚚 {rr.UNITS[uid]} — водитель: {who}\n"
+                   f"{note}\n"
                    f"Маршрут на {date_str} — {len(stops)} точек (порядок выгрузки):\n"
                    + "\n".join(lines))
         kb = InlineKeyboardMarkup([
@@ -321,6 +369,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     driver_id = pkg["driver_id"]
     date_str = target_date.strftime("%d.%m.%Y")
     unit_name = rr.UNITS.get(uid, str(uid))
+    note = _volume_note(uid, stops, pkg["ms_extra"])  # заметка по объёму — во все сообщения
     snap = [{"order_no": s["order_no"], "client": s.get("client"), "seq": s.get("seq")} for s in stops]
     if _DB is not None:
         try:
@@ -350,6 +399,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg = await context.bot.send_message(
                     driver_id,
                     f"🚚 Маршрут на {date_str} — {left} из {len(stops)} точек (порядок выгрузки).\n"
+                    f"{note}\n"
                     "Приехал на точку — жми её, закрывай сдачу:",
                     reply_markup=kb)
             if _DB is not None:
@@ -370,7 +420,8 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_document(
                 sklad, io.BytesIO(pkg["pdf"]),
                 filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
-                caption=f"📦 Лист загрузки — {unit_name}, {date_str}. Грузить по порядку (первая точка к дверям).")
+                caption=(f"📦 Лист загрузки — {unit_name}, {date_str}. Грузить по порядку "
+                         f"(первая точка к дверям).\n{note}"))
             sklad_note = "склад ✓"
         except Exception as e:
             logger.warning("cb_confirm push sklad: %s", e)
