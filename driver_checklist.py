@@ -496,7 +496,8 @@ async def cb_route_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     demand_id = await _resolve_deeplink_payload(order_no)
     if not demand_id:
         await q.message.reply_text(
-            f"По точке №{order_no} отгрузка ещё не создана. Открой список: /рейс")
+            f"🕓 По точке №{order_no} склад ещё не отгрузил — жми эту же кнопку позже, "
+            "она откроется автоматически, как только отгрузку создадут. Список точек: /рейс")
         return
     await _render_card(q.message.reply_text, demand_id, context.bot_data["db"], with_back=False)
 
