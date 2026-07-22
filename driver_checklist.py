@@ -334,10 +334,13 @@ async def _send_alert(context, chat_ids, text, photo_file_id=None):
             continue
         seen.add(cid)
         try:
+            # Без parse_mode: текст содержит имя контрагента из МС (напр. «Розничный
+            # покупатель*** (Инесса)»), Markdown падал бы 400 и алерт о проблеме тихо
+            # не доходил бы до логиста/менеджера. Форматирование тут — только эмодзи.
             if photo_file_id:
-                await context.bot.send_photo(chat_id=cid, photo=photo_file_id, caption=text, parse_mode="Markdown")
+                await context.bot.send_photo(chat_id=cid, photo=photo_file_id, caption=text)
             else:
-                await context.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+                await context.bot.send_message(chat_id=cid, text=text)
         except Exception as e:
             logger.warning("_send_alert → %s: %s", cid, e)
 
@@ -458,7 +461,7 @@ async def _render_card(send, demand_id: str, db, with_back: bool = True):
         await send("Не удалось загрузить отгрузку. Попробуй ещё раз.")
         return
     lines = [
-        f"*{det.get('agent_name') or '?'}*",
+        f"{det.get('agent_name') or '?'}",
         f"Отгрузка № {det.get('name') or '?'}",
         f"Адрес: {det.get('address') or '—'}",
         f"Сумма: {_fmt_rub(det.get('sum_rub'))}",
@@ -475,7 +478,10 @@ async def _render_card(send, demand_id: str, db, with_back: bool = True):
     ]
     if with_back:
         rows.append([InlineKeyboardButton("« К списку", callback_data="drv:pg:0")])
-    await send("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+    # Без parse_mode: имена контрагентов из МС содержат «*» (напр. «Розничный
+    # покупатель*** (Инесса)»), а Markdown на них падает 400 «can't parse entities» →
+    # карточка не открывалась, у водителя «ничего не происходит». Простой текст надёжен.
+    await send("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
