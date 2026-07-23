@@ -17,6 +17,7 @@ Wialon: ресурс заявок 26208, машины 26209 (В 970 СВ 797) / 
 import os
 import io
 import json
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -215,39 +216,50 @@ async def _ms_extra_by_order(order_numbers) -> dict:
         return out
     headers = get_headers()
     import urllib.parse
-    async with aiohttp.ClientSession() as session:
-        for no in order_numbers:
+
+    def _parse(co):
+        places = None
+        for a in co.get("attributes", []) or []:
+            if a.get("name") == "Количество мест":
+                places = a.get("value")
+        # вес = сумма количеств позиций (рыба/морепродукты продаются в кг)
+        weight = 0.0
+        for p in (co.get("positions") or {}).get("rows", []):
+            weight += p.get("quantity") or 0
+        # менеджер / телефон / «здрасте» из контрагента
+        agent = co.get("agent") or {}
+        tags = [str(t).strip().lower() for t in (agent.get("tags") or [])]
+        manager = next((_MANAGER_TAG_NAMES[t] for t in tags if t in _MANAGER_TAG_NAMES), "")
+        return {
+            "places": places,
+            "comment": (co.get("description") or "").strip(),
+            "weight": weight,
+            "manager": manager,
+            "phone": (agent.get("phone") or "").strip(),
+            "zdraste": "здрасте" in tags,
+        }
+
+    # Параллельно, но с семафором — иначе N одновременных GET упрутся в rate-limit МС.
+    sem = asyncio.Semaphore(6)
+
+    async def _one(session, no):
+        async with sem:
             try:
                 f = urllib.parse.quote(f"name={no}")
                 url = (f"{MS_BASE}/entity/customerorder?filter={f}"
                        f"&expand=positions.assortment,agent&limit=1")
                 async with session.get(url, headers=headers) as r:
                     rows = (await r.json()).get("rows", []) if r.status == 200 else []
-                if not rows:
-                    continue
-                co = rows[0]
-                places = None
-                for a in co.get("attributes", []) or []:
-                    if a.get("name") == "Количество мест":
-                        places = a.get("value")
-                # вес = сумма количеств позиций (рыба/морепродукты продаются в кг)
-                weight = 0.0
-                for p in (co.get("positions") or {}).get("rows", []):
-                    weight += p.get("quantity") or 0
-                # менеджер / телефон / «здрасте» из контрагента
-                agent = co.get("agent") or {}
-                tags = [str(t).strip().lower() for t in (agent.get("tags") or [])]
-                manager = next((_MANAGER_TAG_NAMES[t] for t in tags if t in _MANAGER_TAG_NAMES), "")
-                out[no] = {
-                    "places": places,
-                    "comment": (co.get("description") or "").strip(),
-                    "weight": weight,
-                    "manager": manager,
-                    "phone": (agent.get("phone") or "").strip(),
-                    "zdraste": "здрасте" in tags,
-                }
+                return no, (_parse(rows[0]) if rows else None)
             except Exception as e:
                 logger.warning("_ms_extra_by_order %s: %s", no, e)
+                return no, None
+
+    async with aiohttp.ClientSession() as session:
+        results = await asyncio.gather(*(_one(session, no) for no in order_numbers))
+    for no, data in results:
+        if data is not None:
+            out[no] = data
     return out
 
 

@@ -11,6 +11,7 @@ Read-only: приёмка на точке НЕ дублируется — кно
 deep-link'ом `t.me/<bot>?start=chk_<№заказа>` в существующий driver_checklist.
 """
 import os
+import time
 import hmac
 import hashlib
 import logging
@@ -113,12 +114,31 @@ async def _bot_username(bot) -> str:
     return _BOT_USERNAME_DEFAULT
 
 
+_ROUTE_CACHE = {}   # (uid, date_iso) -> (mono_ts, stops, ms_extra, order_routes)
+_ROUTE_TTL = 45     # сек: авто-refresh и повторные заходы бьют кэш, а не Wialon+МС
+
+
+async def _route_data(uid: int, target: date):
+    """(stops, ms_extra, order_routes) с коротким TTL-кэшем — снимает тяжёлый живой
+    фетч Wialon+МС при авто-обновлении и повторных заходах. Закрытость точек (done) и
+    имя водителя берутся мимо кэша (дёшево, из БД) → статус сдачи всегда свежий."""
+    key = (uid, target.isoformat())
+    now = time.monotonic()
+    hit = _ROUTE_CACHE.get(key)
+    if hit and (now - hit[0]) < _ROUTE_TTL:
+        return hit[1], hit[2], hit[3]
+    routes, order_routes = await rr.fetch_routes(with_meta=True)
+    stops = [s for s in (routes.get(uid) or []) if rd._stop_on_date(s, target)]
+    ms_extra = await rr._ms_extra_by_order([s["order_no"] for s in stops]) if stops else {}
+    _ROUTE_CACHE[key] = (now, stops, ms_extra, order_routes)
+    return stops, ms_extra, order_routes
+
+
 async def render_page(uid: int, target: date, db, bot) -> str:
     unit_name = rr.UNITS.get(uid, str(uid))
     date_str = target.strftime("%d.%m.%Y")
 
-    routes, order_routes = await rr.fetch_routes(with_meta=True)
-    stops = [s for s in (routes.get(uid) or []) if rd._stop_on_date(s, target)]
+    stops, ms_extra, order_routes = await _route_data(uid, target)
 
     # Имя водителя + закрытые точки
     driver_name = ""
@@ -145,7 +165,6 @@ async def render_page(uid: int, target: date, db, bot) -> str:
             f"{len(stops)} точек (порядок выгрузки)</div>")
 
     if stops:
-        ms_extra = await rr._ms_extra_by_order([s["order_no"] for s in stops])
         km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
         head += f"<div class='vol'>{_e(rd._volume_note(uid, stops, ms_extra, km=km))}</div>"
     head += "</div>"
@@ -203,7 +222,7 @@ async def render_page(uid: int, target: date, db, bot) -> str:
 def _wrap(title: str, inner: str) -> str:
     return (f"<!doctype html><html lang='ru'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            f"<meta http-equiv='refresh' content='60'>"
+            f"<meta http-equiv='refresh' content='90'>"
             f"<title>Маршрут {_e(title)}</title><style>{_PAGE_CSS}</style></head>"
             f"<body><div class='wrap'>{inner}"
             f"<div class='foot'>Обновляется автоматически каждую минуту · данные из Логистики</div>"
