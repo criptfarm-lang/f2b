@@ -1126,9 +1126,12 @@ async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, cla
           money_val, _yn(doc), accepted_ok,
           ((claim_text or "").strip() or None) if not accepted_ok else None, status))
 
+    ms_target = "Сдан" if accepted_ok else "Сдан с проблемой"
+    wrote, write_on = False, False
     try:
         import delivery_statuses as _dsx
-        await _dsx.write_ms_status(demand_id, "Сдан" if accepted_ok else "Сдан с проблемой")
+        write_on = _dsx._write_enabled()
+        wrote = await _dsx.write_ms_status(demand_id, ms_target)
     except Exception as e:
         logger.warning("web_submit МС-статус: %s", e)
     try:
@@ -1137,8 +1140,14 @@ async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, cla
         logger.warning("web_submit done: %s", e)
     if not accepted_ok:
         await _web_alert_claim(bot, _get_row(db, demand_id))
-    return True, ("✅ Точка закрыта: сдано." if accepted_ok
-                  else "⚠️ Претензия зафиксирована, логист уведомлён.")
+
+    base = ("✅ Точка закрыта: сдано." if accepted_ok
+            else "⚠️ Претензия зафиксирована, логист уведомлён.")
+    if wrote:
+        return True, f"{base} Статус в МС → «{ms_target}»."
+    if not write_on:
+        return True, f"{base} ⚠️ НО в МС статус НЕ записан: запись выключена (DELIVERY_STATUS_WRITE)."
+    return True, f"{base} ⚠️ НО статус «{ms_target}» в МС записать не удалось — сообщи логисту."
 
 
 def register(app: Application, db):
