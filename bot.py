@@ -8394,11 +8394,15 @@ def main():
         web_app.router.add_get("/report", handle_web_report)
 
         # Живой HTML-маршрут водителю (план 2026-07-23). Токен в query, данные —
-        # из Wialon в реальном времени, приёмка — deep-link'ом в driver_checklist.
+        # из Wialon в реальном времени. Приёмка — НАТИВНО на странице (POST /submit),
+        # мимо Telegram (блокировки ТГ ломали inline-кнопки бота). Бот — запаска.
         import route_web
         async def handle_route_page(request):
             return await route_web.handle(request, db, app.bot)
+        async def handle_route_submit(request):
+            return await route_web.handle_submit(request, db, app.bot)
         web_app.router.add_get("/route/{uid}/{date}", handle_route_page)
+        web_app.router.add_post("/route/{uid}/{date}/submit", handle_route_submit)
 
         web_app.router.add_get("/pdz", handle_pdz_html)
         web_app.router.add_get("/pdz/embed", handle_pdz_embed)

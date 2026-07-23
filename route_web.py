@@ -137,6 +137,8 @@ async def _route_data(uid: int, target: date):
 async def render_page(uid: int, target: date, db, bot) -> str:
     unit_name = rr.UNITS.get(uid, str(uid))
     date_str = target.strftime("%d.%m.%Y")
+    date_iso = target.isoformat()
+    token = make_token(uid, date_iso)
 
     stops, ms_extra, order_routes = await _route_data(uid, target)
 
@@ -210,8 +212,26 @@ async def render_page(uid: int, target: date, db, bot) -> str:
 
         if is_done:
             rows.append("<div class='done-badge'>✅ Сдан</div>")
-        elif username:
-            rows.append(f"<a class='btn' href='https://t.me/{username}?start=chk_{_e(order_no)}'>Открыть сдачу</a>")
+        else:
+            is_retail = (client or "").startswith("Рознич")
+            money_q = ("<div class='q'>💵 Деньги приняты?"
+                       "<label><input type='radio' name='money' value='yes'>Да</label>"
+                       "<label><input type='radio' name='money' value='no'>Нет</label></div>") if is_retail else ""
+            bot_link = (f"<a class='blink' href='https://t.me/{username}?start=chk_{_e(order_no)}'>или через бот</a>"
+                        if username else "")
+            rows.append(
+                f"<form class='sd' data-uid='{uid}' data-date='{date_iso}' "
+                f"data-order='{_e(order_no)}' data-token='{_e(token)}'>"
+                f"{money_q}"
+                "<div class='q'>✍️ Документ подписан?"
+                "<label><input type='radio' name='doc' value='yes'>Да</label>"
+                "<label><input type='radio' name='doc' value='no'>Нет</label></div>"
+                "<div class='q'>📦 Итог:"
+                "<label><input type='radio' name='accepted' value='ok'>Сдано</label>"
+                "<label><input type='radio' name='accepted' value='claim'>Претензия</label></div>"
+                "<textarea name='claim_text' class='claim' placeholder='Опиши претензию' hidden></textarea>"
+                "<button type='button' class='btn' onclick='sendSd(this.form)'>Отправить сдачу</button>"
+                f"{bot_link}<div class='msg'></div></form>")
 
         cards.append(f"<div class='{cls}'>" + "".join(rows) + "</div>")
 
@@ -219,14 +239,38 @@ async def render_page(uid: int, target: date, db, bot) -> str:
     return _wrap(unit_name, head + body)
 
 
+_FORM_CSS = (".sd{margin-top:10px;padding-top:8px;border-top:1px solid #eee}"
+             ".q{margin:6px 0;font-size:15px}.q label{margin-left:10px;white-space:nowrap}"
+             ".claim{width:100%;box-sizing:border-box;margin:6px 0;min-height:54px}"
+             ".msg{color:#b91c1c;font-size:14px;margin-top:6px}"
+             ".blink{display:inline-block;margin-left:12px;color:#6b7280;font-size:13px}")
+
+_FORM_JS = (
+    "function sendSd(f){var acc=(f.accepted&&f.accepted.value)||'';"
+    "if(!acc){alert('Отметь: Сдано или Претензия');return;}"
+    "var body={order_no:f.dataset.order,items:{}};"
+    "new FormData(f).forEach(function(v,k){if(k.indexOf('item_')===0){body.items[k.slice(5)]=v;}else{body[k]=v;}});"
+    "if(acc==='claim'&&!((body.claim_text||'').trim())){alert('Опиши претензию');return;}"
+    "var url='/route/'+f.dataset.uid+'/'+f.dataset.date+'/submit?t='+encodeURIComponent(f.dataset.token);"
+    "var btn=f.querySelector('button');btn.disabled=true;btn.textContent='Отправляю…';"
+    "fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})"
+    ".then(function(r){return r.json();}).then(function(d){"
+    "if(d.ok){var c=f.closest('.pt');if(c)c.className='pt done';"
+    "f.outerHTML=\"<div class='done-badge'>\"+(d.msg||'✅ Закрыто')+\"</div>\";}"
+    "else{f.querySelector('.msg').textContent=d.msg||'Ошибка';btn.disabled=false;btn.textContent='Отправить сдачу';}})"
+    ".catch(function(){f.querySelector('.msg').textContent='Сеть недоступна — повтори';"
+    "btn.disabled=false;btn.textContent='Отправить сдачу';});}"
+    "document.addEventListener('change',function(e){if(e.target&&e.target.name==='accepted'){"
+    "var t=e.target.form.querySelector('.claim');if(t)t.hidden=(e.target.value!=='claim');}});")
+
+
 def _wrap(title: str, inner: str) -> str:
     return (f"<!doctype html><html lang='ru'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            f"<meta http-equiv='refresh' content='90'>"
-            f"<title>Маршрут {_e(title)}</title><style>{_PAGE_CSS}</style></head>"
+            f"<title>Маршрут {_e(title)}</title><style>{_PAGE_CSS}{_FORM_CSS}</style></head>"
             f"<body><div class='wrap'>{inner}"
-            f"<div class='foot'>Обновляется автоматически каждую минуту · данные из Логистики</div>"
-            f"</div></body></html>")
+            f"<div class='foot'>Сдача точки — прямо здесь. Обнови страницу, если логист поменял маршрут.</div>"
+            f"</div><script>{_FORM_JS}</script></body></html>")
 
 
 # ─── aiohttp-хендлер ─────────────────────────────────────────────────────────
@@ -255,3 +299,35 @@ async def handle(request, db, bot) -> web.Response:
     except Exception as e:
         logger.error("route_web.handle: %s", e, exc_info=True)
         return _err("Не удалось собрать маршрут. Проверь доступ к Логистике.", 500)
+
+
+async def handle_submit(request, db, bot) -> web.Response:
+    """POST-приёмка точки с веб-страницы (мимо Telegram). Тот же HMAC-токен, что на GET."""
+    try:
+        uid = int(request.match_info["uid"])
+        date_str = request.match_info["date"]
+        date.fromisoformat(date_str)
+    except (ValueError, KeyError):
+        return web.json_response({"ok": False, "msg": "Некорректная ссылка"}, status=400)
+    if uid not in rr.UNITS:
+        return web.json_response({"ok": False, "msg": "Неизвестная машина"}, status=404)
+    if not verify_token(uid, date_str, request.query.get("t", "")):
+        return web.json_response({"ok": False, "msg": "Ссылка недействительна"}, status=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "msg": "Некорректные данные"}, status=400)
+    order_no = str(body.get("order_no") or "").strip()
+    if not order_no:
+        return web.json_response({"ok": False, "msg": "Не указана точка"}, status=400)
+    try:
+        import driver_checklist as dc
+        ok, msg = await dc.web_submit(
+            db, bot, uid, order_no,
+            money=body.get("money"), doc=body.get("doc"),
+            items=body.get("items") or {}, accepted=(body.get("accepted") or ""),
+            claim_text=body.get("claim_text") or "")
+        return web.json_response({"ok": ok, "msg": msg})
+    except Exception as e:
+        logger.error("route_web.handle_submit: %s", e, exc_info=True)
+        return web.json_response({"ok": False, "msg": "Ошибка сохранения, повтори"}, status=500)

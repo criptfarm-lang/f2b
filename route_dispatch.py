@@ -302,6 +302,36 @@ def _existing_done(snap_date, unit_id):
     return set()
 
 
+def mark_done_by_unit(unit_id, order_no):
+    """Пометить точку закрытой в route_dispatch.done по МАШИНЕ (без TG-контекста).
+    Для веб-приёмки: у веба нет driver_chat_id/driver_msg_id, зато есть unit_id из ссылки.
+    Только БД — TG-сообщение не трогаем (веб работает мимо Telegram)."""
+    if _DB is None:
+        return
+    try:
+        today = datetime.now(_MSK).date()
+        row = _DB._fetchone(
+            "SELECT stops, done FROM route_dispatch "
+            "WHERE snap_date=%s AND unit_id=%s AND status='confirmed'", (today, unit_id))
+        if not row:
+            return
+        doc = _doc_no(order_no)
+        stops = row.get("stops") or []
+        done = row.get("done") or []
+        if isinstance(stops, str):
+            stops = json.loads(stops)
+        if isinstance(done, str):
+            done = json.loads(done)
+        if doc not in [_doc_no(s.get("order_no")) for s in stops]:
+            return  # точка не из этого маршрута
+        if doc not in done:
+            done.append(doc)
+            _DB._execute("UPDATE route_dispatch SET done=%s, updated_at=now() WHERE snap_date=%s AND unit_id=%s",
+                         (json.dumps(done, ensure_ascii=False), today, unit_id))
+    except Exception as e:
+        logger.warning("mark_done_by_unit: %s", e)
+
+
 async def _demand_order_no(demand_id):
     """demand → номер его заказа (customerOrder.name) — чтобы сматчить закрытую точку с маршрутом."""
     try:

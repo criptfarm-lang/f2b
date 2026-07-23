@@ -1053,6 +1053,94 @@ class _ClaimPhotoFilter(filters.MessageFilter):
 
 # ─── Регистрация ─────────────────────────────────────────────────────────────
 
+def _point_head_plain(row) -> str:
+    """Шапка точки без Markdown — имена контрагентов из МС содержат '*'/'(' (падает parse)."""
+    return (f"{row.get('agent_name') or '?'}\n"
+            f"Отгрузка № {row.get('demand_name') or '?'}\n"
+            f"Адрес: {row.get('address') or '—'}")
+
+
+async def _web_alert_claim(bot, row):
+    """Претензия с веб-приёмки → логистам (best-effort; TG может тупить, но это канал эскалации)."""
+    if not row:
+        return
+    text = (f"⚠️ Претензия при сдаче (веб-приёмка)\n{_point_head_plain(row)}\n"
+            f"Коммент: {row.get('claim_text') or '—'}")
+    for cid in _logist_chat_ids():
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.warning("_web_alert_claim → %s: %s", cid, e)
+
+
+async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, claim_text):
+    """Приёмка точки С ВЕБ-СТРАНИЦЫ, одним экраном, без telegram-контекста.
+    money/doc/item — строки 'yes'/'no' (или None). accepted — 'ok'/'claim'.
+    Пишет статус в МС (Сдан / Сдан с проблемой), помечает точку закрытой в
+    route_dispatch.done по машине. Возвращает (ok: bool, msg: str). Бот — запаска,
+    поэтому логика записи зеркалит cb_accept/_finish_claim."""
+    import route_dispatch
+    doc = route_dispatch._doc_no(order_no)  # чистим заметки логиста из № (как кнопки маршрута)
+    demand_id = await _resolve_deeplink_payload(doc)
+    if not demand_id:
+        return False, "Точка ещё не отгружена складом — попробуй позже."
+    det = await _fetch_demand_detail(demand_id)
+    if not det:
+        return False, "Не удалось загрузить отгрузку. Попробуй ещё раз."
+
+    is_retail = _is_retail(det.get("agent_name"))
+    is_sample = det.get("max_price_rub", 0) <= _SAMPLE_MAX_PRICE_RUB
+    money_required = is_retail and (not is_sample) and det.get("sum_rub", 0) > 0
+    mtag, _ = await _resolve_manager_chat(det.get("agent_id"))
+    _, _, snap = _msk_today_bounds()
+
+    def _yn(v):
+        return True if v == "yes" else (False if v == "no" else None)
+
+    base_items = _parse_checklist_items(det.get("checklist_raw"), money_required)
+    ci = [{"idx": i, "text": t, "answer": _yn((items or {}).get(str(i)))}
+          for i, t in enumerate(base_items)]
+
+    drow = db._fetchone("SELECT chat_id FROM drivers WHERE unit_id=%s AND active LIMIT 1", (uid,))
+    driver_chat = (drow or {}).get("chat_id")
+    accepted_ok = (accepted == "ok")
+    status = "сдан" if accepted_ok else "сдан с проблемой"
+    money_val = _yn(money) if money_required else None
+
+    db._execute("""
+        INSERT INTO delivery_checklist
+          (demand_id, demand_name, agent_id, agent_name, address, sum_rub,
+           is_retail, is_sample, money_required, manager_tag, driver_chat_id,
+           snap_date, stage, custom_items, money_received, doc_signed,
+           accepted_ok, claim_text, status, arrived_at, completed_at, updated_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'done',%s,%s,%s,%s,%s,%s, now(), now(), now())
+        ON CONFLICT (demand_id) DO UPDATE SET
+           driver_chat_id=EXCLUDED.driver_chat_id, money_required=EXCLUDED.money_required,
+           stage='done', custom_items=EXCLUDED.custom_items,
+           money_received=EXCLUDED.money_received, doc_signed=EXCLUDED.doc_signed,
+           accepted_ok=EXCLUDED.accepted_ok, claim_text=EXCLUDED.claim_text,
+           status=EXCLUDED.status, completed_at=now(), updated_at=now()
+    """, (demand_id, det.get("name"), det.get("agent_id"), det.get("agent_name"),
+          det.get("address"), det.get("sum_rub"), is_retail, is_sample, money_required,
+          mtag, driver_chat, snap, json.dumps(ci, ensure_ascii=False),
+          money_val, _yn(doc), accepted_ok,
+          ((claim_text or "").strip() or None) if not accepted_ok else None, status))
+
+    try:
+        import delivery_statuses as _dsx
+        await _dsx.write_ms_status(demand_id, "Сдан" if accepted_ok else "Сдан с проблемой")
+    except Exception as e:
+        logger.warning("web_submit МС-статус: %s", e)
+    try:
+        route_dispatch.mark_done_by_unit(uid, doc)
+    except Exception as e:
+        logger.warning("web_submit done: %s", e)
+    if not accepted_ok:
+        await _web_alert_claim(bot, _get_row(db, demand_id))
+    return True, ("✅ Точка закрыта: сдано." if accepted_ok
+                  else "⚠️ Претензия зафиксирована, логист уведомлён.")
+
+
 def register(app: Application, db):
     """Подключить чеклист водителя. Вызывать в main() ДО catch-all handle_message."""
     global _DB
