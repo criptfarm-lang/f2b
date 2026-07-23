@@ -60,7 +60,9 @@ IDLE_MIN = 60              # простой: машина стоит на мес
 ROUTE_END_MIN = 10         # на точке ночёвки ≥ этого → фиксируем «конец маршрута» в моменте
 IDLE_RADIUS_M = 150        # «на месте»: не отходит дальше этого от точки стоянки
 DELIVERY_HOURS = (7, 21)   # МСК, в эти часы крон активен
-JOB_INTERVAL_SEC = 600
+JOB_INTERVAL_SEC = 600            # дневной опрос МС↔логистика — каждые 10 мин
+JOB_INTERVAL_EVENING_SEC = 300    # вечерний (активный развоз) — каждые 5 мин
+EVENING_FAST_HOUR = 17            # МСК: с этого часа переходим на 5-мин опрос
 DWELL_UNLOAD_MIN = 5       # стоянка у точки клиента ≥ этого = вероятная выгрузка (нижний порог, верхнего нет)
 UNLOAD_SPEED_KMH = 5       # «стоит»: мгновенная скорость ≤ этого (иначе — проезд мимо, не выгрузка)
 
@@ -815,10 +817,23 @@ async def cmd_statuses(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ошибка расчёта статусов. Проверь WIALON_TOKEN.")
 
 
+_last_run_ts = 0.0  # факт. время прошлого прогона — для гейта дневной/вечерний интервал
+
+
 async def _job(context: ContextTypes.DEFAULT_TYPE):
-    h = datetime.now(_MSK).hour
+    global _last_run_ts
+    now = datetime.now(_MSK)
+    h = now.hour
     if not (DELIVERY_HOURS[0] <= h < DELIVERY_HOURS[1]):
         return
+    # Тик каждые 5 мин, но ДО вечернего часа пропускаем каждый второй тик → 10 мин;
+    # с EVENING_FAST_HOUR (17:00) прогоняем каждый тик → 5 мин. Гейт по факт. паузе
+    # (устойчив к джиттеру тика; глобал сбрасывается при рестарте — не страшно).
+    now_ts = now.timestamp()
+    min_gap = JOB_INTERVAL_EVENING_SEC if h >= EVENING_FAST_HOUR else JOB_INTERVAL_SEC
+    if now_ts - _last_run_ts < min_gap - 45:
+        return
+    _last_run_ts = now_ts
     db = context.application.bot_data.get("db")
     if not db:
         return
@@ -836,5 +851,5 @@ def register(app: Application, db):
     app.add_handler(CommandHandler("statuses", cmd_statuses))
     app.add_handler(MessageHandler(filters.Regex(r"^/статусы(@\w+)?(\s|$)"), cmd_statuses))
     if app.job_queue:
-        app.job_queue.run_repeating(_job, interval=JOB_INTERVAL_SEC, first=90, name="delivery_statuses")
+        app.job_queue.run_repeating(_job, interval=JOB_INTERVAL_EVENING_SEC, first=90, name="delivery_statuses")
     logger.info("delivery_statuses: register (write=%s)", _write_enabled())
