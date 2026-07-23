@@ -421,9 +421,9 @@ async def _render_points(send, page: int, driver_id: int = None):
         chunk = route_stops[page * _PAGE_SIZE:(page + 1) * _PAGE_SIZE]
         buttons = []
         for i, s in enumerate(chunk, start=page * _PAGE_SIZE + 1):
-            title = (s.get("client") or s.get("order_no") or "?")[:40]
             buttons.append([InlineKeyboardButton(
-                f"📍 {i}. {title}", callback_data=f"drv:rp:{route_dispatch._doc_no(s.get('order_no'))}")])
+                f"📍 {i}. {route_dispatch._stop_label(s)}",
+                callback_data=f"drv:rp:{route_dispatch._doc_no(s.get('order_no'))}")])
         nav = _nav_row(page, pages)
         if nav:
             buttons.append(nav)
@@ -442,10 +442,11 @@ async def _render_points(send, page: int, driver_id: int = None):
     page = max(0, min(page, pages - 1))
     chunk = demands[page * _PAGE_SIZE:(page + 1) * _PAGE_SIZE]
 
+    import route_dispatch  # общий помощник подписи: имя клиента + № (розницу сжимает)
     buttons = []
     for d in chunk:
-        title = (d["agent_name"] or d["name"] or "?")[:45]
-        buttons.append([InlineKeyboardButton(f"📍 {title}", callback_data=f"drv:pick:{d['id']}")])
+        label = route_dispatch._btn_label(d["agent_name"] or d["name"], d.get("name"))
+        buttons.append([InlineKeyboardButton(f"📍 {label}", callback_data=f"drv:pick:{d['id']}")])
 
     nav = _nav_row(page, pages)
     if nav:

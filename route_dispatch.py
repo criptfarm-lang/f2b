@@ -235,6 +235,30 @@ def _doc_no(order_no):
     return s.encode("utf-8")[:48].decode("utf-8", "ignore")  # ≤48б → callback ≤55б < 64
 
 
+def _short_retail(name):
+    """Сжать generic-имя розницы «Розничный покупатель*** (Инесса)» → «Розн. Инесса».
+    Отличающий контакт стоит в конце длинного имени и срезался бы лимитом кнопки;
+    вытаскиваем его вперёд. Именованные ООО/ИП возвращаем как есть."""
+    name = (name or "?").strip()
+    if name.startswith("Рознич"):
+        m = re.search(r"\(([^)]+)\)", name)
+        return f"Розн. {m.group(1)}" if m else "Розн."
+    return name
+
+
+def _btn_label(name, num):
+    """Подпись кнопки точки: имя клиента + № заказа (совпадает с УПД в руках водителя).
+    Два одинаковых розничных контакта различаются по №. Имя усечено так, чтобы № влез."""
+    name = _short_retail(name)
+    suffix = f" №{num}" if num else ""
+    return f"{name[:40 - len(suffix)]}{suffix}"
+
+
+def _stop_label(s):
+    """Подпись точки маршрута из stop-словаря (client + № документа)."""
+    return _btn_label(s.get("client") or s.get("order_no"), _doc_no(s.get("order_no")))
+
+
 def _driver_kb(stops, done=None):
     """Кнопки маршрута водителю: точка → drv:rp:<№документа> (обрабатывает driver_checklist).
     done — множество № документов, уже закрытых (не показываем; Фаза 3)."""
@@ -243,8 +267,7 @@ def _driver_kb(stops, done=None):
     for i, s in enumerate(stops, 1):
         if _doc_no(s.get("order_no")) in done:
             continue
-        title = (s.get("client") or s.get("order_no") or "?")[:40]
-        rows.append([InlineKeyboardButton(f"📍 {i}. {title}",
+        rows.append([InlineKeyboardButton(f"📍 {i}. {_stop_label(s)}",
                                           callback_data=f"drv:rp:{_doc_no(s.get('order_no'))}")])
     return InlineKeyboardMarkup(rows) if rows else None
 

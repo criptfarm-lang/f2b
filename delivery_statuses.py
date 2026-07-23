@@ -8,8 +8,9 @@
                           • ФАКТ: конец окна уже прошёл, а машина не доехала (по GPS);
                           • ПРОГНОЗ: план точки + текущее отставание машины перепрыгивают
                             конец окна (знаем о задержке заранее, до конца окна).
-                          При смене статуса на «Задержка» → уведомление владелец+Белякова+
-                          Маланчук (одно на машину за прогон, список точек, прогноз ИЛИ факт).
+                          При смене статуса на «Задержка» → уведомление владелец+логисты
+                          (Белякова, Петровский)+Маланчук (одно на машину за прогон,
+                          список точек, прогноз ИЛИ факт).
                           Менеджеру — отдельно, по ФАКТУ опоздания > 60 мин.
   - «Сдан»/«Сдан с проблемой» — из чеклиста водителя (событийно, см. driver_checklist).
 
@@ -35,7 +36,7 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 from moysklad import MS_BASE, get_headers, PDZ_MANAGER_TG_IDS
@@ -60,6 +61,8 @@ ROUTE_END_MIN = 10         # на точке ночёвки ≥ этого → �
 IDLE_RADIUS_M = 150        # «на месте»: не отходит дальше этого от точки стоянки
 DELIVERY_HOURS = (7, 21)   # МСК, в эти часы крон активен
 JOB_INTERVAL_SEC = 600
+DWELL_UNLOAD_MIN = 5       # стоянка у точки клиента ≥ этого = вероятная выгрузка (нижний порог, верхнего нет)
+UNLOAD_SPEED_KMH = 5       # «стоит»: мгновенная скорость ≤ этого (иначе — проезд мимо, не выгрузка)
 
 # Статусы, которые авто-движок ИМЕЕТ ПРАВО менять (логистические, в процессе развоза).
 # Всё остальное — ручное/бухгалтерское (Отгружен ставит оператор; УПД подписан / Долг /
@@ -123,6 +126,10 @@ def ensure_schema(db):
     """)
     db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS delay_mgr_alerted BOOLEAN DEFAULT FALSE")
     db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS write_fail_target TEXT")
+    # Детект «выгрузил, но не отметил»: копим стоянку у точки (near_since..near_last), дедуп unload_alerted.
+    db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS near_since BIGINT")
+    db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS near_last BIGINT")
+    db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS unload_alerted BOOLEAN DEFAULT FALSE")
     db._execute("""
         CREATE TABLE IF NOT EXISTS unit_dwell (
             unit_id     BIGINT PRIMARY KEY,
@@ -252,6 +259,49 @@ async def _route_end_alert(bot, unit_name, info):
             await bot.send_message(chat_id=cid, text=text)
         except Exception as e:
             logger.warning("_route_end_alert → %s: %s", cid, e)
+
+
+def _unload_recipients() -> list:
+    """Контролёры выгрузки: Саша(Белякова)+Виктор+Александр(Маланчук)+Володя(Петровский)
+    = owner + логисты + партнёр, с дедупом (Белякова уже среди логистов)."""
+    seen = []
+    for cid in [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()]:
+        if cid and cid not in seen:
+            seen.append(cid)
+    return seen
+
+
+async def _unload_driver_alert(bot, driver_chat, unit_name, uf):
+    """Персональный алерт водителю: похоже, выгрузил, но не отметил. Кнопка → полный чек-лист точки."""
+    if not driver_chat:
+        return
+    import route_dispatch
+    s = uf["s"]
+    label = route_dispatch._stop_label(s)
+    doc = route_dispatch._doc_no(s.get("order_no"))
+    text = (f"🔔 Похоже, выгрузка состоялась, но сдача не отмечена.\n"
+            f"{label} — стоянка ~{uf['dwell_min']} мин, точка не закрыта.\n"
+            f"Открой чек-лист и заверши сдачу:")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+        f"📋 Заполнить чек-лист: {label}", callback_data=f"drv:rp:{doc}")]])
+    try:
+        await bot.send_message(chat_id=driver_chat, text=text, reply_markup=kb)
+    except Exception as e:
+        logger.warning("_unload_driver_alert → %s: %s", driver_chat, e)
+
+
+async def _unload_control_alert(bot, unit_name, uf, recipients):
+    """Эскалация контролёрам: машина простояла и уехала, а выгрузка не подтверждена."""
+    import route_dispatch
+    label = route_dispatch._stop_label(uf["s"])
+    text = (f"⚠️ Контроль выгрузки — {unit_name}\n"
+            f"Простояла у точки ~{uf['dwell_min']} мин и уехала, сдача не подтверждена.\n"
+            f"{label}\nПроконтролируйте, что выгрузка состоялась и водитель закрыл точку.")
+    for cid in recipients:
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.warning("_unload_control_alert → %s: %s", cid, e)
 
 
 # ─── Wialon позиции ──────────────────────────────────────────────────────────
@@ -421,6 +471,7 @@ async def run_check(db, bot=None, preview=False) -> list:
             left_base = bool(pos) and _haversine(pos["lat"], pos["lon"], BASE_LAT, BASE_LON) > R_BASE_M
             machine = []   # для расчёта отставания / риска смещения
             recs = []      # разрешённые точки (МС + прибытие + чеклист) — решаем статус вторым проходом
+            unload_flips = []  # точки, где машина простояла и уехала, а сдача не закрыта
             for s in stops:
                 order_no = s["order_no"]
                 info = await _ms_resolve(session, order_no)
@@ -445,6 +496,31 @@ async def run_check(db, bot=None, preview=False) -> list:
                 # проблемой / Едет возврат / УПД подписан / Долг / Оплачен). По таким точкам не
                 # считаем отставание и не алертим — даже если в Wialon заявка ещё висит.
                 done = bool(cur) and cur not in MANAGED
+
+                # ── Детект «выгрузил, но не отметил» ──
+                # Копим стоянку у точки: пока машина СТОИТ (speed≤порог) в радиусе R_STOP_M —
+                # ведём near_since (первый раз) и near_last (каждый прогон). Когда уехала из
+                # радиуса, а точка НЕ закрыта и стоянка была ≥ DWELL_UNLOAD_MIN — кандидат на
+                # алерт (дедуп unload_alerted). Крон 10 мин: реальная выгрузка 5–30 мин почти
+                # всегда ловится на ≥2 прогонах → near_last−near_since ≥ порога.
+                if not preview and pos and s.get("lat") and s.get("lon"):
+                    near_stopped = (_haversine(pos["lat"], pos["lon"], s["lat"], s["lon"]) <= R_STOP_M
+                                    and (pos.get("speed") or 0) <= UNLOAD_SPEED_KMH)
+                    if near_stopped:
+                        if not st.get("near_since"):
+                            _st_upsert(db, order_no, near_since=now_ts, near_last=now_ts,
+                                       demand_id=info["demand_id"], unit_id=uid)
+                        else:
+                            _st_upsert(db, order_no, near_last=now_ts,
+                                       demand_id=info["demand_id"], unit_id=uid)
+                    else:
+                        ns, nl = st.get("near_since"), st.get("near_last")
+                        if (ns and not done and not st.get("unload_alerted")
+                                and ((nl or ns) - ns) >= DWELL_UNLOAD_MIN * 60):
+                            unload_flips.append({"s": s, "order_no": order_no,
+                                                 "demand_id": info["demand_id"],
+                                                 "dwell_min": int(((nl or ns) - ns) / 60)})
+
                 machine.append({"s": s, "arrived": arrived, "done": done, "real_window": real_window})
                 recs.append({"s": s, "order_no": order_no, "info": info, "cur": cur,
                              "st": st, "arrived": arrived, "chk_status": chk_status,
@@ -495,7 +571,7 @@ async def run_check(db, bot=None, preview=False) -> list:
                             await _write_fail_alert(bot, name, order_no, s.get("client"), cur, target, bool(meta))
                             _st_upsert(db, order_no, write_fail_target=target,
                                        demand_id=info["demand_id"], unit_id=uid)
-                # Смена статуса на «Задержка в пути» → уведомление владелец+Белякова+Маланчук.
+                # Смена статуса на «Задержка в пути» → уведомление владелец+логисты (Белякова, Петровский)+Маланчук.
                 # Копим по машине, шлём одним сообщением ниже. Триггер — сам факт смены статуса
                 # (прогноз ИЛИ факт), один раз на заказ (дедуп delay_alerted).
                 tt = s.get("tt") or 0
@@ -512,7 +588,7 @@ async def run_check(db, bot=None, preview=False) -> list:
                                    demand_id=info["demand_id"], unit_id=uid)
 
             # ── Уведомление о смене статуса на «Задержка в пути» ──
-            # Владелец + Белякова + Маланчук: одно сообщение на машину за прогон, список точек.
+            # Владелец + логисты (Белякова, Петровский) + Маланчук: одно сообщение на машину за прогон, список точек.
             if delay_flips:
                 lines.append(f"{name}: уведомление о задержке — точек: {len(delay_flips)}")
                 if bot and not preview:
@@ -522,6 +598,25 @@ async def run_check(db, bot=None, preview=False) -> list:
                     for d in delay_flips:
                         _st_upsert(db, d["order_no"], delay_alerted=True,
                                    demand_id=d["demand_id"], unit_id=uid)
+
+            # ── Алерт «выгрузка состоялась, кнопка не нажата» ──
+            # Машина простояла у точки ≥5 мин и уехала, а сдача не закрыта. Водителю —
+            # персонально с кнопкой на полный чек-лист; контролёрам (Саша/Виктор/Александр/
+            # Володя = owner+логисты+партнёр) — эскалация. Дедуп на заказ (unload_alerted).
+            if unload_flips:
+                lines.append(f"{name}: выгрузка без подтверждения — точек: {len(unload_flips)}")
+                if bot and not preview:
+                    drow = db._fetchone(
+                        "SELECT chat_id FROM drivers WHERE unit_id=%s AND active LIMIT 1", (uid,))
+                    driver_chat = (drow or {}).get("chat_id")
+                    controllers = _unload_recipients()
+                    for uf in unload_flips:
+                        await _unload_driver_alert(bot, driver_chat, name, uf)
+                        await _unload_control_alert(bot, name, uf, controllers)
+                if not preview:
+                    for uf in unload_flips:
+                        _st_upsert(db, uf["order_no"], unload_alerted=True,
+                                   demand_id=uf["demand_id"], unit_id=uid)
 
             # ── Отставание от плана (для лаг-алерта ниже; риск-алерт заменён уведомлением выше) ──
             risk = _compute_risk(machine, now_ts)
@@ -583,7 +678,7 @@ def _compute_risk(machine, now_ts):
 
 
 async def _delay_flip_alert(bot, unit_name, stops, lag_sec, now_ts, recipients):
-    """Уведомление владелец+Белякова+Маланчук: у этих точек статус стал «Задержка в пути»
+    """Уведомление владелец+логисты (Белякова, Петровский)+Маланчук: у этих точек статус стал «Задержка в пути»
     (прогноз ИЛИ факт). Одно сообщение на машину за прогон."""
     def _hm(t):
         return datetime.fromtimestamp(t, _MSK).strftime("%H:%M") if t else "—"
