@@ -20,6 +20,7 @@ from telegram.ext import (
     BusinessConnectionHandler,
     filters,
 )
+from telegram.error import TimedOut, NetworkError
 
 from database import Database
 from notifier import check_order_agreed  # рассылка при согласовании — не трогать!
@@ -7164,12 +7165,51 @@ async def handle_business_connection(update: Update, context: ContextTypes.DEFAU
         logger.error(f"Не удалось отправить алерт собственнику: {e}")
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный обработчик исключений PTB.
+
+    До него исключения в хендлерах молча логировались как
+    «No error handlers are registered» без трейсбека (наблюдалось 22.07.2026 во
+    время шторма Telegram-таймаутов). Теперь: полный трейсбек в лог + при
+    сетевом фейле на нажатии кнопки best-effort даём пользователю обратную
+    связь, чтобы кнопка не выглядела «мёртвой».
+    """
+    err = context.error
+    logger.error("Необработанное исключение при обработке апдейта", exc_info=err)
+    # Сетевой лаг/таймаут при нажатии inline-кнопки — подсказать «нажми ещё раз».
+    if isinstance(err, (TimedOut, NetworkError)):
+        q = getattr(update, "callback_query", None)
+        if q is not None:
+            try:
+                await q.answer("Telegram лагает, нажми ещё раз", show_alert=False)
+            except Exception:
+                pass  # если и это упало — сеть совсем легла, молча выходим
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("Не задан TELEGRAM_BOT_TOKEN в переменных окружения!")
 
-    app = Application.builder().token(token).build()
+    # Таймауты httpx подняты против троттлинга Telegram API из региона Amvera
+    # Москва_0. Дефолты PTB жёсткие (connect/read/write=5с, pool=1с) — при
+    # деградации связи 22.07.2026 это дало шторм `Timed out`/`PoolTimeout` на
+    # каждый send/answer: хендлеры отрабатывали, но ответ Telegram висел →
+    # кнопки «не реагировали» весь день. Более щедрые таймауты + больший пул
+    # сглаживают лаги (не лечат сам троттлинг, но убирают ложные фейлы).
+    app = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(20.0)
+        .read_timeout(20.0)
+        .write_timeout(30.0)          # send_document (PDF-реестры) — с запасом
+        .pool_timeout(10.0)           # дефолт 1с → PoolTimeout под нагрузкой
+        .connection_pool_size(64)     # дефолт 1; апдейты + scheduler конкурируют за пул
+        .get_updates_connect_timeout(20.0)
+        .get_updates_read_timeout(30.0)
+        .build()
+    )
+    app.add_error_handler(on_error)
 
     # Восстанавливаем ожидающие идентификации из БД после рестарта
     try:
