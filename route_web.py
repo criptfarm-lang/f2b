@@ -117,7 +117,7 @@ async def render_page(uid: int, target: date, db, bot) -> str:
     unit_name = rr.UNITS.get(uid, str(uid))
     date_str = target.strftime("%d.%m.%Y")
 
-    routes = await rr.fetch_routes()
+    routes, order_routes = await rr.fetch_routes(with_meta=True)
     stops = [s for s in (routes.get(uid) or []) if rd._stop_on_date(s, target)]
 
     # Имя водителя + закрытые точки
@@ -146,7 +146,8 @@ async def render_page(uid: int, target: date, db, bot) -> str:
 
     if stops:
         ms_extra = await rr._ms_extra_by_order([s["order_no"] for s in stops])
-        head += f"<div class='vol'>{_e(rd._volume_note(uid, stops, ms_extra))}</div>"
+        km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
+        head += f"<div class='vol'>{_e(rd._volume_note(uid, stops, ms_extra, km=km))}</div>"
     head += "</div>"
 
     if not stops:

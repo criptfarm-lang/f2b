@@ -11,6 +11,7 @@ import io
 import os
 import re
 import json
+import math
 import logging
 from datetime import datetime, date, timezone, timedelta
 
@@ -47,13 +48,16 @@ def _sklad_chat_id() -> int:
 # Готовая продукция + мелкая привлечёнка едут в одинаковых гофрокоробах 600×250×200 мм.
 # Объём машины = сумма «Количество мест» по точкам × объём короба. Согласовано 2026-07-22.
 _BOX_VOLUME_M3 = 0.6 * 0.25 * 0.2  # 0.03 м³ на одно «место»
+_BOX_WEIGHT_KG = 12  # наша гофрокоробка вмещает ~12 кг рыбы — для прогноза мест по весу
 _CAP_BOXES = {26210: 190, 26209: 165}  # К459 Porter (~5.7 м³) / В970 KIA (~4.95 м³)
 
 
 def _total_boxes(stops, ms_extra):
-    """Сумма «Количество мест» по точкам маршрута. Возвращает (boxes, n_missing);
-    n_missing — сколько точек с незаполненным полем мест (их объём не учтён)."""
-    total = missing = 0
+    """Сумма «Количество мест» по точкам. Если поле не заполнено — прогнозируем места
+    по весу (наша коробка ~12 кг). Возвращает (boxes, n_missing, n_estimated):
+    n_estimated — сколько точек оценено по весу, n_missing — сколько осталось без мест
+    И без веса (их объём не учтён)."""
+    total = missing = estimated = 0
     for s in stops:
         ex = ms_extra.get(s["order_no"]) or {}
         pl = ex.get("places")
@@ -62,15 +66,21 @@ def _total_boxes(stops, ms_extra):
         except (ValueError, TypeError):
             n = 0
         if n <= 0:
-            missing += 1
+            w = ex.get("weight") or 0
+            if w > 0:
+                n = max(1, math.ceil(w / _BOX_WEIGHT_KG))  # прогноз по весу
+                estimated += 1
+            else:
+                missing += 1
         total += n
-    return total, missing
+    return total, missing, estimated
 
 
-def _volume_note(uid, stops, ms_extra) -> str:
+def _volume_note(uid, stops, ms_extra, km=None) -> str:
     """Заметка по объёму загрузки машины — в САМО сообщение (не в реестр-PDF),
-    видят все: логист, водитель, склад. Предупреждает о перегрузе."""
-    boxes, missing = _total_boxes(stops, ms_extra)
+    видят все: логист, водитель, склад. Предупреждает о перегрузе. km — плановый
+    пробег маршрута (Wialon), если известен."""
+    boxes, missing, estimated = _total_boxes(stops, ms_extra)
     vol = round(boxes * _BOX_VOLUME_M3, 1)
     cap_boxes = _CAP_BOXES.get(uid)
     if not cap_boxes:
@@ -83,8 +93,13 @@ def _volume_note(uid, stops, ms_extra) -> str:
         else:
             pct = round(boxes / cap_boxes * 100)
             note = f"📦 Объём: ~{vol} м³ / {cap_vol} м³ ({boxes}/{cap_boxes} мест, {pct}%)"
+    if km:
+        note += f"\n🛣 Пробег маршрута: ~{km} км"
+    if estimated:
+        note += (f"\n📐 места не заполнены у {estimated} точ. — оценил по весу "
+                 f"(коробка ~{_BOX_WEIGHT_KG} кг)")
     if missing:
-        note += f"\n⚠️ у {missing} точ. не заполнено «Количество мест» — объём занижен"
+        note += f"\n⚠️ у {missing} точ. нет ни мест, ни веса — объём занижен"
     return note
 
 
@@ -304,7 +319,7 @@ async def mark_done_and_refresh(context, driver_chat_id, demand_id):
 
 async def _collect_and_send(context, target_date, to_chat):
     try:
-        routes = await rr.fetch_routes()
+        routes, order_routes = await rr.fetch_routes(with_meta=True)
     except Exception as e:
         logger.exception("collect fetch_routes: %s", e)
         await context.bot.send_message(to_chat, "Не удалось прочитать маршруты Wialon. Проверь доступ.")
@@ -323,7 +338,8 @@ async def _collect_and_send(context, target_date, to_chat):
         _upsert_draft(target_date, uid, pkg["driver_id"], snap)
 
         who = pkg["driver_name"] or "⚠️ водитель не закреплён"
-        note = _volume_note(uid, stops, pkg["ms_extra"])
+        km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
+        note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
         lines = [f"{i}. {(s.get('client') or s.get('order_no') or '?')[:35]} ({rr._hm(s.get('vt'))})"
                  for i, s in enumerate(stops, 1)]
         caption = (f"🚚 {rr.UNITS[uid]} — водитель: {who}\n"
@@ -354,7 +370,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(parts[3])
     dstr = parts[2]
     try:
-        routes = await rr.fetch_routes()
+        routes, order_routes = await rr.fetch_routes(with_meta=True)
         me = await context.bot.get_me()
         pkg = await _unit_package(routes, uid, target_date, me.username)
     except Exception as e:
@@ -369,7 +385,8 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     driver_id = pkg["driver_id"]
     date_str = target_date.strftime("%d.%m.%Y")
     unit_name = rr.UNITS.get(uid, str(uid))
-    note = _volume_note(uid, stops, pkg["ms_extra"])  # заметка по объёму — во все сообщения
+    km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
+    note = _volume_note(uid, stops, pkg["ms_extra"], km=km)  # заметка по объёму — во все сообщения
     snap = [{"order_no": s["order_no"], "client": s.get("client"), "seq": s.get("seq")} for s in stops]
     if _DB is not None:
         try:

@@ -53,9 +53,10 @@ async def _wialon_call(session, svc, params, sid=None):
         return await r.json(content_type=None)
 
 
-async def fetch_routes() -> dict:
+async def fetch_routes(with_meta: bool = False):
     """Возвращает {unit_id: [stop,...]} по машинам, точки отсортированы по порядку выгрузки.
-    stop = {seq, vt, tf, tt, client, address, phone, order_no}."""
+    stop = {seq, vt, tf, tt, client, address, phone, order_no, oid, ...}.
+    with_meta=True → кортеж (routes, order_routes) — order_routes нужен для пробега (mileage_km)."""
     token = os.getenv("WIALON_TOKEN")
     if not token:
         raise RuntimeError("WIALON_TOKEN не задан")
@@ -66,7 +67,9 @@ async def fetch_routes() -> dict:
             raise RuntimeError(f"Wialon login fail: {login}")
         res = await _wialon_call(session, "core/search_item",
                                  {"id": RESOURCE_ID, "flags": 0xffffff}, sid)
-        orders = (res.get("item") or {}).get("orders") or {}
+        item = res.get("item") or {}
+        orders = item.get("orders") or {}
+        order_routes = item.get("order_routes") or {}
 
     routes = {uid: [] for uid in UNITS}
     for o in orders.values():
@@ -84,6 +87,7 @@ async def fetch_routes() -> dict:
             "address": p.get("a") or "",
             "phone": p.get("p") or "",
             "order_no": o.get("n"),
+            "oid": o.get("uid"),  # уникальный id заявки Wialon — для матча с order_routes.ord
             "has_cid": bool(p.get("cid")),  # cid → заявку создал мост; без cid → ручная в Логистике
             "lat": o.get("y"),
             "lon": o.get("x"),
@@ -130,7 +134,33 @@ async def fetch_routes() -> dict:
         routes[uid].sort(key=_order_key)
         for i, s in enumerate(routes[uid]):
             s["seq"] = i
+    if with_meta:
+        return routes, order_routes
     return routes
+
+
+def mileage_km(order_routes, uid, stop_oids):
+    """Плановый пробег маршрута машины (км) из Wialon order_routes.summary.mileage.
+    Матчим по пересечению id заявок (order_routes[*].ord = список oid), а не по дате —
+    у машины бывает несколько исторических раскладок; берём ту, что реально накрывает
+    текущие точки. Возвращает округлённые км или None."""
+    if not order_routes:
+        return None
+    stop_set = {o for o in (stop_oids or []) if o}
+    if not stop_set:
+        return None
+    best, best_ov = None, 0
+    routes = order_routes.values() if isinstance(order_routes, dict) else order_routes
+    for r in routes:
+        if (r.get("st") or {}).get("u") != uid:
+            continue
+        ov = len(set(r.get("ord") or []) & stop_set)
+        if ov > best_ov:
+            best_ov, best = ov, r
+    if not best:
+        return None
+    m = (best.get("summary") or {}).get("mileage")
+    return round(m / 1000.0, 1) if m else None
 
 
 # ─── МойСклад: мест/комментарий по № заказа ──────────────────────────────────
