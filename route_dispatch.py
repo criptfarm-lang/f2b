@@ -396,11 +396,17 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     driver_id, f"🚚 Маршрут на {date_str} — {unit_name}: все точки уже закрыты. ✅")
             else:
                 left = len([s for s in stops if s["order_no"] not in done_prev])
+                try:
+                    import route_web
+                    live = f"\n🌐 Живой маршрут (всегда актуальный): {route_web.route_url(uid, dstr)}"
+                except Exception:
+                    live = ""
                 msg = await context.bot.send_message(
                     driver_id,
                     f"🚚 Маршрут на {date_str} — {left} из {len(stops)} точек (порядок выгрузки).\n"
                     f"{note}\n"
-                    "Приехал на точку — жми её, закрывай сдачу:",
+                    "Приехал на точку — жми её, закрывай сдачу:"
+                    f"{live}",
                     reply_markup=kb)
             if _DB is not None:
                 _DB._execute("UPDATE route_dispatch SET driver_msg_id=%s WHERE snap_date=%s AND unit_id=%s",

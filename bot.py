@@ -8392,6 +8392,14 @@ def main():
         web_app.router.add_post("/webhook/sipuni", handle_sipuni_webhook)
         web_app.router.add_get("/health", handle_health)
         web_app.router.add_get("/report", handle_web_report)
+
+        # Живой HTML-маршрут водителю (план 2026-07-23). Токен в query, данные —
+        # из Wialon в реальном времени, приёмка — deep-link'ом в driver_checklist.
+        import route_web
+        async def handle_route_page(request):
+            return await route_web.handle(request, db, app.bot)
+        web_app.router.add_get("/route/{uid}/{date}", handle_route_page)
+
         web_app.router.add_get("/pdz", handle_pdz_html)
         web_app.router.add_get("/pdz/embed", handle_pdz_embed)
         web_app.router.add_get("/pdz/manager-json/{tag}", handle_pdz_manager_json)
