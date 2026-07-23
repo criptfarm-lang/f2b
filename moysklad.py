@@ -4867,12 +4867,14 @@ async def compute_overdue_color(agent_id: str) -> dict:
             })
 
     real_overdue = max(0.0, round(debt_today - in_сroк_total, 2))
-    if real_overdue < 0.01 or not overdue_orders:
-        return {"color": "green", "days": 0, "debt": 0}
 
-    # День-каунт/сумма — по demand-FIFO (отгрузки + FIFO приходов), единый
-    # источник правды. Заменил cashflow-45 gate + LIFO по payedSum (2026-07-14).
-    # Светофор real-time (заказ свежий, снимка нет) → считаем вживую.
+    # ПЕРВИЧНЫЙ источник истины — demand-FIFO (отгрузки + FIFO приходов).
+    # Не зависит ни от payedSum, ни от ppm заказов (оба ненадёжны), поэтому
+    # решает ПЕРВЫМ, до ppm-предфильтра ниже. Раньше предфильтр
+    # `real_overdue<0.01 → green` стоял выше и давал ЛОЖНЫЙ зелёный, когда
+    # неразнесённые платежи раздували "в-сроке" выше реального долга:
+    # кейс ИП Гайтукиев 23.07.2026 — in_срок_total 207к > долг 188к →
+    # real_overdue=0 маскировал отгрузку 30.06 (9 дн просрочки, 13 212 ₽).
     fifo = await _overdue_by_demand_fifo(agent_id, today)
     if fifo is not None:
         f_days, f_amt, f_url, f_cnt = fifo
@@ -4882,7 +4884,9 @@ async def compute_overdue_color(agent_id: str) -> dict:
         color = "red" if (debt > 0 and f_days > OVERDUE_THRESHOLD_DAYS) else "green"
         return {"color": color, "days": f_days, "debt": debt}
 
-    # МС demand/paymentin недоступны → фолбэк на старый LIFO по payedSum.
+    # МС demand/paymentin недоступны → фолбэк на ppm/LIFO по payedSum.
+    if real_overdue < 0.01 or not overdue_orders:
+        return {"color": "green", "days": 0, "debt": 0}
     covered = _pdz_lifo_cover(overdue_orders, real_overdue)
     if not covered:
         return {"color": "green", "days": 0, "debt": 0}
