@@ -28,8 +28,25 @@ _MSK = timezone(timedelta(hours=3))
 _DB = None
 
 
+# Логисты (равный доступ ко всему логистскому функционалу и рассылкам):
+# 8267564735 — Белякова, 1689203038 — Петровский Владимир. Список — env
+# LOGIST_CHAT_IDS (через запятую) с дефолтом обоих; добавить логиста = дописать id.
+def _logist_chat_ids() -> list:
+    raw = os.getenv("LOGIST_CHAT_IDS") or "8267564735,1689203038"
+    out = []
+    for p in raw.split(","):
+        p = p.strip()
+        if p:
+            try:
+                out.append(int(p))
+            except ValueError:
+                pass
+    return out
+
+
 def _logist_chat_id() -> int:
-    return int(os.getenv("LOGIST_CHAT_ID", "8267564735") or 0)
+    ids = _logist_chat_ids()
+    return ids[0] if ids else 0
 
 
 def _owner_chat_id() -> int:
@@ -37,7 +54,7 @@ def _owner_chat_id() -> int:
 
 
 def _allowed(chat_id: int) -> bool:
-    return chat_id in (_logist_chat_id(), _owner_chat_id())
+    return chat_id in _logist_chat_ids() or chat_id == _owner_chat_id()
 
 
 def _sklad_chat_id() -> int:

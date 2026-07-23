@@ -40,7 +40,7 @@ def _allowed(chat_id: int) -> bool:
     import driver_checklist as dc
     return (dc._is_driver(chat_id)
             or chat_id == dc._owner_chat_id()
-            or chat_id == dc._logist_chat_id())
+            or chat_id in dc._logist_chat_ids())
 
 
 # ─── Wialon: чтение маршрута ──────────────────────────────────────────────────

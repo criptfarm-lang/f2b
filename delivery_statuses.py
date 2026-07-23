@@ -75,8 +75,23 @@ def _owner_chat_id() -> int:
     return int(os.getenv("OWNER_CHAT_ID", "0") or 0)
 
 
+# Логисты (равный доступ + рассылки): 8267564735 Белякова, 1689203038 Петровский.
+def _logist_chat_ids() -> list:
+    raw = os.getenv("LOGIST_CHAT_IDS") or "8267564735,1689203038"
+    out = []
+    for p in raw.split(","):
+        p = p.strip()
+        if p:
+            try:
+                out.append(int(p))
+            except ValueError:
+                pass
+    return out
+
+
 def _logist_chat_id() -> int:
-    return int(os.getenv("LOGIST_CHAT_ID", "8267564735") or 0)  # Белякова
+    ids = _logist_chat_ids()
+    return ids[0] if ids else 0  # Белякова (первичный)
 
 
 def _partner_chat_id() -> int:
@@ -212,7 +227,7 @@ async def _idle_alert(bot, unit_name, info):
             f"Стоит на месте ~{info['idle_min']} мин (с {since}) — не база и не адрес клиента.\n"
             f"Точка: {info['lat']:.4f},{info['lon']:.4f}\n{link}")
     seen = set()
-    for cid in [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()]:
+    for cid in [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()]:
         if not cid or cid in seen:
             continue
         seen.add(cid)
@@ -229,7 +244,7 @@ async def _route_end_alert(bot, unit_name, info):
             f"Вернулась на точку ночёвки (с {since}) — развоз на сегодня завершён.\n"
             f"Точка: {info['lat']:.4f},{info['lon']:.4f}\n{link}")
     seen = set()
-    for cid in [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()]:
+    for cid in [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()]:
         if not cid or cid in seen:
             continue
         seen.add(cid)
@@ -502,7 +517,7 @@ async def run_check(db, bot=None, preview=False) -> list:
                 lines.append(f"{name}: уведомление о задержке — точек: {len(delay_flips)}")
                 if bot and not preview:
                     await _delay_flip_alert(bot, name, [d["s"] for d in delay_flips], lag_sec, now_ts,
-                                            [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()])
+                                            [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()])
                 if not preview:
                     for d in delay_flips:
                         _st_upsert(db, d["order_no"], delay_alerted=True,
@@ -602,7 +617,7 @@ async def _write_fail_alert(bot, unit_name, order_no, client, cur, target, has_m
     text = (f"🛑 Статус в МойСклад НЕ записан\n{unit_name} №{order_no} {client or ''}\n"
             f"{cur} → {target}: {reason}.\nПроверьте отгрузку вручную.")
     seen = set()
-    for cid in [_owner_chat_id(), _logist_chat_id()]:
+    for cid in [_owner_chat_id(), *_logist_chat_ids()]:
         if not cid or cid in seen:
             continue
         seen.add(cid)
@@ -625,7 +640,7 @@ async def _lag_alert(bot, unit_name, lag_min, behind, now_ts):
             f"Даже с плавающими окнами день под угрозой — все точки можно не успеть.\n"
             f"Позади плана ({len(behind)}):\n{rows}")
     seen = set()
-    for cid in [_owner_chat_id(), _logist_chat_id(), _partner_chat_id()]:
+    for cid in [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()]:
         if not cid or cid in seen:
             continue
         seen.add(cid)
@@ -689,7 +704,7 @@ async def cmd_statuses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or update.effective_chat.type != "private":
         return
-    if not (user.id == dc._owner_chat_id() or user.id == dc._logist_chat_id()):
+    if not (user.id == dc._owner_chat_id() or user.id in dc._logist_chat_ids()):
         await update.message.reply_text("⛔ Доступно логисту и владельцу.")
         return
     mode = "ЗАПИСЬ ВКЛючена" if _write_enabled() else "СУХОЙ режим (запись выкл)"

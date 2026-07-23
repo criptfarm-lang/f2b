@@ -54,9 +54,23 @@ def _owner_chat_id() -> int:
     return int(os.getenv("OWNER_CHAT_ID", "0") or 0)
 
 
+# Логисты (равный доступ + рассылки): 8267564735 Белякова, 1689203038 Петровский.
+def _logist_chat_ids() -> list:
+    raw = os.getenv("LOGIST_CHAT_IDS") or "8267564735,1689203038"
+    out = []
+    for p in raw.split(","):
+        p = p.strip()
+        if p:
+            try:
+                out.append(int(p))
+            except ValueError:
+                pass
+    return out
+
+
 def _logist_chat_id() -> int:
-    # Логист = Александра Белякова (решение собственника 2026-07-14).
-    return int(os.getenv("LOGIST_CHAT_ID", "8267564735") or 0)
+    ids = _logist_chat_ids()
+    return ids[0] if ids else 0
 
 
 _DB = None  # ссылка на БД для whitelist водителей (ставится в register)
@@ -732,7 +746,7 @@ async def _signal_item_not_done(context, row, text: str):
     msg = f"🚚 Сдача груза — пункт НЕ выполнен\n{_point_head(row)}\n\n📋 {text}"
     if row.get("manager_tag"):
         msg += f"\nМенеджер: {row.get('manager_tag')}"
-    await _send_alert(context, [_logist_chat_id(), mgr_chat], msg)
+    await _send_alert(context, [*_logist_chat_ids(), mgr_chat], msg)
 
 
 async def cb_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -853,7 +867,7 @@ async def _signal_logist(context, row, reason: str):
     if not row:
         return
     text = f"🚚 Сдача груза — сигнал\n{_point_head(row)}\n\n⚠️ {reason}"
-    await _send_alert(context, [_logist_chat_id()], text)
+    await _send_alert(context, [*_logist_chat_ids()], text)
 
 
 async def _alert_claim(context, row):
@@ -865,7 +879,7 @@ async def _alert_claim(context, row):
             f"Описание: {row.get('claim_text') or '—'}")
     if row.get("manager_tag"):
         text += f"\nМенеджер: {row.get('manager_tag')}"
-    recipients = [_logist_chat_id(), _owner_chat_id(), mgr_chat]
+    recipients = [*_logist_chat_ids(), _owner_chat_id(), mgr_chat]
     await _send_alert(context, recipients, text, photo_file_id=row.get("claim_photo_file_id"))
 
 
@@ -985,7 +999,7 @@ async def cmd_shipment_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not user or not chat or chat.type != "private":
         return
-    if not (_is_driver(user.id) or user.id == _owner_chat_id() or user.id == _logist_chat_id()):
+    if not (_is_driver(user.id) or user.id == _owner_chat_id() or user.id in _logist_chat_ids()):
         await update.message.reply_text("⛔ Лист отгрузок доступен логисту и водителям.")
         return
     await update.message.reply_text("Собираю лист отгрузок за сегодня…")
