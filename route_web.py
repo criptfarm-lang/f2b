@@ -88,15 +88,18 @@ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f
 
 
 async def _bot_username(bot) -> str:
+    """Имя бота для deep-link'ов. Кешируем ТОЛЬКО успех — иначе транзиентный
+    сбой get_me (Telegram-лаг) навсегда убил бы кнопки «Открыть сдачу»."""
     global _bot_username_cache
-    if _bot_username_cache is None:
-        try:
-            me = await bot.get_me()
+    if _bot_username_cache:
+        return _bot_username_cache
+    try:
+        me = await bot.get_me()
+        if me and me.username:
             _bot_username_cache = me.username
-        except Exception as e:
-            logger.warning("route_web: get_me не удался: %s", e)
-            _bot_username_cache = ""
-    return _bot_username_cache
+    except Exception as e:
+        logger.warning("route_web: get_me не удался: %s", e)
+    return _bot_username_cache or ""
 
 
 async def render_page(uid: int, target: date, db, bot) -> str:
