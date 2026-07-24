@@ -66,7 +66,36 @@ def _sklad_chat_id() -> int:
 # Объём машины = сумма «Количество мест» по точкам × объём короба. Согласовано 2026-07-22.
 _BOX_VOLUME_M3 = 0.6 * 0.25 * 0.2  # 0.03 м³ на одно «место»
 _BOX_WEIGHT_KG = 10  # средний вес короба (пляшет 8–12) — для прогноза мест по весу; собственник 2026-07-24
-_CAP_BOXES = {26210: 190, 26209: 165}  # К459 Porter (~5.7 м³) / В970 KIA (~4.95 м³)
+_CAP_BOXES = {26210: 190, 26209: 165}  # К459 Porter / В970 KIA — «руками» (0 паллетов)
+# Вместимость коробов ЗАВИСИТ от числа паллетов (паллет грузится неэффективно).
+# Калибровка собственника 2026-07-24 (memory reference_f2b_truck_capacity_by_pallets).
+_PALLET_KG = 360        # ~вес одного паллета (≈30 коробов) — для расчёта числа паллетов заказа
+_CAP_BY_PALLETS = {
+    26210: {0: 190, 1: 157, 2: 130, 3: 102},  # К459 Porter
+    26209: {0: 165, 1: 140, 2: 121, 3: 102},  # В970 KIA
+}
+# Клиенты паллетной загрузки (имена как в МС, через «;»). Собственник даёт список.
+# Пусто → паллетов 0 → вместимость «руками» (прежнее поведение).
+_PALLET_CLIENTS = {c.strip().lower() for c in os.getenv("PALLET_CLIENTS", "").split(";") if c.strip()}
+
+
+def _pallets_for(stops, ms_extra) -> int:
+    """Число паллетов в загрузке = по заказам клиентов из _PALLET_CLIENTS:
+    вес ÷ 360 кг, округление вверх (обычно 1–2). Без веса — минимум 1 паллет."""
+    pallets = 0
+    for s in stops:
+        if (s.get("client") or "").strip().lower() in _PALLET_CLIENTS:
+            w = (ms_extra.get(s["order_no"]) or {}).get("weight") or 0
+            pallets += max(1, math.ceil(w / _PALLET_KG)) if w > 0 else 1
+    return pallets
+
+
+def _cap_boxes_for(uid, pallets: int):
+    """Вместимость коробов машины с учётом числа паллетов (0–3)."""
+    tbl = _CAP_BY_PALLETS.get(uid)
+    if not tbl:
+        return _CAP_BOXES.get(uid)
+    return tbl[min(pallets, 3)]
 
 
 def _total_boxes(stops, ms_extra):
@@ -99,17 +128,19 @@ def _volume_note(uid, stops, ms_extra, km=None) -> str:
     пробег маршрута (Wialon), если известен."""
     boxes, missing, estimated = _total_boxes(stops, ms_extra)
     vol = round(boxes * _BOX_VOLUME_M3, 1)
-    cap_boxes = _CAP_BOXES.get(uid)
+    pallets = _pallets_for(stops, ms_extra)
+    cap_boxes = _cap_boxes_for(uid, pallets)
+    plt = f", {pallets} паллет" if pallets else ""
     if not cap_boxes:
-        note = f"📦 Объём: ~{vol} м³ ({boxes} мест)"
+        note = f"📦 Объём: ~{vol} м³ ({boxes} мест{plt})"
     else:
         cap_vol = round(cap_boxes * _BOX_VOLUME_M3, 1)
         if boxes > cap_boxes:
             note = (f"📦 ⚠️ ПЕРЕГРУЗ: ~{vol} м³ / лимит {cap_vol} м³ "
-                    f"({boxes} из {cap_boxes} мест) — не влезает, сними точки")
+                    f"({boxes} из {cap_boxes} мест{plt}) — не влезает, сними точки или дай наём")
         else:
             pct = round(boxes / cap_boxes * 100)
-            note = f"📦 Объём: ~{vol} м³ / {cap_vol} м³ ({boxes}/{cap_boxes} мест, {pct}%)"
+            note = f"📦 Объём: ~{vol} м³ / {cap_vol} м³ ({boxes}/{cap_boxes} мест{plt}, {pct}%)"
     if km:
         note += f"\n🛣 Пробег маршрута: ~{km} км"
     if estimated:
