@@ -514,7 +514,9 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sklad, io.BytesIO(pkg["pdf"]),
                 filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
                 caption=(f"📦 Лист загрузки — {unit_name}, {date_str}. Грузить по порядку "
-                         f"(первая точка к дверям).\n{note}"))
+                         f"(первая точка к дверям).\n{note}"
+                         f"\n\n✍️ Перед выездом водитель подписывает копию реестра и отдаёт "
+                         f"оператору склада."))
             sklad_note = "склад ✓"
         except Exception as e:
             logger.warning("cb_confirm push sklad: %s", e)
