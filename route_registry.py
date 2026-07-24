@@ -299,6 +299,8 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
     title = ParagraphStyle("t", fontName=FONT_BOLD, fontSize=14, leading=18, spaceAfter=6)
     small = ParagraphStyle("s", fontName=FONT_NORMAL, fontSize=8, leading=11)
     load = ParagraphStyle("l", fontName=FONT_BOLD, fontSize=9, leading=13)
+    sub = ParagraphStyle("sub", fontName=FONT_NORMAL, fontSize=8, leading=11, spaceAfter=4)
+    legal = ParagraphStyle("lg", fontName=FONT_NORMAL, fontSize=8, leading=11, spaceBefore=4)
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=12 * mm, bottomMargin=10 * mm,
@@ -314,6 +316,9 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
         first = False
         flow.append(Paragraph(f"Реестр развоза — {date_str}", title))
         flow.append(Paragraph(f"Машина {name} — {len(stops)} точек (порядок выгрузки)", h2))
+        flow.append(Paragraph(
+            "Приёмо-сдаточный реестр к договору о материальной ответственности "
+            "водителя-экспедитора.", sub))
         if not stops:
             flow.append(Paragraph("Маршрут по этой машине не построен.", small))
             continue
@@ -375,6 +380,23 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
             ) if x) if (wt or pl not in (None, "")) else ""
             loading.append(f"{idx}. {s['client'][:38]} (№{s['order_no']}){bits}")
         flow.append(Paragraph("<br/>".join(loading), small))
+
+        # Юридический блок: приёмка (подпись) + порядок сдачи (QR = ПЭП)
+        flow.append(Spacer(1, 5 * mm))
+        flow.append(Paragraph(
+            "<b>Приёмка.</b> Груз по реестру принял к перевозке в полном объёме и надлежащем "
+            "качестве. Расхождения при приёмке (при наличии): "
+            "______________________________________", legal))
+        flow.append(Paragraph(
+            "Водитель-экспедитор: _____________ / _____________________ "
+            "(подпись, дата, время)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+            "Передал (склад): _____________ / _____________________", legal))
+        flow.append(Paragraph(
+            "<b>Сдача.</b> По каждой точке подтверждается сканированием QR-кода строки — бот в "
+            "мессенджере или веб-страница по ссылке (простая электронная подпись, ст. 5–6 "
+            "Федерального закона № 63-ФЗ; фиксируется в системе). При недоступности системы — "
+            "подпись водителя на реестре с указанием № точки. Подпись грузополучателя не "
+            "требуется.", legal))
     doc.build(flow)
     return buf.getvalue()
 
