@@ -65,6 +65,12 @@ JOB_INTERVAL_EVENING_SEC = 300    # вечерний (активный разв�
 EVENING_FAST_HOUR = 17            # МСК: с этого часа переходим на 5-мин опрос
 DWELL_UNLOAD_MIN = 5       # стоянка у точки клиента ≥ этого = вероятная выгрузка (нижний порог, верхнего нет)
 UNLOAD_SPEED_KMH = 5       # «стоит»: мгновенная скорость ≤ этого (иначе — проезд мимо, не выгрузка)
+# Долгая стоянка у клиента: норма выгрузки 5–30 мин; стоит дольше — аномалия, эскалация
+# с повтором (в отличие от unload-без-подтверждения — не ждём отъезда). План 2026-07-27.
+LONG_DWELL_MIN = int(os.getenv("LONG_DWELL_MIN", "60"))           # ≥ этого на точке = долгая стоянка
+LONG_DWELL_REPEAT_MIN = int(os.getenv("LONG_DWELL_REPEAT_MIN", "60"))  # повтор эскалации, мин
+# Повтор лаг-алерта при РОСТЕ отставания на ≥ этого (иначе — раз в сутки на машину). Фаза 3.
+LAG_REPEAT_GROWTH_MIN = int(os.getenv("LAG_REPEAT_GROWTH_MIN", "60"))
 
 # Статусы, которые авто-движок ИМЕЕТ ПРАВО менять (логистические, в процессе развоза).
 # Всё остальное — ручное/бухгалтерское (Отгружен ставит оператор; УПД подписан / Долг /
@@ -132,6 +138,10 @@ def ensure_schema(db):
     db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS near_since BIGINT")
     db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS near_last BIGINT")
     db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS unload_alerted BOOLEAN DEFAULT FALSE")
+    # Долгая стоянка у клиента: время последней эскалации (epoch) — для повтора раз в час.
+    db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS long_dwell_alerted_at BIGINT")
+    # Лаг-алерт: отставание (мин), при котором последний раз алертили — для повтора при росте.
+    db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS lag_min_alerted BIGINT")
     db._execute("""
         CREATE TABLE IF NOT EXISTS unit_dwell (
             unit_id     BIGINT PRIMARY KEY,
@@ -306,6 +316,28 @@ async def _unload_control_alert(bot, unit_name, uf, recipients):
             logger.warning("_unload_control_alert → %s: %s", cid, e)
 
 
+async def _long_dwell_alert(bot, unit_name, lf, recipients):
+    """Машина СЕЙЧАС стоит у точки клиента дольше нормы, точка не закрыта. Повтор раз в час,
+    пока не уедет или водитель не закроет сдачу (в отличие от unload — не ждём отъезда)."""
+    import route_dispatch
+    s = lf["s"]
+    label = route_dispatch._stop_label(s)
+    text = (f"🕓 Долгая стоянка у клиента — {unit_name}\n"
+            f"{label} — стоит уже ~{lf['dwell_min']} мин, точка не закрыта.\n"
+            f"Проверьте, что с выгрузкой. Повтор через час, пока не уедет / не закроют.")
+    if s.get("lat") and s.get("lon"):
+        text += f"\nhttps://yandex.ru/maps/?pt={s['lon']:.5f},{s['lat']:.5f}&z=17&l=map"
+    seen = set()
+    for cid in recipients:
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.warning("_long_dwell_alert → %s: %s", cid, e)
+
+
 # ─── Wialon позиции ──────────────────────────────────────────────────────────
 
 async def _wialon_positions(session, sid):
@@ -474,6 +506,7 @@ async def run_check(db, bot=None, preview=False) -> list:
             machine = []   # для расчёта отставания / риска смещения
             recs = []      # разрешённые точки (МС + прибытие + чеклист) — решаем статус вторым проходом
             unload_flips = []  # точки, где машина простояла и уехала, а сдача не закрыта
+            long_dwell_flips = []  # точки, где машина стоит СЕЙЧАС дольше нормы, точка не закрыта
             for s in stops:
                 order_no = s["order_no"]
                 info = await _ms_resolve(session, order_no)
@@ -512,9 +545,21 @@ async def run_check(db, bot=None, preview=False) -> list:
                         if not st.get("near_since"):
                             _st_upsert(db, order_no, near_since=now_ts, near_last=now_ts,
                                        demand_id=info["demand_id"], unit_id=uid)
+                            dwell_since = now_ts
                         else:
                             _st_upsert(db, order_no, near_last=now_ts,
                                        demand_id=info["demand_id"], unit_id=uid)
+                            dwell_since = st.get("near_since")
+                        # Долгая стоянка ПРЯМО СЕЙЧАС: стоит ≥ LONG_DWELL_MIN, точка не закрыта →
+                        # эскалация с повтором раз в LONG_DWELL_REPEAT_MIN (не ждём отъезда, в
+                        # отличие от unload). Дедуп по last-alerted в long_dwell_alerted_at.
+                        dwell_min = int((now_ts - dwell_since) / 60)
+                        last_ld = st.get("long_dwell_alerted_at")
+                        if (not done and dwell_min >= LONG_DWELL_MIN
+                                and (not last_ld or (now_ts - last_ld) >= LONG_DWELL_REPEAT_MIN * 60)):
+                            long_dwell_flips.append({"s": s, "order_no": order_no,
+                                                     "demand_id": info["demand_id"],
+                                                     "dwell_min": dwell_min})
                     else:
                         ns, nl = st.get("near_since"), st.get("near_last")
                         if (ns and not done and not st.get("unload_alerted")
@@ -620,6 +665,19 @@ async def run_check(db, bot=None, preview=False) -> list:
                         _st_upsert(db, uf["order_no"], unload_alerted=True,
                                    demand_id=uf["demand_id"], unit_id=uid)
 
+            # ── Долгая стоянка у клиента (стоит СЕЙЧАС дольше нормы, точка не закрыта) ──
+            # Снимаем слепую зону idle-сторожа у клиента: логистам+владельцу+партнёру, повтор
+            # раз в час, пока не уедет или не закроют точку. План 2026-07-27.
+            if long_dwell_flips:
+                lines.append(f"{name}: долгая стоянка у клиента — точек: {len(long_dwell_flips)}")
+                if bot and not preview:
+                    for lf in long_dwell_flips:
+                        await _long_dwell_alert(bot, name, lf, _unload_recipients())
+                if not preview:
+                    for lf in long_dwell_flips:
+                        _st_upsert(db, lf["order_no"], long_dwell_alerted_at=now_ts,
+                                   demand_id=lf["demand_id"], unit_id=uid)
+
             # ── Отставание от плана (для лаг-алерта ниже; риск-алерт заменён уведомлением выше) ──
             risk = _compute_risk(machine, now_ts)
 
@@ -629,9 +687,13 @@ async def run_check(db, bot=None, preview=False) -> list:
                 lines.append(f"{name}: ОТСТАВАНИЕ ~{risk['lag_min']} мин, точек позади плана: {len(behind)}")
                 if bot and not preview:
                     lkey = f"lag:{uid}:{datetime.now(_MSK).date().isoformat()}"
-                    if not (_st_get(db, lkey) or {}).get("delay_alerted"):
+                    prev_lag = (_st_get(db, lkey) or {}).get("lag_min_alerted")
+                    # Первый раз — всегда; далее — только при росте отставания на ≥ порога
+                    # (иначе одно сообщение в сутки скрыло бы усугубление, как 27.07). Фаза 3.
+                    if prev_lag is None or (risk["lag_min"] - prev_lag) >= LAG_REPEAT_GROWTH_MIN:
                         await _lag_alert(bot, name, risk["lag_min"], behind, now_ts)
-                        _st_upsert(db, lkey, delay_alerted=True, unit_id=uid)
+                        _st_upsert(db, lkey, delay_alerted=True,
+                                   lag_min_alerted=risk["lag_min"], unit_id=uid)
 
             # ── Простой машины (стоит на месте ≥ IDLE_MIN, не база и не клиент) ──
             idle = _check_idle(db, uid, name, pos, stops, now_ts, preview)
