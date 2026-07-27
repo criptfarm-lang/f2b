@@ -227,9 +227,21 @@ async def cmd_routes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb)
 
 
+async def _safe_answer(q, text=None):
+    """q.answer() — первый исходящий вызов в колбэке. При деградации связи Amvera↔Telegram
+    он падает по TimedOut и БЕЗ обёртки ронял весь хендлер (сбор/подтверждение маршрута) ещё
+    до полезной работы: draft не писался, PDF не уходил — «нажала, бот не сработал»
+    (см. project_f2b_bot_telegram_timeout_outage_2026_07_22). Спиннер кнопки не критичен —
+    глушим сетевую ошибку и доводим сбор до конца."""
+    try:
+        await q.answer(text)
+    except Exception as e:
+        logger.warning("q.answer проигнорирован (Telegram лагает?): %s", e)
+
+
 async def cb_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer("Собираю…")
+    await _safe_answer(q, "Собираю…")
     day_off = int(q.data.split(":")[2])
     target = (datetime.now(_MSK) + timedelta(days=day_off)).date()
     await _collect_and_send(context, target, to_chat=q.from_user.id)
@@ -465,7 +477,7 @@ async def _collect_and_send(context, target_date, to_chat):
 async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подтверждение → status=confirmed + пуш водителю (PDF + кнопки) + PDF в склад-группу."""
     q = update.callback_query
-    await q.answer("Отправляю…")
+    await _safe_answer(q, "Отправляю…")
     parts = q.data.split(":")  # rd:conf:<date>:<uid>
     target_date = date.fromisoformat(parts[2])
     uid = int(parts[3])
