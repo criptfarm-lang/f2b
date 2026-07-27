@@ -60,6 +60,44 @@ class Database:
             row = cur.fetchone()
             return dict(row) if row else None
 
+    def save_channel_post(self, message_id, channel_chat_id, text,
+                          photo_file_id, has_video, media_group_id=None):
+        """Складывает пост публичного канала (@fishto_biz) в publishing.channel_posts
+        для зеркалирования в «Публикации» карточки Яндекс Бизнеса.
+
+        Источник постов сменён со скрейпа t.me/s/ (заблокирован из РФ-инфры) на
+        Bot API: «Эф» админ канала, ловит channel_post, кладёт сюда; f2b-publisher
+        (yandex_news.py) читает posted=false и публикует. Фото — по file_id через
+        getFile на api.telegram.org (из Amvera работает). Дедуп — (channel_chat_id,
+        message_id). Альбомы схлопывает publisher по media_group_id.
+        """
+        self._execute("CREATE SCHEMA IF NOT EXISTS publishing")
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS publishing.channel_posts (
+                channel_chat_id BIGINT      NOT NULL,
+                message_id      BIGINT      NOT NULL,
+                text            TEXT,
+                photo_file_id   TEXT,
+                has_video       BOOLEAN     NOT NULL DEFAULT FALSE,
+                media_group_id  TEXT,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                posted          BOOLEAN     NOT NULL DEFAULT FALSE,
+                posted_at       TIMESTAMPTZ,
+                PRIMARY KEY (channel_chat_id, message_id)
+            )
+            """
+        )
+        self._execute(
+            """
+            INSERT INTO publishing.channel_posts
+                (channel_chat_id, message_id, text, photo_file_id, has_video, media_group_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (channel_chat_id, message_id) DO NOTHING
+            """,
+            (channel_chat_id, message_id, text, photo_file_id, has_video, media_group_id),
+        )
+
     def _create_tables(self):
         sql = """
             CREATE TABLE IF NOT EXISTS tasks (

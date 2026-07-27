@@ -3015,6 +3015,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Обработка vision'ом — на стороне Claude Code (скилл update-market-intel),
 # бот только сохраняет сырьё в БД и медиа на persistent volume Amvera.
 MARKET_INTEL_CHAT_ID = int(os.getenv("MARKET_INTEL_CHAT_ID", "-1002964644525"))
+# Публичный канал @fishto_biz («FISHTOBIZ info») → зеркалим Новости в карточку
+# Яндекс Бизнеса. Ловим channel_post, кладём в БД, публикует f2b-publisher.
+FISHTOBIZ_CHAT_ID = int(os.getenv("FISHTOBIZ_CHAT_ID", "-1002344232944"))
 MARKET_INTEL_DIR = os.getenv("MARKET_INTEL_DIR", "/data/market-intel")
 
 
@@ -3030,6 +3033,28 @@ async def handle_market_intel_post(update: Update, context: ContextTypes.DEFAULT
         f"chat_title={getattr(msg.chat, 'title', '?')} "
         f"msg_id={msg.message_id} expected_chat_id={MARKET_INTEL_CHAT_ID}"
     )
+    # @fishto_biz → Новости на карточку Яндекс Бизнеса (источник вместо t.me/s/).
+    # Ветка стоит ДО whitelist «Мониторинга»: handle_market_intel_post —
+    # единственный channel_post-handler в group 0, значит через него проходят все
+    # посты каналов. Здесь только сохраняем в БД, публикует f2b-publisher.
+    if msg.chat_id == FISHTOBIZ_CHAT_ID:
+        try:
+            photo_file_id = msg.photo[-1].file_id if msg.photo else None
+            has_video = bool(msg.video) or bool(
+                msg.document and (msg.document.mime_type or "").startswith("video/"))
+            db.save_channel_post(
+                message_id=msg.message_id,
+                channel_chat_id=msg.chat_id,
+                text=(msg.text or msg.caption or ""),
+                photo_file_id=photo_file_id,
+                has_video=has_video,
+                media_group_id=getattr(msg, "media_group_id", None),
+            )
+            logger.info(f"fishto_biz: пост {msg.message_id} сохранён для карточки Яндекс")
+        except Exception as e:
+            logger.error(f"fishto_biz: не смог сохранить пост {msg.message_id}: {e}")
+        return
+
     if msg.chat_id != MARKET_INTEL_CHAT_ID:
         return  # whitelist по chat_id
 
