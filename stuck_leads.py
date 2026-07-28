@@ -6,19 +6,26 @@ type=0 (status_id=85554790): именно сюда лид попадает пр�
 2026-07-14: 48/50 недавних сделок). Системные «Входящие» type=1 (85554786) и /leads/unsorted
 в аккаунте не используются — НЕ мониторим.
 
-Механика:
+Механика (v2, 2026-07-28 — трёхступенчатая эскалация со штрафом):
   - Polling через PTB JobQueue run_repeating (AsyncIOScheduler на Amvera молча теряет
     interval-тики — см. market_intel/payment_planned/светофоры).
   - «Возраст в статусе» = now − последний lead_status_changed в статус 85554790; если
     переходов ещё не было (лид создан в этом статусе) — по created_at сделки.
-  - Пинг при возрасте ≥ STUCK_LEAD_HOURS (по умолч. 5 ч).
-  - Пинги только в окне 09:00–20:00 МСК (любой день недели). Вне окна — тихо, первый
-    пинг откладывается до открытия окна.
-  - Повтор не чаще STUCK_LEAD_REPEAT_HOURS (по умолч. 3 ч), пока лид не уйдёт со статуса.
+  - Считаем РАБОЧЕЕ время в стадии: только окно 09:00–20:00 МСК в рабочие дни
+    (ПН-ПТ + ВС; суббота — выходной). Вне окна время не идёт, пинги на паузе.
+  - «Лид из паузы = горячий»: если лид вошёл в статус вне рабочего окна (ночь/суббота),
+    добавляем кредит 1 раб.ч, чтобы на открытии окна сразу шёл пинг №1.
+  - Уровни по effective = раб.часы_в_стадии + кредит:
+      ≥ L1 (1 ч) → пинг-напоминание;
+      ≥ L2 (2 ч) → пинг с предупреждением о штрафе 500 ₽;
+      ≥ L3 (3 ч) → пинг «штраф начислен» + запись 500 ₽ в lead_stuck_penalties
+                    (ТОЛЬКО менеджерам ОП; закупщиков/не-ОП штраф не касается).
+    Каждый уровень шлётся один раз. После L3 — тишина (один штраф на вход в статус).
   - Адресат — личка ответственного (reverse manager_chats.amo_user_id → user_id). Если
     связки нет — fallback на OWNER_CHAT_ID с пометкой.
 
-План: plans/2026-07-14-пинг-зависших-лидов-неразобранное.md
+Планы: plans/2026-07-14-пинг-зависших-лидов-неразобранное.md,
+       plans/2026-07-28-штраф-зависание-неразобранное.md
 """
 
 import os
@@ -32,10 +39,26 @@ logger = logging.getLogger(__name__)
 PIPELINE_ID = 10873622
 STAGE_ID = 85554790  # «Неразобранное» type=0 — первый рабочий столбец воронки ПРИВЛЕЧЕНИЕ
 
-STUCK_LEAD_HOURS = float(os.getenv("STUCK_LEAD_HOURS", "5"))
-STUCK_LEAD_REPEAT_HOURS = float(os.getenv("STUCK_LEAD_REPEAT_HOURS", "3"))
+# Пороги эскалации в РАБОЧИХ часах (effective = раб.часы + кредит паузы)
+NERAZ_L1_H = float(os.getenv("NERAZ_L1_H", "1"))  # напоминание
+NERAZ_L2_H = float(os.getenv("NERAZ_L2_H", "2"))  # предупреждение о штрафе
+NERAZ_L3_H = float(os.getenv("NERAZ_L3_H", "3"))  # штраф начислен
+NERAZ_PENALTY_RUB = int(os.getenv("NERAZ_PENALTY_RUB", "500"))
+NERAZ_PAUSE_CREDIT_H = float(os.getenv("NERAZ_PAUSE_CREDIT_H", "1"))  # кредит «лид из паузы»
+
 WINDOW_START_H = int(os.getenv("STUCK_LEAD_WINDOW_START", "9"))   # включительно
 WINDOW_END_H = int(os.getenv("STUCK_LEAD_WINDOW_END", "20"))       # не включая (последний пинг в 19:xx)
+# Рабочие дни недели (Пн=0 .. Вс=6). По умолчанию ПН-ПТ + ВС, суббота (5) исключена.
+WORKDAYS = {
+    int(x) for x in os.getenv("STUCK_LEAD_WORKDAYS", "0,1,2,3,4,6").split(",") if x.strip() != ""
+}
+
+# amo_user_id пяти менеджеров ОП — только им начисляется денежный штраф.
+# Источник правды — MANAGER_TAG_TO_AMO_USER_ID в f2b-publisher/src/manager_dashboard_data.py
+# (кросс-репо, импортировать нельзя; при смене состава ОП синхронизировать оба места).
+# баласанян/дьяченко/коликов/мерзлякова/скляр.
+_op_raw = os.getenv("STUCK_LEAD_OP_AMO_IDS", "12625622,13746010,13665786,12788698,11544494")
+OP_AMO_IDS = {int(x) for x in _op_raw.split(",") if x.strip() != ""}
 
 AMO_SUBDOMAIN = os.getenv("AMO_SUBDOMAIN", "victorfishtobiz")
 MSK = timezone(timedelta(hours=3))
@@ -52,7 +75,50 @@ def _lead_url(lead_id: int) -> str:
 
 
 def _in_window(now_msk: datetime) -> bool:
-    return WINDOW_START_H <= now_msk.hour < WINDOW_END_H
+    """True, если сейчас рабочее окно: рабочий день И час в [START, END)."""
+    return now_msk.weekday() in WORKDAYS and WINDOW_START_H <= now_msk.hour < WINDOW_END_H
+
+
+def _working_hours(entered_utc: datetime, now_utc: datetime) -> float:
+    """Рабочее время (в часах) между entered и now: сумма пересечений с окнами
+    09–20 МСК в рабочие дни (ПН-ПТ + ВС). Суббота и ночи не считаются."""
+    start = entered_utc.astimezone(MSK)
+    end = now_utc.astimezone(MSK)
+    if end <= start:
+        return 0.0
+    total = 0.0
+    day = start.date()
+    last = end.date()
+    while day <= last:
+        if day.weekday() in WORKDAYS:
+            win_s = datetime(day.year, day.month, day.day, WINDOW_START_H, tzinfo=MSK)
+            win_e = datetime(day.year, day.month, day.day, WINDOW_END_H, tzinfo=MSK)
+            s = max(start, win_s)
+            e = min(end, win_e)
+            if e > s:
+                total += (e - s).total_seconds()
+        day += timedelta(days=1)
+    return total / 3600.0
+
+
+def _effective_hours(entered_utc: datetime, now_utc: datetime) -> float:
+    """effective = рабочие часы в стадии + кредит паузы (1 ч, если лид вошёл в
+    статус вне рабочего окна — «лид из паузы = горячий»)."""
+    w = _working_hours(entered_utc, now_utc)
+    entered_msk = entered_utc.astimezone(MSK)
+    credit = 0.0 if _in_window(entered_msk) else NERAZ_PAUSE_CREDIT_H
+    return w + credit
+
+
+def _level_for(effective: float) -> int:
+    """Уровень эскалации 0..3 по effective рабочим часам."""
+    if effective >= NERAZ_L3_H:
+        return 3
+    if effective >= NERAZ_L2_H:
+        return 2
+    if effective >= NERAZ_L1_H:
+        return 1
+    return 0
 
 
 async def _get_user_name(user_id: int) -> str:
@@ -181,8 +247,9 @@ async def poll_job(app, db):
         lead_id = lead["id"]
         try:
             entered_at = await _stage_entered_at(lead)
-            hours = (now_utc - entered_at).total_seconds() / 3600.0
-            if hours < STUCK_LEAD_HOURS:
+            effective = _effective_hours(entered_at, now_utc)
+            target_level = _level_for(effective)
+            if target_level == 0:
                 continue
 
             rec = db._fetchone(
@@ -198,17 +265,15 @@ async def poll_job(app, db):
                 if abs((prev - entered_at).total_seconds()) > 120:
                     reentered = True
 
-            last_ping = None if (rec is None or reentered) else rec.get("last_ping_at")
+            sent_level = 0 if (rec is None or reentered) else int(rec.get("pings_count") or 0)
 
-            # Вне окна 09–20 МСК — не шлём (первый пинг откладывается)
+            # Вне рабочего окна (ночь/суббота/до 9/после 20) — пауза, откладываем
             if not _in_window(now_msk):
                 continue
 
-            # Анти-спам: не чаще REPEAT_HOURS
-            if last_ping is not None:
-                lp = last_ping if last_ping.tzinfo else last_ping.replace(tzinfo=timezone.utc)
-                if (now_utc - lp).total_seconds() / 3600.0 < STUCK_LEAD_REPEAT_HOURS:
-                    continue
+            # Каждый уровень шлём один раз; после L3 — тишина
+            if target_level <= sent_level:
+                continue
 
             responsible_id = lead.get("responsible_user_id")
             chat_id, is_fallback = _resolve_target(db, responsible_id)
@@ -217,14 +282,37 @@ async def poll_job(app, db):
                 continue
 
             client = await _get_client_name(lead)
-            hours_txt = f"{int(hours)} ч" if hours >= 2 else f"{hours:.1f} ч"
+            url = _lead_url(lead_id)
+            is_op = responsible_id in OP_AMO_IDS
 
-            text = (
-                f"⏰ Лид завис на «Неразобранном» уже {hours_txt}\n\n"
-                f"👤 {client}\n"
-                f"🔗 {_lead_url(lead_id)}\n\n"
-                f"Возьми в работу — переведи на следующий этап."
-            )
+            if target_level >= 3:
+                penalty_note = (
+                    f"Начислен штраф {NERAZ_PENALTY_RUB} ₽ (виден в дашборде)."
+                    if is_op else
+                    "Разбери сделку — она провисела 3 рабочих часа."
+                )
+                text = (
+                    f"⛔ Лид висел 3 рабочих часа на «Неразобранном» без движения.\n"
+                    f"{penalty_note}\n\n"
+                    f"👤 {client}\n🔗 {url}\n\nРазбери сделку."
+                )
+            elif target_level == 2:
+                warn = (
+                    f"Ещё час без движения — штраф {NERAZ_PENALTY_RUB} ₽."
+                    if is_op else
+                    "Разбери сделку, чтобы не висела."
+                )
+                text = (
+                    f"⚠️ Лид висит ~2 часа на «Неразобранном». {warn}\n\n"
+                    f"👤 {client}\n🔗 {url}\n\nРазбери сделку сейчас."
+                )
+            else:  # level 1
+                text = (
+                    f"⏰ Лид завис на «Неразобранном» ~1 час.\n\n"
+                    f"👤 {client}\n🔗 {url}\n\n"
+                    f"Возьми в работу — переведи на следующий этап."
+                )
+
             if is_fallback:
                 mgr = await _get_user_name(responsible_id) if responsible_id else "не назначен"
                 text = (
@@ -238,22 +326,40 @@ async def poll_job(app, db):
                 logger.error(f"stuck_leads: send lead={lead_id} chat={chat_id}: {e}")
                 continue
 
+            # На уровне 3 (впервые) — начисляем штраф, только менеджерам ОП
+            if target_level >= 3 and sent_level < 3 and is_op:
+                try:
+                    db._execute(
+                        """
+                        INSERT INTO lead_stuck_penalties
+                            (lead_id, stage_entered_at, responsible_id, amount_rub, charged_at)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (lead_id, stage_entered_at) DO NOTHING
+                        """,
+                        (lead_id, entered_at, responsible_id, NERAZ_PENALTY_RUB, now_utc),
+                    )
+                    logger.info(
+                        f"stuck_leads: ШТРАФ {NERAZ_PENALTY_RUB}₽ lead={lead_id} "
+                        f"responsible={responsible_id}"
+                    )
+                except Exception as e:
+                    logger.error(f"stuck_leads: не записал штраф lead={lead_id}: {e}")
+
+            # pings_count = максимальный отправленный уровень (анти-спам по уровням)
             db._execute(
                 """
                 INSERT INTO lead_stuck_pings (lead_id, stage_entered_at, last_ping_at, pings_count)
-                VALUES (%s, %s, %s, 1)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT (lead_id) DO UPDATE
                     SET stage_entered_at = EXCLUDED.stage_entered_at,
                         last_ping_at = EXCLUDED.last_ping_at,
-                        pings_count = CASE
-                            WHEN %s THEN 1
-                            ELSE lead_stuck_pings.pings_count + 1 END
+                        pings_count = EXCLUDED.pings_count
                 """,
-                (lead_id, entered_at, now_utc, reentered),
+                (lead_id, entered_at, now_utc, target_level),
             )
             logger.info(
-                f"stuck_leads: пинг lead={lead_id} chat={chat_id} "
-                f"fallback={is_fallback} hours={hours:.1f}"
+                f"stuck_leads: пинг L{target_level} lead={lead_id} chat={chat_id} "
+                f"fallback={is_fallback} eff={effective:.2f}ч op={is_op}"
             )
         except Exception as e:
             logger.error(f"stuck_leads: обработка lead={lead_id}: {e}", exc_info=True)

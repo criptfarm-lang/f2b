@@ -7869,7 +7869,9 @@ def main():
         except Exception as e:
             logger.error(f"stuck_leads job wrapper: {e}", exc_info=True)
 
-    app.job_queue.run_repeating(_stuck_leads_wrapper, interval=1800, first=120)
+    # interval=600 (10 мин): эскалация 1ч→2ч→3ч требует более частого тика, чем
+    # прежние 30 мин, иначе пинг/штраф опаздывают. План 2026-07-28-штраф-зависание.
+    app.job_queue.run_repeating(_stuck_leads_wrapper, interval=600, first=120)
 
     # ────────────────────────────────────────────────────────────────────
     # Wazzup classifier — дневная сводка собственнику 17:00 МСК.
