@@ -2181,25 +2181,30 @@ async def _overdue_by_demand_fifo(agent_id: str, today, delay: Optional[int] = N
                 if len(rows) < 100:
                     break
                 offset += 100
-            # Сумма приходов
-            pay = 0.0; offset = 0
-            while True:
-                async with session.get(f"{MS_BASE}/entity/paymentin", headers=get_headers(),
-                        params={"filter": f"agent={agent_href}", "limit": 100, "offset": offset}) as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json()
-                rows = data.get("rows", []) or []
-                pay += sum((p.get("sum", 0) or 0) / 100 for p in rows)
-                if len(rows) < 100:
-                    break
-                offset += 100
+            # Реальный кредит контрагента = Σотгрузок − |сальдо|.
+            # Сальдо (report/counterparty) учитывает ВСЕ погашения долга:
+            # платежи (paymentin), возвраты, корректировки взаиморасчётов,
+            # взаимозачёты, начальное сальдо. Раньше гасили только Σpaymentin —
+            # у холдингов со взаимозачётами (GFC, Фугу) это раздувало просрочку
+            # в разы: GFC 13.2М при реальном долге 3.2М (просрочка не может
+            # превышать долг). Балансовый кредит сходится с сальдо копейка-в-
+            # копейку. См. project_f2b_pdz_penalty_days_inflated,
+            # feedback_notifier_pdz_must_match_digest.
+            async with session.get(f"{MS_BASE}/report/counterparty/{agent_id}",
+                                    headers=get_headers()) as r:
+                if r.status != 200:
+                    return None
+                balance = ((await r.json()).get("balance", 0) or 0) / 100
     except Exception as e:
         logger.warning(f"_overdue_by_demand_fifo({agent_id[:8]}): {e}")
         return None
 
-    # FIFO: платежи гасят отгрузки oldest-first
-    remaining = pay
+    if balance >= 0:
+        return (0, 0.0, None, 0)
+    total_demand = sum(row[1] for row in demands)
+    # FIFO: весь кредит сальдо гасит отгрузки oldest-first; в долге остаются
+    # самые свежие отгрузки суммарно на |сальдо|.
+    remaining = max(0.0, round(total_demand - abs(balance), 2))
     for row in demands:
         paid_here = min(remaining, row[1]); row.append(row[1] - paid_here); remaining -= paid_here
     overdue = []
