@@ -7990,6 +7990,22 @@ def main():
     app.job_queue.run_repeating(_stuck_leads_wrapper, interval=600, first=120)
 
     # ────────────────────────────────────────────────────────────────────
+    # Дослыка FISHки-рассылки по пропущенным согласованным заказам — каждые 2 ч.
+    # Ловит заказы, у которых webhook «Согласован» потерян или обработан после
+    # ухода заказа дальше по конвейеру. Дедуп по order_id → без задвоений.
+    # План: 2026-07-29-дослыка-fishki-по-пропущенным-согласованным.
+    # ────────────────────────────────────────────────────────────────────
+    from notifier import sweep_missed_fishki as _sweep_missed_fishki
+
+    async def _fishki_sweep_wrapper(context):
+        try:
+            await _sweep_missed_fishki(app.bot, db)
+        except Exception as e:
+            logger.error(f"fishki_sweep job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_fishki_sweep_wrapper, interval=7200, first=180)
+
+    # ────────────────────────────────────────────────────────────────────
     # Wazzup classifier — дневная сводка собственнику 17:00 МСК.
     # Счётчик за день + топ-5 срочных. Если 0 — «0 запросов, всё тихо».
     # ────────────────────────────────────────────────────────────────────

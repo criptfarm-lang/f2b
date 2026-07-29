@@ -743,6 +743,137 @@ async def manual_send_fishki(order_id: str, db) -> tuple[bool, str]:
 
 
 # ============================================================================
+# Дослыка FISHки-рассылки по пропущенным согласованным заказам.
+# План: plans/2026-07-29-дослыка-fishki-по-пропущенным-согласованным.md
+#
+# Зачем: webhook «Согласован» иногда теряется или обрабатывается уже после
+# того, как заказ ушёл дальше по конвейеру («Собирается»/«Отгружен») → живой
+# статус ≠ «Согласован» → check_order_agreed выходит, единственная отправка не
+# происходит. Sweep ловит такие пропуски по факту «заказ дошёл до Согласован».
+# Дедуп по order_id (try_claim_agreed_notification) → строго одна отправка,
+# цикл «Согласован → откат → снова Согласован» не задваивается.
+# ============================================================================
+
+# Статусы конвейера ≥ «Согласован» (по имени — устойчиво к смене UUID).
+# «На согласовании», «НЕ СОГЛАСОВАН», «ЗА ЛИМИТОМ», «Возврат» и черновики — НЕ здесь.
+FISHKI_SWEEP_STATES = {
+    "Согласован", "Собирается", "Собран", "Документы готовы", "Отгружен",
+}
+
+
+def _order_is_fresh(order: dict, grace_days: int) -> bool:
+    """Заказ «свежий» — плановая отгрузка не раньше, чем grace_days назад (или в
+    будущем). Защита от «зомби»: у старых заказов updated подскакивает от
+    привязки отгрузки/возврата, но слать «проверьте заказ» по заказу
+    двухмесячной давности нельзя. Если даты отгрузки нет — берём created.
+    """
+    from datetime import date
+    raw = order.get("deliveryPlannedMoment") or order.get("created") or ""
+    if not raw:
+        return False
+    try:
+        d = date.fromisoformat(raw[:10])
+    except Exception:
+        return False
+    from datetime import datetime, timedelta
+    return d >= (datetime.now().date() - timedelta(days=grace_days))
+
+
+async def sweep_missed_fishki(bot, db) -> dict:
+    """Находит согласованные заказы без рассылки и дошлёт по каждому один раз.
+
+    Окно — заказы с updated за последние FISHKI_SWEEP_HOURS часов (дефолт 48).
+    Кандидат = текущий статус в FISHKI_SWEEP_STATES и order_id нет в
+    agreed_notifications. Отправку/фильтры (розница, исключения, нет контакта,
+    дедуп) делает manual_send_fishki → _send_fishki_mailing.
+    """
+    import aiohttp
+    from datetime import datetime, timedelta
+    from moysklad import get_headers
+
+    hours = int(os.getenv("FISHKI_SWEEP_HOURS", "48") or "48")
+    cap   = int(os.getenv("FISHKI_SWEEP_MAX", "40") or "40")
+    grace = int(os.getenv("FISHKI_SWEEP_GRACE_DAYS", "4") or "4")
+    since = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    headers = get_headers()
+
+    stats = {"checked": 0, "candidates": 0, "sent": 0,
+             "retail": 0, "excluded": 0, "no_contact": 0,
+             "already": 0, "stale": 0, "errors": 0}
+
+    # 1) Тянем заказы, обновлённые за окно (пагинация).
+    orders: list[dict] = []
+    offset = 0
+    try:
+        async with aiohttp.ClientSession() as session:
+            while True:
+                params = {
+                    "filter": f"updated>={since}",
+                    "expand": "agent,state",
+                    "limit": 100,
+                    "offset": offset,
+                }
+                async with session.get(
+                    f"{MS_BASE}/entity/customerorder", headers=headers, params=params
+                ) as r:
+                    if r.status != 200:
+                        logger.error(f"fishki-sweep: МС {r.status}: {(await r.text())[:200]}")
+                        stats["errors"] += 1
+                        break
+                    data = await r.json()
+                rows = data.get("rows", [])
+                orders.extend(rows)
+                size = data.get("meta", {}).get("size", 0)
+                offset += 100
+                if offset >= size or not rows:
+                    break
+    except Exception as e:
+        logger.error(f"fishki-sweep: ошибка загрузки заказов: {e}", exc_info=True)
+        stats["errors"] += 1
+        return stats
+
+    stats["checked"] = len(orders)
+
+    # 2) Отбираем кандидатов и дошлём.
+    for o in orders:
+        state_name = (o.get("state") or {}).get("name", "")
+        if state_name not in FISHKI_SWEEP_STATES:
+            continue
+        order_id = o.get("id", "")
+        if not order_id or db.is_agreed_notified(order_id):
+            continue
+        if not _order_is_fresh(o, grace):
+            stats["stale"] += 1
+            continue
+        stats["candidates"] += 1
+        if stats["sent"] + stats["already"] >= cap:
+            logger.warning(f"fishki-sweep: достигнут кап {cap}, остаток отложен до след. тика")
+            break
+        sent, reason = await manual_send_fishki(order_id, db)
+        if sent:
+            stats["sent"] += 1
+            logger.info(f"fishki-sweep: ✅ дослано {o.get('name','')} ({o.get('agent',{}).get('name','')})")
+        elif reason == "retail":
+            stats["retail"] += 1
+        elif reason == "excluded":
+            stats["excluded"] += 1
+        elif reason == "no_contact":
+            stats["no_contact"] += 1
+        elif reason == "already_claimed":
+            stats["already"] += 1
+        else:
+            stats["errors"] += 1
+            logger.info(f"fishki-sweep: {o.get('name','')} не отправлено: {reason}")
+
+    logger.info(
+        f"fishki-sweep итог: проверено={stats['checked']} кандидатов={stats['candidates']} "
+        f"дослано={stats['sent']} розница={stats['retail']} исключ={stats['excluded']} "
+        f"нет_контакта={stats['no_contact']} старых={stats['stale']} ошибок={stats['errors']}"
+    )
+    return stats
+
+
+# ============================================================================
 # Объединённый алерт «На согласовании» / «ЗА ЛИМИТОМ»
 # План: 2026-05-21-объединённый-алерт-на-согласование.md, Фаза 3.
 # Светофор: Лимит → Договор → Просрочка → ДДС → Сайт → Контакты → Цена.
