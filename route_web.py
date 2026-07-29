@@ -11,6 +11,7 @@ Read-only: приёмка на точке НЕ дублируется — кно
 deep-link'ом `t.me/<bot>?start=chk_<№заказа>` в существующий driver_checklist.
 """
 import os
+import re
 import time
 import hmac
 import hashlib
@@ -57,6 +58,23 @@ def route_url(uid, date_str: str) -> str:
 
 def _maps_link(address: str) -> str:
     return "https://yandex.ru/maps/?text=" + urllib.parse.quote(address)
+
+
+# Телефон приёмки менеджеры пишут в Комментарии заказа в разном виде (+7 901…, 8 (901)…).
+_PHONE_RE = re.compile(r"(?:\+7|8|7)[\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-()]*\d{2}[\s\-()]*\d{2}")
+
+
+def _phone_from_text(text: str) -> str:
+    """Первый телефон из текста → нормализованный +7XXXXXXXXXX для tel:-ссылки. Пусто, если нет."""
+    if not text:
+        return ""
+    m = _PHONE_RE.search(text)
+    if not m:
+        return ""
+    digits = re.sub(r"\D", "", m.group(0))
+    if len(digits) == 11 and digits[0] in "78":
+        return "+7" + digits[1:]
+    return "+" + digits if digits else ""
 
 
 def _e(s) -> str:
@@ -187,7 +205,6 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         win = f"{rr._hm(s.get('tf'))}–{rr._hm(s.get('tt'))}"
         plan = rr._hm(s.get("vt"))
         address = s.get("address") or ""
-        phone = (ex.get("phone") or s.get("phone") or "").strip()
         wt = rr._fmt_weight(ex.get("weight"))
         places = ex.get("places")
         places = str(places) if places not in (None, "") else "—"
@@ -200,8 +217,11 @@ async def render_page(uid: int, target: date, db, bot) -> str:
                     f"<span class='win'>🕒 {_e(plan)} · {_e(win)}</span></div>")
         if address:
             rows.append(f"<div class='row'>📍 <a href='{_maps_link(address)}' target='_blank'>{_e(address)}</a></div>")
-        if phone:
-            rows.append(f"<div class='row'>📞 <a href='tel:{_e(phone)}'>{_e(phone)}</a></div>")
+        # Телефон приёмки — из Комментария заказа (менеджеры вписывают контакт туда),
+        # карточку контрагента больше не читаем. Номер из комментария делаем кликабельным.
+        tel = _phone_from_text(comment)
+        if tel:
+            rows.append(f"<div class='row'>📞 <a href='tel:{_e(tel)}'>{_e(tel)}</a></div>")
         wbits = " · ".join(x for x in ((f"{wt} кг" if wt else ""), f"{places} мест") if x)
         meta = " · ".join(x for x in (wbits, (f"Отв: {_e(resp)}" if resp else "")) if x)
         if meta:

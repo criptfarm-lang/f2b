@@ -264,6 +264,8 @@ async def _fetch_demand_detail(demand_id: str) -> dict:
         "max_price_rub": max(prices) if prices else 0,
         "positions_text": "\n".join(lines),
         "checklist_raw": checklist_raw,
+        # Комментарий заказа = контакт/условия приёмки, которые менеджер оставил водителю.
+        "comment": (co.get("description") or "").strip(),
     }
 
 
@@ -482,6 +484,9 @@ async def _render_card(send, demand_id: str, db, with_back: bool = True):
         f"Адрес: {det.get('address') or '—'}",
         f"Сумма: {_fmt_rub(det.get('sum_rub'))}",
     ]
+    # Контакт/условия приёмки менеджер оставляет в Комментарии заказа — показываем водителю.
+    if det.get("comment"):
+        lines.append(f"💬 Приёмка: {det['comment']}")
     if det.get("positions_text"):
         lines.append("\n" + det["positions_text"])
     preview = _parse_checklist_items(det.get("checklist_raw"), _money_required(det))

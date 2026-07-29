@@ -235,7 +235,8 @@ async def _ms_extra_by_order(order_numbers) -> dict:
             "comment": (co.get("description") or "").strip(),
             "weight": weight,
             "manager": manager,
-            "phone": (agent.get("phone") or "").strip(),
+            # Телефон приёмки водитель берёт из Комментария заказа (менеджеры вписывают
+            # контакт туда). Поле «Телефон» карточки контрагента больше НЕ тянем.
             "zdraste": "здрасте" in tags,
         }
 
@@ -333,19 +334,19 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
             wt = _fmt_weight(ex.get("weight"))
             wcell = (f"<b>{wt} кг</b><br/>" if wt else "") + f"{places} мест"
             info = (f"<b>{s['client'][:40]}</b> (№{s['order_no']})<br/>{(s['address'] or '')[:70]}")
-            # Ответственный + телефон (из карточки контрагента)
+            # Ответственный менеджер (из тега контрагента). Телефон приёмки — в Комментарии.
             resp = ex.get("manager") or ""
-            phone = ex.get("phone") or s.get("phone") or ""
             meta_line = " · ".join(x for x in (
                 (f"Отв: {resp}" if resp else ""),
-                (f"тел: {phone}" if phone else ""),
                 ("Здрасте" if ex.get("zdraste") else ""),
             ) if x)
             if meta_line:
                 info += f"<br/><font size=7 color='#444444'>{meta_line[:80]}</font>"
+            # Комментарий = контакт/условия приёмки (менеджеры пишут телефон сюда) —
+            # лимит выше, чтобы не срезать номер в конце строки. Paragraph переносит текст.
             cm = (ex.get("comment") or "").replace("\n", " ")
             if cm:
-                info += f"<br/><font size=7 color='#888888'>{cm[:70]}</font>"
+                info += f"<br/><font size=7 color='#888888'>{cm[:140]}</font>"
             link = f"https://t.me/{bot_username}?start=chk_{s['order_no']}"
             rows.append([
                 Paragraph(str(idx), cell),
