@@ -336,8 +336,9 @@ async def run_batch(months: int = 3, concurrency: int = 4) -> dict:
     async def _one(cp: dict):
         async with sem:
             try:
-                res = await asyncio.wait_for(check_counterparty(cp["inn"]),
-                                             timeout=PER_CHECK_TIMEOUT)
+                res = await asyncio.wait_for(
+                    check_counterparty(cp["inn"], with_finance=False),
+                    timeout=PER_CHECK_TIMEOUT)
             except asyncio.TimeoutError:
                 logger.warning("run_batch %s → таймаут проверки", cp["inn"])
                 res = None
@@ -391,13 +392,17 @@ async def weekly_batch_job(app=None, db=None):
     return summary
 
 
-async def check_counterparty(inn: str, save: bool = True) -> dict:
+async def check_counterparty(inn: str, save: bool = True, with_finance: bool = True) -> dict:
     """Считает светофор по ИНН, при save=True кладёт/обновляет в БД. Возвращает
-    {inn, name, color, flags, checked_at}."""
+    {inn, name, color, flags, checked_at}.
+
+    with_finance=False — пропустить ГИР БО (для батча: гос-сайт тарпитит параллельные
+    запросы и подвешивает воркеры; в массовом прогоне берём только стоп-флаги ЕГРЮЛ из
+    DaData, финансы доступны в одиночном /svetofor)."""
     inn = (inn or "").strip()
     async with aiohttp.ClientSession() as session:
         egrul = await _dadata_party(session, inn)
-        finance = await _bo_finance(session, inn) if egrul else None
+        finance = await _bo_finance(session, inn) if (egrul and with_finance) else None
     color, flags = _compute_color(egrul, finance)
     name = egrul.get("name") if egrul else None
     if save:
