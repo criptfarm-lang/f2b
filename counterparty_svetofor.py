@@ -321,7 +321,7 @@ async def fetch_shipped_counterparties(months: int = 3) -> tuple[list[dict], lis
     return counterparties, list(no_inn.keys())
 
 
-async def run_batch(months: int = 3, concurrency: int = 4) -> dict:
+async def run_batch(months: int = 3, concurrency: int = 2) -> dict:
     """Прогоняет светофор по всем контрагентам с отгрузкой за `months` мес, апсертит в БД.
     Параллельно (пачками по `concurrency`), иначе по всей базе с медленным ГИР БО уходит
     полчаса. Возвращает сводку по цветам + список «не проверено» (без ИНН)."""
@@ -334,11 +334,14 @@ async def run_batch(months: int = 3, concurrency: int = 4) -> dict:
     progress = {"n": 0}
 
     async def _one(cp: dict):
+        logger.info("DIAG _one вход %s", cp["inn"])
         async with sem:
+            logger.info("DIAG _one sem+ %s", cp["inn"])
             try:
                 res = await asyncio.wait_for(
                     check_counterparty(cp["inn"], with_finance=False),
                     timeout=PER_CHECK_TIMEOUT)
+                logger.info("DIAG _one готово %s → %s", cp["inn"], res and res.get("color"))
             except asyncio.TimeoutError:
                 logger.warning("run_batch %s → таймаут проверки", cp["inn"])
                 res = None
@@ -350,7 +353,9 @@ async def run_batch(months: int = 3, concurrency: int = 4) -> dict:
             logger.info("run_batch: %s/%s", progress["n"], total)
         return (cp, res)
 
+    logger.info("DIAG старт gather по %s (concurrency %s)", total, concurrency)
     results = await asyncio.gather(*[_one(cp) for cp in counterparties])
+    logger.info("DIAG gather вернул %s", len(results))
     for cp, res in results:
         if not res:
             continue
@@ -402,6 +407,7 @@ async def check_counterparty(inn: str, save: bool = True, with_finance: bool = T
     inn = (inn or "").strip()
     async with aiohttp.ClientSession() as session:
         egrul = await _dadata_party(session, inn)
+        logger.info("DIAG check DaData ok %s egrul=%s", inn, bool(egrul))
         finance = await _bo_finance(session, inn) if (egrul and with_finance) else None
     color, flags = _compute_color(egrul, finance)
     name = egrul.get("name") if egrul else None
