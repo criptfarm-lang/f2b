@@ -19,6 +19,7 @@ import os
 import io
 import re as _re
 import json
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -606,7 +607,7 @@ async def cb_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = await context.bot.get_me()
     link = f"https://t.me/{me.username}?start=chk_{demand_id}"
     try:
-        png = _qr_png(link)
+        png = await asyncio.to_thread(_qr_png, link)  # reportlab CPU-sync → в поток, не блокируем loop
         await context.bot.send_photo(
             chat_id=q.from_user.id, photo=io.BytesIO(png),
             caption=f"QR точки. Скан любой камерой → откроется сдача груза.\n{link}",
@@ -1011,7 +1012,8 @@ async def cmd_shipment_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         me = await context.bot.get_me()
         _, _, snap = _msk_today_bounds()
-        pdf = _build_shipment_list_pdf(shipments, me.username, snap.strftime("%d.%m.%Y"))
+        pdf = await asyncio.to_thread(_build_shipment_list_pdf, shipments, me.username,
+                                      snap.strftime("%d.%m.%Y"))  # reportlab CPU-sync → в поток
         await context.bot.send_document(
             chat_id=user.id, document=io.BytesIO(pdf),
             filename=f"shipments_{snap.isoformat()}.pdf",
