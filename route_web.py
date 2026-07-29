@@ -202,7 +202,8 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         cls = "pt done" if is_done else "pt"
 
         client = s.get("client") or order_no or "?"
-        win = f"{rr._hm(s.get('tf'))}–{rr._hm(s.get('tt'))}"
+        # Окно приёмки — из полей заказа МС «Окно доставки с/до (время)», фолбэк на заявку.
+        win = rr._fmt_window(ex.get("win_from"), ex.get("win_to"), s.get("tf"), s.get("tt"))
         plan = rr._hm(s.get("vt"))
         address = s.get("address") or ""
         wt = rr._fmt_weight(ex.get("weight"))

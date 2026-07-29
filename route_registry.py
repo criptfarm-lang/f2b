@@ -219,9 +219,15 @@ async def _ms_extra_by_order(order_numbers) -> dict:
 
     def _parse(co):
         places = None
+        win_from = win_to = ""
         for a in co.get("attributes", []) or []:
-            if a.get("name") == "Количество мест":
+            nm = a.get("name")
+            if nm == "Количество мест":
                 places = a.get("value")
+            elif nm == ATTR_WINDOW_FROM:
+                win_from = _attr_time(a.get("value"))
+            elif nm == ATTR_WINDOW_TO:
+                win_to = _attr_time(a.get("value"))
         # вес = сумма количеств позиций (рыба/морепродукты продаются в кг)
         weight = 0.0
         for p in (co.get("positions") or {}).get("rows", []):
@@ -237,6 +243,8 @@ async def _ms_extra_by_order(order_numbers) -> dict:
             "manager": manager,
             # Телефон приёмки водитель берёт из Комментария заказа (менеджеры вписывают
             # контакт туда). Поле «Телефон» карточки контрагента больше НЕ тянем.
+            "win_from": win_from,   # «Окно доставки с (время)» → HH:MM
+            "win_to": win_to,       # «Окно доставки до (время)» → HH:MM
             "zdraste": "здрасте" in tags,
         }
 
@@ -273,6 +281,53 @@ def _hm(ts):
         return datetime.fromtimestamp(ts, _MSK).strftime("%H:%M")
     except Exception:
         return "—"
+
+
+# Имена доп.полей заказа МС с окном приёмки (тип «дата-время», значащая часть — ВРЕМЯ).
+ATTR_WINDOW_FROM = "Окно доставки с (время)"
+ATTR_WINDOW_TO = "Окно доставки до (время)"
+
+import re as _re_rr
+
+
+def _attr_time(val) -> str:
+    """«2026-07-29 09:30:00.000» → «09:30». Пусто → ''. Дата в поле ненадёжна, берём только время."""
+    if not val:
+        return ""
+    s = str(val).strip()
+    m = _re_rr.search(r"\b(\d{1,2}):(\d{2})\b", s)
+    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else ""
+
+
+def _fmt_window(win_from: str, win_to: str, tf=None, tt=None) -> str:
+    """Окно приёмки для листа: приоритет — поля заказа МС «Окно доставки с/до (время)».
+    Обе стороны → «09:00–09:30»; только до → «до 09:30»; только с → «с 14:00 »;
+    ни одной → фолбэк на окно заявки Wialon (tf/tt)."""
+    wf, wt = (win_from or "").strip(), (win_to or "").strip()
+    if wf and wt:
+        return f"{wf}–{wt}"
+    if wt:
+        return f"до {wt}"
+    if wf:
+        return f"с {wf}"
+    return f"{_hm(tf)}–{_hm(tt)}"
+
+
+# Телефон приёмки менеджеры пишут в Комментарии заказа в разном виде (+7 901…, 8 (901)…).
+_PHONE_RE = _re_rr.compile(r"(?:\+7|8|7)[\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-()]*\d{2}[\s\-()]*\d{2}")
+
+
+def _phone_from_text(text: str) -> str:
+    """Первый телефон из текста → нормализованный +7XXXXXXXXXX для tel:. Пусто, если нет."""
+    if not text:
+        return ""
+    m = _PHONE_RE.search(text)
+    if not m:
+        return ""
+    d = _re_rr.sub(r"\D", "", m.group(0))
+    if len(d) == 11 and d[0] in "78":
+        return "+7" + d[1:]
+    return "+" + d if d else ""
 
 
 def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
@@ -342,16 +397,21 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
             ) if x)
             if meta_line:
                 info += f"<br/><font size=7 color='#444444'>{meta_line[:80]}</font>"
-            # Комментарий = контакт/условия приёмки (менеджеры пишут телефон сюда) —
-            # лимит выше, чтобы не срезать номер в конце строки. Paragraph переносит текст.
+            # Комментарий = контакт/условия приёмки (менеджеры пишут телефон сюда).
             cm = (ex.get("comment") or "").replace("\n", " ")
+            # Телефон приёмки — из комментария, кликабельной tel:-ссылкой (звонок из PDF).
+            tel = _phone_from_text(cm)
+            if tel:
+                info += (f"<br/><font size=8><a href='tel:{tel}' color='#0645ad'>"
+                         f"тел. {tel}</a></font>")
             if cm:
+                # Лимит выше (140), чтобы не срезать инструкции/номер. Paragraph переносит текст.
                 info += f"<br/><font size=7 color='#888888'>{cm[:140]}</font>"
             link = f"https://t.me/{bot_username}?start=chk_{s['order_no']}"
             rows.append([
                 Paragraph(str(idx), cell),
                 Paragraph(_hm(s["vt"]), cell),
-                Paragraph(f"{_hm(s['tf'])}–{_hm(s['tt'])}", cell),
+                Paragraph(_fmt_window(ex.get("win_from"), ex.get("win_to"), s["tf"], s["tt"]), cell),
                 Paragraph(info, cell),
                 Paragraph(wcell, cell),
                 qr_flow(link),
@@ -398,6 +458,13 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
             "Федерального закона № 63-ФЗ; фиксируется в системе). При недоступности системы — "
             "подпись водителя на реестре с указанием № точки. Подпись грузополучателя не "
             "требуется.", legal))
+        flow.append(Paragraph(
+            "<b>Платные дороги.</b> Организация оплачивает только СОГЛАСОВАННЫЕ проезды по "
+            "платным дорогам (перечень согласованных маршрутов — у логиста). Несогласованный "
+            "проезд водитель оплачивает самостоятельно.", legal))
+        flow.append(Paragraph(
+            "<b>ПДД.</b> Нарушения Правил дорожного движения (штрафы) — ответственность "
+            "водителя.", legal))
     doc.build(flow)
     return buf.getvalue()
 

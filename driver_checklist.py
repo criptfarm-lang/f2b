@@ -251,10 +251,15 @@ async def _fetch_demand_detail(demand_id: str) -> dict:
     # Пункты чек-листа лежат на ЗАКАЗЕ (customerorder.attributes), не на отгрузке.
     co = d.get("customerOrder") or {}
     checklist_raw = None
+    win_from = win_to = ""
     for a in co.get("attributes", []) or []:
-        if a.get("name") == _CHECKLIST_ATTR_NAME:
+        nm = a.get("name")
+        if nm == _CHECKLIST_ATTR_NAME:
             checklist_raw = a.get("value")
-            break
+        elif nm == "Окно доставки с (время)":
+            win_from = _attr_time_hm(a.get("value"))
+        elif nm == "Окно доставки до (время)":
+            win_to = _attr_time_hm(a.get("value"))
     return {
         "agent_id": ag.get("id"),
         "agent_name": ag.get("name"),
@@ -266,6 +271,8 @@ async def _fetch_demand_detail(demand_id: str) -> dict:
         "checklist_raw": checklist_raw,
         # Комментарий заказа = контакт/условия приёмки, которые менеджер оставил водителю.
         "comment": (co.get("description") or "").strip(),
+        "win_from": win_from,   # «Окно доставки с (время)» → HH:MM
+        "win_to": win_to,       # «Окно доставки до (время)» → HH:MM
     }
 
 
@@ -287,6 +294,27 @@ async def _fetch_agent_tags(agent_id: str) -> list:
 
 def _is_retail(agent_name: str) -> bool:
     return bool(agent_name) and agent_name.strip().startswith(_RETAIL_PREFIX)
+
+
+def _attr_time_hm(val) -> str:
+    """«2026-07-29 09:30:00.000» → «09:30» (дата в поле ненадёжна, берём только время)."""
+    if not val:
+        return ""
+    m = _re.search(r"\b(\d{1,2}):(\d{2})\b", str(val))
+    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else ""
+
+
+def _fmt_window(win_from: str, win_to: str) -> str:
+    """Окно приёмки для карточки: обе стороны → «09:00–09:30»; только до → «до 09:30»;
+    только с → «с 14:00»; ни одной → '' (строку не показываем)."""
+    wf, wt = (win_from or "").strip(), (win_to or "").strip()
+    if wf and wt:
+        return f"{wf}–{wt}"
+    if wt:
+        return f"до {wt}"
+    if wf:
+        return f"с {wf}"
+    return ""
 
 
 # Ведущая нумерация пункта: «1. », «2) », «3 -» → срезаем, оставляем текст задачи.
@@ -484,6 +512,10 @@ async def _render_card(send, demand_id: str, db, with_back: bool = True):
         f"Адрес: {det.get('address') or '—'}",
         f"Сумма: {_fmt_rub(det.get('sum_rub'))}",
     ]
+    # Окно приёмки — из полей заказа МС «Окно доставки с/до (время)».
+    _win = _fmt_window(det.get("win_from"), det.get("win_to"))
+    if _win:
+        lines.append(f"🕒 Окно приёмки: {_win}")
     # Контакт/условия приёмки менеджер оставляет в Комментарии заказа — показываем водителю.
     if det.get("comment"):
         lines.append(f"💬 Приёмка: {det['comment']}")
