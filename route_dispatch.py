@@ -501,6 +501,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     unit_name = rr.UNITS.get(uid, str(uid))
     km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
     note = _volume_note(uid, stops, pkg["ms_extra"], km=km)  # заметка по объёму — во все сообщения
+    ya_url = rr.yandex_route_url(stops)  # навигация в Яндекс.Картах (база Ильинский → точки по порядку)
     snap = [{"order_no": s["order_no"], "client": s.get("client"), "seq": s.get("seq")} for s in stops]
     if _DB is not None:
         try:
@@ -515,10 +516,11 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     driver_note = ""
     if driver_id:
         try:
+            ya_caption = f"\n🧭 Маршрут в Яндекс.Картах: {ya_url}" if ya_url else ""
             await context.bot.send_document(
                 driver_id, io.BytesIO(pkg["pdf"]),
                 filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
-                caption=f"🚚 Твой маршрут на {date_str} — {unit_name}. Реестр во вложении.")
+                caption=f"🚚 Твой маршрут на {date_str} — {unit_name}. Реестр во вложении.{ya_caption}")
             # Сохраняем прогресс: при пересборе/переподтверждении уже закрытые точки не показываем.
             done_prev = _existing_done(dstr, uid)
             kb = _driver_kb(stops, done=done_prev)
@@ -532,12 +534,13 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     live = f"\n🌐 Живой маршрут (всегда актуальный): {route_web.route_url(uid, dstr)}"
                 except Exception:
                     live = ""
+                nav = f"\n🧭 Маршрут в Яндекс.Картах: {ya_url}" if ya_url else ""
                 msg = await context.bot.send_message(
                     driver_id,
                     f"🚚 Маршрут на {date_str} — {left} из {len(stops)} точек (порядок выгрузки).\n"
                     f"{note}\n"
                     "Приехал на точку — жми её, закрывай сдачу:"
-                    f"{live}",
+                    f"{nav}{live}",
                     reply_markup=kb)
             if _DB is not None:
                 _DB._execute("UPDATE route_dispatch SET driver_msg_id=%s WHERE snap_date=%s AND unit_id=%s",

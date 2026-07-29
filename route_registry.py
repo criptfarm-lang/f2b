@@ -164,6 +164,33 @@ def mileage_km(order_routes, uid, stop_oids):
     return round(m / 1000.0, 1) if m else None
 
 
+# ─── Навигационная ссылка Яндекс.Карт ─────────────────────────────────────────
+
+# База Ильинский (производство, Рабочая ул. 48/8) — старт развоза.
+# Координата сверена геокодером DaData 2026-07-29 (совпала с точкой из ручного
+# маршрута Беляковой 55.633302,38.104360). (lat, lon).
+BASE_ILINSKY = (55.633297, 38.104351)
+
+
+def yandex_route_url(stops, with_base: bool = True) -> str | None:
+    """Собирает ссылку на маршрут в Яндекс.Картах из точек машины по порядку выгрузки.
+    Формат: https://yandex.ru/maps/?mode=routes&rtext=lat,lon~...&rtt=auto.
+    Первой точкой (with_base) — база Ильинский. Возвращает None, если валидных точек нет.
+    Порядок stops уже = порядок выгрузки (fetch_routes сортирует по времени визита)."""
+    pts = []
+    if with_base:
+        pts.append(BASE_ILINSKY)
+    for s in stops or []:
+        lat, lon = s.get("lat"), s.get("lon")
+        if lat in (None, "", 0) or lon in (None, "", 0):
+            continue
+        pts.append((float(lat), float(lon)))
+    if len(pts) < 2:  # маршрут из одной точки бессмыслен
+        return None
+    rtext = "~".join(f"{lat:.6f},{lon:.6f}" for lat, lon in pts)
+    return f"https://yandex.ru/maps/?mode=routes&rtext={rtext}&rtt=auto"
+
+
 # ─── МойСклад: мест/комментарий по № заказа ──────────────────────────────────
 
 # Теги-фамилии менеджеров ОП → отображаемое имя (для колонки «Ответственный»).
