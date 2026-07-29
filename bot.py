@@ -5414,6 +5414,116 @@ async def handle_doc_approval_callback(update: Update, context: ContextTypes.DEF
         )
 
 
+# ── Претензии менеджеров (из quiz-game) ──────────────────────────────────────
+# Callbacks: mclaim_resolved:{id} | mclaim_fix:{id}. Таблица manager_claims в общей
+# f2b-postgres (создаёт дашборд). План: 2026-07-29-претензии-вкладка-в-сервисах.md (v2).
+_CLAIM_STATUS_RU = {
+    "pending": "ожидает решения", "resolved": "решено", "fix_docs": "исправление документов",
+}
+# tag → фамилия для резолва chat_id менеджера через manager_chats (LIKE по имени).
+_CLAIM_TAG_SURNAME = {
+    "баласанян": "Баласанян", "мерзлякова": "Мерзлякова", "скляр": "Скляр",
+    "дьяченко": "Дьяченко", "коликов": "Коликов",
+}
+
+
+def _resolve_manager_chat(tag: str):
+    """chat_id менеджера по тегу претензии (тег→фамилия→manager_chats). None если не нашли."""
+    surname = _CLAIM_TAG_SURNAME.get((tag or "").lower())
+    if not surname:
+        return None
+    try:
+        return db.get_manager_chat_id(surname)
+    except Exception:
+        return None
+
+
+async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    uid = update.effective_user.id if update.effective_user else 0
+    # Гейт: решать по претензии могут только собственник и партнёр.
+    if uid not in (OWNER_CHAT_ID, PARTNER_CHAT_ID):
+        await query.answer("Только для руководителей.", show_alert=True)
+        return
+    await query.answer()
+    data = query.data or ""
+    try:
+        action, sid = data.split(":", 1)
+        claim_id = int(sid)
+    except (ValueError, TypeError):
+        return
+
+    row = db._fetchone("SELECT * FROM manager_claims WHERE id=%s", (claim_id,))
+    if not row:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text(f"⚠️ Претензия №{claim_id} не найдена в базе.")
+        return
+
+    if row.get("status") != "pending":
+        await query.answer(
+            f"Уже обработано: {_CLAIM_STATUS_RU.get(row.get('status'), row.get('status'))}",
+            show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    decided_by = "Виктор" if uid == OWNER_CHAT_ID else "Маланчук"
+    if action == "mclaim_resolved":
+        new_status, note = "resolved", "Принято решение: претензия решена."
+    else:
+        new_status, note = "fix_docs", (
+            "Принято решение: исправить документы. "
+            "Напишите в amoCRM согласование на исправление документов.")
+
+    # Идемпотентно: меняем только из pending (защита от двойного клика второй копией).
+    db._execute(
+        "UPDATE manager_claims SET status=%s, decision_note=%s, decided_by=%s, decided_at=NOW() "
+        "WHERE id=%s AND status='pending'",
+        (new_status, note, decided_by, claim_id),
+    )
+
+    cli = row.get("client_name") or "—"
+    label = "✅ Решено" if new_status == "resolved" else "📝 Исправление документов"
+
+    # Снимаем кнопки во всех копиях сообщения (Виктор + Маланчук).
+    tg_messages = row.get("tg_messages") or []
+    if isinstance(tg_messages, str):
+        import json as _json
+        try:
+            tg_messages = _json.loads(tg_messages)
+        except Exception:
+            tg_messages = []
+    for m in tg_messages:
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=m["chat_id"], message_id=m["message_id"], reply_markup=None)
+        except Exception:
+            pass
+
+    await query.message.reply_text(f"{label} — претензия №{claim_id} ({cli}). Решил: {decided_by}.")
+
+    # Уведомляем менеджера (в дашборде статус уже сменился, плюс ТГ-пуш).
+    mgr_chat = _resolve_manager_chat(row.get("manager_tag"))
+    if mgr_chat:
+        if new_status == "resolved":
+            mtext = f"✅ По вашей претензии №{claim_id} (клиент «{cli}») принято решение: *Решено*."
+        else:
+            mtext = (f"📝 По вашей претензии №{claim_id} (клиент «{cli}») принято решение: "
+                     f"*исправить документы*.\n\nНапишите в amoCRM согласование на исправление документов.")
+        try:
+            await context.bot.send_message(chat_id=mgr_chat, text=mtext, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("claim %s: не уведомил менеджера %s: %r", claim_id, row.get("manager_tag"), e)
+    else:
+        logger.warning("claim %s: chat_id менеджера '%s' не найден — ТГ-пуш пропущен",
+                       claim_id, row.get("manager_tag"))
+
+
 async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обрабатывает нажатия на кнопки объединённого алерта «На согласовании / ЗА ЛИМИТОМ».
@@ -7369,6 +7479,7 @@ def main():
     from supply_svetofor import handle_supply_approval_callback
     app.add_handler(CallbackQueryHandler(handle_supply_approval_callback, pattern="^sappr:"))
     app.add_handler(CallbackQueryHandler(handle_doc_approval_callback, pattern="^doc_(approve|reject):"))
+    app.add_handler(CallbackQueryHandler(handle_claim_callback, pattern="^mclaim_(resolved|fix):"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing|wazzup_later)"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
