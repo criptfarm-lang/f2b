@@ -762,7 +762,7 @@ async def _pdz_escalate_broken_events(app: Application, db, events: list) -> dic
                     due_msk = datetime.now(MSK) + timedelta(days=2)
                     desc = (
                         f"2-й перенос обещания у клиента {agent_name}. "
-                        f"Согласовать с собственником при необходимости."
+                        f"Согласовать с руководителем при необходимости."
                     )
                     await ms_create_task(assignee_id, desc, due_msk)
                     summary["tasks_created"] += 1

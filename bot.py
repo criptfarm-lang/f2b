@@ -3818,7 +3818,7 @@ async def cmd_pdz_send_owner_pending_test(update: Update, context: ContextTypes.
     if not update.message:
         return
 
-    await update.message.reply_text("⏳ Считаю необработанных для пинга собственнику...")
+    await update.message.reply_text("⏳ Считаю необработанных клиентов...")
     try:
         from scheduler import pdz_send_owner_pending_job
         result = await pdz_send_owner_pending_job(context.application, db)
@@ -3832,7 +3832,7 @@ async def cmd_pdz_send_owner_pending_test(update: Update, context: ContextTypes.
 
     status = result.get("status")
     if status == "all_clear":
-        await update.message.reply_text("ℹ️ Сводка: все менеджеры обработали (сообщение пошло собственнику).")
+        await update.message.reply_text("ℹ️ Сводка: все менеджеры обработали (сообщение отправлено).")
     elif status == "sent":
         await update.message.reply_text(
             f"ℹ️ Сводка: {result.get('managers',0)} менеджеров с необработанными, "
@@ -7587,7 +7587,7 @@ def main():
         q = update.callback_query
         await q.answer()
         if not q.from_user or q.from_user.id != OWNER_CHAT_ID:
-            await q.answer("⛔ Только для собственника.", show_alert=True)
+            await q.answer("⛔ Только для руководителя.", show_alert=True)
             return
         try:
             _, action, cid_str = q.data.split(":", 2)
@@ -9099,7 +9099,7 @@ async def cmd_payment_planned_autofill_test(update: Update, context: ContextType
     /payment_planned_autofill_test live <order_id> — реальный PATCH одного заказа
     """
     if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
-        await update.message.reply_text("⛔ Только для собственника.")
+        await update.message.reply_text("⛔ Только для руководителя.")
         return
 
     args = list(context.args or [])
@@ -9154,7 +9154,7 @@ async def cmd_payment_planned_history(update: Update, context: ContextTypes.DEFA
     /payment_planned_history <order_id>
     """
     if not update.effective_user or update.effective_user.id != OWNER_CHAT_ID:
-        await update.message.reply_text("⛔ Только для собственника.")
+        await update.message.reply_text("⛔ Только для руководителя.")
         return
     if not context.args:
         await update.message.reply_text("Формат: /payment_planned_history <order_id>")
