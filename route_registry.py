@@ -172,11 +172,16 @@ def mileage_km(order_routes, uid, stop_oids):
 BASE_ILINSKY = (55.633297, 38.104351)
 
 
-def yandex_route_url(stops, with_base: bool = True) -> str | None:
-    """Собирает ссылку на маршрут в Яндекс.Картах из точек машины по порядку выгрузки.
-    Формат: https://yandex.ru/maps/?mode=routes&rtext=lat,lon~...&rtt=auto.
-    Первой точкой (with_base) — база Ильинский. Возвращает None, если валидных точек нет.
-    Порядок stops уже = порядок выгрузки (fetch_routes сортирует по времени визита)."""
+# Практический лимит точек в ОДНОЙ ссылке Яндекс.Карт. Веб/приложение Карт держит
+# ~10 точек (ручные маршруты Беляковой — 10, работали); на большем Яндекс молча режет
+# хвост. Больше — дробим на части с перекрытием.
+YA_MAX_WAYPOINTS = 10
+
+
+def _route_points(stops, with_base: bool):
+    """Список координат маршрута (lat, lon) по порядку выгрузки. База Ильинский первой
+    (with_base). Подряд идущие одинаковые координаты схлопываются — несколько заказов
+    одному клиенту (один адрес) не должны занимать несколько точек в ссылке."""
     pts = []
     if with_base:
         pts.append(BASE_ILINSKY)
@@ -184,11 +189,38 @@ def yandex_route_url(stops, with_base: bool = True) -> str | None:
         lat, lon = s.get("lat"), s.get("lon")
         if lat in (None, "", 0) or lon in (None, "", 0):
             continue
-        pts.append((float(lat), float(lon)))
-    if len(pts) < 2:  # маршрут из одной точки бессмыслен
-        return None
+        c = (round(float(lat), 6), round(float(lon), 6))
+        if pts and pts[-1] == c:  # тот же адрес подряд
+            continue
+        pts.append(c)
+    return pts
+
+
+def _ya_url(pts) -> str:
     rtext = "~".join(f"{lat:.6f},{lon:.6f}" for lat, lon in pts)
     return f"https://yandex.ru/maps/?mode=routes&rtext={rtext}&rtt=auto"
+
+
+def yandex_route_urls(stops, with_base: bool = True, max_wp: int = YA_MAX_WAYPOINTS):
+    """Ссылки на маршрут в Яндекс.Картах (старт база Ильинский → точки по порядку выгрузки).
+    Если точек больше лимита Яндекса — дробит на части с перекрытием в 1 точку (части
+    стыкуются). Возвращает список URL (обычно 1) или [] если валидных точек < 2."""
+    pts = _route_points(stops, with_base)
+    if len(pts) < 2:
+        return []
+    if len(pts) <= max_wp:
+        return [_ya_url(pts)]
+    urls, i = [], 0
+    while i < len(pts) - 1:
+        urls.append(_ya_url(pts[i:i + max_wp]))
+        i += max_wp - 1  # перекрытие последней точки части со следующей
+    return urls
+
+
+def yandex_route_url(stops, with_base: bool = True) -> str | None:
+    """Первая (обычно единственная) ссылка маршрута — тонкая обёртка над yandex_route_urls."""
+    urls = yandex_route_urls(stops, with_base=with_base)
+    return urls[0] if urls else None
 
 
 # ─── МойСклад: мест/комментарий по № заказа ──────────────────────────────────
