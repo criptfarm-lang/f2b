@@ -6169,13 +6169,10 @@ async def cmd_svetofor_batch(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not user or user.id != OWNER_CHAT_ID:
         return
     await update.message.reply_text(
-        "🚦 Запускаю батч светофора по контрагентам с отгрузкой за 3 мес (займёт пару минут)..."
+        "🚦 Батч запущен в фоне. Пришлю сводку по готовности (несколько минут)."
     )
-    try:
-        from counterparty_svetofor import weekly_batch_job
-        await weekly_batch_job(context.application)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка батча: {e}")
+    from counterparty_svetofor import weekly_batch_job
+    context.application.create_task(weekly_batch_job(context.application))
 
 
 async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE):

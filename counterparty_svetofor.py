@@ -320,17 +320,33 @@ async def fetch_shipped_counterparties(months: int = 3) -> tuple[list[dict], lis
     return counterparties, list(no_inn.keys())
 
 
-async def run_batch(months: int = 3, throttle: float = 0.4) -> dict:
+async def run_batch(months: int = 3, concurrency: int = 6) -> dict:
     """Прогоняет светофор по всем контрагентам с отгрузкой за `months` мес, апсертит в БД.
-    Возвращает сводку по цветам + список «не проверено» (без ИНН)."""
+    Параллельно (пачками по `concurrency`), иначе по всей базе с медленным ГИР БО уходит
+    полчаса. Возвращает сводку по цветам + список «не проверено» (без ИНН)."""
     counterparties, no_inn = await fetch_shipped_counterparties(months)
+    total = len(counterparties)
+    logger.info("run_batch: контрагентов к проверке %s (без ИНН %s)", total, len(no_inn))
     summary = {"checked": 0, "green": 0, "yellow": 0, "red": 0, "unknown": 0,
                "reds": [], "yellows": [], "no_inn": no_inn}
-    for cp in counterparties:
-        try:
-            res = await check_counterparty(cp["inn"])
-        except Exception as e:
-            logger.error("run_batch %s → %s", cp["inn"], e)
+    sem = asyncio.Semaphore(concurrency)
+    progress = {"n": 0}
+
+    async def _one(cp: dict):
+        async with sem:
+            try:
+                res = await check_counterparty(cp["inn"])
+            except Exception as e:
+                logger.error("run_batch %s → %s", cp["inn"], e)
+                res = None
+        progress["n"] += 1
+        if progress["n"] % 25 == 0:
+            logger.info("run_batch: %s/%s", progress["n"], total)
+        return (cp, res)
+
+    results = await asyncio.gather(*[_one(cp) for cp in counterparties])
+    for cp, res in results:
+        if not res:
             continue
         color = res.get("color", "unknown")
         summary["checked"] += 1
@@ -340,7 +356,7 @@ async def run_batch(months: int = 3, throttle: float = 0.4) -> dict:
             summary["reds"].append(label)
         elif color == "yellow":
             summary["yellows"].append(label)
-        await asyncio.sleep(throttle)
+    logger.info("run_batch: готово %s", {k: summary[k] for k in ('checked','green','yellow','red','unknown')})
     return summary
 
 
