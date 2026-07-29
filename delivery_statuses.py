@@ -256,11 +256,14 @@ async def _idle_alert(bot, unit_name, info):
             logger.warning("_idle_alert → %s: %s", cid, e)
 
 
-async def _route_end_alert(bot, unit_name, info):
+async def _route_end_alert(bot, unit_name, info, n_open=0):
     since = datetime.fromtimestamp(info["since"], _MSK).strftime("%H:%M")
     link = f"https://yandex.ru/maps/?pt={info['lon']:.5f},{info['lat']:.5f}&z=17&l=map"
+    open_line = (f"⚠️ Незакрытых точек в МС: {n_open} — проверьте сдачу.\n"
+                 if n_open else "")
     text = (f"🏁 Конец маршрута\n{unit_name}\n"
             f"Вернулась на точку ночёвки (с {since}) — развоз на сегодня завершён.\n"
+            f"{open_line}"
             f"Точка: {info['lat']:.4f},{info['lon']:.4f}\n{link}")
     seen = set()
     for cid in [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()]:
@@ -503,6 +506,9 @@ async def run_check(db, bot=None, preview=False) -> list:
             stops = [s for s in (routes.get(uid) or []) if _stop_is_today(s, now_ts)]
             pos = positions.get(uid)
             left_base = bool(pos) and _haversine(pos["lat"], pos["lon"], BASE_LAT, BASE_LON) > R_BASE_M
+            # Машина уже на точке ночёвки → развоз завершён: forward-looking алерты
+            # («день под угрозой») бессмысленны, глушим лаг-алерт ниже.
+            at_home = bool(pos) and _near_home(uid, pos["lat"], pos["lon"])
             machine = []   # для расчёта отставания / риска смещения
             recs = []      # разрешённые точки (МС + прибытие + чеклист) — решаем статус вторым проходом
             unload_flips = []  # точки, где машина простояла и уехала, а сдача не закрыта
@@ -683,7 +689,9 @@ async def run_check(db, bot=None, preview=False) -> list:
 
             # ── Отставание от плана ≥2ч по ≥2 точкам (ловит коллапс дня и при плавающих окнах) ──
             behind = risk.get("behind") or []
-            if risk["lag_min"] >= LAG_ALERT_MIN and len(behind) >= LAG_ALERT_POINTS:
+            # at_home: машина на ночёвке — день закончен, «не успеть» уже неактуально;
+            # незакрытые точки покажет route_end-алерт ниже.
+            if not at_home and risk["lag_min"] >= LAG_ALERT_MIN and len(behind) >= LAG_ALERT_POINTS:
                 lines.append(f"{name}: ОТСТАВАНИЕ ~{risk['lag_min']} мин, точек позади плана: {len(behind)}")
                 if bot and not preview:
                     lkey = f"lag:{uid}:{datetime.now(_MSK).date().isoformat()}"
@@ -701,7 +709,7 @@ async def run_check(db, bot=None, preview=False) -> list:
                 lines.append(idle["line"])
                 if idle["fire"] and bot:
                     if idle["kind"] == "route_end":
-                        await _route_end_alert(bot, name, idle)
+                        await _route_end_alert(bot, name, idle, len(behind))
                     else:
                         await _idle_alert(bot, name, idle)
                     _dwell_set(db, uid, idle["anchor"][0], idle["anchor"][1], idle["since"], True)
