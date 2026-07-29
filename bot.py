@@ -6117,6 +6117,51 @@ async def cmd_digest_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка анализа: {e}")
 
 
+async def cmd_svetofor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/svetofor <ИНН> — светофор надёжности контрагента (DaData + ГИР БО).
+    План (второй мозг): plans/2026-07-29-svetofor-nadezhnosti-kontragenta.md — Фаза 2."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: /svetofor <ИНН>")
+        return
+    inn = args[0].strip()
+    await update.message.reply_text(f"🔍 Проверяю контрагента по ИНН {inn}...")
+    try:
+        from counterparty_svetofor import check_counterparty
+        res = await check_counterparty(inn)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка проверки: {e}")
+        return
+    icon = {"green": "🟢", "yellow": "🟡", "red": "🔴", "unknown": "⚪"}.get(res["color"], "⚪")
+    flags = res.get("flags") or {}
+
+    def _m(v):
+        return f"{v/1_000_000:.1f} млн ₽" if isinstance(v, (int, float)) else "—"
+
+    lines = [f"{icon} {res.get('name') or inn} — {res['color'].upper()}", f"ИНН {inn}"]
+    if flags.get("egrul_status"):
+        lines.append(f"Статус ЕГРЮЛ: {flags['egrul_status']}")
+    if flags.get("disqualified"):
+        lines.append("Руководитель дисквалифицирован")
+    fin = flags.get("finance")
+    if isinstance(fin, dict):
+        lines.append(
+            f"Финансы {fin.get('year') or ''}: выручка {_m(fin.get('revenue'))}, "
+            f"прибыль {_m(fin.get('profit'))}, чист.активы {_m(fin.get('equity'))}"
+        )
+    else:
+        lines.append("Финансы: не проверено")
+    for r in (flags.get("red_reasons") or []):
+        lines.append(f"🔴 {r}")
+    for r in (flags.get("yellow_reasons") or []):
+        lines.append(f"🟡 {r}")
+    lines.append("Долги ФССП / иски-ответчик: не проверено (ручная досверка)")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/notifier_status — заказы за сегодня которым не ушла рассылка."""
     user = update.effective_user
@@ -7464,6 +7509,7 @@ def main():
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
     app.add_handler(CommandHandler("ms_attributes", cmd_ms_attributes))
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
+    app.add_handler(CommandHandler("svetofor", cmd_svetofor))
     app.add_handler(CommandHandler("digest_today", cmd_digest_today))
     app.add_handler(CommandHandler("fishki_remind_dry", cmd_fishki_remind_dry))
     app.add_handler(CommandHandler("fishki_remind_send", cmd_fishki_remind_send))
