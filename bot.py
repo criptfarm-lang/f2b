@@ -6172,7 +6172,8 @@ async def cmd_svetofor_batch(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🚦 Батч запущен в фоне. Пришлю сводку по готовности (несколько минут)."
     )
     from counterparty_svetofor import weekly_batch_job
-    context.application.create_task(weekly_batch_job(context.application))
+    logger.info("cmd_svetofor_batch: запускаю фоновый батч светофора")
+    asyncio.create_task(weekly_batch_job(context.application))
 
 
 async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
