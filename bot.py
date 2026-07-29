@@ -6168,12 +6168,17 @@ async def cmd_svetofor_batch(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.effective_user
     if not user or user.id != OWNER_CHAT_ID:
         return
-    await update.message.reply_text(
-        "🚦 Батч запущен в фоне. Пришлю сводку по готовности (несколько минут)."
-    )
+    # Батч запускаем ПЕРВЫМ делом — иначе при деградации связи Amvera↔Telegram
+    # первый же await reply_text падает по Timed out и роняет хендлер до запуска батча.
     from counterparty_svetofor import weekly_batch_job
     logger.info("cmd_svetofor_batch: запускаю фоновый батч светофора")
     asyncio.create_task(weekly_batch_job(context.application))
+    try:
+        await update.message.reply_text(
+            "🚦 Батч запущен в фоне. Пришлю сводку по готовности (несколько минут)."
+        )
+    except Exception as e:
+        logger.warning("cmd_svetofor_batch: ответ не ушёл (%s), батч уже запущен", e)
 
 
 async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
