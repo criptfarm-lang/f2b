@@ -336,14 +336,14 @@ def render(snap: dict) -> tuple[str, str | None]:
     moment = datetime.strptime(snap["moment"], "%Y-%m-%d %H:%M:%S.%f").strftime("%d.%m")
 
     if cost is None:
-        cost_line = ("Себестоимость: н/д (битая себест. выбытия — проверь)"
-                     if cost_broken else "Себестоимость: н/д")
+        cost_frag = ("себест. н/д (битая себест. выбытия — проверь)"
+                     if cost_broken else "себест. н/д")
     elif med_cost is None:
-        cost_line = f"Себестоимость: {cost:.0f} ₽/кг  ⚪ нет нормы"
+        cost_frag = f"{cost:.0f} ₽/кг  ⚪ нет нормы"
     else:
         thin = " · мало данных" if n_cost and n_cost <= 2 else ""
-        cost_line = (f"Себестоимость: {cost:.0f} ₽/кг  {c_cost} "
-                     f"{_pct(cost, med_cost):+.1f}% к норме {med_cost:.0f} (n={n_cost}){thin}")
+        cost_frag = (f"{cost:.0f} ₽/кг  {c_cost} "
+                     f"{_pct(cost, med_cost):+.1f}% к норме {med_cost:.0f}{thin}")
 
     if yld is None:
         yld_line = (f"Выход: {snap['yield_pct']:.0f}% ⚪ вне диапазона — проверь состав"
@@ -353,10 +353,10 @@ def render(snap: dict) -> tuple[str, str | None]:
     else:
         thin = " · мало данных" if n_yld and n_yld <= 2 else ""
         yld_line = (f"Выход: {yld:.1f}%  {c_yld} "
-                    f"{_pct(yld, med_yld):+.1f}% к норме {med_yld:.1f}% (n={n_yld}){thin}")
+                    f"{_pct(yld, med_yld):+.1f}% к норме {med_yld:.1f}%{thin}")
 
     lines = [f"{_overall(c_cost, c_yld)} Техоперация №{snap['name']} · {moment}",
-             f"{sku_name} ({snap['out_sku_code']})",
+             f"{snap['out_sku_code']} {sku_name} – {cost_frag}",
              yld_line]
     # Рыба-сырьё вне папки СЫРЬЕ: засчитана в выход по токену — помечаем, чтобы было
     # видно, что зачёт по fallback, а не по папке.
@@ -364,19 +364,17 @@ def render(snap: dict) -> tuple[str, str | None]:
     if outside:
         names = ", ".join(f"{n} ({f'{q:g}'.replace('.', ',')} кг)" for n, q in outside)
         lines.append(f"ℹ учтено в выходе по токену (вне папки СЫРЬЕ): {names}")
-    lines += ["", cost_line]
-
     # Рентабельность к цене продажи (как в отчёте МС «Прибыльность»):
     # (цена − себест) / цена. Только при достоверной себестоимости.
+    rentab = []
     card_prices = snap.get("card_prices") or {}
     for label, ptype in (("ОПТ", PRICE_OPT), ("ХОР", PRICE_HOR)):
         price = card_prices.get(ptype)
         if price and cost:
             r = (price - cost) / price * 100
-            lines.append(f"Рентабельность {label}: {r:.1f}% (цена {price:.0f} / себест {cost:.0f})")
-
-    if snap.get("check_status"):
-        lines += ["", "", f"статус в МС: {snap['check_status']}"]
+            rentab.append(f"Рентабельность {label}: {r:.1f}% (цена {price:.0f} / себест {cost:.0f})")
+    if rentab:
+        lines += [""] + rentab
 
     body = "\n".join(lines)
     # Комментарий техоперации (поле description МС) — под чертой курсивом.
@@ -384,7 +382,7 @@ def render(snap: dict) -> tuple[str, str | None]:
     comment = (snap.get("comment") or "").strip()
     if not comment:
         return body, None
-    return (f"{html.escape(body, quote=False)}\n"
+    return (f"{html.escape(body, quote=False)}\n\n"
             f"──────────\n"
             f"<i>{html.escape(comment, quote=False)}</i>"), "HTML"
 
