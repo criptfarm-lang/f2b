@@ -158,6 +158,13 @@ def _num(v):
         return None
 
 
+def _num_rub(v):
+    """ГИР БО отдаёт суммы в ТЫСЯЧАХ рублей (проверено live: gainSum=148393 = 148.4 млн ₽).
+    Приводим к рублям."""
+    n = _num(v)
+    return n * 1000 if n is not None else None
+
+
 def _parse_bfo(reports: list) -> dict:
     """Из списка годовых отчётов ГИР БО достаёт выручку (2110), чистую прибыль (2400),
     капитал/чистые активы (1300) за последние 2 года.
@@ -172,11 +179,15 @@ def _parse_bfo(reports: list) -> dict:
         corr = corr or rep.get("correction") or rep
         fin = corr.get("financialResult") or {}
         bal = corr.get("balance") or {}
+        # Fallback на топ-левел gainSum (выручка), если financialResult пуст.
+        revenue = _num_rub(fin.get("current2110"))
+        if revenue is None:
+            revenue = _num_rub(rep.get("gainSum"))
         years.append({
             "year": period,
-            "revenue": _num(fin.get("current2110")),
-            "profit": _num(fin.get("current2400")),
-            "equity": _num(bal.get("current1300")),
+            "revenue": revenue,
+            "profit": _num_rub(fin.get("current2400")),
+            "equity": _num_rub(bal.get("current1300")),
         })
     years = [y for y in years if y["year"] is not None]
     years.sort(key=lambda y: y["year"], reverse=True)
