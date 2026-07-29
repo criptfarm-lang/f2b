@@ -465,6 +465,9 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
         flow.append(Paragraph(
             "<b>ПДД.</b> Нарушения Правил дорожного движения (штрафы) — ответственность "
             "водителя.", legal))
+        flow.append(Paragraph(
+            "<b>Манёвры.</b> Поворот и разворот налево выполнять только с крайней левой "
+            "полосы (п. 8.5 ПДД). Нарушение — ответственность водителя.", legal))
     doc.build(flow)
     return buf.getvalue()
 
