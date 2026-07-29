@@ -49,7 +49,8 @@ BO_HEADERS = {
     "Accept-Language": "ru,en;q=0.9",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
 }
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=12, connect=6, sock_connect=6, sock_read=10)
+PER_CHECK_TIMEOUT = 25  # hard-таймаут на одну проверку в батче (backstop против зависаний ГИР БО)
 
 # ── DDL / DB (свой коннект, autocommit — как в supply_svetofor) ────────────────
 DDL = """
@@ -320,7 +321,7 @@ async def fetch_shipped_counterparties(months: int = 3) -> tuple[list[dict], lis
     return counterparties, list(no_inn.keys())
 
 
-async def run_batch(months: int = 3, concurrency: int = 6) -> dict:
+async def run_batch(months: int = 3, concurrency: int = 4) -> dict:
     """Прогоняет светофор по всем контрагентам с отгрузкой за `months` мес, апсертит в БД.
     Параллельно (пачками по `concurrency`), иначе по всей базе с медленным ГИР БО уходит
     полчаса. Возвращает сводку по цветам + список «не проверено» (без ИНН)."""
@@ -335,7 +336,11 @@ async def run_batch(months: int = 3, concurrency: int = 6) -> dict:
     async def _one(cp: dict):
         async with sem:
             try:
-                res = await check_counterparty(cp["inn"])
+                res = await asyncio.wait_for(check_counterparty(cp["inn"]),
+                                             timeout=PER_CHECK_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("run_batch %s → таймаут проверки", cp["inn"])
+                res = None
             except Exception as e:
                 logger.error("run_batch %s → %s", cp["inn"], e)
                 res = None
