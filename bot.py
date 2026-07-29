@@ -6162,6 +6162,22 @@ async def cmd_svetofor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_svetofor_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/svetofor_batch — прогон светофора по всем контрагентам с отгрузкой за 3 мес.
+    План (второй мозг): plans/2026-07-29-svetofor-nadezhnosti-kontragenta.md — Фаза 3."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    await update.message.reply_text(
+        "🚦 Запускаю батч светофора по контрагентам с отгрузкой за 3 мес (займёт пару минут)..."
+    )
+    try:
+        from counterparty_svetofor import weekly_batch_job
+        await weekly_batch_job(context.application)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка батча: {e}")
+
+
 async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/notifier_status — заказы за сегодня которым не ушла рассылка."""
     user = update.effective_user
@@ -7510,6 +7526,7 @@ def main():
     app.add_handler(CommandHandler("ms_attributes", cmd_ms_attributes))
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
     app.add_handler(CommandHandler("svetofor", cmd_svetofor))
+    app.add_handler(CommandHandler("svetofor_batch", cmd_svetofor_batch))
     app.add_handler(CommandHandler("digest_today", cmd_digest_today))
     app.add_handler(CommandHandler("fishki_remind_dry", cmd_fishki_remind_dry))
     app.add_handler(CommandHandler("fishki_remind_send", cmd_fishki_remind_send))

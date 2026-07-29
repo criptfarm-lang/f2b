@@ -220,11 +220,30 @@ def setup_scheduler(app: Application, db):
             misfire_grace_time=3600, coalesce=True,
         )
 
+    # ПН 05:00 МСК — недельный светофор надёжности контрагентов (отгрузки за 3 мес)
+    # План: f2b-second-brain/plans/2026-07-29-svetofor-nadezhnosti-kontragenta.md (Фаза 3)
+    scheduler.add_job(
+        counterparty_svetofor_weekly,
+        CronTrigger(day_of_week='mon', hour=5, minute=0, timezone=MSK),
+        args=[app, db],
+        id="counterparty_svetofor_weekly",
+        misfire_grace_time=3600, coalesce=True,
+    )
+
     scheduler.start()
     logger.info("✅ Планировщик запущен")
     for job in scheduler.get_jobs():
         nxt = job.next_run_time.astimezone(MSK).strftime("%Y-%m-%d %H:%M %Z") if job.next_run_time else "?"
         logger.info(f"  job={job.id} next_run={nxt}")
+
+async def counterparty_svetofor_weekly(app: Application, db):
+    """Недельный прогон светофора надёжности по всем контрагентам с отгрузкой за 3 мес."""
+    try:
+        from counterparty_svetofor import weekly_batch_job
+        await weekly_batch_job(app, db)
+    except Exception as e:
+        logger.error(f"counterparty_svetofor_weekly → {e}")
+
 
 async def direct_check_reminder(app: Application):
     """Разовое напоминание собственнику о контроле Я.Директ (08.07.2026 10:00 МСК)."""

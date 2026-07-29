@@ -276,6 +276,100 @@ def _compute_color(egrul: dict | None, finance: dict | None) -> tuple[str, dict]
     return "green", flags
 
 
+async def fetch_shipped_counterparties(months: int = 3) -> tuple[list[dict], list[str]]:
+    """Контрагенты, которым были отгрузки (demand) за последние `months` месяцев.
+    Дедуп по ИНН. Возвращает (список {inn, name}, список имён без ИНН)."""
+    from moysklad import MS_BASE, get_headers
+    from datetime import datetime, timedelta
+    since = (datetime.now() - timedelta(days=months * 31)).strftime("%Y-%m-%d 00:00:00")
+    url = f"{MS_BASE}/entity/demand"
+    by_inn: dict[str, str] = {}
+    no_inn: dict[str, int] = {}
+    offset = 0
+    async with aiohttp.ClientSession() as session:
+        while True:
+            params = {
+                "limit": 100, "offset": offset, "expand": "agent",
+                "filter": f"moment>={since}", "order": "moment,asc",
+            }
+            try:
+                async with session.get(url, headers=get_headers(), params=params,
+                                       timeout=HTTP_TIMEOUT) as r:
+                    if r.status != 200:
+                        logger.error("demand fetch %s: %s", r.status, (await r.text())[:200])
+                        break
+                    data = await r.json()
+            except Exception as e:
+                logger.error("demand fetch → %s", e)
+                break
+            rows = data.get("rows", [])
+            for d in rows:
+                ag = d.get("agent") or {}
+                name = (ag.get("name") or "").strip()
+                if not name or "розничный покупатель" in name.lower():
+                    continue
+                inn = (ag.get("inn") or "").strip()
+                if inn:
+                    by_inn.setdefault(inn, name)
+                else:
+                    no_inn[name] = no_inn.get(name, 0) + 1
+            if len(rows) < 100:
+                break
+            offset += 100
+    counterparties = [{"inn": inn, "name": name} for inn, name in by_inn.items()]
+    return counterparties, list(no_inn.keys())
+
+
+async def run_batch(months: int = 3, throttle: float = 0.4) -> dict:
+    """Прогоняет светофор по всем контрагентам с отгрузкой за `months` мес, апсертит в БД.
+    Возвращает сводку по цветам + список «не проверено» (без ИНН)."""
+    counterparties, no_inn = await fetch_shipped_counterparties(months)
+    summary = {"checked": 0, "green": 0, "yellow": 0, "red": 0, "unknown": 0,
+               "reds": [], "yellows": [], "no_inn": no_inn}
+    for cp in counterparties:
+        try:
+            res = await check_counterparty(cp["inn"])
+        except Exception as e:
+            logger.error("run_batch %s → %s", cp["inn"], e)
+            continue
+        color = res.get("color", "unknown")
+        summary["checked"] += 1
+        summary[color] = summary.get(color, 0) + 1
+        label = f"{res.get('name') or cp['name']} (ИНН {cp['inn']})"
+        if color == "red":
+            summary["reds"].append(label)
+        elif color == "yellow":
+            summary["yellows"].append(label)
+        await asyncio.sleep(throttle)
+    return summary
+
+
+async def weekly_batch_job(app=None, db=None):
+    """PTB/APScheduler-джоба: недельный прогон светофора по всей активной базе,
+    сводка собственнику (OWNER_CHAT_ID)."""
+    logger.info("counterparty_svetofor: старт недельного батча")
+    summary = await run_batch()
+    owner = (os.getenv("OWNER_CHAT_ID") or "").strip()
+    if not (app and owner.lstrip("-").isdigit()):
+        logger.info("counterparty_svetofor батч готов: %s", summary)
+        return summary
+    lines = [
+        "🚦 Светофор контрагентов (отгрузки за 3 мес)",
+        f"Проверено: {summary['checked']}  🟢 {summary['green']}  🟡 {summary['yellow']}  🔴 {summary['red']}  ⚪ {summary['unknown']}",
+    ]
+    if summary["reds"]:
+        lines.append("\n🔴 Красные:")
+        lines += [f"• {x}" for x in summary["reds"][:15]]
+    if summary["no_inn"]:
+        lines.append(f"\n⚪ Без ИНН (не проверено): {len(summary['no_inn'])}")
+        lines += [f"• {x}" for x in summary["no_inn"][:15]]
+    try:
+        await app.bot.send_message(chat_id=int(owner), text="\n".join(lines))
+    except Exception as e:
+        logger.error("counterparty_svetofor: не отправил сводку → %s", e)
+    return summary
+
+
 async def check_counterparty(inn: str, save: bool = True) -> dict:
     """Считает светофор по ИНН, при save=True кладёт/обновляет в БД. Возвращает
     {inn, name, color, flags, checked_at}."""
