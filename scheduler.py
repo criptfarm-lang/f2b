@@ -256,6 +256,8 @@ async def fishki_reminder_job(app: Application, db) -> dict:
         Текст со ссылкой на блок дашборда «FISHки → изучить вопросы».
       - 2 закупщика (request_handler.ASSIGNEE_TG belyakova/kristina). У них нет
         менеджерского дашборда, поэтому вариант текста без него — только learn-ссылка.
+      - собственник (OWNER_CHAT_ID) + партнёр-логистика (PARTNER_CHAT_ID), env,
+        тот же текст без дашборда.
     Возвращает сводку {получатель: "sent"|"no_chat_id"|"error"} для теста."""
     from moysklad import PDZ_MANAGER_TAG_MAP, PDZ_MANAGER_TG_IDS
     from request_handler import ASSIGNEE_TG
@@ -298,9 +300,15 @@ async def fishki_reminder_job(app: Application, db) -> dict:
             chat_id = db.get_manager_chat_id(first_name) if first_name else None
         await _send(tag, chat_id, text_managers)
 
-    # Закупщики (Виктор в ASSIGNEE_TG — это собственник, не получатель)
+    # Закупщики (Виктор в ASSIGNEE_TG — это собственник, отправляем ниже отдельно)
     for buyer in ("belyakova", "kristina"):
         await _send(buyer, ASSIGNEE_TG.get(buyer), text_buyers)
+
+    # Собственник + партнёр (логистика) — тот же текст без дашборда. id из env.
+    _owner = os.getenv("OWNER_CHAT_ID")
+    _partner = os.getenv("PARTNER_CHAT_ID")
+    await _send("viktor", int(_owner) if _owner else None, text_buyers)
+    await _send("malanchuk", int(_partner) if _partner else None, text_buyers)
 
     logger.info(f"fishki_reminder_job завершена: {report}")
     return report
