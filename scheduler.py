@@ -249,40 +249,59 @@ def setup_scheduler(app: Application, db):
         logger.info(f"  job={job.id} next_run={nxt}")
 
 async def fishki_reminder_job(app: Application, db) -> dict:
-    """ВС 15:00 МСК — напоминание менеджерам ОП изучить новые вопросы FISHки недели.
+    """ВС 15:00 МСК — напоминание изучить новые вопросы FISHки недели.
 
-    Шлёт в ЛС каждому менеджеру из PDZ_MANAGER_TG_IDS (тот же реестр состава ОП,
-    что у ПДЗ-дайджестов; при отсутствии id — fallback на manager_chats по имени).
-    Возвращает сводку {tag: "sent"|"no_chat_id"|"error"} для теста."""
+    Получатели в ЛС:
+      - 5 менеджеров ОП (PDZ_MANAGER_TG_IDS; fallback — manager_chats по имени).
+        Текст со ссылкой на блок дашборда «FISHки → изучить вопросы».
+      - 2 закупщика (request_handler.ASSIGNEE_TG belyakova/kristina). У них нет
+        менеджерского дашборда, поэтому вариант текста без него — только learn-ссылка.
+    Возвращает сводку {получатель: "sent"|"no_chat_id"|"error"} для теста."""
     from moysklad import PDZ_MANAGER_TAG_MAP, PDZ_MANAGER_TG_IDS
+    from request_handler import ASSIGNEE_TG
 
-    text = (
+    text_managers = (
         "Воскресное напоминание. С сегодняшнего дня в FISHки новый набор "
         "вопросов на неделю. Загляните в свой дашборд → блок "
         "«FISHки → изучить вопросы», чтобы знать, что на этой неделе "
         "спрашивают у клиентов. Прямой просмотр: https://fishki.f2b.group/?learn=1"
     )
+    text_buyers = (
+        "Воскресное напоминание. С сегодняшнего дня в FISHки новый набор "
+        "вопросов на неделю. Полистай, чтобы быть в теме, что на этой неделе "
+        "спрашивают у клиентов: https://fishki.f2b.group/?learn=1"
+    )
 
     logger.info(f"fishki_reminder_job стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}")
     report: dict = {}
+
+    async def _send(key: str, chat_id, text: str):
+        if not chat_id:
+            logger.warning(f"fishki_reminder_job: {key} — chat_id не найден")
+            report[key] = "no_chat_id"
+            return
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id, text=text, disable_web_page_preview=True,
+            )
+            report[key] = "sent"
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.error(f"fishki_reminder_job: {key} send_message → {chat_id}: {e}")
+            report[key] = "error"
+
+    # Менеджеры ОП
     for tag, manager_name in PDZ_MANAGER_TAG_MAP.items():
         chat_id = PDZ_MANAGER_TG_IDS.get(tag)
         if not chat_id:
             first_name = manager_name.split()[0] if manager_name else ""
             chat_id = db.get_manager_chat_id(first_name) if first_name else None
-        if not chat_id:
-            logger.warning(f"fishki_reminder_job: {tag} ({manager_name}) — chat_id не найден")
-            report[tag] = "no_chat_id"
-            continue
-        try:
-            await app.bot.send_message(
-                chat_id=chat_id, text=text, disable_web_page_preview=True,
-            )
-            report[tag] = "sent"
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            logger.error(f"fishki_reminder_job: {tag} send_message → {chat_id}: {e}")
-            report[tag] = "error"
+        await _send(tag, chat_id, text_managers)
+
+    # Закупщики (Виктор в ASSIGNEE_TG — это собственник, не получатель)
+    for buyer in ("belyakova", "kristina"):
+        await _send(buyer, ASSIGNEE_TG.get(buyer), text_buyers)
+
     logger.info(f"fishki_reminder_job завершена: {report}")
     return report
 
