@@ -89,6 +89,28 @@ def upsert_svetofor(inn: str, name: str | None, color: str, flags: dict):
         """, (inn, name, color, json.dumps(flags, ensure_ascii=False)))
 
 
+def _bulk_upsert(rows: list):
+    """Пишет пачку (inn, name, color, flags) ОДНИМ свежим коннектом (не общий _conn) —
+    чтобы массовая запись в конце батча не зависела от состояния общего соединения."""
+    if not rows:
+        return
+    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(DDL)
+            for inn, name, color, flags in rows:
+                cur.execute("""
+                    insert into public.counterparty_svetofor (inn, name, color, flags, checked_at)
+                    values (%s, %s, %s, %s::jsonb, now())
+                    on conflict (inn) do update set
+                      name = excluded.name, color = excluded.color,
+                      flags = excluded.flags, checked_at = now()
+                """, (inn, name, color, json.dumps(flags, ensure_ascii=False)))
+    finally:
+        conn.close()
+
+
 def get_svetofor(inn: str) -> dict | None:
     with _db().cursor() as cur:
         cur.execute("select inn, name, color, flags, checked_at "
@@ -321,52 +343,48 @@ async def fetch_shipped_counterparties(months: int = 3) -> tuple[list[dict], lis
     return counterparties, list(no_inn.keys())
 
 
-async def run_batch(months: int = 3, concurrency: int = 2) -> dict:
-    """Прогоняет светофор по всем контрагентам с отгрузкой за `months` мес, апсертит в БД.
-    Параллельно (пачками по `concurrency`), иначе по всей базе с медленным ГИР БО уходит
-    полчаса. Возвращает сводку по цветам + список «не проверено» (без ИНН)."""
+async def run_batch(months: int = 3) -> dict:
+    """Прогоняет светофор по всем контрагентам с отгрузкой за `months` мес.
+    ПОСЛЕДОВАТЕЛЬНО (массовый asyncio.gather зависал наглухо), save=False в цикле —
+    БД пишем одним bulk в конце через СВЕЖИЙ коннект (не общий _conn). Возвращает
+    сводку по цветам + список «не проверено» (без ИНН)."""
     counterparties, no_inn = await fetch_shipped_counterparties(months)
     total = len(counterparties)
     logger.info("run_batch: контрагентов к проверке %s (без ИНН %s)", total, len(no_inn))
     summary = {"checked": 0, "green": 0, "yellow": 0, "red": 0, "unknown": 0,
                "reds": [], "yellows": [], "no_inn": no_inn}
-    sem = asyncio.Semaphore(concurrency)
-    progress = {"n": 0}
-
-    async def _one(cp: dict):
-        logger.info("DIAG _one вход %s", cp["inn"])
-        async with sem:
-            logger.info("DIAG _one sem+ %s", cp["inn"])
-            try:
-                res = await asyncio.wait_for(
-                    check_counterparty(cp["inn"], with_finance=False),
-                    timeout=PER_CHECK_TIMEOUT)
-                logger.info("DIAG _one готово %s → %s", cp["inn"], res and res.get("color"))
-            except asyncio.TimeoutError:
-                logger.warning("run_batch %s → таймаут проверки", cp["inn"])
-                res = None
-            except Exception as e:
-                logger.error("run_batch %s → %s", cp["inn"], e)
-                res = None
-        progress["n"] += 1
-        if progress["n"] % 25 == 0:
-            logger.info("run_batch: %s/%s", progress["n"], total)
-        return (cp, res)
-
-    logger.info("DIAG старт gather по %s (concurrency %s)", total, concurrency)
-    results = await asyncio.gather(*[_one(cp) for cp in counterparties])
-    logger.info("DIAG gather вернул %s", len(results))
-    for cp, res in results:
-        if not res:
-            continue
-        color = res.get("color", "unknown")
-        summary["checked"] += 1
-        summary[color] = summary.get(color, 0) + 1
-        label = f"{res.get('name') or cp['name']} (ИНН {cp['inn']})"
-        if color == "red":
-            summary["reds"].append(label)
-        elif color == "yellow":
-            summary["yellows"].append(label)
+    rows = []  # (inn, name, color, flags) — для bulk-записи в конце
+    logger.info("DIAG старт цикла по %s", total)
+    for i, cp in enumerate(counterparties, 1):
+        inn = cp["inn"]
+        logger.info("DIAG вход %s", inn)
+        try:
+            res = await asyncio.wait_for(
+                check_counterparty(inn, save=False, with_finance=False),
+                timeout=PER_CHECK_TIMEOUT)
+            logger.info("DIAG готово %s → %s", inn, res and res.get("color"))
+        except asyncio.TimeoutError:
+            logger.warning("run_batch %s → таймаут проверки", inn)
+            res = None
+        except Exception as e:
+            logger.error("run_batch %s → %s", inn, e)
+            res = None
+        if res:
+            color = res.get("color", "unknown")
+            summary["checked"] += 1
+            summary[color] = summary.get(color, 0) + 1
+            label = f"{res.get('name') or cp['name']} (ИНН {inn})"
+            if color == "red":
+                summary["reds"].append(label)
+            elif color == "yellow":
+                summary["yellows"].append(label)
+            rows.append((inn, res.get("name"), color, res.get("flags") or {}))
+        if i % 25 == 0:
+            logger.info("run_batch: %s/%s", i, total)
+    try:
+        _bulk_upsert(rows)
+    except Exception as e:
+        logger.error("run_batch bulk upsert → %s", e)
     logger.info("run_batch: готово %s", {k: summary[k] for k in ('checked','green','yellow','red','unknown')})
     return summary
 
