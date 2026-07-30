@@ -17,7 +17,8 @@ import logging
 from datetime import datetime, date, timezone, timedelta
 
 import aiohttp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
+                      InputMediaDocument, InputFile)
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           CallbackQueryHandler, ContextTypes, filters)
 
@@ -60,6 +61,43 @@ def _allowed(chat_id: int) -> bool:
 
 def _sklad_chat_id() -> int:
     return int(os.getenv("SKLAD_CHAT_ID", "-4750423130") or 0)  # группа «Склад»
+
+
+def _links_block(uid, stops, dstr) -> str:
+    """Активные ссылки на маршрут: Яндекс-навигация (по порядку точек) + живой
+    веб-реестр (всегда актуальный). Для сообщения в группу Склад."""
+    lines = []
+    try:
+        ya_urls = rr.yandex_route_urls(stops)
+    except Exception:
+        ya_urls = []
+    if len(ya_urls) == 1:
+        lines.append(f"🧭 Маршрут в Яндекс.Картах: {ya_urls[0]}")
+    elif len(ya_urls) > 1:
+        lines += [f"🧭 Яндекс.Карты, часть {i + 1}/{len(ya_urls)}: {u}"
+                  for i, u in enumerate(ya_urls)]
+    try:
+        import route_web
+        lines.append(f"🌐 Живой реестр (всегда актуальный): {route_web.route_url(uid, dstr)}")
+    except Exception:
+        pass
+    return ("\n" + "\n".join(lines)) if lines else ""
+
+
+def _sklad_kb(dstr, uid) -> InlineKeyboardMarkup:
+    """Кнопка обновления листа склада (перечитать места из МС перед выездом)."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "🔄 Обновить (места)", callback_data=f"rd:sklrf:{dstr}:{uid}")]])
+
+
+def _sklad_caption(unit_name, date_str, note, links, refreshed_at=None) -> str:
+    """Подпись листа загрузки для группы Склад."""
+    head = (f"📦 Лист загрузки — {unit_name}, {date_str}. Грузить по порядку "
+            f"(первая точка к дверям).\n{note}")
+    tail = ("\n\n✍️ Перед выездом водитель подписывает копию реестра и отдаёт "
+            "оператору склада.")
+    stamp = f"\n\n🔄 Обновлено {refreshed_at:%H:%M} — места актуальны." if refreshed_at else ""
+    return head + links + tail + stamp
 
 
 # ─── Кубатура / вместимость машин ────────────────────────────────────────────
@@ -228,14 +266,14 @@ async def cmd_routes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb)
 
 
-async def _safe_answer(q, text=None):
+async def _safe_answer(q, text=None, alert=False):
     """q.answer() — первый исходящий вызов в колбэке. При деградации связи Amvera↔Telegram
     он падает по TimedOut и БЕЗ обёртки ронял весь хендлер (сбор/подтверждение маршрута) ещё
     до полезной работы: draft не писался, PDF не уходил — «нажала, бот не сработал»
     (см. project_f2b_bot_telegram_timeout_outage_2026_07_22). Спиннер кнопки не критичен —
-    глушим сетевую ошибку и доводим сбор до конца."""
+    глушим сетевую ошибку и доводим сбор до конца. alert=True — всплывающее окно (для ошибок)."""
     try:
-        await q.answer(text)
+        await q.answer(text, show_alert=alert)
     except Exception as e:
         logger.warning("q.answer проигнорирован (Telegram лагает?): %s", e)
 
@@ -567,10 +605,9 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_document(
                 sklad, io.BytesIO(pkg["pdf"]),
                 filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
-                caption=(f"📦 Лист загрузки — {unit_name}, {date_str}. Грузить по порядку "
-                         f"(первая точка к дверям).\n{note}"
-                         f"\n\n✍️ Перед выездом водитель подписывает копию реестра и отдаёт "
-                         f"оператору склада."))
+                caption=_sklad_caption(unit_name, date_str, note,
+                                       _links_block(uid, stops, dstr)),
+                reply_markup=_sklad_kb(dstr, uid))
             sklad_note = "склад ✓"
         except Exception as e:
             logger.warning("cb_confirm push sklad: %s", e)
@@ -581,6 +618,72 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=(q.message.caption or "") + f"\n\n✅ Подтверждено → {driver_note}; {sklad_note}.")
     except Exception as e:
         logger.warning("cb_confirm edit: %s", e)
+
+
+async def cb_sklad_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «🔄 Обновить (места)» под листом склада → перечитать Wialon+МС,
+    перегенерить PDF со свежими местами, заменить лист склада на месте и прислать
+    водителю обновлённый реестр. Места проставляются ночью/утром — освежаем к выезду."""
+    q = update.callback_query
+    await _safe_answer(q, "Обновляю…")
+    parts = q.data.split(":")  # rd:sklrf:<date>:<uid>
+    dstr = parts[2]
+    target_date = date.fromisoformat(dstr)
+    uid = int(parts[3])
+    try:
+        routes, order_routes = await rr.fetch_routes(with_meta=True)
+        me = await context.bot.get_me()
+        pkg = await _unit_package(routes, uid, target_date, me.username)
+    except Exception as e:
+        logger.exception("cb_sklad_refresh fetch: %s", e)
+        await _safe_answer(q, "Не удалось перечитать маршрут Wialon.", alert=True)
+        return
+    if not pkg:
+        await _safe_answer(q, "Маршрут пуст — обновлять нечего.", alert=True)
+        return
+
+    stops = pkg["stops"]
+    unit_name = rr.UNITS.get(uid, str(uid))
+    date_str = target_date.strftime("%d.%m.%Y")
+    km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
+    note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
+    caption = _sklad_caption(unit_name, date_str, note, _links_block(uid, stops, dstr),
+                             refreshed_at=datetime.now(_MSK))
+
+    # 1) Заменить лист склада на месте; фолбэк — прислать новый документ.
+    try:
+        media = InputMediaDocument(
+            media=InputFile(io.BytesIO(pkg["pdf"]), filename=f"reestr_{uid}_{dstr}.pdf"),
+            caption=caption)
+        await context.bot.edit_message_media(
+            chat_id=q.message.chat_id, message_id=q.message.message_id,
+            media=media, reply_markup=_sklad_kb(dstr, uid))
+    except Exception as e:
+        logger.warning("cb_sklad_refresh edit media: %s", e)
+        try:
+            await context.bot.send_document(
+                q.message.chat_id, io.BytesIO(pkg["pdf"]),
+                filename=f"reestr_{uid}_{dstr}.pdf", caption=caption,
+                reply_markup=_sklad_kb(dstr, uid))
+        except Exception as e2:
+            logger.warning("cb_sklad_refresh send fallback: %s", e2)
+            await _safe_answer(q, "Не удалось обновить лист склада.", alert=True)
+            return
+
+    # 2) Прислать водителю обновлённый реестр (места уточнены).
+    driver_id = pkg.get("driver_id")
+    drv = ""
+    if driver_id:
+        try:
+            await context.bot.send_document(
+                driver_id, io.BytesIO(pkg["pdf"]),
+                filename=f"reestr_{uid}_{dstr}.pdf",
+                caption=f"🔄 Обновлённый реестр на {date_str} — {unit_name}. Места уточнены.")
+            drv = " Водителю отправлено."
+        except Exception as e:
+            logger.warning("cb_sklad_refresh push driver: %s", e)
+            drv = " ⚠️ Водителю не доставлено."
+    await _safe_answer(q, f"Обновлено.{drv}")
 
 
 async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -638,6 +741,7 @@ def register(app: Application, db):
     app.add_handler(MessageHandler(filters.Regex(r"^/ход(@\w+)?(\s|$)"), cmd_progress))
     app.add_handler(CallbackQueryHandler(cb_collect, pattern=r"^rd:col:"))
     app.add_handler(CallbackQueryHandler(cb_confirm, pattern=r"^rd:conf:"))
+    app.add_handler(CallbackQueryHandler(cb_sklad_refresh, pattern=r"^rd:sklrf:"))
     # ensure_schema — после хендлеров и best-effort: сбой БД на старте не должен ронять
     # register и глушить кнопки маршрута (та же защита, что в driver_checklist).
     try:

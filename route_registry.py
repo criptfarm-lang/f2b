@@ -473,8 +473,8 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
                 info += (f"<br/><font size=8><a href='tel:{tel}' color='#0645ad'>"
                          f"тел. {tel}</a></font>")
             if cm:
-                # Лимит выше (140), чтобы не срезать инструкции/номер. Paragraph переносит текст.
-                info += f"<br/><font size=7 color='#888888'>{cm[:140]}</font>"
+                # Лимит 300, чтобы не срезать длинные инструкции приёмки/номер. Paragraph переносит.
+                info += f"<br/><font size=7 color='#888888'>{cm[:300]}</font>"
             link = f"https://t.me/{bot_username}?start=chk_{s['order_no']}"
             rows.append([
                 Paragraph(str(idx), cell),
@@ -520,6 +520,9 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
             "Водитель-экспедитор: _____________ / _____________________ "
             "(подпись, дата, время)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
             "Передал (склад): _____________ / _____________________", legal))
+        flow.append(Paragraph(
+            "<b>Фирменная одежда.</b> Водитель-экспедитор выходит на рейс в фирменной одежде "
+            "компании.", legal))
         flow.append(Paragraph(
             "<b>Сдача.</b> По каждой точке подтверждается сканированием QR-кода строки — бот в "
             "мессенджере или веб-страница по ссылке (простая электронная подпись, ст. 5–6 "
