@@ -3015,9 +3015,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Обработка vision'ом — на стороне Claude Code (скилл update-market-intel),
 # бот только сохраняет сырьё в БД и медиа на persistent volume Amvera.
 MARKET_INTEL_CHAT_ID = int(os.getenv("MARKET_INTEL_CHAT_ID", "-1002964644525"))
-# Публичный канал @fishto_biz («FISHTOBIZ info») → зеркалим Новости в карточку
-# Яндекс Бизнеса. Ловим channel_post, кладём в БД, публикует f2b-publisher.
-FISHTOBIZ_CHAT_ID = int(os.getenv("FISHTOBIZ_CHAT_ID", "-1002344232944"))
+# Публичный канал @fishto_biz («FISHTOBIZ info», id -1001691680651) → зеркалим
+# Новости в карточку Яндекс Бизнеса. Ловим channel_post, кладём в БД, публикует
+# f2b-publisher. ВНИМАНИЕ: -1002344232944 — это НЕ этот канал, а «FISH TO BUSINESS
+# opt» (опт-прайс публикатора, publishers.py OPT_CHANNEL_ID). С 27.07 по 30.07 тут
+# по ошибке стоял именно opt-id — посты @fishto_biz не совпадали, в БД не писались,
+# карточка не обновлялась. Правильный id новостного канала — -1001691680651.
+FISHTOBIZ_CHAT_ID = int(os.getenv("FISHTOBIZ_CHAT_ID", "-1001691680651"))
 MARKET_INTEL_DIR = os.getenv("MARKET_INTEL_DIR", "/data/market-intel")
 
 
