@@ -32,6 +32,7 @@ import os
 from datetime import datetime, timezone
 
 import aiohttp
+import requests
 import psycopg2
 import psycopg2.extras
 
@@ -299,6 +300,52 @@ def _compute_color(egrul: dict | None, finance: dict | None) -> tuple[str, dict]
     return "green", flags
 
 
+def _dadata_party_sync(inn: str) -> dict | None:
+    """Синхронная версия DaData (requests) — для батча через asyncio.to_thread.
+    aiohttp-сессия в фоновой create_task-задаче PTB залипает намертво (ни таймаут aiohttp,
+    ни wait_for не срабатывают), а requests с timeout отрабатывает надёжно в отдельном потоке."""
+    token = os.getenv("DADATA_TOKEN")
+    if not token:
+        return None
+    try:
+        r = requests.post(
+            DADATA_PARTY_URL, json={"query": inn},
+            headers={"Content-Type": "application/json", "Accept": "application/json",
+                     "Authorization": f"Token {token}"},
+            timeout=12)
+        if r.status_code != 200:
+            logger.warning("DaData(sync) %s → HTTP %s", inn, r.status_code)
+            return None
+        data = r.json()
+    except Exception as e:
+        logger.warning("DaData(sync) %s → %s", inn, e)
+        return None
+    sugg = data.get("suggestions") or []
+    if not sugg:
+        return None
+    d = sugg[0].get("data") or {}
+    state = d.get("state") or {}
+    mgmt = d.get("management") or {}
+    return {
+        "name": sugg[0].get("value"),
+        "status": state.get("status"),
+        "liquidation_date": state.get("liquidation_date"),
+        "disqualified": bool(mgmt.get("disqualified")),
+        "manager": mgmt.get("name"),
+        "address": (d.get("address") or {}).get("value"),
+    }
+
+
+def check_counterparty_sync(inn: str) -> dict:
+    """Синхронная проверка для батча: только DaData (стоп-флаги ЕГРЮЛ), без финансов.
+    Запускать через asyncio.to_thread — не блокирует event loop, requests-таймаут надёжен."""
+    inn = (inn or "").strip()
+    egrul = _dadata_party_sync(inn)
+    color, flags = _compute_color(egrul, None)
+    name = egrul.get("name") if egrul else None
+    return {"inn": inn, "name": name, "color": color, "flags": flags}
+
+
 async def fetch_shipped_counterparties(months: int = 3) -> tuple[list[dict], list[str]]:
     """Контрагенты, которым были отгрузки (demand) за последние `months` месяцев.
     Дедуп по ИНН. Возвращает (список {inn, name}, список имён без ИНН)."""
@@ -357,12 +404,10 @@ async def run_batch(months: int = 3) -> dict:
     logger.info("DIAG старт цикла по %s", total)
     for i, cp in enumerate(counterparties, 1):
         inn = cp["inn"]
-        logger.info("DIAG вход %s", inn)
         try:
             res = await asyncio.wait_for(
-                check_counterparty(inn, save=False, with_finance=False),
+                asyncio.to_thread(check_counterparty_sync, inn),
                 timeout=PER_CHECK_TIMEOUT)
-            logger.info("DIAG готово %s → %s", inn, res and res.get("color"))
         except asyncio.TimeoutError:
             logger.warning("run_batch %s → таймаут проверки", inn)
             res = None
