@@ -230,11 +230,62 @@ def setup_scheduler(app: Application, db):
         misfire_grace_time=3600, coalesce=True,
     )
 
+    # ВС 15:00 МСК — напоминание менеджерам ОП изучить новые вопросы FISHки недели.
+    # Слать в ЛС каждому из 5 менеджеров (PDZ_MANAGER_TG_IDS — тот же реестр состава,
+    # что у ПДЗ-дайджестов). Воскресенье — день ротации недели квиза, набор уже активен.
+    # План: f2b-second-brain/plans/2026-07-30-fishki-воскресное-напоминание-менеджерам.md
+    scheduler.add_job(
+        fishki_reminder_job,
+        CronTrigger(day_of_week='sun', hour=15, minute=0, timezone=MSK),
+        args=[app, db],
+        id="fishki_reminder_sun_15",
+        misfire_grace_time=3600, coalesce=True,
+    )
+
     scheduler.start()
     logger.info("✅ Планировщик запущен")
     for job in scheduler.get_jobs():
         nxt = job.next_run_time.astimezone(MSK).strftime("%Y-%m-%d %H:%M %Z") if job.next_run_time else "?"
         logger.info(f"  job={job.id} next_run={nxt}")
+
+async def fishki_reminder_job(app: Application, db) -> dict:
+    """ВС 15:00 МСК — напоминание менеджерам ОП изучить новые вопросы FISHки недели.
+
+    Шлёт в ЛС каждому менеджеру из PDZ_MANAGER_TG_IDS (тот же реестр состава ОП,
+    что у ПДЗ-дайджестов; при отсутствии id — fallback на manager_chats по имени).
+    Возвращает сводку {tag: "sent"|"no_chat_id"|"error"} для теста."""
+    from moysklad import PDZ_MANAGER_TAG_MAP, PDZ_MANAGER_TG_IDS
+
+    text = (
+        "Воскресное напоминание. С сегодняшнего дня в FISHки новый набор "
+        "вопросов на неделю. Загляните в свой дашборд → блок "
+        "«FISHки → изучить вопросы», чтобы знать, что на этой неделе "
+        "спрашивают у клиентов. Прямой просмотр: https://fishki.f2b.group/?learn=1"
+    )
+
+    logger.info(f"fishki_reminder_job стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}")
+    report: dict = {}
+    for tag, manager_name in PDZ_MANAGER_TAG_MAP.items():
+        chat_id = PDZ_MANAGER_TG_IDS.get(tag)
+        if not chat_id:
+            first_name = manager_name.split()[0] if manager_name else ""
+            chat_id = db.get_manager_chat_id(first_name) if first_name else None
+        if not chat_id:
+            logger.warning(f"fishki_reminder_job: {tag} ({manager_name}) — chat_id не найден")
+            report[tag] = "no_chat_id"
+            continue
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id, text=text, disable_web_page_preview=True,
+            )
+            report[tag] = "sent"
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.error(f"fishki_reminder_job: {tag} send_message → {chat_id}: {e}")
+            report[tag] = "error"
+    logger.info(f"fishki_reminder_job завершена: {report}")
+    return report
+
 
 async def counterparty_svetofor_weekly(app: Application, db):
     """Недельный прогон светофора надёжности по всем контрагентам с отгрузкой за 3 мес."""
