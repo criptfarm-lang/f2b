@@ -915,6 +915,7 @@ def _build_approval_text(
     site: dict, contacts: dict, upd_debt: dict = None,
     address: dict = None,
     payment_planned_date: str = "",
+    reliability: dict = None,
 ) -> str:
     """
     Шаблон алерта. Порядок строк (по убыванию важности):
@@ -934,7 +935,13 @@ def _build_approval_text(
     colors = [credit["color"], contract["color"], overdue["color"], cashflow["color"],
               price["color"], site["color"], contacts["color"], payment_color,
               upd_debt["color"], address["color"]]
-    all_green = all(c == "green" for c in colors)
+    # Надёжность контрагента (ЕГРЮЛ+финансы) — отдельная строка. unknown («не
+    # проверено») не рушит all_green; yellow/red — рушат, чтобы строка показалась.
+    rel_color, rel_line = (None, None)
+    if reliability is not None:
+        from counterparty_svetofor import format_reliability_line
+        rel_color, rel_line = format_reliability_line(reliability)
+    all_green = all(c == "green" for c in colors) and rel_color not in ("yellow", "red")
 
     header = (
         f"🔔 *{client_name}* · {_fmt_money(order_sum)} ₽\n"
@@ -946,15 +953,22 @@ def _build_approval_text(
         limit_pct = 0
         if credit.get("limit", 0) > 0:
             limit_pct = int(credit["effective_debt"] / credit["limit"] * 100)
+        rel_suffix = ""
+        if rel_color == "green":
+            rel_suffix = " · надёжность ЕГРЮЛ"
+        elif rel_color == "unknown":
+            rel_suffix = " · надёжность не пров."
         body = (
-            f"\n🟢 Все 10 проверок ОК "
+            f"\n🟢 Все проверки ОК "
             f"(лимит {limit_pct}% · договор · ДДС {cashflow.get('n_days', 0)}д · "
             f"долг {_fmt_money(credit.get('current_debt', 0))} _на {sent_at}_ · "
-            f"УПД · сайт · контакты · адрес · цена · оплата {payment_planned_date})\n"
+            f"УПД · сайт · контакты · адрес · цена · оплата {payment_planned_date}{rel_suffix})\n"
         )
         return header + body
 
     lines = ["\n"]
+    if rel_line:
+        lines.append(rel_line)
 
     # 1. Лимит
     # snapshot-маркер: долг = balance на момент webhook'а. К моменту, когда
@@ -1132,6 +1146,18 @@ async def check_approval_needed(order_href: str, bot, db):
         # 2. Атрибуты counterparty (1 GET, передаётся в 3 sync helper'а)
         cp_attrs = await load_counterparty_attrs(agent_id)
 
+        # 2a. Надёжность контрагента (ЕГРЮЛ+финансы по ИНН) — мягкая деградация:
+        # при таймауте/ошибке reliability=None → блок «не проверено», алерт уходит как обычно.
+        reliability = None
+        cp_inn = (cp_attrs.get("inn") or "").strip()
+        if cp_inn:
+            try:
+                from counterparty_svetofor import check_counterparty
+                reliability = await asyncio.wait_for(
+                    check_counterparty(cp_inn, save=True), timeout=15)
+            except Exception as e:
+                logger.warning(f"check_approval_needed: надёжность {cp_inn} → {e}")
+
         # 3. Параллельно: cashflow, overdue, price, upd_debt (+ timeout 20с с fallback)
         try:
             cashflow, overdue, price, upd_debt = await asyncio.wait_for(
@@ -1182,6 +1208,7 @@ async def check_approval_needed(order_href: str, bot, db):
             "contacts": contacts["color"],
             "upd_debt": upd_debt["color"],
             "address": address["color"],
+            "reliability": (reliability or {}).get("color", "unknown"),
         }
         # Дата планируемой оплаты — то что выставил webhook-autofill за 60с до
         # этого алерта. Берём из attributes заказа, форматируем DD.MM.YYYY.
@@ -1204,6 +1231,7 @@ async def check_approval_needed(order_href: str, bot, db):
             price=price, site=site, contacts=contacts, upd_debt=upd_debt,
             address=address,
             payment_planned_date=ppm_str,
+            reliability=reliability,
         )
 
         # 6. Дедуп: sum_hash = округлённая сумма в ₽

@@ -90,6 +90,40 @@ def upsert_svetofor(inn: str, name: str | None, color: str, flags: dict):
         """, (inn, name, color, json.dumps(flags, ensure_ascii=False)))
 
 
+_EGRUL_STATUS_RU = {
+    "LIQUIDATING": "в стадии ликвидации",
+    "LIQUIDATED": "ликвидирована",
+    "BANKRUPT": "банкротство",
+    "REORGANIZING": "реорганизация",
+}
+
+
+def format_reliability_line(res: dict | None) -> tuple[str, str]:
+    """Короткая строка «Надёжность» для алертов согласования (заказ/договор).
+    Возвращает (color, markdown-строка). color ∈ green|yellow|red|unknown."""
+    icon_map = {"green": "🟢", "yellow": "🟡", "red": "🔴", "unknown": "⚪"}
+    if not res or res.get("color") == "unknown":
+        return "unknown", "⚪ *Надёжность:* не проверено (нет ИНН / источник недоступен)"
+    color = res.get("color", "unknown")
+    flags = res.get("flags") or {}
+    icon = icon_map.get(color, "⚪")
+    if color == "red":
+        reasons = []
+        for r in (flags.get("red_reasons") or []):
+            # «статус ЕГРЮЛ: LIQUIDATING» → человеческое
+            if r.startswith("статус ЕГРЮЛ:"):
+                code = r.split(":", 1)[1].strip()
+                reasons.append(_EGRUL_STATUS_RU.get(code, code))
+            else:
+                reasons.append(r)
+        return color, f"{icon} *Надёжность:* " + "; ".join(reasons[:2] or ["стоп-флаг ЕГРЮЛ"])
+    if color == "yellow":
+        prefix = "ЕГРЮЛ действующая, но " if flags.get("egrul_status") == "ACTIVE" else ""
+        ys = flags.get("yellow_reasons") or ["есть тревожные признаки"]
+        return color, f"{icon} *Надёжность:* {prefix}" + "; ".join(ys[:2])
+    return color, f"{icon} *Надёжность:* ЕГРЮЛ действующая, финансы ОК"
+
+
 def _bulk_upsert(rows: list):
     """Пишет пачку (inn, name, color, flags) ОДНИМ свежим коннектом (не общий _conn) —
     чтобы массовая запись в конце батча не зависела от состояния общего соединения."""

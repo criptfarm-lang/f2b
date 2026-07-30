@@ -4706,6 +4706,7 @@ async def load_counterparty_attrs(agent_id: str) -> dict:
 
     attrs = cp.get("attributes", []) or []
     return {
+        "inn":             (cp.get("inn") or "").strip(),
         "site":            (_extract_attr_value(attrs, ATTR_CP_SITE) or "").strip(),
         "max":             (_extract_attr_value(attrs, ATTR_CP_MAX) or "").strip(),
         "telegram":        (_extract_attr_value(attrs, ATTR_CP_TELEGRAM) or "").strip(),
