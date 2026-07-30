@@ -142,6 +142,11 @@ def ensure_schema(db):
     db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS long_dwell_alerted_at BIGINT")
     # Лаг-алерт: отставание (мин), при котором последний раз алертили — для повтора при росте.
     db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS lag_min_alerted BIGINT")
+    # Расщепление алертов задержки: прогноз (логистам — «нестыковка в маршруте») и факт
+    # прохождения окна (владелец+логисты+партнёр+менеджер) — ОТДЕЛЬНЫЕ дедуп-флаги, чтобы
+    # ранний прогнозный алерт НЕ глушил факт-алерт по окну. План 2026-07-30.
+    db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS prognosis_alerted BOOLEAN DEFAULT FALSE")
+    db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS fact_alerted BOOLEAN DEFAULT FALSE")
     db._execute("""
         CREATE TABLE IF NOT EXISTS unit_dwell (
             unit_id     BIGINT PRIMARY KEY,
@@ -582,7 +587,8 @@ async def run_check(db, bot=None, preview=False) -> list:
             # Отставание машины считаем ПО ВСЕМ точкам — нужно для прогнозной «Задержки в пути»
             # (точка получает статус до конца окна, если план + отставание перепрыгивают окно).
             lag_sec = _machine_lag(machine, now_ts)
-            delay_flips = []   # точки, чей статус в этом прогоне стал «Задержка в пути»
+            route_conflicts = []   # прогноз: не успеваем в окно, окно ещё открыто → логистам
+            fact_misses = []       # факт: окно прошло, точка не сдана → владелец+логисты+партнёр+менеджер
 
             for rec in recs:
                 s, order_no, info = rec["s"], rec["order_no"], rec["info"]
@@ -603,6 +609,30 @@ async def run_check(db, bot=None, preview=False) -> list:
                             _st_upsert(db, order_no, ms_status="Оплачен",
                                        demand_id=info["demand_id"], unit_id=uid)
                     continue
+
+                # ── Детект задержки — НЕЗАВИСИМО от смены статуса в МС ──
+                # БАГ (до 2026-07-30): этот блок стоял ПОСЛЕ `if target == cur: continue`,
+                # поэтому когда статус уже «Задержка в пути» (записан на раннем прогнозе),
+                # факт-алерт по прохождению окна и алерт менеджеру НЕ доходили. Теперь считаем
+                # по сырым условиям окна/плана, до статусных continue. Точка должна быть в
+                # развозе (cur ∈ MANAGED = не закрыта) и не прибыта.
+                tt = s.get("tt") or 0
+                vt = s.get("vt")
+                if (rec["real_window"] and tt and left_base
+                        and not rec["arrived"] and cur in MANAGED):
+                    if now_ts > tt:
+                        # ФАКТ: окно приёмки прошло, точка не сдана → факт-алерт (дедуп fact_alerted)
+                        if not st.get("fact_alerted"):
+                            fact_misses.append({"s": s, "order_no": order_no,
+                                                "demand_id": info["demand_id"],
+                                                "agent_tags": info["agent_tags"]})
+                    elif vt and (vt + lag_sec) > tt:
+                        # ПРОГНОЗ: окно ещё открыто, но план+отставание не успевают →
+                        # логистам «нестыковка в маршруте» (дедуп prognosis_alerted)
+                        if not st.get("prognosis_alerted"):
+                            route_conflicts.append({"s": s, "order_no": order_no,
+                                                    "demand_id": info["demand_id"]})
+
                 # трогаем только логистические статусы; ручные/бухгалтерские/терминальные — нет
                 if not target or cur not in MANAGED:
                     continue
@@ -624,32 +654,36 @@ async def run_check(db, bot=None, preview=False) -> list:
                             await _write_fail_alert(bot, name, order_no, s.get("client"), cur, target, bool(meta))
                             _st_upsert(db, order_no, write_fail_target=target,
                                        demand_id=info["demand_id"], unit_id=uid)
-                # Смена статуса на «Задержка в пути» → уведомление владелец+логисты (Белякова, Петровский)+Маланчук.
-                # Копим по машине, шлём одним сообщением ниже. Триггер — сам факт смены статуса
-                # (прогноз ИЛИ факт), один раз на заказ (дедуп delay_alerted).
-                tt = s.get("tt") or 0
-                if target == "Задержка в пути" and not st.get("delay_alerted"):
-                    delay_flips.append({"s": s, "order_no": order_no, "demand_id": info["demand_id"]})
-                # Опоздание > 60 мин ПО ФАКТУ — дополнительно ответственному менеджеру.
-                if (target == "Задержка в пути" and now_ts > tt and (now_ts - tt) / 60 >= 60
-                        and not st.get("delay_mgr_alerted")):
-                    if bot and not preview:
-                        _tag, mgr = _manager_chat(info["agent_tags"])
-                        if mgr:
-                            await _delay_alert(bot, name, s, [mgr], over60=True)
-                        _st_upsert(db, order_no, delay_mgr_alerted=True,
-                                   demand_id=info["demand_id"], unit_id=uid)
 
-            # ── Уведомление о смене статуса на «Задержка в пути» ──
-            # Владелец + логисты (Белякова, Петровский) + Маланчук: одно сообщение на машину за прогон, список точек.
-            if delay_flips:
-                lines.append(f"{name}: уведомление о задержке — точек: {len(delay_flips)}")
+            # ── Ранний прогноз «нестыковка в маршруте» → ТОЛЬКО ЛОГИСТАМ ──
+            # По плану+отставанию не успеваем в окно, но окно ещё открыто. Логисты
+            # переставляют точку в маршруте или предупреждают менеджера клиента о времени
+            # прибытия. Одно сообщение на машину за прогон, дедуп на заказ (prognosis_alerted).
+            if route_conflicts:
+                lines.append(f"{name}: нестыковка в маршруте (прогноз) — точек: {len(route_conflicts)}")
                 if bot and not preview:
-                    await _delay_flip_alert(bot, name, [d["s"] for d in delay_flips], lag_sec, now_ts,
-                                            [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()])
+                    await _route_conflict_alert(bot, name, [d["s"] for d in route_conflicts],
+                                                lag_sec, now_ts, _logist_chat_ids())
                 if not preview:
-                    for d in delay_flips:
-                        _st_upsert(db, d["order_no"], delay_alerted=True,
+                    for d in route_conflicts:
+                        _st_upsert(db, d["order_no"], prognosis_alerted=True,
+                                   demand_id=d["demand_id"], unit_id=uid)
+
+            # ── Факт: окно приёмки ПРОШЛО, точка не сдана ──
+            # Владелец + логисты + Маланчук + ответственный менеджер клиента (чтобы менеджер
+            # сразу позвонил). Отдельный дедуп (fact_alerted) — НЕ глушится ранним прогнозом.
+            if fact_misses:
+                lines.append(f"{name}: окно прошло, не сдано — точек: {len(fact_misses)}")
+                if bot and not preview:
+                    for d in fact_misses:
+                        _tag, mgr = _manager_chat(d["agent_tags"])
+                        recips = [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()]
+                        if mgr:
+                            recips.append(mgr)
+                        await _window_passed_alert(bot, name, d["s"], now_ts, recips)
+                if not preview:
+                    for d in fact_misses:
+                        _st_upsert(db, d["order_no"], fact_alerted=True,
                                    demand_id=d["demand_id"], unit_id=uid)
 
             # ── Алерт «выгрузка состоялась, кнопка не нажата» ──
@@ -749,9 +783,10 @@ def _compute_risk(machine, now_ts):
             "at_risk": at_risk, "behind": behind}
 
 
-async def _delay_flip_alert(bot, unit_name, stops, lag_sec, now_ts, recipients):
-    """Уведомление владелец+логисты (Белякова, Петровский)+Маланчук: у этих точек статус стал «Задержка в пути»
-    (прогноз ИЛИ факт). Одно сообщение на машину за прогон."""
+async def _route_conflict_alert(bot, unit_name, stops, lag_sec, now_ts, recipients):
+    """Ранний ПРОГНОЗ → логистам: по плану+отставанию не успеваем в окно приёмки (окно ещё
+    открыто). Логисты переставляют точку в маршруте или предупреждают менеджера клиента о
+    времени прибытия. Одно сообщение на машину за прогон."""
     def _hm(t):
         return datetime.fromtimestamp(t, _MSK).strftime("%H:%M") if t else "—"
 
@@ -759,14 +794,12 @@ async def _delay_flip_alert(bot, unit_name, stops, lag_sec, now_ts, recipients):
         tf, tt, vt = s.get("tf"), s.get("tt"), s.get("vt")
         win = f"{_hm(tf)}–{_hm(tt)}" if tf and tt else "—"
         proj = _hm(vt + lag_sec) if vt else "—"
-        tail = ""
-        if tt and now_ts > tt:                    # окно уже прошло (факт)
-            tail = f" — уже просрочено ~{int((now_ts - tt) / 60)} мин"
         return (f"• {s['client'][:30]} (№{s['order_no']}) окно {win}\n"
-                f"   план {_hm(vt)} → ожидается ~{proj}{tail}")
+                f"   план визита {_hm(vt)} → ожидается ~{proj} (позже окна)")
     rows = "\n".join(line(s) for s in stops)
-    text = (f"⏱ Статус → «Задержка в пути»\n{unit_name} отстаёт ~{int(lag_sec / 60)} мин от плана.\n"
-            f"Не укладываемся в окно приёмки:\n{rows}")
+    text = (f"🗺 Нестыковка в маршруте — {unit_name}\n"
+            f"Машина отстаёт ~{int(lag_sec / 60)} мин, по плану не успеваем в окно приёмки:\n{rows}\n"
+            f"Переставьте точку в маршруте или предупредите менеджера клиента о времени прибытия.")
     seen = set()
     for cid in recipients:
         if not cid or cid in seen:
@@ -775,7 +808,7 @@ async def _delay_flip_alert(bot, unit_name, stops, lag_sec, now_ts, recipients):
         try:
             await bot.send_message(chat_id=cid, text=text)
         except Exception as e:
-            logger.warning("_delay_flip_alert → %s: %s", cid, e)
+            logger.warning("_route_conflict_alert → %s: %s", cid, e)
 
 
 async def _write_fail_alert(bot, unit_name, order_no, client, cur, target, has_meta):
@@ -840,19 +873,18 @@ async def _fetch_routes_via(session, sid):
     return routes
 
 
-async def _delay_alert(bot, unit_name, stop, recipients, over60=False, status_written=True):
-    vt = stop.get("vt")
-    plan = datetime.fromtimestamp(vt, _MSK).strftime("%H:%M") if vt else "—"
-    if over60:
-        text = (f"⏱ ЗАДЕРЖКА больше 60 мин\n{unit_name}\n"
-                f"{stop['client']} (№{stop['order_no']})\n"
-                f"План прибытия {plan} — опоздание больше часа.")
-    else:
-        text = (f"⏱ ЗАДЕРЖКА в пути\n{unit_name}\n"
-                f"{stop['client']} (№{stop['order_no']})\n"
-                f"План прибытия {plan} + 30 мин — машина ещё не на точке.")
-    if status_written is False:
-        text += "\n⚠️ Статус «Задержка в пути» в МойСклад выставить НЕ удалось — проверьте отгрузку вручную."
+async def _window_passed_alert(bot, unit_name, s, now_ts, recipients):
+    """ФАКТ: окно приёмки прошло, а точка не сдана. Владелец+логисты+партнёр+ответственный
+    менеджер клиента (чтобы менеджер сразу позвонил клиенту). Одно сообщение на заказ."""
+    def _hm(t):
+        return datetime.fromtimestamp(t, _MSK).strftime("%H:%M") if t else "—"
+    tf, tt = s.get("tf"), s.get("tt")
+    win = f"{_hm(tf)}–{_hm(tt)}" if tf and tt else "—"
+    over = int((now_ts - tt) / 60) if tt else 0
+    text = (f"⏱ Окно приёмки ПРОШЛО — точка не сдана\n{unit_name}\n"
+            f"{s['client'][:30]} (№{s['order_no']})\n"
+            f"Окно {win}, просрочено ~{over} мин. Машина ещё не сдала заказ — "
+            f"свяжитесь с клиентом.")
     seen = set()
     for cid in recipients:
         if not cid or cid in seen:
@@ -861,7 +893,7 @@ async def _delay_alert(bot, unit_name, stop, recipients, over60=False, status_wr
         try:
             await bot.send_message(chat_id=cid, text=text)
         except Exception as e:
-            logger.warning("_delay_alert → %s: %s", cid, e)
+            logger.warning("_window_passed_alert → %s: %s", cid, e)
 
 
 # ─── Команда превью + крон ───────────────────────────────────────────────────
