@@ -579,7 +579,8 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
             info = ""
             if is_pickup:
                 pickup_rows.append(idx)
-                info += "<b><font color='#e65100'>🔄 ЗАБОР ТОВАРА (заказ поставщику)</font></b><br/>"
+                info += ("<font size=10 color='#e65100'><b>➤➤ ЗАБОР ТОВАРА ◀</b></font>"
+                         "<font size=7 color='#e65100'> · заказ поставщику, не доставка</font><br/>")
             info += f"<b>{client[:40]}</b> (№{s['order_no']})<br/>{address[:70]}"
             resp = ex.get("manager") or ""
             if is_pickup:
@@ -625,7 +626,8 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
             ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
         ]
         for ridx in pickup_rows:  # заборы — оранжевый фон строки
-            style.append(("BACKGROUND", (0, ridx), (-1, ridx), colors.HexColor("#fff3e0")))
+            style.append(("BACKGROUND", (0, ridx), (-1, ridx), colors.HexColor("#ffe0b2")))
+            style.append(("LINEBEFORE", (0, ridx), (0, ridx), 3, colors.HexColor("#e65100")))
         t.setStyle(TableStyle(style))
         flow.append(t)
 
