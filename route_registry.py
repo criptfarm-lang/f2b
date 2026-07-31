@@ -360,6 +360,7 @@ _OUR_PICKUP_CARS = {
 _ATTR_PICKUP_CAR = "Автомобиль на Доверенность"
 _ATTR_PICKUP_ADDR = "Адрес забора"
 _ATTR_PICKUP_DRIVER = "Водитель, которому выдана Доверенность"
+_ATTR_PICKUP_COMMENT = "Комментарий водителю"  # driver-facing коммент ЗП (аналог адресного у доставки)
 
 
 def _customentity_value_id(attr) -> str:
@@ -394,7 +395,7 @@ async def _ms_pickup_by_order(order_numbers) -> dict:
                     return no, None
                 po = rows[0]
                 car_id = ""
-                car_name = addr = driver = ""
+                car_name = addr = driver = drv_comment = ""
                 for a in po.get("attributes", []) or []:
                     nm = a.get("name")
                     if nm == _ATTR_PICKUP_CAR:
@@ -405,6 +406,8 @@ async def _ms_pickup_by_order(order_numbers) -> dict:
                         addr = (a.get("value") or "").strip()
                     elif nm == _ATTR_PICKUP_DRIVER:
                         driver = (a.get("value") or "").strip()
+                    elif nm == _ATTR_PICKUP_COMMENT:
+                        drv_comment = (a.get("value") or "").strip()
                 if car_id not in _OUR_PICKUP_CARS:
                     return no, None  # не наша машина → это не наш забор (или доставка-однофамилец)
                 agent = po.get("agent") or {}
@@ -416,7 +419,9 @@ async def _ms_pickup_by_order(order_numbers) -> dict:
                     "is_pickup": True,
                     "client": (agent.get("name") or "").strip(),   # поставщик
                     "address": addr,                               # «Адрес забора»
-                    "comment": (po.get("description") or "").strip(),
+                    # Комментарий водителю (новое поле ЗП) — аналог адресного комментария у доставки;
+                    # фолбэк на описание ЗП, если поле пустое (старые заказы без него).
+                    "comment": drv_comment or (po.get("description") or "").strip(),
                     "manager": (owner.get("name") or "").strip(),  # закупщик = автор ЗП
                     "driver": driver,
                     "car": car_name,
