@@ -158,6 +158,9 @@ def ensure_schema(db):
     # custom_items — пункты чек-листа из доп.поля заказа «Чек-лист водителя» (Фаза 7).
     # Массив [{idx, text, answer}]; answer: true/false/null (ещё не отвечено).
     db._execute("ALTER TABLE delivery_checklist ADD COLUMN IF NOT EXISTS custom_items JSONB DEFAULT '[]'::jsonb")
+    # order_name — номер ЗАКАЗА покупателя (по нему сверяет логист и реестр развозки).
+    # demand_name — номер расходной/отгрузки; логист по нему не сверяет → показываем оба.
+    db._execute("ALTER TABLE delivery_checklist ADD COLUMN IF NOT EXISTS order_name TEXT")
     logger.info("delivery_checklist: схема готова")
 
 
@@ -266,6 +269,7 @@ async def _fetch_demand_detail(demand_id: str) -> dict:
         "address": d.get("shipmentAddress"),
         "sum_rub": (d.get("sum", 0) or 0) / 100,
         "name": d.get("name"),
+        "order_name": co.get("name"),  # номер ЗАКАЗА — по нему сверяет логист
         "max_price_rub": max(prices) if prices else 0,
         "positions_text": "\n".join(lines),
         "checklist_raw": checklist_raw,
@@ -510,7 +514,7 @@ async def _render_card(send, demand_id: str, db, with_back: bool = True):
         return
     lines = [
         f"{det.get('agent_name') or '?'}",
-        f"Отгрузка № {det.get('name') or '?'}",
+        f"{_doc_ref(det.get('order_name'), det.get('name'))}",
         f"Адрес: {det.get('address') or '—'}",
         f"Сумма: {_fmt_rub(det.get('sum_rub'))}",
     ]
@@ -686,18 +690,19 @@ async def cb_arrive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # upsert
     db._execute("""
         INSERT INTO delivery_checklist
-          (demand_id, demand_name, agent_id, agent_name, address, sum_rub,
+          (demand_id, demand_name, order_name, agent_id, agent_name, address, sum_rub,
            is_retail, is_sample, money_required, manager_tag, driver_chat_id,
            snap_date, stage, custom_items, arrived_at, updated_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now(), now())
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now(), now())
         ON CONFLICT (demand_id) DO UPDATE SET
+           order_name = EXCLUDED.order_name,
            driver_chat_id = EXCLUDED.driver_chat_id,
            money_required = EXCLUDED.money_required,
            stage = EXCLUDED.stage,
            custom_items = EXCLUDED.custom_items,
            updated_at = now()
     """, (
-        demand_id, det.get("name"), det.get("agent_id"), det.get("agent_name"),
+        demand_id, det.get("name"), det.get("order_name"), det.get("agent_id"), det.get("agent_name"),
         det.get("address"), det.get("sum_rub"), is_retail, is_sample, money_required,
         mtag, driver_id, snap, "money" if money_required else "doc", items_json,
     ))
@@ -898,9 +903,22 @@ async def _finish_claim(context, demand_id, reply):
 
 # ─── Алерты ──────────────────────────────────────────────────────────────────
 
+def _doc_ref(order_name, demand_name) -> str:
+    """Идентификатор точки: номер ЗАКАЗА (по нему сверяет логист и реестр развозки)
+    + номер отгрузки в скобках (напечатан на накладной у водителя). Заказ отсутствует
+    (старые строки без колонки) → фолбэк на прежний «Отгрузка № …»."""
+    o = (order_name or "").strip()
+    d = (demand_name or "").strip()
+    if o and d:
+        return f"Заказ № {o} (отгр. {d})"
+    if o:
+        return f"Заказ № {o}"
+    return f"Отгрузка № {d or '?'}"
+
+
 def _point_head(row) -> str:
     return (f"*{row.get('agent_name') or '?'}*\n"
-            f"Отгрузка № {row.get('demand_name') or '?'}\n"
+            f"{_doc_ref(row.get('order_name'), row.get('demand_name'))}\n"
             f"Адрес: {row.get('address') or '—'}")
 
 
@@ -962,6 +980,7 @@ async def _fetch_shipments_for_list() -> list:
                 out.append({
                     "demand_id": x.get("id"),
                     "demand_name": x.get("name"),
+                    "order_name": co.get("name"),  # номер ЗАКАЗА — по нему сверяет логист
                     "agent_name": ag.get("name") if isinstance(ag, dict) else None,
                     "address": x.get("shipmentAddress"),
                     "sum_rub": (x.get("sum", 0) or 0) / 100,
@@ -1019,7 +1038,7 @@ def _build_shipment_list_pdf(shipments, bot_username, date_str) -> bytes:
         comment = (s.get("comment") or "").strip().replace("\n", " ")
         if len(comment) > 90:
             comment = comment[:90] + "…"
-        info = (f"<b>{i}. {s.get('agent_name') or '?'}</b>  (№ {s.get('demand_name') or '?'})<br/>"
+        info = (f"<b>{i}. {s.get('agent_name') or '?'}</b>  ({_doc_ref(s.get('order_name'), s.get('demand_name'))})<br/>"
                 f"{s.get('address') or '—'}<br/>{win}{places}")
         if comment:
             info += f"<br/><font size=8 color='#555555'>{comment}</font>"
@@ -1099,7 +1118,7 @@ class _ClaimPhotoFilter(filters.MessageFilter):
 def _point_head_plain(row) -> str:
     """Шапка точки без Markdown — имена контрагентов из МС содержат '*'/'(' (падает parse)."""
     return (f"{row.get('agent_name') or '?'}\n"
-            f"Отгрузка № {row.get('demand_name') or '?'}\n"
+            f"{_doc_ref(row.get('order_name'), row.get('demand_name'))}\n"
             f"Адрес: {row.get('address') or '—'}")
 
 
@@ -1152,18 +1171,19 @@ async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, cla
 
     db._execute("""
         INSERT INTO delivery_checklist
-          (demand_id, demand_name, agent_id, agent_name, address, sum_rub,
+          (demand_id, demand_name, order_name, agent_id, agent_name, address, sum_rub,
            is_retail, is_sample, money_required, manager_tag, driver_chat_id,
            snap_date, stage, custom_items, money_received, doc_signed,
            accepted_ok, claim_text, status, arrived_at, completed_at, updated_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'done',%s,%s,%s,%s,%s,%s, now(), now(), now())
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'done',%s,%s,%s,%s,%s,%s, now(), now(), now())
         ON CONFLICT (demand_id) DO UPDATE SET
+           order_name=EXCLUDED.order_name,
            driver_chat_id=EXCLUDED.driver_chat_id, money_required=EXCLUDED.money_required,
            stage='done', custom_items=EXCLUDED.custom_items,
            money_received=EXCLUDED.money_received, doc_signed=EXCLUDED.doc_signed,
            accepted_ok=EXCLUDED.accepted_ok, claim_text=EXCLUDED.claim_text,
            status=EXCLUDED.status, completed_at=now(), updated_at=now()
-    """, (demand_id, det.get("name"), det.get("agent_id"), det.get("agent_name"),
+    """, (demand_id, det.get("name"), det.get("order_name"), det.get("agent_id"), det.get("agent_name"),
           det.get("address"), det.get("sum_rub"), is_retail, is_sample, money_required,
           mtag, driver_chat, snap, json.dumps(ci, ensure_ascii=False),
           money_val, _yn(doc), accepted_ok,
