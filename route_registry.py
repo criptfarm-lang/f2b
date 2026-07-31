@@ -396,6 +396,7 @@ async def _ms_pickup_by_order(order_numbers) -> dict:
                 po = rows[0]
                 car_id = ""
                 car_name = addr = driver = drv_comment = ""
+                win_from = win_to = ""
                 for a in po.get("attributes", []) or []:
                     nm = a.get("name")
                     if nm == _ATTR_PICKUP_CAR:
@@ -408,6 +409,10 @@ async def _ms_pickup_by_order(order_numbers) -> dict:
                         driver = (a.get("value") or "").strip()
                     elif nm == _ATTR_PICKUP_COMMENT:
                         drv_comment = (a.get("value") or "").strip()
+                    elif nm == ATTR_WINDOW_FROM:
+                        win_from = _attr_time(a.get("value"))
+                    elif nm == ATTR_WINDOW_TO:
+                        win_to = _attr_time(a.get("value"))
                 if car_id not in _OUR_PICKUP_CARS:
                     return no, None  # не наша машина → это не наш забор (или доставка-однофамилец)
                 agent = po.get("agent") or {}
@@ -427,7 +432,7 @@ async def _ms_pickup_by_order(order_numbers) -> dict:
                     "car": car_name,
                     "weight": weight,
                     "places": None,
-                    "win_from": "", "win_to": "", "zdraste": False,
+                    "win_from": win_from, "win_to": win_to, "zdraste": False,
                 }
             except Exception as e:
                 logger.warning("_ms_pickup_by_order %s: %s", no, e)
