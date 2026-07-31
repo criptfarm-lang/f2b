@@ -269,8 +269,10 @@ async def _fetch_demand_detail(demand_id: str) -> dict:
         "max_price_rub": max(prices) if prices else 0,
         "positions_text": "\n".join(lines),
         "checklist_raw": checklist_raw,
-        # Комментарий заказа = контакт/условия приёмки, которые менеджер оставил водителю.
-        "comment": (co.get("description") or "").strip(),
+        # Контакт/условия приёмки для водителя — из комментария ПОД адресом доставки
+        # (shipmentAddressFull.comment). Стандартный «Комментарий» заказа (description) —
+        # производственный (партии/разделка), водителю не показываем.
+        "comment": ((co.get("shipmentAddressFull") or {}).get("comment") or "").strip(),
         "win_from": win_from,   # «Окно доставки с (время)» → HH:MM
         "win_to": win_to,       # «Окно доставки до (время)» → HH:MM
     }
@@ -964,7 +966,9 @@ async def _fetch_shipments_for_list() -> list:
                     "address": x.get("shipmentAddress"),
                     "sum_rub": (x.get("sum", 0) or 0) / 100,
                     "window_from": wfrom, "window_to": wto,
-                    "places": places, "comment": co.get("description"),
+                    "places": places,
+                    # комментарий под адресом доставки (контакт/приёмка), не производственный description
+                    "comment": (co.get("shipmentAddressFull") or {}).get("comment"),
                 })
             if len(rows) < 100:
                 break

@@ -304,13 +304,18 @@ async def _ms_extra_by_order(order_numbers) -> dict:
         agent = co.get("agent") or {}
         tags = [str(t).strip().lower() for t in (agent.get("tags") or [])]
         manager = next((_MANAGER_TAG_NAMES[t] for t in tags if t in _MANAGER_TAG_NAMES), "")
+        # Комментарий приёмки для водителя — из поля «Комментарий» ПОД адресом доставки
+        # (shipmentAddressFull.comment): туда менеджеры пишут контакт/телефон/окно/условия.
+        # Стандартное поле «Комментарий» заказа (description) — производственное (партии,
+        # разделка, сроки), водителю не показываем.
+        addr_comment = ((co.get("shipmentAddressFull") or {}).get("comment") or "").strip()
         return {
             "places": places,
-            "comment": (co.get("description") or "").strip(),
+            "comment": addr_comment,
             "weight": weight,
             "manager": manager,
-            # Телефон приёмки водитель берёт из Комментария заказа (менеджеры вписывают
-            # контакт туда). Поле «Телефон» карточки контрагента больше НЕ тянем.
+            # Телефон приёмки водитель берёт из Комментария под адресом доставки (менеджеры
+            # вписывают контакт туда). Поле «Телефон» карточки контрагента больше НЕ тянем.
             "win_from": win_from,   # «Окно доставки с (время)» → HH:MM
             "win_to": win_to,       # «Окно доставки до (время)» → HH:MM
             "zdraste": "здрасте" in tags,
@@ -457,7 +462,7 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
             wt = _fmt_weight(ex.get("weight"))
             wcell = (f"<b>{wt} кг</b><br/>" if wt else "") + f"{places} мест"
             info = (f"<b>{s['client'][:40]}</b> (№{s['order_no']})<br/>{(s['address'] or '')[:70]}")
-            # Ответственный менеджер (из тега контрагента). Телефон приёмки — в Комментарии.
+            # Ответственный менеджер (из тега контрагента). Телефон приёмки — в комментарии под адресом.
             resp = ex.get("manager") or ""
             meta_line = " · ".join(x for x in (
                 (f"Отв: {resp}" if resp else ""),
@@ -465,7 +470,7 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
             ) if x)
             if meta_line:
                 info += f"<br/><font size=7 color='#444444'>{meta_line[:80]}</font>"
-            # Комментарий = контакт/условия приёмки (менеджеры пишут телефон сюда).
+            # Комментарий под адресом доставки = контакт/условия приёмки (телефон, окно).
             cm = (ex.get("comment") or "").replace("\n", " ")
             # Телефон приёмки — из комментария, кликабельной tel:-ссылкой (звонок из PDF).
             tel = _phone_from_text(cm)
