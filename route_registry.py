@@ -646,7 +646,7 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
             ) if x) if (wt or pl not in (None, "")) else ""
             is_pickup = ex.get("is_pickup")
             nm = (ex.get("client") if is_pickup and ex.get("client") else s["client"])[:38]
-            tag = "🔄 ЗАБОР " if is_pickup else ""
+            tag = "➤ ЗАБОР: " if is_pickup else ""
             loading.append(f"{idx}. {tag}{nm} (№{s['order_no']}){bits}")
         flow.append(Paragraph("<br/>".join(loading), small))
 
