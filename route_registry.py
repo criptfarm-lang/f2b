@@ -390,17 +390,36 @@ def _fmt_window(win_from: str, win_to: str, tf=None, tt=None) -> str:
 _PHONE_RE = _re_rr.compile(r"(?:\+7|8|7)[\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-()]*\d{2}[\s\-()]*\d{2}")
 
 
+def _norm_phone(raw: str) -> str:
+    """'8 (901) 712-61-96' → '+79017126196' для tel:. Пусто, если цифр нет."""
+    d = _re_rr.sub(r"\D", "", raw)
+    if len(d) == 11 and d[0] in "78":
+        return "+7" + d[1:]
+    return "+" + d if d else ""
+
+
 def _phone_from_text(text: str) -> str:
     """Первый телефон из текста → нормализованный +7XXXXXXXXXX для tel:. Пусто, если нет."""
     if not text:
         return ""
     m = _PHONE_RE.search(text)
-    if not m:
+    return _norm_phone(m.group(0)) if m else ""
+
+
+def _linkify_phones(text: str) -> str:
+    """Экранирует текст для reportlab и оборачивает КАЖДЫЙ телефон в кликабельную tel:-ссылку.
+    Символы телефона (цифры, +, -, (), пробел) не XML-спец, поэтому экранируем до подмены."""
+    if not text:
         return ""
-    d = _re_rr.sub(r"\D", "", m.group(0))
-    if len(d) == 11 and d[0] in "78":
-        return "+7" + d[1:]
-    return "+" + d if d else ""
+    esc = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _repl(m):
+        tel = _norm_phone(m.group(0))
+        if not tel:
+            return m.group(0)
+        return f"<a href='tel:{tel}' color='#0645ad'>{m.group(0)}</a>"
+
+    return _PHONE_RE.sub(_repl, esc)
 
 
 def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
@@ -479,7 +498,8 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
                          f"тел. {tel}</a></font>")
             if cm:
                 # Лимит 300, чтобы не срезать длинные инструкции приёмки/номер. Paragraph переносит.
-                info += f"<br/><font size=7 color='#888888'>{cm[:300]}</font>"
+                # Обрезаем ДО линкификации (иначе можно разрезать <a>-тег), все номера — кликабельные tel:.
+                info += f"<br/><font size=7 color='#888888'>{_linkify_phones(cm[:300])}</font>"
             link = f"https://t.me/{bot_username}?start=chk_{s['order_no']}"
             rows.append([
                 Paragraph(str(idx), cell),
