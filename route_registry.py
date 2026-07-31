@@ -271,10 +271,11 @@ async def _ms_names_by_order(order_numbers) -> dict:
     return out
 
 
-async def _ms_extra_by_order(order_numbers) -> dict:
+async def _ms_extra_by_order(order_numbers, names=None) -> dict:
     """{order_no: {places, comment, weight, manager, phone, zdraste}} — из заказов МС по номеру.
     weight — суммарный вес (кг = сумма количеств позиций); manager — из тега контрагента;
-    phone/zdraste — из карточки контрагента (телефон и флаг-тег «здрасте»)."""
+    phone/zdraste — из карточки контрагента (телефон и флаг-тег «здрасте»).
+    names={order_no: имя точки Wialon} — для матча заборов по названию поставщика, не только по номеру."""
     out = {}
     if not order_numbers:
         return out
@@ -335,7 +336,7 @@ async def _ms_extra_by_order(order_numbers) -> dict:
 
     # Сначала — заборы товара (заказы поставщику с нашей машиной). Их номера НЕ резолвим
     # как customerorder: в МС бывает совпадающий по номеру заказ покупателя (другая сущность).
-    pickups = await _ms_pickup_by_order(order_numbers)
+    pickups = await _ms_pickup_by_order(order_numbers, names=names)
     out.update(pickups)
     rest = [no for no in order_numbers if no not in pickups]
 
@@ -415,20 +416,33 @@ def _parse_pickup_po(po) -> dict:
     }
 
 
-async def _ms_pickup_by_order(order_numbers) -> dict:
+def _norm_name(s) -> str:
+    """Нормализация названия для матча точки Логистики с поставщиком ЗП: без кавычек, upper, схлоп пробелов.
+    'ООО \"АСАГИ-ФИШ\"' → 'ООО АСАГИ-ФИШ'."""
+    if not s:
+        return ""
+    for ch in '«»""“”„':
+        s = s.replace(ch, "")
+    return " ".join(s.upper().split())
+
+
+async def _ms_pickup_by_order(order_numbers, names=None) -> dict:
     """{order_no: pickup_dict} — точки ЗАБОРА (заказы поставщику с нашей машиной в «Автомобиль на
-    Доверенность»). ОДИН пакетный запрос свежих ЗП (окно 14 дней) вместо GET на каждый номер: заборы
-    редки, гонять N запросов дорого (и упор в rate-limit). Матч по номеру ЗП."""
+    Доверенность»). ОДИН пакетный запрос свежих ЗП (окно 14 дней). Матч точки к ЗП по НОМЕРУ, а если
+    не сошёлся — по НАЗВАНИЮ ПОСТАВЩИКА (логист в Логистике часто пишет номер с опечаткой или свой
+    текст, а имя поставщика совпадает). names={order_no: имя точки из Wialon}."""
     out = {}
     wanted = {str(n) for n in order_numbers if n}
     if not wanted:
         return out
+    names = names or {}
     headers = get_headers()
     import urllib.parse
     since = (datetime.now(_MSK) - timedelta(days=14)).strftime("%Y-%m-%d 00:00:00")
     flt = urllib.parse.quote(f"moment>={since}")
     base = (f"{MS_BASE}/entity/purchaseorder?filter={flt}"
             f"&expand=agent,owner,positions.assortment&order=moment,desc&limit=100")
+    by_number, by_supplier = {}, {}   # ЗП.name -> pickup ; norm(поставщик) -> pickup
     async with aiohttp.ClientSession() as session:
         offset = 0
         while offset < 500:  # бэкстоп; свежих ЗП за 14 дней столько не бывает
@@ -442,18 +456,26 @@ async def _ms_pickup_by_order(order_numbers) -> dict:
                 logger.warning("_ms_pickup_by_order fetch: %s", e)
                 break
             for po in rows:
-                name = po.get("name")
-                if name in wanted and name not in out:
-                    try:
-                        pk = _parse_pickup_po(po)
-                    except Exception as e:
-                        logger.warning("_ms_pickup_by_order parse %s: %s", name, e)
-                        pk = None
-                    if pk:
-                        out[name] = pk
-            if len(out) == len(wanted) or len(rows) < 100:
+                try:
+                    pk = _parse_pickup_po(po)   # None, если машина не наша
+                except Exception as e:
+                    logger.warning("_ms_pickup_by_order parse %s: %s", po.get("name"), e)
+                    pk = None
+                if not pk:
+                    continue
+                num = po.get("name")
+                if num and num not in by_number:
+                    by_number[num] = pk
+                sup = _norm_name(pk.get("client"))
+                if sup and sup not in by_supplier:
+                    by_supplier[sup] = pk
+            if len(rows) < 100:
                 break
             offset += 100
+    for no in wanted:
+        pk = by_number.get(no) or by_supplier.get(_norm_name(names.get(no)))
+        if pk:
+            out[no] = pk
     return out
 
 
@@ -723,7 +745,8 @@ async def cmd_registry(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Маршрут ещё не построен — логист не разложил заказы по машинам в Wialon.")
             return
         order_numbers = [s["order_no"] for v in routes.values() for s in v]
-        ms_extra = await _ms_extra_by_order(order_numbers)
+        names = {s["order_no"]: s.get("client") for v in routes.values() for s in v}
+        ms_extra = await _ms_extra_by_order(order_numbers, names=names)
         me = await context.bot.get_me()
         now = datetime.now(_MSK)
         pdf = _build_registry_pdf(routes, ms_extra, me.username, now.strftime("%d.%m.%Y"))

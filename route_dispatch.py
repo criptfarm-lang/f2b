@@ -347,7 +347,9 @@ async def _unit_package(routes, uid, target_date, bot_username):
     if not stops:
         return None
     driver_id, driver_name = _driver_for_unit(uid)
-    ms_extra = await rr._ms_extra_by_order([s["order_no"] for s in stops])
+    ms_extra = await rr._ms_extra_by_order(
+        [s["order_no"] for s in stops],
+        names={s["order_no"]: s.get("client") for s in stops})
     pdf = await asyncio.to_thread(rr._build_registry_pdf, {uid: stops}, ms_extra,
                                   bot_username, target_date.strftime("%d.%m.%Y"))  # reportlab CPU-sync → поток
     return {"stops": stops, "pdf": pdf, "driver_id": driver_id, "driver_name": driver_name,
