@@ -333,11 +333,106 @@ async def _ms_extra_by_order(order_numbers) -> dict:
                 logger.warning("_ms_extra_by_order %s: %s", no, e)
                 return no, None
 
+    # Сначала — заборы товара (заказы поставщику с нашей машиной). Их номера НЕ резолвим
+    # как customerorder: в МС бывает совпадающий по номеру заказ покупателя (другая сущность).
+    pickups = await _ms_pickup_by_order(order_numbers)
+    out.update(pickups)
+    rest = [no for no in order_numbers if no not in pickups]
+
     async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(*(_one(session, no) for no in order_numbers))
+        results = await asyncio.gather(*(_one(session, no) for no in rest))
     for no, data in results:
         if data is not None:
             out[no] = data
+    return out
+
+
+# ─── Заборы товара (заказы поставщику с нашей машиной) ────────────────────────
+
+# Значения справочника «Автомобиль на Доверенность» = НАШИ 3 машины (UUID значения customentity).
+# Источник: memory reference_f2b_pickup_via_purchaseorder_car. Чужие (Газель/Peugeot, регион 790)
+# в набор НЕ входят — забор на чужом транспорте нам в реестр не нужен.
+_OUR_PICKUP_CARS = {
+    "c1136692-f693-11f0-0a80-147c0004c634",  # KIA BONGO III (В 970 СВ / 797)
+    "e8a8abdb-b264-11f0-0a80-17240021276f",  # Hyundai Porter 2 (К 459 ХК / 797)
+    "da849c4f-0663-11f1-0a80-09cc000ab1fd",  # LADA LARGUS (Е 898 СР / 797)
+}
+_ATTR_PICKUP_CAR = "Автомобиль на Доверенность"
+_ATTR_PICKUP_ADDR = "Адрес забора"
+_ATTR_PICKUP_DRIVER = "Водитель, которому выдана Доверенность"
+
+
+def _customentity_value_id(attr) -> str:
+    """UUID выбранного значения справочника из value.meta.href (последний сегмент)."""
+    v = attr.get("value")
+    if isinstance(v, dict):
+        href = (v.get("meta") or {}).get("href") or ""
+        return href.rstrip("/").split("/")[-1]
+    return ""
+
+
+async def _ms_pickup_by_order(order_numbers) -> dict:
+    """{order_no: pickup_dict} — точки ЗАБОРА товара: заказы поставщику (purchaseorder),
+    у которых «Автомобиль на Доверенность» = одна из наших машин. Остальные номера не попадают.
+    Ответственный за забор = закупщик (owner заказа поставщику)."""
+    out = {}
+    if not order_numbers:
+        return out
+    headers = get_headers()
+    import urllib.parse
+    sem = asyncio.Semaphore(6)
+
+    async def _one(session, no):
+        async with sem:
+            try:
+                f = urllib.parse.quote(f"name={no}")
+                url = (f"{MS_BASE}/entity/purchaseorder?filter={f}"
+                       f"&expand=agent,owner,positions.assortment&limit=1")
+                async with session.get(url, headers=headers) as r:
+                    rows = (await r.json()).get("rows", []) if r.status == 200 else []
+                if not rows:
+                    return no, None
+                po = rows[0]
+                car_id = ""
+                car_name = addr = driver = ""
+                for a in po.get("attributes", []) or []:
+                    nm = a.get("name")
+                    if nm == _ATTR_PICKUP_CAR:
+                        car_id = _customentity_value_id(a)
+                        v = a.get("value")
+                        car_name = (v.get("name") if isinstance(v, dict) else "") or ""
+                    elif nm == _ATTR_PICKUP_ADDR:
+                        addr = (a.get("value") or "").strip()
+                    elif nm == _ATTR_PICKUP_DRIVER:
+                        driver = (a.get("value") or "").strip()
+                if car_id not in _OUR_PICKUP_CARS:
+                    return no, None  # не наша машина → это не наш забор (или доставка-однофамилец)
+                agent = po.get("agent") or {}
+                owner = po.get("owner") or {}
+                weight = 0.0
+                for p in (po.get("positions") or {}).get("rows", []):
+                    weight += p.get("quantity") or 0
+                return no, {
+                    "is_pickup": True,
+                    "client": (agent.get("name") or "").strip(),   # поставщик
+                    "address": addr,                               # «Адрес забора»
+                    "comment": (po.get("description") or "").strip(),
+                    "manager": (owner.get("name") or "").strip(),  # закупщик = автор ЗП
+                    "driver": driver,
+                    "car": car_name,
+                    "weight": weight,
+                    "places": None,
+                    "win_from": "", "win_to": "", "zdraste": False,
+                }
+            except Exception as e:
+                logger.warning("_ms_pickup_by_order %s: %s", no, e)
+                return no, None
+
+    async with aiohttp.ClientSession() as session:
+        results = await asyncio.gather(*(_one(session, no) for no in order_numbers))
+    for no, pk in results:
+        if pk:
+            out[no] = pk
     return out
 
 
@@ -470,21 +565,37 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
         header = [Paragraph(x, ParagraphStyle("hd", fontName=FONT_BOLD, fontSize=8, leading=10))
                   for x in ["#", "План", "Окно", "Клиент / адрес", "Вес / Мест", "QR"]]
         rows = [header]
+        pickup_rows = []  # индексы строк-заборов → подсветим фон, чтобы кидалось в глаза
         for idx, s in enumerate(stops, 1):
             ex = ms_extra.get(s["order_no"], {})
+            is_pickup = ex.get("is_pickup")
             places = ex.get("places")
             places = str(places) if places not in (None, "") else "—"
             wt = _fmt_weight(ex.get("weight"))
-            wcell = (f"<b>{wt} кг</b><br/>" if wt else "") + f"{places} мест"
-            info = (f"<b>{s['client'][:40]}</b> (№{s['order_no']})<br/>{(s['address'] or '')[:70]}")
-            # Ответственный менеджер (из тега контрагента). Телефон приёмки — в комментарии под адресом.
+            wcell = (f"<b>{wt} кг</b><br/>" if wt else "") + (f"{places} мест" if not is_pickup else "забор")
+            # Для забора: имя = поставщик, адрес = «Адрес забора» (оба из заказа поставщику).
+            client = (ex.get("client") if is_pickup and ex.get("client") else s["client"]) or "?"
+            address = (ex.get("address") if is_pickup and ex.get("address") else s["address"]) or ""
+            info = ""
+            if is_pickup:
+                pickup_rows.append(idx)
+                info += "<b><font color='#e65100'>🔄 ЗАБОР ТОВАРА (заказ поставщику)</font></b><br/>"
+            info += f"<b>{client[:40]}</b> (№{s['order_no']})<br/>{address[:70]}"
             resp = ex.get("manager") or ""
-            meta_line = " · ".join(x for x in (
-                (f"Отв: {resp}" if resp else ""),
-                ("Здрасте" if ex.get("zdraste") else ""),
-            ) if x)
+            if is_pickup:
+                # Ответственный за забор = закупщик (автор ЗП). Плюс водитель по доверенности, если есть.
+                meta_line = " · ".join(x for x in (
+                    (f"Отв (закупка): {resp}" if resp else ""),
+                    (f"Довер.: {ex.get('driver')}" if ex.get("driver") else ""),
+                ) if x)
+            else:
+                # Ответственный менеджер (из тега контрагента). Телефон приёмки — в комментарии под адресом.
+                meta_line = " · ".join(x for x in (
+                    (f"Отв: {resp}" if resp else ""),
+                    ("Здрасте" if ex.get("zdraste") else ""),
+                ) if x)
             if meta_line:
-                info += f"<br/><font size=7 color='#444444'>{meta_line[:80]}</font>"
+                info += f"<br/><font size=7 color='#444444'>{meta_line[:90]}</font>"
             # Комментарий под адресом доставки = контакт/условия приёмки (телефон, окно).
             cm = (ex.get("comment") or "").replace("\n", " ")
             # Телефон приёмки — из комментария, кликабельной tel:-ссылкой (звонок из PDF).
@@ -506,13 +617,16 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
                 qr_flow(link),
             ])
         t = Table(rows, colWidths=[7 * mm, 15 * mm, 22 * mm, 99 * mm, 26 * mm, 21 * mm])
-        t.setStyle(TableStyle([
+        style = [
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#cccccc")),
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eef2f5")),
             ("TOPPADDING", (0, 0), (-1, -1), 3),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ]))
+        ]
+        for ridx in pickup_rows:  # заборы — оранжевый фон строки
+            style.append(("BACKGROUND", (0, ridx), (-1, ridx), colors.HexColor("#fff3e0")))
+        t.setStyle(TableStyle(style))
         flow.append(t)
 
         # Лист загрузки (LIFO): грузим с последней точки, первая — к дверям
@@ -528,7 +642,10 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
                 (f"{wt} кг" if wt else ""),
                 (f"{pl} мест" if pl not in (None, "") else ""),
             ) if x) if (wt or pl not in (None, "")) else ""
-            loading.append(f"{idx}. {s['client'][:38]} (№{s['order_no']}){bits}")
+            is_pickup = ex.get("is_pickup")
+            nm = (ex.get("client") if is_pickup and ex.get("client") else s["client"])[:38]
+            tag = "🔄 ЗАБОР " if is_pickup else ""
+            loading.append(f"{idx}. {tag}{nm} (№{s['order_no']}){bits}")
         flow.append(Paragraph("<br/>".join(loading), small))
 
         # Юридический блок: приёмка (подпись) + порядок сдачи (QR = ПЭП)
