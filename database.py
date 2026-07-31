@@ -1366,6 +1366,15 @@ class Database:
             self.conn.commit()
             return row is not None
 
+    def release_agreed_notification(self, order_id: str):
+        """Откат claim'а: удаляет отметку, если рассылка по заказу не удалась.
+
+        Нужен, когда try_claim_agreed_notification прошёл (мы «первые»), но Wazzup
+        отклонил отправку по всем каналам — иначе заказ навсегда считается
+        уведомлённым и sweep-крон его больше не дошлёт (тихий пропуск).
+        """
+        self._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
+
     def try_claim_bulk_notification(self, order_id: str) -> bool:
         """Атомарный claim для алерта «крупный заказ готовой продукции».
 

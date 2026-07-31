@@ -253,9 +253,13 @@ async def _sync_amocrm_contact(agent_phone: str | None, contact_data: dict) -> i
     return contact_id
 
 
-async def _get_contact_from_ms(agent_id: str, headers: dict) -> dict | None:
-    """Читает контакт для рассылки из дополнительных полей контрагента в МойСклад.
-    Возвращает {chat_id, chat_type, channel_id} или None."""
+async def _get_contacts_from_ms(agent_id: str, headers: dict) -> list[dict]:
+    """Читает ВСЕ каналы для рассылки из доп.полей контрагента в МойСклад.
+
+    Возвращает список {chat_id, chat_type, channel_id} в порядке приоритета
+    Telegram → Max → WhatsApp. Пустой список — ни один канал не заполнен.
+    Список нужен для фолбэка: если отправка по первому каналу падает
+    (напр. Telegram username не найден), пробуем следующий."""
     import aiohttp
     try:
         async with aiohttp.ClientSession() as session:
@@ -265,7 +269,7 @@ async def _get_contact_from_ms(agent_id: str, headers: dict) -> dict | None:
                 params={"expand": "attributes"}
             ) as r:
                 if r.status != 200:
-                    return None
+                    return []
                 cp = await r.json()
 
         attributes = cp.get("attributes", [])
@@ -286,16 +290,24 @@ async def _get_contact_from_ms(agent_id: str, headers: dict) -> dict | None:
                 max_id = str(value)
 
         # Приоритет: Telegram → Max → WhatsApp
+        contacts = []
         if telegram_id:
-            return {"chat_id": telegram_id, "chat_type": "telegram", "channel_id": CHANNEL_TELEGRAM}
+            contacts.append({"chat_id": telegram_id, "chat_type": "telegram", "channel_id": CHANNEL_TELEGRAM})
         if max_id:
-            return {"chat_id": max_id, "chat_type": "max", "channel_id": CHANNEL_MAX}
+            contacts.append({"chat_id": max_id, "chat_type": "max", "channel_id": CHANNEL_MAX})
         if whatsapp_id:
-            return {"chat_id": whatsapp_id, "chat_type": "whatsapp", "channel_id": CHANNEL_WHATSAPP}
+            contacts.append({"chat_id": whatsapp_id, "chat_type": "whatsapp", "channel_id": CHANNEL_WHATSAPP})
+        return contacts
 
     except Exception as e:
-        logger.warning(f"_get_contact_from_ms: {e}")
-    return None
+        logger.warning(f"_get_contacts_from_ms: {e}")
+    return []
+
+
+async def _get_contact_from_ms(agent_id: str, headers: dict) -> dict | None:
+    """Первый по приоритету канал контрагента (совместимость со старыми вызовами)."""
+    contacts = await _get_contacts_from_ms(agent_id, headers)
+    return contacts[0] if contacts else None
 
 
 async def _load_order(order_href: str, headers: dict) -> dict | None:
@@ -359,10 +371,13 @@ async def _send_fishki_mailing(order: dict, db) -> tuple[bool, str]:
         db.save_agreed_notification(order_id)
         return (False, "excluded")
 
-    # Контакт в МойСклад
-    contact = await _get_contact_from_ms(agent_id, headers)
-    if contact:
-        logger.info(f"notifier: контакт {agent_name} найден в МойСклад → {contact['chat_type']}")
+    # Контакты в МойСклад (все каналы по приоритету, для фолбэка при отказе)
+    contacts = await _get_contacts_from_ms(agent_id, headers)
+    if contacts:
+        logger.info(
+            f"notifier: контакт {agent_name} найден в МойСклад → "
+            f"{', '.join(c['chat_type'] for c in contacts)}"
+        )
     else:
         logger.info(f"notifier: контакт {agent_name} не найден в МойСклад, пропускаем")
         # НЕ сохраняем флаг — заполни поля Telegram/Max/WhatsApp в карточке контрагента
@@ -425,54 +440,66 @@ async def _send_fishki_mailing(order: dict, db) -> tuple[bool, str]:
     # Синхронизация amoCRM-контакта (защита от дублей сделок)
     try:
         agent_phone = await _get_agent_phone(agent_id, headers)
-        await _sync_amocrm_contact(agent_phone, contact)
+        await _sync_amocrm_contact(agent_phone, contacts[0])
     except Exception as _e:
         logger.warning(f"notifier: amocrm sync failed (non-blocking): {_e}")
 
     # Атомарный claim прямо перед отправкой.
     # INSERT ... ON CONFLICT DO NOTHING RETURNING — победитель шлёт, остальные выходят.
-    # Если флаг стоит — НЕ откатываем даже при ошибке Wazzup (один POST на заказ).
+    # При полном провале (все каналы отвергли) claim ОТКАТЫВАЕМ, чтобы sweep дошлёт.
     if not db.try_claim_agreed_notification(order_id):
         logger.info(f"notifier: заказ {order_id} уже отправлен параллельным вызовом, пропускаем")
         return (False, "already_claimed")
 
-    # POST в Wazzup
+    # POST в Wazzup с фолбэком по каналам: Telegram → Max → WhatsApp.
+    # Частый кейс — CHANNEL_TGAPI_CONTACT_NOT_FOUND_BY_USERNAME: Wazzup не может
+    # инициировать Telegram-диалог по @username, если клиент туда не писал.
+    # Тогда пробуем следующий заполненный канал (Max/WhatsApp).
     api_key = os.getenv("WAZZUP_API_KEY", "")
-    chat_id_value = contact["chat_id"]
-    wazzup_payload = {
-        "channelId": contact["channel_id"],
-        "chatType":  contact["chat_type"],
-        "text":      msg,
-    }
-    if chat_id_value.startswith("@"):
-        wazzup_payload["username"] = chat_id_value.lstrip("@")
-    else:
-        wazzup_payload["chatId"] = chat_id_value
-
+    last_err = "no_channels"
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            WAZZUP_API_URL,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=wazzup_payload,
-        ) as r:
-            if r.status in (200, 201):
-                logger.info(f"notifier: ✅ отправлено {agent_name} → {contact['chat_type']}")
-                logger.info(f"notifier: QUIZ_BASE_URL={QUIZ_BASE_URL!r}")
-                if QUIZ_BASE_URL:
-                    try:
-                        async with aiohttp.ClientSession() as _s:
-                            await _s.post(
-                                f"{QUIZ_BASE_URL}/api/log-mailing",
-                                json={"order_id": order_id, "client_id": agent_id, "company_name": agent_name},
-                                timeout=aiohttp.ClientTimeout(total=5)
-                            )
-                    except Exception as _e:
-                        logger.warning(f"notifier: log-mailing failed ({_e})")
-                return (True, "sent")
+        for contact in contacts:
+            chat_id_value = contact["chat_id"]
+            wazzup_payload = {
+                "channelId": contact["channel_id"],
+                "chatType":  contact["chat_type"],
+                "text":      msg,
+            }
+            if chat_id_value.startswith("@"):
+                wazzup_payload["username"] = chat_id_value.lstrip("@")
             else:
-                body = await r.text()
-                logger.error(f"notifier: ❌ ошибка {r.status} для {agent_name}: {body[:200]}")
-                return (False, f"wazzup_err:{r.status}:{body[:200]}")
+                wazzup_payload["chatId"] = chat_id_value
+
+            async with session.post(
+                WAZZUP_API_URL,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=wazzup_payload,
+            ) as r:
+                if r.status in (200, 201):
+                    logger.info(f"notifier: ✅ отправлено {agent_name} → {contact['chat_type']}")
+                    if QUIZ_BASE_URL:
+                        try:
+                            async with aiohttp.ClientSession() as _s:
+                                await _s.post(
+                                    f"{QUIZ_BASE_URL}/api/log-mailing",
+                                    json={"order_id": order_id, "client_id": agent_id, "company_name": agent_name},
+                                    timeout=aiohttp.ClientTimeout(total=5)
+                                )
+                        except Exception as _e:
+                            logger.warning(f"notifier: log-mailing failed ({_e})")
+                    return (True, "sent")
+                else:
+                    body = await r.text()
+                    last_err = f"wazzup_err:{r.status}:{body[:200]}"
+                    logger.warning(
+                        f"notifier: канал {contact['chat_type']} отверг {agent_name} "
+                        f"({r.status}): {body[:200]}"
+                    )
+
+    # Все каналы провалились — откатываем claim, чтобы sweep-крон дошлёт позже.
+    db.release_agreed_notification(order_id)
+    logger.error(f"notifier: ❌ все каналы провалились для {agent_name}, claim откачен: {last_err}")
+    return (False, last_err)
 
 
 async def check_order_agreed(order_href: str, bot, db):
