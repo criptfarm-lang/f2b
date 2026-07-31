@@ -372,77 +372,88 @@ def _customentity_value_id(attr) -> str:
     return ""
 
 
+def _parse_pickup_po(po) -> dict:
+    """Заказ поставщику → pickup_dict, если «Автомобиль на Доверенность» = наша машина; иначе None.
+    ВНИМАНИЕ: «Водитель…» и «Автомобиль…» — customentity (value = dict), берём .name, не .strip()."""
+    car_id = car_name = addr = driver = drv_comment = ""
+    win_from = win_to = ""
+    for a in po.get("attributes", []) or []:
+        nm = a.get("name")
+        v = a.get("value")
+        if nm == _ATTR_PICKUP_CAR:
+            car_id = _customentity_value_id(a)
+            car_name = (v.get("name") if isinstance(v, dict) else (v or ""))
+        elif nm == _ATTR_PICKUP_DRIVER:
+            driver = (v.get("name") if isinstance(v, dict) else (v or "")).strip()
+        elif nm == _ATTR_PICKUP_ADDR:
+            addr = (v if isinstance(v, str) else "").strip()
+        elif nm == _ATTR_PICKUP_COMMENT:
+            drv_comment = (v if isinstance(v, str) else "").strip()
+        elif nm == ATTR_WINDOW_FROM:
+            win_from = _attr_time(v)
+        elif nm == ATTR_WINDOW_TO:
+            win_to = _attr_time(v)
+    if car_id not in _OUR_PICKUP_CARS:
+        return None
+    agent = po.get("agent") or {}
+    owner = po.get("owner") or {}
+    weight = 0.0
+    for p in (po.get("positions") or {}).get("rows", []):
+        weight += p.get("quantity") or 0
+    return {
+        "is_pickup": True,
+        "client": (agent.get("name") or "").strip(),   # поставщик
+        "address": addr,                               # «Адрес забора»
+        # Комментарий водителю (поле ЗП) — аналог адресного комментария доставки; фолбэк на описание.
+        "comment": drv_comment or (po.get("description") or "").strip(),
+        "manager": (owner.get("name") or "").strip(),  # закупщик = автор ЗП
+        "driver": driver,
+        "car": car_name,
+        "weight": weight,
+        "places": None,
+        "win_from": win_from, "win_to": win_to, "zdraste": False,
+    }
+
+
 async def _ms_pickup_by_order(order_numbers) -> dict:
-    """{order_no: pickup_dict} — точки ЗАБОРА товара: заказы поставщику (purchaseorder),
-    у которых «Автомобиль на Доверенность» = одна из наших машин. Остальные номера не попадают.
-    Ответственный за забор = закупщик (owner заказа поставщику)."""
+    """{order_no: pickup_dict} — точки ЗАБОРА (заказы поставщику с нашей машиной в «Автомобиль на
+    Доверенность»). ОДИН пакетный запрос свежих ЗП (окно 14 дней) вместо GET на каждый номер: заборы
+    редки, гонять N запросов дорого (и упор в rate-limit). Матч по номеру ЗП."""
     out = {}
-    if not order_numbers:
+    wanted = {str(n) for n in order_numbers if n}
+    if not wanted:
         return out
     headers = get_headers()
     import urllib.parse
-    sem = asyncio.Semaphore(6)
-
-    async def _one(session, no):
-        async with sem:
-            try:
-                f = urllib.parse.quote(f"name={no}")
-                url = (f"{MS_BASE}/entity/purchaseorder?filter={f}"
-                       f"&expand=agent,owner,positions.assortment&limit=1")
-                async with session.get(url, headers=headers) as r:
-                    rows = (await r.json()).get("rows", []) if r.status == 200 else []
-                if not rows:
-                    return no, None
-                po = rows[0]
-                car_id = ""
-                car_name = addr = driver = drv_comment = ""
-                win_from = win_to = ""
-                for a in po.get("attributes", []) or []:
-                    nm = a.get("name")
-                    if nm == _ATTR_PICKUP_CAR:
-                        car_id = _customentity_value_id(a)
-                        v = a.get("value")
-                        car_name = (v.get("name") if isinstance(v, dict) else "") or ""
-                    elif nm == _ATTR_PICKUP_ADDR:
-                        addr = (a.get("value") or "").strip()
-                    elif nm == _ATTR_PICKUP_DRIVER:
-                        driver = (a.get("value") or "").strip()
-                    elif nm == _ATTR_PICKUP_COMMENT:
-                        drv_comment = (a.get("value") or "").strip()
-                    elif nm == ATTR_WINDOW_FROM:
-                        win_from = _attr_time(a.get("value"))
-                    elif nm == ATTR_WINDOW_TO:
-                        win_to = _attr_time(a.get("value"))
-                if car_id not in _OUR_PICKUP_CARS:
-                    return no, None  # не наша машина → это не наш забор (или доставка-однофамилец)
-                agent = po.get("agent") or {}
-                owner = po.get("owner") or {}
-                weight = 0.0
-                for p in (po.get("positions") or {}).get("rows", []):
-                    weight += p.get("quantity") or 0
-                return no, {
-                    "is_pickup": True,
-                    "client": (agent.get("name") or "").strip(),   # поставщик
-                    "address": addr,                               # «Адрес забора»
-                    # Комментарий водителю (новое поле ЗП) — аналог адресного комментария у доставки;
-                    # фолбэк на описание ЗП, если поле пустое (старые заказы без него).
-                    "comment": drv_comment or (po.get("description") or "").strip(),
-                    "manager": (owner.get("name") or "").strip(),  # закупщик = автор ЗП
-                    "driver": driver,
-                    "car": car_name,
-                    "weight": weight,
-                    "places": None,
-                    "win_from": win_from, "win_to": win_to, "zdraste": False,
-                }
-            except Exception as e:
-                logger.warning("_ms_pickup_by_order %s: %s", no, e)
-                return no, None
-
+    since = (datetime.now(_MSK) - timedelta(days=14)).strftime("%Y-%m-%d 00:00:00")
+    flt = urllib.parse.quote(f"moment>={since}")
+    base = (f"{MS_BASE}/entity/purchaseorder?filter={flt}"
+            f"&expand=agent,owner,positions.assortment&order=moment,desc&limit=100")
     async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(*(_one(session, no) for no in order_numbers))
-    for no, pk in results:
-        if pk:
-            out[no] = pk
+        offset = 0
+        while offset < 500:  # бэкстоп; свежих ЗП за 14 дней столько не бывает
+            try:
+                async with session.get(f"{base}&offset={offset}", headers=headers) as r:
+                    if r.status != 200:
+                        logger.warning("_ms_pickup_by_order fetch off=%s: HTTP %s", offset, r.status)
+                        break
+                    rows = (await r.json()).get("rows", [])
+            except Exception as e:
+                logger.warning("_ms_pickup_by_order fetch: %s", e)
+                break
+            for po in rows:
+                name = po.get("name")
+                if name in wanted and name not in out:
+                    try:
+                        pk = _parse_pickup_po(po)
+                    except Exception as e:
+                        logger.warning("_ms_pickup_by_order parse %s: %s", name, e)
+                        pk = None
+                    if pk:
+                        out[name] = pk
+            if len(out) == len(wanted) or len(rows) < 100:
+                break
+            offset += 100
     return out
 
 

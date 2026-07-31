@@ -288,13 +288,20 @@ async def cmd_sklad_push(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = await context.bot.get_me()
     sklad = _sklad_chat_id()
     sent = []
-    for uid in rr.UNITS:
-        pkg = await _unit_package(routes, uid, target, me.username)
+    # Пакеты машин — параллельно.
+    pkgs = await asyncio.gather(
+        *[_unit_package(routes, uid, target, me.username) for uid in rr.UNITS],
+        return_exceptions=True)
+    for uid, pkg in zip(rr.UNITS, pkgs):
+        if isinstance(pkg, Exception):
+            logger.warning("cmd_sklad_push _unit_package %s: %s", uid, pkg)
+            continue
         if not pkg:
             continue
         stops = pkg["stops"]
         unit_name = rr.UNITS.get(uid, str(uid))
         km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
+        _PKG_CACHE[(dstr, uid)] = (pkg, km)
         note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
         caption = _sklad_caption(unit_name, target.strftime("%d.%m.%Y"), note,
                                  _links_block(uid, stops, dstr), refreshed_at=datetime.now(_MSK))
@@ -515,6 +522,12 @@ async def mark_done_and_refresh(context, driver_chat_id, demand_id):
         logger.warning("mark_done_and_refresh: %s", e)
 
 
+# Кэш готовых пакетов маршрута: {(dstr, uid): (pkg, km)}. Заполняется при сборе/пересборе/обновлении,
+# читается при «Подтвердить» — чтобы не гонять Wialon+МС+reportlab повторно. Живёт в процессе бота;
+# рестарт очищает → cb_confirm тогда фолбэчит на полный перечит. «Пересобрать» перезаписывает кэш.
+_PKG_CACHE: dict = {}
+
+
 async def _collect_and_send(context, target_date, to_chat):
     try:
         routes, order_routes = await rr.fetch_routes(with_meta=True)
@@ -525,9 +538,16 @@ async def _collect_and_send(context, target_date, to_chat):
     me = await context.bot.get_me()
     date_str = target_date.strftime("%d.%m.%Y")
     day_off = (target_date - datetime.now(_MSK).date()).days
+    dstr = target_date.isoformat()
+    # Пакеты обеих машин строим ПАРАЛЛЕЛЬНО (МС-запросы + reportlab каждой машины — независимы).
+    pkgs = await asyncio.gather(
+        *[_unit_package(routes, uid, target_date, me.username) for uid in rr.UNITS],
+        return_exceptions=True)
     sent = 0
-    for uid in rr.UNITS:
-        pkg = await _unit_package(routes, uid, target_date, me.username)
+    for uid, pkg in zip(rr.UNITS, pkgs):
+        if isinstance(pkg, Exception):
+            logger.warning("collect _unit_package %s: %s", uid, pkg)
+            continue
         if not pkg:
             continue
         stops = pkg["stops"]
@@ -537,6 +557,7 @@ async def _collect_and_send(context, target_date, to_chat):
 
         who = pkg["driver_name"] or "⚠️ водитель не закреплён"
         km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
+        _PKG_CACHE[(dstr, uid)] = (pkg, km)  # чтобы «Подтвердить» не пересобирал всё заново
         note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
         lines = [f"{i}. {(s.get('client') or s.get('order_no') or '?')[:35]} ({rr._hm(s.get('vt'))})"
                  for i, s in enumerate(stops, 1)]
@@ -567,23 +588,27 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_date = date.fromisoformat(parts[2])
     uid = int(parts[3])
     dstr = parts[2]
-    try:
-        routes, order_routes = await rr.fetch_routes(with_meta=True)
-        me = await context.bot.get_me()
-        pkg = await _unit_package(routes, uid, target_date, me.username)
-    except Exception as e:
-        logger.exception("cb_confirm fetch: %s", e)
-        await context.bot.send_message(q.from_user.id, "Не удалось перечитать маршрут Wialon для отправки.")
-        return
-    if not pkg:
-        await context.bot.send_message(q.from_user.id, f"Маршрут {rr.UNITS.get(uid)} пуст — отправлять нечего.")
-        return
+    cached = _PKG_CACHE.get((dstr, uid))
+    if cached:
+        pkg, km = cached  # берём то, что логист только что видел при сборе — быстро, без перечита
+    else:
+        try:
+            routes, order_routes = await rr.fetch_routes(with_meta=True)
+            me = await context.bot.get_me()
+            pkg = await _unit_package(routes, uid, target_date, me.username)
+        except Exception as e:
+            logger.exception("cb_confirm fetch: %s", e)
+            await context.bot.send_message(q.from_user.id, "Не удалось перечитать маршрут Wialon для отправки.")
+            return
+        if not pkg:
+            await context.bot.send_message(q.from_user.id, f"Маршрут {rr.UNITS.get(uid)} пуст — отправлять нечего.")
+            return
+        km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in pkg["stops"]])
 
     stops = pkg["stops"]
     driver_id = pkg["driver_id"]
     date_str = target_date.strftime("%d.%m.%Y")
     unit_name = rr.UNITS.get(uid, str(uid))
-    km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
     note = _volume_note(uid, stops, pkg["ms_extra"], km=km)  # заметка по объёму — во все сообщения
     # Навигация в Яндекс.Картах (база Ильинский → точки по порядку). На «густой» день
     # точек больше лимита Яндекса — тогда ya_block содержит несколько ссылок-частей.
@@ -692,6 +717,7 @@ async def cb_sklad_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     unit_name = rr.UNITS.get(uid, str(uid))
     date_str = target_date.strftime("%d.%m.%Y")
     km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
+    _PKG_CACHE[(dstr, uid)] = (pkg, km)  # свежий пакет — чтобы подтверждение взяло его же
     note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
     caption = _sklad_caption(unit_name, date_str, note, _links_block(uid, stops, dstr),
                              refreshed_at=datetime.now(_MSK))
