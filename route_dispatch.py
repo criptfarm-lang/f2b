@@ -266,6 +266,52 @@ async def cmd_routes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb)
 
 
+async def cmd_sklad_push(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/склад — разом отправить листы ВСЕХ машин на сегодня в группу «Склад», без прохода по
+    подтверждению. Удобно, когда маршруты уже подтверждены и складу нужны свежие листы."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat or chat.type != "private":
+        return
+    if not _allowed(user.id):
+        await update.message.reply_text("⛔ Доступно логисту и владельцу.")
+        return
+    await update.message.reply_text("Собираю листы склада по машинам…")
+    target = datetime.now(_MSK).date()
+    dstr = target.isoformat()
+    try:
+        routes, order_routes = await rr.fetch_routes(with_meta=True)
+    except Exception as e:
+        logger.exception("cmd_sklad_push fetch: %s", e)
+        await update.message.reply_text("Не удалось прочитать маршруты Wialon. Проверь доступ.")
+        return
+    me = await context.bot.get_me()
+    sklad = _sklad_chat_id()
+    sent = []
+    for uid in rr.UNITS:
+        pkg = await _unit_package(routes, uid, target, me.username)
+        if not pkg:
+            continue
+        stops = pkg["stops"]
+        unit_name = rr.UNITS.get(uid, str(uid))
+        km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
+        note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
+        caption = _sklad_caption(unit_name, target.strftime("%d.%m.%Y"), note,
+                                 _links_block(uid, stops, dstr), refreshed_at=datetime.now(_MSK))
+        try:
+            await context.bot.send_document(
+                sklad, io.BytesIO(pkg["pdf"]),
+                filename=f"reestr_{uid}_{dstr}.pdf", caption=caption,
+                reply_markup=_sklad_kb(dstr, uid))
+            sent.append(f"{unit_name}: {len(stops)}")
+        except Exception as e:
+            logger.warning("cmd_sklad_push send %s: %s", uid, e)
+    if sent:
+        await update.message.reply_text("Отправлено в «Склад»: " + " / ".join(sent))
+    else:
+        await update.message.reply_text("Маршруты на сегодня не построены — отправлять нечего.")
+
+
 async def _safe_answer(q, text=None, alert=False):
     """q.answer() — первый исходящий вызов в колбэке. При деградации связи Amvera↔Telegram
     он падает по TimedOut и БЕЗ обёртки ронял весь хендлер (сбор/подтверждение маршрута) ещё
@@ -736,6 +782,8 @@ def register(app: Application, db):
     app.add_handler(MessageHandler(filters.Regex(r"^/маршруты(@\w+)?(\s|$)"), cmd_routes))
     app.add_handler(CommandHandler("progress", cmd_progress))
     app.add_handler(MessageHandler(filters.Regex(r"^/ход(@\w+)?(\s|$)"), cmd_progress))
+    app.add_handler(CommandHandler("sklad", cmd_sklad_push))
+    app.add_handler(MessageHandler(filters.Regex(r"^/склад(@\w+)?(\s|$)"), cmd_sklad_push))
     app.add_handler(CallbackQueryHandler(cb_collect, pattern=r"^rd:col:"))
     app.add_handler(CallbackQueryHandler(cb_confirm, pattern=r"^rd:conf:"))
     app.add_handler(CallbackQueryHandler(cb_sklad_refresh, pattern=r"^rd:sklrf:"))
