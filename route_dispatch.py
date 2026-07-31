@@ -18,7 +18,7 @@ from datetime import datetime, date, timezone, timedelta
 
 import aiohttp
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                      InputMediaDocument, InputFile)
+                      InputFile)
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           CallbackQueryHandler, ContextTypes, filters)
 
@@ -650,25 +650,22 @@ async def cb_sklad_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = _sklad_caption(unit_name, date_str, note, _links_block(uid, stops, dstr),
                              refreshed_at=datetime.now(_MSK))
 
-    # 1) Заменить лист склада на месте; фолбэк — прислать новый документ.
+    # 1) Свежий лист склада — НОВЫМ сообщением (внизу группы), старое удаляем, чтобы
+    #    устаревшие реестры не путались. Сначала шлём новый; только при успехе удаляем старый.
     try:
-        media = InputMediaDocument(
-            media=InputFile(io.BytesIO(pkg["pdf"]), filename=f"reestr_{uid}_{dstr}.pdf"),
-            caption=caption)
-        await context.bot.edit_message_media(
-            chat_id=q.message.chat_id, message_id=q.message.message_id,
-            media=media, reply_markup=_sklad_kb(dstr, uid))
+        await context.bot.send_document(
+            q.message.chat_id, io.BytesIO(pkg["pdf"]),
+            filename=f"reestr_{uid}_{dstr}.pdf", caption=caption,
+            reply_markup=_sklad_kb(dstr, uid))
     except Exception as e:
-        logger.warning("cb_sklad_refresh edit media: %s", e)
-        try:
-            await context.bot.send_document(
-                q.message.chat_id, io.BytesIO(pkg["pdf"]),
-                filename=f"reestr_{uid}_{dstr}.pdf", caption=caption,
-                reply_markup=_sklad_kb(dstr, uid))
-        except Exception as e2:
-            logger.warning("cb_sklad_refresh send fallback: %s", e2)
-            await _safe_answer(q, "Не удалось обновить лист склада.", alert=True)
-            return
+        logger.warning("cb_sklad_refresh send: %s", e)
+        await _safe_answer(q, "Не удалось обновить лист склада.", alert=True)
+        return
+    # удаляем предыдущее сообщение (то, под которым нажали «Обновить»)
+    try:
+        await context.bot.delete_message(q.message.chat_id, q.message.message_id)
+    except Exception as e:
+        logger.warning("cb_sklad_refresh delete old: %s", e)  # >48ч Telegram не даёт удалить — не критично
 
     # 2) Прислать водителю обновлённый реестр (места уточнены).
     driver_id = pkg.get("driver_id")
