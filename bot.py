@@ -7884,8 +7884,15 @@ def main():
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
 
-    # Планировщик
-    setup_scheduler(app, db)
+    # Планировщик — НЕ здесь. setup_scheduler() поднимает AsyncIOScheduler, а он
+    # на старте цепляется к текущему event loop. main() синхронная и выполняется
+    # ДО asyncio.run(run_all()), поэтому scheduler привязывался к петле, которая
+    # никогда не крутится: джобы логировались как «Added job», но «Running job»
+    # не наступало никогда (подтверждено логами 29.07-03.08.2026 — ни одного
+    # исполнения morning_summary, ПДЗ-дайджесты жили только на catch-up при
+    # рестарте контейнера, воскресное FISHки-напоминание 02.08 не ушло).
+    # Отсюда же росла легенда «AsyncIOScheduler на Amvera теряет interval-тики» —
+    # он не терял, он вообще не работал. Вызов перенесён в run_all().
 
     # Алерт собственнику при приближении к авто-блоку JSON API МС.
     # Инциденты 29.05 и 01.06.2026: МС блокирует при >200 ответов 429/мин или
@@ -8804,6 +8811,11 @@ def main():
         await run_web()
         await app.initialize()
         await app.start()
+
+        # Планировщик поднимаем ВНУТРИ работающего event loop (см. комментарий
+        # на месте прежнего вызова в main()). Только так AsyncIOScheduler цепляет
+        # живую петлю и cron-джобы реально исполняются.
+        setup_scheduler(app, db)
 
         # Catch-up пропущенных PDZ-cron'ов: fire-and-forget в фон. Иначе
         # snapshot тянет МС API ~3 мин и блокирует start_polling — бот не
