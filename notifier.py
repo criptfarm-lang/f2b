@@ -253,6 +253,33 @@ async def _sync_amocrm_contact(agent_phone: str | None, contact_data: dict) -> i
     return contact_id
 
 
+def _normalize_phone(value: str) -> str:
+    """Приводит российский номер к виду 7XXXXXXXXXX, остальное возвращает как есть.
+
+    В карточках МойСклад номер пишут руками: '8-920-315-54-51', '+7 (965) 229-73-74',
+    '7991121 66 69'. Wazzup такие строки не резолвит и отвечает
+    CHANNEL_MAX_PHONE_NOT_OCCUPIED — рассылка молча теряется.
+    План: plans/2026-08-04-нормализация-номера-рассылка-фишки.md
+
+    НЕ трогаем всё, что не похоже на телефон: MAX user-id (5–9 цифр),
+    '@username', Telegram numeric id. Поэтому к каналу telegram эта функция
+    не применяется вообще — там 10-значный user_id, его нельзя путать с номером.
+    """
+    import re
+    raw = (value or "").strip()
+    if not raw or raw.startswith("@"):
+        return raw
+    # Только цифры и типовые разделители — иначе это не номер (id, ник, мусор).
+    if not re.fullmatch(r"[\d\s\-()+.]+", raw):
+        return raw
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits[0] in ("7", "8"):
+        return "7" + digits[1:]
+    if len(digits) == 10 and digits[0] == "9":
+        return "7" + digits
+    return raw
+
+
 async def _get_contacts_from_ms(agent_id: str, headers: dict) -> list[dict]:
     """Читает ВСЕ каналы для рассылки из доп.полей контрагента в МойСклад.
 
@@ -288,6 +315,19 @@ async def _get_contacts_from_ms(agent_id: str, headers: dict) -> list[dict]:
                 whatsapp_id = str(value)
             elif ATTR_MAX in attr_href:
                 max_id = str(value)
+
+        # Max и WhatsApp адресуются номером — приводим его к 7XXXXXXXXXX,
+        # иначе Wazzup не резолвит контакт. Telegram не нормализуем (numeric id).
+        for label, val in (("max", max_id), ("whatsapp", whatsapp_id)):
+            if not val:
+                continue
+            fixed = _normalize_phone(val)
+            if fixed != val:
+                logger.info(f"notifier: 📞 {label}: {val!r} → {fixed!r}")
+                if label == "max":
+                    max_id = fixed
+                else:
+                    whatsapp_id = fixed
 
         # Приоритет: Telegram → Max → WhatsApp
         contacts = []
