@@ -2223,8 +2223,13 @@ class Database:
         try:
             with self.conn.cursor() as cur:
                 cur.execute(
+                    # Перевыпуск идёт под прежним номером — обновляем реквизиты последней
+                    # редакции, но created_at/created_by (дату выпуска) не трогаем.
                     """INSERT INTO contracts (contract_number, buyer_name, buyer_data, created_by)
-                       VALUES (%s, %s, %s, %s) ON CONFLICT (contract_number) DO NOTHING""",
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (contract_number) DO UPDATE
+                       SET buyer_name = EXCLUDED.buyer_name,
+                           buyer_data = COALESCE(EXCLUDED.buyer_data, contracts.buyer_data)""",
                     (contract_number, buyer_name,
                      json.dumps(buyer_data, ensure_ascii=False) if buyer_data else None,
                      created_by)

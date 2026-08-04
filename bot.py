@@ -5376,11 +5376,18 @@ async def handle_doc_approval_callback(update: Update, context: ContextTypes.DEF
             import json as _json
             payload = _json.loads(payload)
         buyer_name = payload.get("buyer_name") or cp
-        try:
-            contract_number = get_contract_number(_dt.now(), db)
-        except Exception as e:
-            logger.error(f"doc approve: get_contract_number fail: {e}")
-            contract_number = _dt.now().strftime("%d%m%y")
+        # Номер договора с контрагентом присваивается ОДИН раз: если он уже есть
+        # (пришёл в payload из карточки МС) — перевыпуск идёт под тем же номером,
+        # новый не генерим и в МС не переписываем. Решение собственника 04.08.2026.
+        existing_number = str(payload.get("contract_number") or "").strip()
+        if existing_number and existing_number != "проект":
+            contract_number = existing_number
+        else:
+            try:
+                contract_number = get_contract_number(_dt.now(), db)
+            except Exception as e:
+                logger.error(f"doc approve: get_contract_number fail: {e}")
+                contract_number = _dt.now().strftime("%d%m%y")
         # Атомарно: статус + номер (только из pending)
         db._execute(
             "UPDATE documents SET status='approved', decided_at=NOW(), contract_number=%s WHERE id=%s AND status='pending'",
@@ -5391,7 +5398,10 @@ async def handle_doc_approval_callback(update: Update, context: ContextTypes.DEF
         except Exception as e:
             logger.error(f"doc approve: save_contract fail: {e}")
         agent_id = doc.get("counterparty_id")
-        if agent_id:
+        reissue = bool(existing_number and existing_number != "проект")
+        if reissue:
+            ms_ok = True  # номер в карточке МС уже стоит — переписывать нечего
+        elif agent_id:
             try:
                 import moysklad
                 ms_ok = await moysklad.set_counterparty_contract_number(agent_id, contract_number)
@@ -5406,9 +5416,14 @@ async def handle_doc_approval_callback(update: Update, context: ContextTypes.DEF
         pass
 
     if is_contract:
-        ms_note = "№ записан в карточку МС." if ms_ok else "⚠️ № в карточку МС записать не удалось — проверь вручную."
+        if reissue:
+            num_note = f"Перевыпущен под прежним № {contract_number}."
+            ms_note = ""
+        else:
+            num_note = f"Присвоен № {contract_number}."
+            ms_note = " № записан в карточку МС." if ms_ok else " ⚠️ № в карточку МС записать не удалось — проверь вручную."
         await query.message.reply_text(
-            f"✅ Одобрено — договор №{doc_id} ({cp}). Присвоен № {contract_number}. {ms_note}\n"
+            f"✅ Одобрено — договор №{doc_id} ({cp}). {num_note}{ms_note}\n"
             f"Подписанный PDF доступен в приложении (архив).",
         )
     else:
