@@ -455,50 +455,71 @@ async def _send_fishki_mailing(order: dict, db) -> tuple[bool, str]:
     # Частый кейс — CHANNEL_TGAPI_CONTACT_NOT_FOUND_BY_USERNAME: Wazzup не может
     # инициировать Telegram-диалог по @username, если клиент туда не писал.
     # Тогда пробуем следующий заполненный канал (Max/WhatsApp).
+    # Сетевой сбой (Wazzup недоступен, таймаут) — такой же провал канала, как и
+    # отказ 4xx: ловим внутри цикла, иначе исключение улетает наружу и claim
+    # остаётся навсегда → sweep не дошлёт (кейс ООО «ЛСК» 03.08.2026,
+    # Cannot connect to host api.wazzup24.com). Откат claim — в finally, чтобы
+    # сработал при любом исходе, кроме успешной отправки.
     api_key = os.getenv("WAZZUP_API_KEY", "")
     last_err = "no_channels"
-    async with aiohttp.ClientSession() as session:
-        for contact in contacts:
-            chat_id_value = contact["chat_id"]
-            wazzup_payload = {
-                "channelId": contact["channel_id"],
-                "chatType":  contact["chat_type"],
-                "text":      msg,
-            }
-            if chat_id_value.startswith("@"):
-                wazzup_payload["username"] = chat_id_value.lstrip("@")
-            else:
-                wazzup_payload["chatId"] = chat_id_value
-
-            async with session.post(
-                WAZZUP_API_URL,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=wazzup_payload,
-            ) as r:
-                if r.status in (200, 201):
-                    logger.info(f"notifier: ✅ отправлено {agent_name} → {contact['chat_type']}")
-                    if QUIZ_BASE_URL:
-                        try:
-                            async with aiohttp.ClientSession() as _s:
-                                await _s.post(
-                                    f"{QUIZ_BASE_URL}/api/log-mailing",
-                                    json={"order_id": order_id, "client_id": agent_id, "company_name": agent_name},
-                                    timeout=aiohttp.ClientTimeout(total=5)
-                                )
-                        except Exception as _e:
-                            logger.warning(f"notifier: log-mailing failed ({_e})")
-                    return (True, "sent")
+    sent = False
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            for contact in contacts:
+                chat_id_value = contact["chat_id"]
+                wazzup_payload = {
+                    "channelId": contact["channel_id"],
+                    "chatType":  contact["chat_type"],
+                    "text":      msg,
+                }
+                if chat_id_value.startswith("@"):
+                    wazzup_payload["username"] = chat_id_value.lstrip("@")
                 else:
-                    body = await r.text()
-                    last_err = f"wazzup_err:{r.status}:{body[:200]}"
-                    logger.warning(
-                        f"notifier: канал {contact['chat_type']} отверг {agent_name} "
-                        f"({r.status}): {body[:200]}"
-                    )
+                    wazzup_payload["chatId"] = chat_id_value
 
-    # Все каналы провалились — откатываем claim, чтобы sweep-крон дошлёт позже.
-    db.release_agreed_notification(order_id)
-    logger.error(f"notifier: ❌ все каналы провалились для {agent_name}, claim откачен: {last_err}")
+                try:
+                    async with session.post(
+                        WAZZUP_API_URL,
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json=wazzup_payload,
+                    ) as r:
+                        if r.status in (200, 201):
+                            sent = True
+                            logger.info(f"notifier: ✅ отправлено {agent_name} → {contact['chat_type']}")
+                            if QUIZ_BASE_URL:
+                                try:
+                                    async with aiohttp.ClientSession() as _s:
+                                        await _s.post(
+                                            f"{QUIZ_BASE_URL}/api/log-mailing",
+                                            json={"order_id": order_id, "client_id": agent_id, "company_name": agent_name},
+                                            timeout=aiohttp.ClientTimeout(total=5)
+                                        )
+                                except Exception as _e:
+                                    logger.warning(f"notifier: log-mailing failed ({_e})")
+                            return (True, "sent")
+                        else:
+                            body = await r.text()
+                            last_err = f"wazzup_err:{r.status}:{body[:200]}"
+                            logger.warning(
+                                f"notifier: канал {contact['chat_type']} отверг {agent_name} "
+                                f"({r.status}): {body[:200]}"
+                            )
+                except Exception as _net:
+                    last_err = f"net_err:{type(_net).__name__}:{str(_net)[:200]}"
+                    logger.warning(
+                        f"notifier: канал {contact['chat_type']} недоступен для {agent_name}: {_net}"
+                    )
+    except Exception as _outer:
+        last_err = f"net_err:{type(_outer).__name__}:{str(_outer)[:200]}"
+        logger.warning(f"notifier: отправка {agent_name} прервана: {_outer}")
+    finally:
+        # Все каналы провалились — откатываем claim, чтобы sweep-крон дошлёт позже.
+        if not sent:
+            db.release_agreed_notification(order_id)
+            logger.error(
+                f"notifier: ❌ все каналы провалились для {agent_name}, claim откачен: {last_err}"
+            )
+
     return (False, last_err)
 
 
