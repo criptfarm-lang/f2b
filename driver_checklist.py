@@ -451,23 +451,26 @@ async def _render_points(send, page: int, driver_id: int = None):
 
     if route_stops:
         import route_registry as rr
-        import route_dispatch  # _doc_no: заметки логиста в № заказа не должны рвать callback (лимит 64 байта)
+        import route_dispatch
+        # Кнопки-точки водителю убраны (собственник, 2026-08-04): в Telegram они не
+        # нажимались/подвисали. Отдаём ссылку на веб-чеклист — он всегда актуален,
+        # там же закрытие точек. Список точек оставляем текстом, чтобы было видно
+        # порядок выгрузки, не открывая страницу.
         total = len(route_stops)
-        pages = (total + _PAGE_SIZE - 1) // _PAGE_SIZE
-        page = max(0, min(page, pages - 1))
-        chunk = route_stops[page * _PAGE_SIZE:(page + 1) * _PAGE_SIZE]
-        buttons = []
-        for i, s in enumerate(chunk, start=page * _PAGE_SIZE + 1):
-            buttons.append([InlineKeyboardButton(
-                f"📍 {i}. {route_dispatch._stop_label(s)}",
-                callback_data=f"drv:rp:{route_dispatch._doc_no(s.get('order_no'))}")])
-        nav = _nav_row(page, pages)
-        if nav:
-            buttons.append(nav)
         unit_name = rr.UNITS.get(unit_id, "")
-        text = (f"🚚 Твой маршрут ({unit_name}) — {total} точек, порядок выгрузки. "
-                f"Стр. {page+1}/{pages}.\nВыбери точку, куда приехал:")
-        await send(text, reply_markup=InlineKeyboardMarkup(buttons))
+        today = datetime.now(_MSK).date()
+        lines = [f"🚚 Твой маршрут ({unit_name}) — {total} точек, порядок выгрузки:"]
+        # Лимит сообщения Telegram — 4096 символов; на «густой» день список режем,
+        # полный всегда есть на странице чеклиста.
+        _MAX_LISTED = 30
+        for i, s in enumerate(route_stops[:_MAX_LISTED], start=1):
+            lines.append(f"{i}. {route_dispatch._stop_label(s)}")
+        if total > _MAX_LISTED:
+            lines.append(f"…и ещё {total - _MAX_LISTED} — весь список в чеклисте.")
+        link = route_dispatch._route_link(unit_id, today.isoformat())
+        if link:
+            lines.append(f"\n👉 Открой чеклист и закрывай точки там: {link}")
+        await send("\n".join(lines), disable_web_page_preview=True)
         return
 
     demands = await _fetch_today_demands()
@@ -551,20 +554,28 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cb_route_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор точки из маршрута машины: callback несёт № заказа → резолвим в отгрузку.
-    Карточку сдачи открываем ОТДЕЛЬНЫМ сообщением, список точек не редактируем:
-    так кнопки остальных клиентов остаются на месте, а сданную убираем поштучно
-    (mark_done_and_refresh правит driver_msg_id по № заказа) — в любом порядке нажатий."""
+    """Нажатие точки в СТАРОМ сообщении маршрута (кнопки убраны 2026-08-04).
+
+    Новые пуши приходят без клавиатуры, но у водителей в чатах остались прежние
+    сообщения. Карточку сдачи в боте больше не открываем — отвечаем ссылкой на
+    веб-чеклист с якорем на эту точку.
+    """
     q = update.callback_query
     await q.answer()
     order_no = q.data.split(":", 2)[2]
-    demand_id = await _resolve_deeplink_payload(order_no)
-    if not demand_id:
+    import route_dispatch
+    unit_id = _driver_unit_id(q.from_user.id)
+    link = (route_dispatch._route_link(unit_id, datetime.now(_MSK).date().isoformat())
+            if unit_id else "")
+    if not link:
         await q.message.reply_text(
-            f"🕓 По точке №{order_no} склад ещё не отгрузил — жми эту же кнопку позже, "
-            "она откроется автоматически, как только отгрузку создадут. Список точек: /рейс")
+            "Сдача груза переехала на страницу чеклиста — открой ссылку из сообщения "
+            "с маршрутом или напиши логисту.")
         return
-    await _render_card(q.message.reply_text, demand_id, context.bot_data["db"], with_back=False)
+    doc = route_dispatch._doc_no(order_no)
+    await q.message.reply_text(
+        f"👉 Сдача груза теперь здесь: {link}#o{doc}",
+        disable_web_page_preview=True)
 
 
 _UUID_RE = _re.compile(r"^[0-9a-fA-F-]{36}$")
@@ -619,8 +630,12 @@ async def _resolve_deeplink_payload(payload: str):
 
 
 async def open_from_deeplink(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: str):
-    """Вход по QR-диплинку: /start chk_<id|номер> → карточка сдачи сразу, без списка.
-    payload — id отгрузки, id заказа или номер документа (резолвим к отгрузке)."""
+    """Вход по СТАРОМУ QR-диплинку `/start chk_<...>` из уже напечатанных реестров.
+
+    Карточку сдачи в боте больше не открываем (собственник, 2026-08-04: кнопки в
+    Telegram убраны целиком). Отвечаем ссылкой на веб-чеклист машины водителя —
+    с якорем на точку, если payload похож на № документа. Новые QR ведут в веб сразу.
+    """
     user = update.effective_user
     chat = update.effective_chat
     if not user or not chat or chat.type != "private":
@@ -628,11 +643,23 @@ async def open_from_deeplink(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not _is_driver(user.id):
         await update.message.reply_text("⛔ Сдача груза доступна водителям развозки.")
         return
-    demand_id = await _resolve_deeplink_payload(payload)
-    if not demand_id:
-        await update.message.reply_text("Не удалось найти отгрузку по коду. Открой список: /рейс")
+    import route_dispatch
+    unit_id = _driver_unit_id(user.id)
+    if not unit_id:
+        await update.message.reply_text(
+            "За тобой не закреплена машина — попроси логиста привязать, "
+            "тогда придёт ссылка на чеклист.")
         return
-    await _render_card(update.message.reply_text, demand_id, context.bot_data["db"], with_back=False)
+    link = route_dispatch._route_link(unit_id, datetime.now(_MSK).date().isoformat())
+    if not link:
+        await update.message.reply_text("Чеклист сейчас недоступен, напиши логисту.")
+        return
+    doc = route_dispatch._doc_no(payload)
+    if doc and doc.isdigit():
+        link += f"#o{doc}"
+    await update.message.reply_text(
+        f"👉 Сдача груза теперь на странице чеклиста: {link}",
+        disable_web_page_preview=True)
 
 
 def _qr_png(data: str) -> bytes:

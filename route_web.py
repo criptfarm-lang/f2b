@@ -103,6 +103,10 @@ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f
   padding:9px 14px;border-radius:9px;font-size:14px;font-weight:600}
 .foot{text-align:center;color:#889;font-size:12px;padding:8px 0 24px}
 .empty{background:#fff;border-radius:12px;padding:24px;text-align:center;color:#667}
+/* Подсветка точки, на которую привёл QR из реестра (якорь #o<№ документа>).
+   scroll-margin — чтобы карточка не прилипала к верхней кромке экрана. */
+.pt:target{box-shadow:0 0 0 3px #f59e0b,0 1px 3px rgba(0,0,0,.06);scroll-margin-top:12px}
+.pt:target .num{color:#b45309}
 """
 
 
@@ -152,6 +156,19 @@ async def _route_data(uid: int, target: date):
     return stops, ms_extra, order_routes
 
 
+def _q_block(question: str, name: str, options) -> str:
+    """Один вопрос чеклиста колонкой: заголовок сверху, варианты — крупными строками.
+
+    Вариант — это <label> во всю ширину: попасть пальцем можно в любую его точку,
+    а не только в кружок радиокнопки (жалоба водителей на «строчный» вариант).
+    """
+    opts = "".join(
+        f"<label class='opt'><input type='radio' name='{_e(name)}' value='{_e(v)}'>"
+        f"<span>{_e(t)}</span></label>" for v, t in options)
+    return (f"<div class='q'><div class='qt'>{_e(question)}</div>"
+            f"<div class='opts'>{opts}</div></div>")
+
+
 async def render_page(uid: int, target: date, db, bot) -> str:
     unit_name = rr.UNITS.get(uid, str(uid))
     date_str = target.strftime("%d.%m.%Y")
@@ -193,7 +210,6 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         body = "<div class='empty'>Маршрут по этой машине ещё не построен в Логистике.</div>"
         return _wrap(unit_name, head + body)
 
-    username = await _bot_username(bot)
     cards = []
     for i, s in enumerate(stops, 1):
         order_no = s.get("order_no")
@@ -235,36 +251,46 @@ async def render_page(uid: int, target: date, db, bot) -> str:
             rows.append("<div class='done-badge'>✅ Сдан</div>")
         else:
             is_retail = (client or "").startswith("Рознич")
-            money_q = ("<div class='q'>💵 Деньги приняты?"
-                       "<label><input type='radio' name='money' value='yes'>Да</label>"
-                       "<label><input type='radio' name='money' value='no'>Нет</label></div>") if is_retail else ""
-            bot_link = (f"<a class='blink' href='https://t.me/{username}?start=chk_{_e(order_no)}'>или через бот</a>"
-                        if username else "")
+            # Чеклист — колонкой: вопрос строкой, ответы под ним (собственник, 2026-08-04).
+            # В строку не помещалось на телефоне и водитель промахивался по варианту.
+            money_q = _q_block("💵 Забрал деньги?", "money",
+                               [("yes", "Да"), ("no", "Нет")]) if is_retail else ""
+            # Запасной вход «или через бот» убран (собственник, 2026-08-04): кнопки в
+            # Telegram не нажимались/подвисали, сдача закрывается только здесь.
             rows.append(
                 f"<form class='sd' data-uid='{uid}' data-date='{date_iso}' "
                 f"data-order='{_e(order_no)}' data-token='{_e(token)}'>"
                 f"{money_q}"
-                "<div class='q'>✍️ Документ подписан?"
-                "<label><input type='radio' name='doc' value='yes'>Да</label>"
-                "<label><input type='radio' name='doc' value='no'>Нет</label></div>"
-                "<div class='q'>📦 Итог:"
-                "<label><input type='radio' name='accepted' value='ok'>Сдано</label>"
-                "<label><input type='radio' name='accepted' value='claim'>Претензия</label></div>"
-                "<textarea name='claim_text' class='claim' placeholder='Опиши претензию' hidden></textarea>"
-                "<button type='button' class='btn' onclick='sendSd(this.form)'>Отправить сдачу</button>"
-                f"{bot_link}<div class='msg'></div></form>")
+                + _q_block("✍️ Подписал документ?", "doc", [("yes", "Да"), ("no", "Нет")])
+                + _q_block("📦 Итог сдачи:", "accepted",
+                           [("ok", "Сдано"), ("claim", "Претензия")])
+                + "<textarea name='claim_text' class='claim' placeholder='Опиши претензию' hidden></textarea>"
+                  "<button type='button' class='btn' onclick='sendSd(this.form)'>Отправить сдачу</button>"
+                  "<div class='msg'></div></form>")
 
-        cards.append(f"<div class='{cls}'>" + "".join(rows) + "</div>")
+        # id карточки = № документа: QR в PDF-реестре ведёт сюда якорем (#o<№>),
+        # и точка подсвечивается рамкой — водителю видно, какую именно он сканировал.
+        cards.append(f"<div class='{cls}' id='o{_e(rd._doc_no(order_no))}'>"
+                     + "".join(rows) + "</div>")
 
     body = "".join(cards)
     return _wrap(unit_name, head + body)
 
 
-_FORM_CSS = (".sd{margin-top:10px;padding-top:8px;border-top:1px solid #eee}"
-             ".q{margin:6px 0;font-size:15px}.q label{margin-left:10px;white-space:nowrap}"
-             ".claim{width:100%;box-sizing:border-box;margin:6px 0;min-height:54px}"
-             ".msg{color:#b91c1c;font-size:14px;margin-top:6px}"
-             ".blink{display:inline-block;margin-left:12px;color:#6b7280;font-size:13px}")
+# Чеклист колонкой: вопрос — строкой, под ним варианты во всю ширину (палец не
+# промахивается). Раньше вопрос и ответы шли в одну строку и на телефоне ломались.
+_FORM_CSS = (".sd{margin-top:10px;padding-top:10px;border-top:1px solid #eee}"
+             ".q{margin:12px 0}"
+             ".qt{font-size:15px;font-weight:600;margin-bottom:6px}"
+             ".opts{display:flex;flex-direction:column;gap:6px}"
+             ".opt{display:flex;align-items:center;gap:10px;padding:11px 12px;"
+             "border:1px solid #d7dbe0;border-radius:10px;font-size:15px;background:#fff}"
+             ".opt input{width:20px;height:20px;margin:0;flex:none}"
+             ".opt:has(input:checked),.opt.sel{border-color:#0d2b45;background:#eef2f7;font-weight:600}"
+             ".claim{width:100%;box-sizing:border-box;margin:6px 0;min-height:54px;"
+             "font-size:15px;padding:8px;border:1px solid #d7dbe0;border-radius:10px}"
+             ".sd .btn{display:block;width:100%;margin-top:12px;border:0;cursor:pointer}"
+             ".msg{color:#b91c1c;font-size:14px;margin-top:6px}")
 
 _FORM_JS = (
     "function sendSd(f){var acc=(f.accepted&&f.accepted.value)||'';"
@@ -283,8 +309,12 @@ _FORM_JS = (
     "else if(d){fail(d.msg||('Ошибка '+res.status));}"
     "else{fail('HTTP '+res.status+': '+((res.txt||'нет ответа').replace(/<[^>]*>/g,' ').trim().slice(0,140)));}})"
     ".catch(function(e){fail('Сбой запроса: '+((e&&e.message)||e));});}"
-    "document.addEventListener('change',function(e){if(e.target&&e.target.name==='accepted'){"
-    "var t=e.target.form.querySelector('.claim');if(t)t.hidden=(e.target.value!=='claim');}});")
+    "document.addEventListener('change',function(e){var el=e.target;if(!el||el.type!=='radio')return;"
+    "if(el.name==='accepted'){var t=el.form.querySelector('.claim');if(t)t.hidden=(el.value!=='claim');}"
+    # Подсветка выбранного варианта — на случай браузера без поддержки CSS :has().
+    "var grp=el.form.querySelectorAll(\"input[name='\"+el.name+\"']\");"
+    "for(var i=0;i<grp.length;i++){var lab=grp[i].closest('.opt');"
+    "if(lab)lab.className=grp[i].checked?'opt sel':'opt';}});")
 
 
 def _wrap(title: str, inner: str) -> str:

@@ -84,6 +84,21 @@ def _links_block(uid, stops, dstr) -> str:
     return ("\n" + "\n".join(lines)) if lines else ""
 
 
+def _route_link(uid, dstr) -> str:
+    """Ссылка на веб-чеклист маршрута машины на дату (пустая строка, если недоступна).
+
+    Единственный интерфейс водителя с 2026-08-04: инлайн-кнопки в Telegram убраны
+    (водители их не нажимали, сообщения подвисали). Страница всегда актуальна —
+    она читает Wialon и МС на каждый запрос, в отличие от снимка в сообщении.
+    """
+    try:
+        import route_web
+        return route_web.route_url(uid, dstr)
+    except Exception as e:
+        logger.warning("_route_link: %s", e)
+        return ""
+
+
 def _sklad_kb(dstr, uid) -> InlineKeyboardMarkup:
     """Кнопка обновления листа склада (перечитать места из МС перед выездом)."""
     return InlineKeyboardMarkup([[InlineKeyboardButton(
@@ -339,8 +354,12 @@ async def cb_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _collect_and_send(context, target, to_chat=q.from_user.id)
 
 
-async def _unit_package(routes, uid, target_date, bot_username):
-    """Пакет по машине на дату: {stops, pdf, driver_id, driver_name} или None (нет точек)."""
+async def _unit_package(routes, uid, target_date, bot_username=None):
+    """Пакет по машине на дату: {stops, pdf, driver_id, driver_name} или None (нет точек).
+
+    bot_username больше не используется (QR реестра ведёт в веб, а не в бота) —
+    параметр оставлен, чтобы не переписывать все места вызова.
+    """
     stops = sorted(
         [s for s in (routes.get(uid) or []) if _stop_on_date(s, target_date)],
         key=lambda s: (s.get("seq") if s.get("seq") is not None else 999))
@@ -350,8 +369,9 @@ async def _unit_package(routes, uid, target_date, bot_username):
     ms_extra = await rr._ms_extra_by_order(
         [s["order_no"] for s in stops],
         names={s["order_no"]: s.get("client") for s in stops})
-    pdf = await asyncio.to_thread(rr._build_registry_pdf, {uid: stops}, ms_extra,
-                                  bot_username, target_date.strftime("%d.%m.%Y"))  # reportlab CPU-sync → поток
+    pdf = await asyncio.to_thread(  # reportlab CPU-sync → поток
+        rr._build_registry_pdf, {uid: stops}, ms_extra,
+        target_date.strftime("%d.%m.%Y"), target_date.isoformat())
     return {"stops": stops, "pdf": pdf, "driver_id": driver_id, "driver_name": driver_name,
             "ms_extra": ms_extra}
 
@@ -396,17 +416,9 @@ def _stop_label(s):
     return _btn_label(s.get("client") or s.get("order_no"), _doc_no(s.get("order_no")))
 
 
-def _driver_kb(stops, done=None):
-    """Кнопки маршрута водителю: точка → drv:rp:<№документа> (обрабатывает driver_checklist).
-    done — множество № документов, уже закрытых (не показываем; Фаза 3)."""
-    done = done or set()
-    rows = []
-    for i, s in enumerate(stops, 1):
-        if _doc_no(s.get("order_no")) in done:
-            continue
-        rows.append([InlineKeyboardButton(f"📍 {i}. {_stop_label(s)}",
-                                          callback_data=f"drv:rp:{_doc_no(s.get('order_no'))}")])
-    return InlineKeyboardMarkup(rows) if rows else None
+# _driver_kb (клавиатура точек водителю) удалена 2026-08-04: кнопки в Telegram
+# водители не нажимали, сообщения подвисали. Маршрут закрывается на веб-чеклисте
+# (route_web), ссылка на который уходит вместо клавиатуры — см. _route_link.
 
 
 def is_confirmed_today(unit_id) -> bool:
@@ -512,14 +524,19 @@ async def mark_done_and_refresh(context, driver_chat_id, demand_id):
             done.append(doc)
         _DB._execute("UPDATE route_dispatch SET done=%s, updated_at=now() WHERE snap_date=%s AND unit_id=%s",
                      (json.dumps(done, ensure_ascii=False), today, row["unit_id"]))
-        kb = _driver_kb(stops, done=set(done))
-        if kb is None:
-            await context.bot.edit_message_text(
-                chat_id=driver_chat_id, message_id=row["driver_msg_id"],
-                text="✅ Маршрут завершён — все точки закрыты. Спасибо!")
+        # Кнопок в сообщении водителя больше нет — обновляем только текст-счётчик.
+        done_docs = {_doc_no(d) for d in done}
+        left = len([s for s in stops if _doc_no(s.get("order_no")) not in done_docs])
+        if left == 0:
+            text = "✅ Маршрут завершён — все точки закрыты. Спасибо!"
         else:
-            await context.bot.edit_message_reply_markup(
-                chat_id=driver_chat_id, message_id=row["driver_msg_id"], reply_markup=kb)
+            text = f"🚚 Маршрут: закрыто {len(done_docs)} из {len(stops)}, осталось {left}."
+            link = _route_link(row["unit_id"], today.isoformat())
+            if link:
+                text += f"\n👉 Чеклист: {link}"
+        await context.bot.edit_message_text(
+            chat_id=driver_chat_id, message_id=row["driver_msg_id"], text=text,
+            disable_web_page_preview=True)
     except Exception as e:
         logger.warning("mark_done_and_refresh: %s", e)
 
@@ -642,24 +659,23 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=f"🚚 Твой маршрут на {date_str} — {unit_name}. Реестр во вложении.{ya_block}")
             # Сохраняем прогресс: при пересборе/переподтверждении уже закрытые точки не показываем.
             done_prev = _existing_done(dstr, uid)
-            kb = _driver_kb(stops, done=done_prev)
-            if kb is None:
+            # `done` хранит ОЧИЩЕННЫЕ № документов (_doc_no) — сравниваем так же:
+            # в сыром order_no бывают заметки логиста, и счётчик закрытых врал.
+            left = len([s for s in stops if _doc_no(s.get("order_no")) not in done_prev])
+            if left == 0:
                 msg = await context.bot.send_message(
                     driver_id, f"🚚 Маршрут на {date_str} — {unit_name}: все точки уже закрыты. ✅")
             else:
-                left = len([s for s in stops if s["order_no"] not in done_prev])
-                try:
-                    import route_web
-                    live = f"\n🌐 Живой маршрут (всегда актуальный): {route_web.route_url(uid, dstr)}"
-                except Exception:
-                    live = ""
+                # Кнопок водителю больше нет (решение собственника 2026-08-04): в Telegram
+                # они не нажимались/подвисали. Весь ход маршрута — на веб-странице чеклиста,
+                # она всегда актуальна и не зависит от состояния сообщения в чате.
                 msg = await context.bot.send_message(
                     driver_id,
                     f"🚚 Маршрут на {date_str} — {left} из {len(stops)} точек (порядок выгрузки).\n"
                     f"{note}\n"
-                    "Приехал на точку — жми её, закрывай сдачу:"
-                    f"{ya_block}{live}",
-                    reply_markup=kb)
+                    f"👉 Открой чеклист и закрывай точки там: {_route_link(uid, dstr)}"
+                    f"{ya_block}",
+                    disable_web_page_preview=True)
             if _DB is not None:
                 _DB._execute("UPDATE route_dispatch SET driver_msg_id=%s WHERE snap_date=%s AND unit_id=%s",
                              (msg.message_id, dstr, uid))

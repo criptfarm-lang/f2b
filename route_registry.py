@@ -556,7 +556,14 @@ def _linkify_phones(text: str) -> str:
     return _PHONE_RE.sub(_repl, esc)
 
 
-def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
+def _build_registry_pdf(routes, ms_extra, date_str, date_iso=None) -> bytes:
+    """PDF реестра развоза. date_str — для заголовка (ДД.ММ.ГГГГ), date_iso — для
+    ссылок QR (ГГГГ-ММ-ДД); если не задан, берётся сегодня по МСК.
+
+    QR каждой точки ведёт на ЖИВОЙ веб-реестр этой машины с якорем на саму отгрузку
+    (страница её подсвечивает). Раньше вёл в Telegram-бота — отказались 2026-08-04:
+    кнопки в боте водители не нажимали, сообщения подвисали.
+    """
     from contract_generator import FONT_NORMAL, FONT_BOLD
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
@@ -575,6 +582,19 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
         d = Drawing(size, size, transform=[size / w, 0, 0, size / h, 0, 0])
         d.add(qr)
         return d
+
+    if not date_iso:
+        date_iso = datetime.now(_MSK).date().isoformat()
+
+    def stop_url(uid, order_no) -> str:
+        """Ссылка QR: живой реестр машины + якорь на точку (#o<№ документа>)."""
+        try:
+            import route_dispatch as rd
+            import route_web
+            return f"{route_web.route_url(uid, date_iso)}#o{rd._doc_no(order_no)}"
+        except Exception as e:
+            logger.warning("stop_url: %s", e)
+            return ""
 
     cell = ParagraphStyle("c", fontName=FONT_NORMAL, fontSize=8, leading=10)
     h2 = ParagraphStyle("h2", fontName=FONT_BOLD, fontSize=12, leading=15, spaceBefore=6, spaceAfter=4)
@@ -651,14 +671,14 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
                 # Лимит 300, чтобы не срезать длинные инструкции приёмки/номер. Paragraph переносит.
                 # Обрезаем ДО линкификации (иначе можно разрезать <a>-тег), все номера — кликабельные tel:.
                 info += f"<br/><font size=7 color='#888888'>{_linkify_phones(cm[:300])}</font>"
-            link = f"https://t.me/{bot_username}?start=chk_{s['order_no']}"
+            link = stop_url(uid, s["order_no"])
             rows.append([
                 Paragraph(str(idx), cell),
                 Paragraph(_hm(s["vt"]), cell),
                 Paragraph(_fmt_window(ex.get("win_from"), ex.get("win_to"), s["tf"], s["tt"]), cell),
                 Paragraph(info, cell),
                 Paragraph(wcell, cell),
-                qr_flow(link),
+                qr_flow(link) if link else Paragraph("", cell),
             ])
         t = Table(rows, colWidths=[7 * mm, 15 * mm, 22 * mm, 99 * mm, 26 * mm, 21 * mm])
         style = [
@@ -721,8 +741,11 @@ def _build_registry_pdf(routes, ms_extra, bot_username, date_str) -> bytes:
         flow.append(sig_box)
         flow.append(Paragraph("Как отмечаем сдачу по точкам", f_lgb))
         flow.append(Paragraph(
-            "Каждая точка отмечается сканированием QR-кода строки, отметкой в мессенджере либо в "
-            "приложении — это простая электронная подпись (ст. 5–6 Федерального закона № 63-ФЗ).", legal))
+            "Приехал на точку — наведи камеру телефона на QR-код её строки. Откроется чеклист "
+            "маршрута с подсвеченной точкой: ответь на вопросы сдачи и нажми «Отправить сдачу». "
+            "Ссылка на чеклист со всеми точками приходит водителю вместе с этим реестром. "
+            "Отправленная сдача — простая электронная подпись (ст. 5–6 Федерального закона "
+            "№ 63-ФЗ).", legal))
         flow.append(Paragraph("Памятка водителю-экспедитору", f_lgb))
         for _it in (
             "<b>Фирменная одежда:</b> на рейс выезжаем в фирменной одежде компании.",
@@ -759,14 +782,15 @@ async def cmd_registry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ms_extra = await _ms_extra_by_order(order_numbers, names=names)
         me = await context.bot.get_me()
         now = datetime.now(_MSK)
-        pdf = _build_registry_pdf(routes, ms_extra, me.username, now.strftime("%d.%m.%Y"))
+        pdf = _build_registry_pdf(routes, ms_extra, now.strftime("%d.%m.%Y"),
+                                  now.date().isoformat())
         parts = " / ".join(f"{UNITS[u]}: {len(routes[u])}" for u in UNITS)
         await context.bot.send_document(
             chat_id=user.id, document=io.BytesIO(pdf),
             filename=f"reestr_{now.strftime('%Y-%m-%d')}.pdf",
             caption=(f"Реестр развоза {now.strftime('%d.%m.%Y')} — {parts}.\n"
                      "У каждой машины: порядок выгрузки (сверху) + лист загрузки LIFO (снизу). "
-                     "QR по каждой точке → скан открывает сдачу груза."),
+                     "QR по каждой точке → скан открывает чеклист маршрута на этой точке."),
         )
     except Exception as e:
         logger.exception("cmd_registry: %s", e)
