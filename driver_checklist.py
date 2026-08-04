@@ -102,6 +102,50 @@ def _is_driver(chat_id: int) -> bool:
     return chat_id in _driver_chat_ids()
 
 
+def is_registered_driver(chat_id: int) -> bool:
+    """Водитель «по должности» — строка в `drivers` (active) или env DRIVER_CHAT_IDS.
+
+    В отличие от `_is_driver` НЕ включает владельца (у него whitelist-доступ ко всему,
+    но меню /start должно оставаться руководительским)."""
+    if not chat_id:
+        return False
+    raw = os.getenv("DRIVER_CHAT_IDS", "")
+    for part in raw.split(","):
+        if part.strip().isdigit() and int(part.strip()) == chat_id:
+            return True
+    if _DB is None:
+        return False
+    try:
+        r = _DB._fetchone("SELECT 1 AS x FROM drivers WHERE chat_id=%s AND active", (chat_id,))
+        return bool(r)
+    except Exception as e:
+        logger.warning("is_registered_driver: %s", e)
+        return False
+
+
+def driver_menu_keyboard() -> InlineKeyboardMarkup:
+    """Меню водителя (вместо меню ОП): рейс дня + реестр развоза."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚚 Мой рейс сегодня", callback_data="drv:menu:reis")],
+        [InlineKeyboardButton("📋 Реестр развоза (PDF)", callback_data="drv:menu:registry")],
+    ])
+
+
+async def cb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки меню водителя из /start."""
+    q = update.callback_query
+    await q.answer()
+    what = q.data.split(":")[2]
+    if not _is_driver(q.from_user.id):
+        await q.message.reply_text("⛔ Доступно водителям развозки.")
+        return
+    if what == "reis":
+        await _render_points(q.message.reply_text, page=0, driver_id=q.from_user.id)
+    elif what == "registry":
+        import route_registry as rr
+        await rr.send_registry(context.bot, q.from_user.id, q.message.reply_text)
+
+
 def _driver_unit_id(chat_id: int):
     """Юнит Wialon, закреплённый за водителем (drivers.unit_id). None → фильтра нет."""
     if _DB is None or not chat_id:
@@ -1162,6 +1206,40 @@ async def _web_alert_claim(bot, row):
             logger.warning("_web_alert_claim → %s: %s", cid, e)
 
 
+async def web_pickup_submit(db, bot, uid, order_no, *, doc, accepted, claim_text, title=""):
+    """Закрытие точки ЗАБОРА товара (заказ поставщику или ручная точка Логистики).
+
+    У забора нет отгрузки в МС → резолвить demand и писать статус отгрузки нечего.
+    Делаем две вещи: гасим точку в route_dispatch.done и уведомляем логистов
+    (собственник, 2026-08-04: по забору логисты хотят видеть каждое закрытие)."""
+    import route_dispatch
+    doc_no = route_dispatch._doc_no(order_no)
+    ok_taken = (accepted == "ok")
+    try:
+        route_dispatch.mark_done_by_unit(uid, doc_no)
+    except Exception as e:
+        logger.warning("web_pickup_submit done: %s", e)
+        return False, "Не удалось отметить точку, повтори."
+
+    import route_registry as rr
+    head = f"{title or doc_no} ({rr.UNITS.get(uid, uid)})"
+    if ok_taken:
+        text = (f"📦 Забор выполнен — {head}\n"
+                f"№ {doc_no}\nДокументы: {'забрал' if doc == 'yes' else 'НЕ забрал'}")
+    else:
+        text = (f"⚠️ Проблема на заборе — {head}\n"
+                f"№ {doc_no}\nДокументы: {'забрал' if doc == 'yes' else 'НЕ забрал'}\n"
+                f"Коммент: {(claim_text or '').strip() or '—'}")
+    for cid in _logist_chat_ids():
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.warning("web_pickup_submit → %s: %s", cid, e)
+
+    return True, ("✅ Забор закрыт, логист уведомлён." if ok_taken
+                  else "⚠️ Проблема зафиксирована, логист уведомлён.")
+
+
 async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, claim_text):
     """Приёмка точки С ВЕБ-СТРАНИЦЫ, одним экраном, без telegram-контекста.
     money/doc/item — строки 'yes'/'no' (или None). accepted — 'ok'/'claim'.
@@ -1254,6 +1332,7 @@ def register(app: Application, db):
     app.add_handler(CommandHandler("shipmentlist", cmd_shipment_list))
     app.add_handler(MessageHandler(filters.Regex(r"^/лист(@\w+)?(\s|$)"), cmd_shipment_list))
 
+    app.add_handler(CallbackQueryHandler(cb_menu, pattern=r"^drv:menu:"))
     app.add_handler(CallbackQueryHandler(cb_page, pattern=r"^drv:pg:"))
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^drv:pick:"))
     app.add_handler(CallbackQueryHandler(cb_route_pick, pattern=r"^drv:rp:"))

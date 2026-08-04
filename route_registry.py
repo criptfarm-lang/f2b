@@ -35,6 +35,15 @@ _MSK = timezone(timedelta(hours=3))
 WIALON_BASE = "https://app.gpsnetwork.ru/wialon/ajax.html"
 RESOURCE_ID = 26208
 UNITS = {26209: "В 970 СВ 797", 26210: "К 459 ХК 797", 26695: "Е 898 СР 797"}
+# Марки — для шапки сообщения складу (собственник, 2026-08-04): «KIA BONGO III — В 970 СВ 797».
+UNIT_MODELS = {26209: "KIA BONGO III", 26210: "Hyundai Porter", 26695: "Lada Ларгус"}
+
+
+def unit_title(uid) -> str:
+    """«Марка — номер» для шапки; если марки нет — только номер."""
+    num = UNITS.get(uid, str(uid))
+    model = UNIT_MODELS.get(uid)
+    return f"{model} — {num}" if model else num
 
 
 # ─── Доступ (переиспользуем whitelist из driver_checklist) ───────────────────
@@ -297,8 +306,10 @@ async def _ms_extra_by_order(order_numbers, names=None) -> dict:
                 win_to = _attr_time(a.get("value"))
         # вес = сумма количеств позиций (рыба/морепродукты продаются в кг)
         weight = 0.0
+        max_price = 0.0   # макс. цена позиции, ₽ — по ней веб-приёмка узнаёт образцы (≤ 1 ₽)
         for p in (co.get("positions") or {}).get("rows", []):
             weight += p.get("quantity") or 0
+            max_price = max(max_price, (p.get("price") or 0) / 100.0)
         # менеджер / телефон / «здрасте» из контрагента
         agent = co.get("agent") or {}
         tags = [str(t).strip().lower() for t in (agent.get("tags") or [])]
@@ -318,23 +329,30 @@ async def _ms_extra_by_order(order_numbers, names=None) -> dict:
             "win_from": win_from,   # «Окно доставки с (время)» → HH:MM
             "win_to": win_to,       # «Окно доставки до (время)» → HH:MM
             "zdraste": "здрасте" in tags,
+            "max_price_rub": max_price,
+            "sum_rub": (co.get("sum") or 0) / 100.0,
         }
 
-    # Параллельно, но с семафором — иначе N одновременных GET упрутся в rate-limit МС.
-    sem = asyncio.Semaphore(6)
+    # Заказы тянем ПАЧКАМИ: условия по одному полю в фильтре МС объединяются по ИЛИ,
+    # поэтому 20 точек = 1 запрос вместо 20. Раньше был GET на каждую точку — на «густом»
+    # дне это десятки round-trip'ов подряд, из-за них реестр и собирался долго.
+    _BATCH = 20
+    sem = asyncio.Semaphore(4)
 
-    async def _one(session, no):
+    async def _batch(session, nos):
         async with sem:
             try:
-                f = urllib.parse.quote(f"name={no}")
+                f = urllib.parse.quote(";".join(f"name={no}" for no in nos))
+                # expand=positions (без .assortment): из позиций нужны только quantity и
+                # price — карточки товаров тянуть незачем, с ними ответ вдвое тяжелее.
                 url = (f"{MS_BASE}/entity/customerorder?filter={f}"
-                       f"&expand=positions.assortment,agent&limit=1")
+                       f"&expand=positions,agent&limit=100")
                 async with session.get(url, headers=headers) as r:
                     rows = (await r.json()).get("rows", []) if r.status == 200 else []
-                return no, (_parse(rows[0]) if rows else None)
+                return {row.get("name"): _parse(row) for row in rows if row.get("name")}
             except Exception as e:
-                logger.warning("_ms_extra_by_order %s: %s", no, e)
-                return no, None
+                logger.warning("_ms_extra_by_order batch %s: %s", nos[:3], e)
+                return {}
 
     # Сначала — заборы товара (заказы поставщику с нашей машиной). Их номера НЕ резолвим
     # как customerorder: в МС бывает совпадающий по номеру заказ покупателя (другая сущность).
@@ -343,10 +361,13 @@ async def _ms_extra_by_order(order_numbers, names=None) -> dict:
     rest = [no for no in order_numbers if no not in pickups]
 
     async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(*(_one(session, no) for no in rest))
-    for no, data in results:
-        if data is not None:
-            out[no] = data
+        chunks = [rest[i:i + _BATCH] for i in range(0, len(rest), _BATCH)]
+        results = await asyncio.gather(*(_batch(session, c) for c in chunks))
+    rest_set = set(rest)
+    for found in results:
+        for no, data in found.items():
+            if data is not None and no in rest_set:
+                out[no] = data
     return out
 
 
@@ -443,37 +464,45 @@ async def _ms_pickup_by_order(order_numbers, names=None) -> dict:
     since = (datetime.now(_MSK) - timedelta(days=14)).strftime("%Y-%m-%d 00:00:00")
     flt = urllib.parse.quote(f"moment>={since}")
     base = (f"{MS_BASE}/entity/purchaseorder?filter={flt}"
-            f"&expand=agent,owner,positions.assortment&order=moment,desc&limit=100")
+            f"&expand=agent,owner,positions&order=moment,desc&limit=100")
     by_number, by_supplier = {}, {}   # ЗП.name -> pickup ; norm(поставщик) -> pickup
+
+    async def _page(session, offset):
+        try:
+            async with session.get(f"{base}&offset={offset}", headers=headers) as r:
+                if r.status != 200:
+                    logger.warning("_ms_pickup_by_order fetch off=%s: HTTP %s", offset, r.status)
+                    return []
+                return ((await r.json()).get("rows", []))
+        except Exception as e:
+            logger.warning("_ms_pickup_by_order fetch off=%s: %s", offset, e)
+            return []
+
     async with aiohttp.ClientSession() as session:
-        offset = 0
-        while offset < 500:  # бэкстоп; свежих ЗП за 14 дней столько не бывает
-            try:
-                async with session.get(f"{base}&offset={offset}", headers=headers) as r:
-                    if r.status != 200:
-                        logger.warning("_ms_pickup_by_order fetch off=%s: HTTP %s", offset, r.status)
-                        break
-                    rows = (await r.json()).get("rows", [])
-            except Exception as e:
-                logger.warning("_ms_pickup_by_order fetch: %s", e)
-                break
-            for po in rows:
-                try:
-                    pk = _parse_pickup_po(po)   # None, если машина не наша
-                except Exception as e:
-                    logger.warning("_ms_pickup_by_order parse %s: %s", po.get("name"), e)
-                    pk = None
-                if not pk:
-                    continue
-                num = po.get("name")
-                if num and num not in by_number:
-                    by_number[num] = pk
-                sup = _norm_name(pk.get("client"))
-                if sup and sup not in by_supplier:
-                    by_supplier[sup] = pk
-            if len(rows) < 100:
-                break
-            offset += 100
+        # Первая страница — синхронно; если она полная (100), остальные тянем ПАРАЛЛЕЛЬНО
+        # (последовательное листание было вторым источником долгой сборки реестра).
+        # На meta.size не опираемся — МС отдаёт его нестабильно и мы бы теряли заборы.
+        rows = await _page(session, 0)
+        all_rows = list(rows)
+        if len(rows) >= 100:
+            pages = await asyncio.gather(*(_page(session, o) for o in (100, 200, 300, 400)))
+            for chunk in pages:
+                all_rows.extend(chunk)
+
+    for po in all_rows:
+        try:
+            pk = _parse_pickup_po(po)   # None, если машина не наша
+        except Exception as e:
+            logger.warning("_ms_pickup_by_order parse %s: %s", po.get("name"), e)
+            pk = None
+        if not pk:
+            continue
+        num = po.get("name")
+        if num and num not in by_number:
+            by_number[num] = pk
+        sup = _norm_name(pk.get("client"))
+        if sup and sup not in by_supplier:
+            by_supplier[sup] = pk
     for no in wanted:
         pk = by_number.get(no) or by_supplier.get(_norm_name(names.get(no)))
         if pk:
@@ -613,13 +642,12 @@ def _build_registry_pdf(routes, ms_extra, date_str, date_iso=None) -> bytes:
     first = True
     # Итерируем по переданным машинам (одна или обе) — позволяет собрать PDF на одну машину.
     for uid in routes:
-        name = UNITS.get(uid, str(uid))
         stops = routes.get(uid) or []
         if not first:
             flow.append(PageBreak())
         first = False
         flow.append(Paragraph(f"Реестр развоза — {date_str}", title))
-        flow.append(Paragraph(f"Машина {name} — {len(stops)} точек (порядок выгрузки)", h2))
+        flow.append(Paragraph(f"Машина {unit_title(uid)} — {len(stops)} точек (порядок выгрузки)", h2))
         flow.append(Paragraph(
             "Приёмо-сдаточный реестр к договору о материальной ответственности "
             "водителя-экспедитора.", sub))
@@ -763,6 +791,35 @@ def _build_registry_pdf(routes, ms_extra, date_str, date_iso=None) -> bytes:
 
 # ─── Команда ─────────────────────────────────────────────────────────────────
 
+async def send_registry(bot, chat_id: int, say):
+    """Собрать и отправить PDF реестра. `say` — корутина-отправитель текста (reply_text)."""
+    await say("Собираю реестр развоза из Wialon…")
+    try:
+        routes = await fetch_routes()
+        total = sum(len(v) for v in routes.values())
+        if total == 0:
+            await say("Маршрут ещё не построен — логист не разложил заказы по машинам в Wialon.")
+            return
+        order_numbers = [s["order_no"] for v in routes.values() for s in v]
+        names = {s["order_no"]: s.get("client") for v in routes.values() for s in v}
+        ms_extra = await _ms_extra_by_order(order_numbers, names=names)
+        now = datetime.now(_MSK)
+        # reportlab + генерация QR — CPU-sync, в event loop блокировали бы весь бот.
+        pdf = await asyncio.to_thread(_build_registry_pdf, routes, ms_extra,
+                                      now.strftime("%d.%m.%Y"), now.date().isoformat())
+        parts = " / ".join(f"{UNITS[u]}: {len(routes[u])}" for u in UNITS)
+        await bot.send_document(
+            chat_id=chat_id, document=io.BytesIO(pdf),
+            filename=f"reestr_{now.strftime('%Y-%m-%d')}.pdf",
+            caption=(f"Реестр развоза {now.strftime('%d.%m.%Y')} — {parts}.\n"
+                     "У каждой машины: порядок выгрузки (сверху) + лист загрузки LIFO (снизу). "
+                     "QR по каждой точке → скан открывает чеклист маршрута на этой точке."),
+        )
+    except Exception as e:
+        logger.exception("send_registry: %s", e)
+        await say("Не удалось собрать реестр. Проверь WIALON_TOKEN / доступ.")
+
+
 async def cmd_registry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
@@ -771,32 +828,7 @@ async def cmd_registry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(user.id):
         await update.message.reply_text("⛔ Реестр доступен логисту и водителям.")
         return
-    await update.message.reply_text("Собираю реестр развоза из Wialon…")
-    try:
-        routes = await fetch_routes()
-        total = sum(len(v) for v in routes.values())
-        if total == 0:
-            await update.message.reply_text(
-                "Маршрут ещё не построен — логист не разложил заказы по машинам в Wialon.")
-            return
-        order_numbers = [s["order_no"] for v in routes.values() for s in v]
-        names = {s["order_no"]: s.get("client") for v in routes.values() for s in v}
-        ms_extra = await _ms_extra_by_order(order_numbers, names=names)
-        me = await context.bot.get_me()
-        now = datetime.now(_MSK)
-        pdf = _build_registry_pdf(routes, ms_extra, now.strftime("%d.%m.%Y"),
-                                  now.date().isoformat())
-        parts = " / ".join(f"{UNITS[u]}: {len(routes[u])}" for u in UNITS)
-        await context.bot.send_document(
-            chat_id=user.id, document=io.BytesIO(pdf),
-            filename=f"reestr_{now.strftime('%Y-%m-%d')}.pdf",
-            caption=(f"Реестр развоза {now.strftime('%d.%m.%Y')} — {parts}.\n"
-                     "У каждой машины: порядок выгрузки (сверху) + лист загрузки LIFO (снизу). "
-                     "QR по каждой точке → скан открывает чеклист маршрута на этой точке."),
-        )
-    except Exception as e:
-        logger.exception("cmd_registry: %s", e)
-        await update.message.reply_text("Не удалось собрать реестр. Проверь WIALON_TOKEN / доступ.")
+    await send_registry(context.bot, user.id, update.message.reply_text)
 
 
 def register(app: Application):

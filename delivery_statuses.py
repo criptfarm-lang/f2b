@@ -36,7 +36,7 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 from moysklad import MS_BASE, get_headers, PDZ_MANAGER_TG_IDS
@@ -291,23 +291,23 @@ def _unload_recipients() -> list:
     return seen
 
 
-async def _unload_driver_alert(bot, driver_chat, unit_name, uf):
-    """Персональный алерт водителю: похоже, выгрузил, но не отметил. Кнопка → полный чек-лист точки."""
-    if not driver_chat:
-        return
+async def _unload_driver_alert(bot, unit_name, uf):
+    """Алерт «похоже, выгрузил, но не отметил» — в группу «Логистика».
+
+    Раньше уходил водителю в личку; с 2026-08-04 (собственник) бот водителям в личку
+    не пишет — логисты видят алерт в группе и пингуют водителя сами."""
     import route_dispatch
+    group = route_dispatch._logist_group_chat_id()
+    if not group:
+        return
     s = uf["s"]
     label = route_dispatch._stop_label(s)
-    doc = route_dispatch._doc_no(s.get("order_no"))
-    text = (f"🔔 Похоже, выгрузка состоялась, но сдача не отмечена.\n"
-            f"{label} — стоянка ~{uf['dwell_min']} мин, точка не закрыта.\n"
-            f"Открой чек-лист и заверши сдачу:")
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
-        f"📋 Заполнить чек-лист: {label}", callback_data=f"drv:rp:{doc}")]])
+    text = (f"🔔 Похоже, выгрузка состоялась, но сдача не отмечена — {unit_name}\n"
+            f"{label} — стоянка ~{uf['dwell_min']} мин, точка не закрыта.")
     try:
-        await bot.send_message(chat_id=driver_chat, text=text, reply_markup=kb)
+        await bot.send_message(chat_id=group, text=text)
     except Exception as e:
-        logger.warning("_unload_driver_alert → %s: %s", driver_chat, e)
+        logger.warning("_unload_driver_alert → group %s: %s", group, e)
 
 
 async def _unload_control_alert(bot, unit_name, uf, recipients):
@@ -693,12 +693,9 @@ async def run_check(db, bot=None, preview=False) -> list:
             if unload_flips:
                 lines.append(f"{name}: выгрузка без подтверждения — точек: {len(unload_flips)}")
                 if bot and not preview:
-                    drow = db._fetchone(
-                        "SELECT chat_id FROM drivers WHERE unit_id=%s AND active LIMIT 1", (uid,))
-                    driver_chat = (drow or {}).get("chat_id")
                     controllers = _unload_recipients()
                     for uf in unload_flips:
-                        await _unload_driver_alert(bot, driver_chat, name, uf)
+                        await _unload_driver_alert(bot, name, uf)
                         await _unload_control_alert(bot, name, uf, controllers)
                 if not preview:
                     for uf in unload_flips:

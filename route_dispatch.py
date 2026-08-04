@@ -63,6 +63,16 @@ def _sklad_chat_id() -> int:
     return int(os.getenv("SKLAD_CHAT_ID", "-4750423130") or 0)  # группа «Склад»
 
 
+def _logist_group_chat_id() -> int:
+    """Группа «Логистика». Второй (и последний) адресат рассылки маршрутов.
+
+    С 2026-08-04 маршруты и алерты по развозу НЕ уходят водителям в личку —
+    только в две группы: «Склад» и «Логистика». Водители забирают свой маршрут
+    сами (веб-чеклист по машине), поэтому и имён водителей в сообщениях нет.
+    Дефолт -5154587608 — группа «Логистика» (id снят 04.08.2026 по сообщению Беляковой)."""
+    return int(os.getenv("LOGIST_GROUP_CHAT_ID", "-5154587608") or 0)
+
+
 def _links_block(uid, stops, dstr) -> str:
     """Активные ссылки на маршрут: Яндекс-навигация (по порядку точек) + живой
     веб-реестр (всегда актуальный). Для сообщения в группу Склад."""
@@ -78,10 +88,13 @@ def _links_block(uid, stops, dstr) -> str:
                   for i, u in enumerate(ya_urls)]
     try:
         import route_web
+        # Пустая строка перед живым реестром — блоки в сообщении разделены (макет 2026-08-04).
+        if lines:
+            lines.append("")
         lines.append(f"🌐 Живой реестр (всегда актуальный): {route_web.route_url(uid, dstr)}")
     except Exception:
         pass
-    return ("\n" + "\n".join(lines)) if lines else ""
+    return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
 def _route_link(uid, dstr) -> str:
@@ -105,10 +118,12 @@ def _sklad_kb(dstr, uid) -> InlineKeyboardMarkup:
         "🔄 Обновить (места)", callback_data=f"rd:sklrf:{dstr}:{uid}")]])
 
 
-def _sklad_caption(unit_name, date_str, note, links, refreshed_at=None) -> str:
-    """Подпись листа загрузки для группы Склад."""
-    head = (f"📦 Лист загрузки — {unit_name}, {date_str}. Грузить по порядку "
-            f"(первая точка к дверям).\n{note}")
+def _sklad_caption(unit_name, date_str, note, links, refreshed_at=None, uid=None) -> str:
+    """Подпись листа загрузки для группы Склад (макет собственника, 2026-08-04):
+    шапка «марка — номер, дата» → объём/пробег → предупреждения → ссылки → подпись.
+    Порядок загрузки («первая точка к дверям») из сообщения убран — он в самом PDF."""
+    title = rr.unit_title(uid) if uid is not None else unit_name
+    head = f"🚚 *{title}*, {date_str}.\n\n{note}"
     tail = ("\n\n✍️ Перед выездом водитель подписывает копию реестра и отдаёт "
             "оператору склада.")
     stamp = f"\n\n🔄 Обновлено {refreshed_at:%H:%M} — места актуальны." if refreshed_at else ""
@@ -201,11 +216,15 @@ def _volume_note(uid, stops, ms_extra, km=None) -> str:
             note = f"📦 Объём: ~{vol} м³ / {cap_vol} м³ ({boxes}/{cap_boxes} мест{plt}, {pct}%)"
     if km:
         note += f"\n🛣 Пробег маршрута: ~{km} км"
+    # Предупреждения — отдельным блоком через пустую строку (макет собственника 2026-08-04).
+    warn = []
     if estimated:
-        note += (f"\n📐 места не заполнены у {estimated} точ. — оценил по весу "
-                 f"(коробка ~{_BOX_WEIGHT_KG} кг)")
+        warn.append(f"📐 места не заполнены у {estimated} точ. — оценил по весу "
+                    f"(коробка ~{_BOX_WEIGHT_KG} кг)")
     if missing:
-        note += f"\n⚠️ у {missing} точ. нет ни мест, ни веса — объём занижен"
+        warn.append(f"⚠️ у {missing} точ. нет ни мест, ни веса — объём занижен")
+    if warn:
+        note += "\n\n" + "\n".join(warn)
     return note
 
 
@@ -323,12 +342,13 @@ async def cmd_sklad_push(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _PKG_CACHE[(dstr, uid)] = (pkg, km)
         note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
         caption = _sklad_caption(unit_name, target.strftime("%d.%m.%Y"), note,
-                                 _links_block(uid, stops, dstr), refreshed_at=datetime.now(_MSK))
+                                 _links_block(uid, stops, dstr),
+                                 refreshed_at=datetime.now(_MSK), uid=uid)
         try:
             await context.bot.send_document(
                 sklad, io.BytesIO(pkg["pdf"]),
                 filename=f"reestr_{uid}_{dstr}.pdf", caption=caption,
-                reply_markup=_sklad_kb(dstr, uid))
+                parse_mode="Markdown", reply_markup=_sklad_kb(dstr, uid))
             sent.append(f"{unit_name}: {len(stops)}")
         except Exception as e:
             logger.warning("cmd_sklad_push send %s: %s", uid, e)
@@ -578,13 +598,12 @@ async def _collect_and_send(context, target_date, to_chat):
                 for s in stops]
         _upsert_draft(target_date, uid, pkg["driver_id"], snap)
 
-        who = pkg["driver_name"] or "⚠️ водитель не закреплён"
         km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
         _PKG_CACHE[(dstr, uid)] = (pkg, km)  # чтобы «Подтвердить» не пересобирал всё заново
         note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
         lines = [f"{i}. {(s.get('client') or s.get('order_no') or '?')[:35]} ({rr._hm(s.get('vt'))})"
                  for i, s in enumerate(stops, 1)]
-        caption = (f"🚚 {rr.UNITS[uid]} — водитель: {who}\n"
+        caption = (f"🚚 *{rr.unit_title(uid)}*\n"
                    f"{note}\n"
                    f"Маршрут на {date_str} — {len(stops)} точек (порядок выгрузки):\n"
                    + "\n".join(lines))
@@ -596,7 +615,7 @@ async def _collect_and_send(context, target_date, to_chat):
         await context.bot.send_document(
             to_chat, document=io.BytesIO(pkg["pdf"]),
             filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
-            caption=caption[:1024], reply_markup=kb)
+            caption=caption[:1024], parse_mode="Markdown", reply_markup=kb)
         sent += 1
     if sent == 0:
         await context.bot.send_message(
@@ -629,7 +648,6 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in pkg["stops"]])
 
     stops = pkg["stops"]
-    driver_id = pkg["driver_id"]
     date_str = target_date.strftime("%d.%m.%Y")
     unit_name = rr.UNITS.get(uid, str(uid))
     note = _volume_note(uid, stops, pkg["ms_extra"], km=km)  # заметка по объёму — во все сообщения
@@ -653,42 +671,37 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning("cb_confirm update: %s", e)
 
-    # 1) Пуш водителю: PDF + кнопки маршрута
+    # 1) Пуш в группу «Логистика»: PDF + ссылка на веб-чеклист машины.
+    # Личку водителя не трогаем (собственник, 2026-08-04): маршрут забирает сам водитель
+    # по машине, поэтому и имя водителя в сообщении не пишем — только марка и номер.
     driver_note = ""
-    if driver_id:
+    logist_group = _logist_group_chat_id()
+    if logist_group:
         try:
-            await context.bot.send_document(
-                driver_id, io.BytesIO(pkg["pdf"]),
-                filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
-                caption=f"🚚 Твой маршрут на {date_str} — {unit_name}. Реестр во вложении.{ya_block}")
             # Сохраняем прогресс: при пересборе/переподтверждении уже закрытые точки не показываем.
             done_prev = _existing_done(dstr, uid)
             # `done` хранит ОЧИЩЕННЫЕ № документов (_doc_no) — сравниваем так же:
             # в сыром order_no бывают заметки логиста, и счётчик закрытых врал.
             left = len([s for s in stops if _doc_no(s.get("order_no")) not in done_prev])
+            head = f"🚚 *{rr.unit_title(uid)}*, {date_str}."
             if left == 0:
-                msg = await context.bot.send_message(
-                    driver_id, f"🚚 Маршрут на {date_str} — {unit_name}: все точки уже закрыты. ✅")
+                body = "Все точки уже закрыты. ✅"
             else:
-                # Кнопок водителю больше нет (решение собственника 2026-08-04): в Telegram
-                # они не нажимались/подвисали. Весь ход маршрута — на веб-странице чеклиста,
-                # она всегда актуальна и не зависит от состояния сообщения в чате.
-                msg = await context.bot.send_message(
-                    driver_id,
-                    f"🚚 Маршрут на {date_str} — {left} из {len(stops)} точек (порядок выгрузки).\n"
-                    f"{note}\n"
-                    f"👉 Открой чеклист и закрывай точки там: {_route_link(uid, dstr)}"
-                    f"{ya_block}",
-                    disable_web_page_preview=True)
+                body = (f"Маршрут — {left} из {len(stops)} точек (порядок выгрузки).\n\n{note}\n\n"
+                        f"👉 Чеклист машины: {_route_link(uid, dstr)}")
+            msg = await context.bot.send_document(
+                logist_group, io.BytesIO(pkg["pdf"]),
+                filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
+                caption=f"{head}\n\n{body}{ya_block}", parse_mode="Markdown")
             if _DB is not None:
                 _DB._execute("UPDATE route_dispatch SET driver_msg_id=%s WHERE snap_date=%s AND unit_id=%s",
                              (msg.message_id, dstr, uid))
-            driver_note = f"водитель {pkg['driver_name'] or driver_id}"
+            driver_note = "логистика ✓"
         except Exception as e:
-            logger.warning("cb_confirm push driver: %s", e)
-            driver_note = "⚠️ водителю НЕ доставлено (не нажимал /start у бота?)"
+            logger.warning("cb_confirm push logist group: %s", e)
+            driver_note = "⚠️ в «Логистику» НЕ доставлено"
     else:
-        driver_note = f"⚠️ за {unit_name} не закреплён водитель — не отправлено"
+        driver_note = "⚠️ группа «Логистика» не задана (LOGIST_GROUP_CHAT_ID)"
 
     # 2) PDF в склад-группу (лист загрузки)
     sklad_note = ""
@@ -699,8 +712,8 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sklad, io.BytesIO(pkg["pdf"]),
                 filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
                 caption=_sklad_caption(unit_name, date_str, note,
-                                       _links_block(uid, stops, dstr)),
-                reply_markup=_sklad_kb(dstr, uid))
+                                       _links_block(uid, stops, dstr), uid=uid),
+                parse_mode="Markdown", reply_markup=_sklad_kb(dstr, uid))
             sklad_note = "склад ✓"
         except Exception as e:
             logger.warning("cb_confirm push sklad: %s", e)
@@ -742,7 +755,7 @@ async def cb_sklad_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _PKG_CACHE[(dstr, uid)] = (pkg, km)  # свежий пакет — чтобы подтверждение взяло его же
     note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
     caption = _sklad_caption(unit_name, date_str, note, _links_block(uid, stops, dstr),
-                             refreshed_at=datetime.now(_MSK))
+                             refreshed_at=datetime.now(_MSK), uid=uid)
 
     # 1) Свежий лист склада — НОВЫМ сообщением (внизу группы), старое удаляем, чтобы
     #    устаревшие реестры не путались. Сначала шлём новый; только при успехе удаляем старый.
@@ -750,7 +763,7 @@ async def cb_sklad_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_document(
             q.message.chat_id, io.BytesIO(pkg["pdf"]),
             filename=f"reestr_{uid}_{dstr}.pdf", caption=caption,
-            reply_markup=_sklad_kb(dstr, uid))
+            parse_mode="Markdown", reply_markup=_sklad_kb(dstr, uid))
     except Exception as e:
         logger.warning("cb_sklad_refresh send: %s", e)
         await _safe_answer(q, "Не удалось обновить лист склада.", alert=True)
@@ -761,19 +774,20 @@ async def cb_sklad_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning("cb_sklad_refresh delete old: %s", e)  # >48ч Telegram не даёт удалить — не критично
 
-    # 2) Прислать водителю обновлённый реестр (места уточнены).
-    driver_id = pkg.get("driver_id")
+    # 2) Обновлённый реестр — в группу «Логистика» (в личку водителям больше не шлём).
     drv = ""
-    if driver_id:
+    logist_group = _logist_group_chat_id()
+    if logist_group:
         try:
             await context.bot.send_document(
-                driver_id, io.BytesIO(pkg["pdf"]),
+                logist_group, io.BytesIO(pkg["pdf"]),
                 filename=f"reestr_{uid}_{dstr}.pdf",
-                caption=f"🔄 Обновлённый реестр на {date_str} — {unit_name}. Места уточнены.")
-            drv = " Водителю отправлено."
+                caption=f"🔄 Обновлённый реестр — *{rr.unit_title(uid)}*, {date_str}. Места уточнены.",
+                parse_mode="Markdown")
+            drv = " В «Логистику» отправлено."
         except Exception as e:
-            logger.warning("cb_sklad_refresh push driver: %s", e)
-            drv = " ⚠️ Водителю не доставлено."
+            logger.warning("cb_sklad_refresh push logist group: %s", e)
+            drv = " ⚠️ В «Логистику» не доставлено."
     await _safe_answer(q, f"Обновлено.{drv}")
 
 

@@ -162,6 +162,11 @@ def clean_query(text: str) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
+    # Блокировка (уволенные) раньше закрывала только свободный текст — /start отдавал
+    # меню как ни в чём не бывало. Закрываем и вход в меню (собственник, 2026-08-04).
+    if user and db.is_user_blocked(user.id):
+        await update.message.reply_text("⛔ Доступ ограничен. Обратитесь к руководителю.")
+        return
     if user and chat_id == user.id:
         db.save_manager_chat_id(user.id, user.full_name)
         logger.info(f"cmd_start: сохранён chat_id={chat_id} name={user.full_name}")
@@ -174,6 +179,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"driver_checklist deeplink упал: {e}")
             await update.message.reply_text("Не удалось открыть точку по QR.")
         return
+    # Водителю развозки меню ОП не нужно — у него свой набор (рейс + реестр).
+    if user is not None:
+        try:
+            import driver_checklist as dc
+            if dc.is_registered_driver(user.id):
+                await update.message.reply_text(
+                    f"👋 Привет, *{user.full_name}*! Я Эф — ассистент F2B PRO.\n\n"
+                    "Твой рейс и реестр развоза — в меню ниже.\n"
+                    "Команды: /рейс — точки на сегодня, /реестр — PDF развоза.",
+                    parse_mode="Markdown",
+                    reply_markup=dc.driver_menu_keyboard(),
+                )
+                return
+        except Exception as e:
+            logger.warning(f"cmd_start: проверка водителя упала, отдаю общее меню: {e}")
     is_author = user is not None and _is_task_author(user.id)
     await update.message.reply_text(
         f"👋 Привет, *{user.full_name if user else 'друг'}*! Я Эф — ассистент F2B PRO.\n\n"
@@ -228,6 +248,10 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
     await query.answer()
     user = query.from_user
     action = query.data
+
+    if user and db.is_user_blocked(user.id):
+        await query.message.reply_text("⛔ Доступ ограничен. Обратитесь к руководителю.")
+        return
 
     if action == "user_photo":
         await query.message.reply_text(

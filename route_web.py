@@ -81,6 +81,19 @@ def _e(s) -> str:
     return _html.escape(str(s or ""))
 
 
+# Забор товара «руками»: точка Логистики без документа в МС, названная «ЗАБРАТЬ ПОДДОНЫ»,
+# «забрать тунец» и т.п. Заборы по заказу поставщику ловятся точнее — по is_pickup из МС.
+_PICKUP_RE = re.compile(r"забра|забор", re.IGNORECASE)
+
+
+def _looks_like_pickup(order_no, client) -> bool:
+    return bool(_PICKUP_RE.search(f"{order_no or ''} {client or ''}"))
+
+
+# Бесплатные образцы клиенту проводят по 1 ₽ (зеркало driver_checklist._SAMPLE_MAX_PRICE_RUB).
+_SAMPLE_MAX_PRICE_RUB = 1.0
+
+
 _PAGE_CSS = """
 *{box-sizing:border-box}
 body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f2f4f7;color:#111}
@@ -103,6 +116,13 @@ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f
   padding:9px 14px;border-radius:9px;font-size:14px;font-weight:600}
 .foot{text-align:center;color:#889;font-size:12px;padding:8px 0 24px}
 .empty{background:#fff;border-radius:12px;padding:24px;text-align:center;color:#667}
+/* Забор товара — оранжевый акцент, как строка забора в PDF-реестре: водитель должен
+   с первого взгляда отличать «приехал забрать» от «приехал сдать». */
+.pt.pickup{background:#fff7ed;border-left:5px solid #f59e0b}
+.pt.pickup .num{color:#b45309}
+.tag-pickup{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:6px;
+  background:#f59e0b;color:#fff;font-size:11px;font-weight:700;vertical-align:middle}
+.pt .meta.sample{color:#b45309;font-weight:600}
 /* Подсветка точки, на которую привёл QR из реестра (якорь #o<№ документа>).
    scroll-margin — чтобы карточка не прилипала к верхней кромке экрана. */
 .pt:target{box-shadow:0 0 0 3px #f59e0b,0 1px 3px rgba(0,0,0,.06);scroll-margin-top:12px}
@@ -151,7 +171,12 @@ async def _route_data(uid: int, target: date):
         return hit[1], hit[2], hit[3]
     routes, order_routes = await rr.fetch_routes(with_meta=True)
     stops = [s for s in (routes.get(uid) or []) if rd._stop_on_date(s, target)]
-    ms_extra = await rr._ms_extra_by_order([s["order_no"] for s in stops]) if stops else {}
+    # names — чтобы заборы (заказы поставщику) матчились ещё и по названию поставщика,
+    # а не только по номеру ЗП: иначе точка забора приезжает в веб как обычная доставка.
+    ms_extra = await rr._ms_extra_by_order(
+        [s["order_no"] for s in stops],
+        names={s["order_no"]: s.get("client") for s in stops},
+    ) if stops else {}
     _ROUTE_CACHE[key] = (now, stops, ms_extra, order_routes)
     return stops, ms_extra, order_routes
 
@@ -177,16 +202,10 @@ async def render_page(uid: int, target: date, db, bot) -> str:
 
     stops, ms_extra, order_routes = await _route_data(uid, target)
 
-    # Имя водителя + закрытые точки
-    driver_name = ""
+    # Закрытые точки. Имя водителя на странице больше не показываем (собственник,
+    # 2026-08-04): маршрут привязан к машине, водители забирают свой рейс сами.
     done_set = set()
     if db is not None:
-        try:
-            r = db._fetchone("SELECT name FROM drivers WHERE unit_id=%s AND active LIMIT 1", (uid,))
-            if r:
-                driver_name = r.get("name") or ""
-        except Exception as e:
-            logger.warning("route_web driver: %s", e)
         try:
             import json
             row = db._fetchone("SELECT done FROM route_dispatch WHERE snap_date=%s AND unit_id=%s",
@@ -197,9 +216,8 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         except Exception as e:
             logger.warning("route_web done: %s", e)
 
-    head = (f"<div class='head'><h1>🚚 {_e(unit_name)}</h1>"
-            f"<div class='sub'>Водитель: {_e(driver_name or '—')} · {date_str} · "
-            f"{len(stops)} точек (порядок выгрузки)</div>")
+    head = (f"<div class='head'><h1>🚚 {_e(rr.unit_title(uid))}</h1>"
+            f"<div class='sub'>{date_str} · {len(stops)} точек (порядок выгрузки)</div>")
 
     if stops:
         km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
@@ -215,13 +233,17 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         order_no = s.get("order_no")
         ex = ms_extra.get(order_no, {})
         is_done = rd._doc_no(order_no) in done_set
-        cls = "pt done" if is_done else "pt"
+        # Забор товара: заказ поставщику с нашей машиной (is_pickup из МС) ЛИБО ручная
+        # точка Логистики, названная «забрать …» (документа в МС у неё нет вообще).
+        is_pickup = bool(ex.get("is_pickup")) or _looks_like_pickup(order_no, s.get("client"))
+        cls = "pt" + (" done" if is_done else "") + (" pickup" if is_pickup else "")
 
-        client = s.get("client") or order_no or "?"
+        # Для забора имя = поставщик, адрес = «Адрес забора» из заказа поставщику (как в PDF-реестре).
+        client = (ex.get("client") if is_pickup and ex.get("client") else s.get("client")) or order_no or "?"
         # Окно приёмки — из полей заказа МС «Окно доставки с/до (время)», фолбэк на заявку.
         win = rr._fmt_window(ex.get("win_from"), ex.get("win_to"), s.get("tf"), s.get("tt"))
         plan = rr._hm(s.get("vt"))
-        address = s.get("address") or ""
+        address = (ex.get("address") if is_pickup and ex.get("address") else s.get("address")) or ""
         wt = rr._fmt_weight(ex.get("weight"))
         places = ex.get("places")
         places = str(places) if places not in (None, "") else "—"
@@ -229,8 +251,9 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         comment = (ex.get("comment") or "").replace("\n", " ").strip()
 
         rows = []
+        badge = "<span class='tag-pickup'>ЗАБОР</span>" if is_pickup else ""
         rows.append(f"<div class='top'><span class='num'>{i}.</span>"
-                    f"<span class='cli'>{_e(client)}</span>"
+                    f"<span class='cli'>{_e(client)}{badge}</span>"
                     f"<span class='win'>🕒 {_e(plan)} · {_e(win)}</span></div>")
         if address:
             rows.append(f"<div class='row'>📍 <a href='{_maps_link(address)}' target='_blank'>{_e(address)}</a></div>")
@@ -248,13 +271,30 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         rows.append(f"<div class='meta'>№ заказа {_e(order_no)}</div>")
 
         if is_done:
-            rows.append("<div class='done-badge'>✅ Сдан</div>")
+            rows.append(f"<div class='done-badge'>{'✅ Забрано' if is_pickup else '✅ Сдан'}</div>")
+        elif is_pickup:
+            # Забор: денег и «сдачи» нет — водитель забирает товар и документы у поставщика.
+            rows.append(
+                f"<form class='sd' data-uid='{uid}' data-date='{date_iso}' data-kind='pickup' "
+                f"data-order='{_e(order_no)}' data-token='{_e(token)}'>"
+                + _q_block("✍️ Забрал документы?", "doc", [("yes", "Да"), ("no", "Нет")])
+                + _q_block("📦 Итог забора:", "accepted",
+                           [("ok", "Забрал"), ("claim", "Проблема")])
+                + "<textarea name='claim_text' class='claim' placeholder='Что не так: чего не хватило, что не отдали' hidden></textarea>"
+                  "<button type='button' class='btn' onclick='sendSd(this.form)'>Отправить забор</button>"
+                  "<div class='msg'></div></form>")
         else:
             is_retail = (client or "").startswith("Рознич")
+            # Бесплатные образцы клиенту проводят по 1 ₽ за позицию (собственник, 2026-08-04):
+            # денег с такой точки водитель не берёт → вопрос про деньги не показываем.
+            is_sample = 0 < (ex.get("max_price_rub") or 0) <= _SAMPLE_MAX_PRICE_RUB
+            money_needed = is_retail and not is_sample
             # Чеклист — колонкой: вопрос строкой, ответы под ним (собственник, 2026-08-04).
             # В строку не помещалось на телефоне и водитель промахивался по варианту.
             money_q = _q_block("💵 Забрал деньги?", "money",
-                               [("yes", "Да"), ("no", "Нет")]) if is_retail else ""
+                               [("yes", "Да"), ("no", "Нет")]) if money_needed else ""
+            if is_sample:
+                rows.append("<div class='meta sample'>🎁 Образцы — деньги не берём</div>")
             # Запасной вход «или через бот» убран (собственник, 2026-08-04): кнопки в
             # Telegram не нажимались/подвисали, сдача закрывается только здесь.
             rows.append(
@@ -293,18 +333,20 @@ _FORM_CSS = (".sd{margin-top:10px;padding-top:10px;border-top:1px solid #eee}"
              ".msg{color:#b91c1c;font-size:14px;margin-top:6px}")
 
 _FORM_JS = (
-    "function sendSd(f){var acc=(f.accepted&&f.accepted.value)||'';"
-    "if(!acc){alert('Отметь: Сдано или Претензия');return;}"
+    "function sendSd(f){var pk=f.dataset.kind==='pickup';"
+    "var acc=(f.accepted&&f.accepted.value)||'';"
+    "if(!acc){alert(pk?'Отметь: Забрал или Проблема':'Отметь: Сдано или Претензия');return;}"
     "var body={order_no:f.dataset.order,items:{}};"
+    "if(pk){body.kind='pickup';body.title=(f.closest('.pt').querySelector('.cli')||{}).textContent||'';}"
     "new FormData(f).forEach(function(v,k){if(k.indexOf('item_')===0){body.items[k.slice(5)]=v;}else{body[k]=v;}});"
-    "if(acc==='claim'&&!((body.claim_text||'').trim())){alert('Опиши претензию');return;}"
+    "if(acc==='claim'&&!((body.claim_text||'').trim())){alert(pk?'Опиши, что не так':'Опиши претензию');return;}"
     "var url='/route/'+f.dataset.uid+'/'+f.dataset.date+'/submit?t='+encodeURIComponent(f.dataset.token);"
-    "var btn=f.querySelector('button');btn.disabled=true;btn.textContent='Отправляю…';"
-    "function fail(t){f.querySelector('.msg').textContent=t;btn.disabled=false;btn.textContent='Отправить сдачу';}"
+    "var btn=f.querySelector('button');var lbl=btn.textContent;btn.disabled=true;btn.textContent='Отправляю…';"
+    "function fail(t){f.querySelector('.msg').textContent=t;btn.disabled=false;btn.textContent=lbl;}"
     "fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})"
     ".then(function(r){return r.text().then(function(txt){return{status:r.status,txt:txt};});})"
     ".then(function(res){var d=null;try{d=JSON.parse(res.txt);}catch(_){}"
-    "if(d&&d.ok){var c=f.closest('.pt');if(c)c.className='pt done';"
+    "if(d&&d.ok){var c=f.closest('.pt');if(c)c.className='pt done'+(pk?' pickup':'');"
     "f.outerHTML=\"<div class='done-badge'>\"+(d.msg||'✅ Закрыто')+\"</div>\";}"
     "else if(d){fail(d.msg||('Ошибка '+res.status));}"
     "else{fail('HTTP '+res.status+': '+((res.txt||'нет ответа').replace(/<[^>]*>/g,' ').trim().slice(0,140)));}})"
@@ -375,6 +417,13 @@ async def handle_submit(request, db, bot) -> web.Response:
         return web.json_response({"ok": False, "msg": "Не указана точка"}, status=400)
     try:
         import driver_checklist as dc
+        if (body.get("kind") or "") == "pickup":
+            # Забор: отгрузки в МС нет — своя ветка (гасим точку + уведомляем логистов).
+            ok, msg = await dc.web_pickup_submit(
+                db, bot, uid, order_no,
+                doc=body.get("doc"), accepted=(body.get("accepted") or ""),
+                claim_text=body.get("claim_text") or "", title=(body.get("title") or "").strip())
+            return web.json_response({"ok": ok, "msg": msg})
         ok, msg = await dc.web_submit(
             db, bot, uid, order_no,
             money=body.get("money"), doc=body.get("doc"),
