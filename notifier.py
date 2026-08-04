@@ -485,6 +485,7 @@ async def _send_fishki_mailing(order: dict, db) -> tuple[bool, str]:
                     ) as r:
                         if r.status in (200, 201):
                             sent = True
+                            db.clear_fishki_failure(order_id)
                             logger.info(f"notifier: ✅ отправлено {agent_name} → {contact['chat_type']}")
                             if QUIZ_BASE_URL:
                                 try:
@@ -513,9 +514,15 @@ async def _send_fishki_mailing(order: dict, db) -> tuple[bool, str]:
         last_err = f"net_err:{type(_outer).__name__}:{str(_outer)[:200]}"
         logger.warning(f"notifier: отправка {agent_name} прервана: {_outer}")
     finally:
-        # Все каналы провалились — откатываем claim, чтобы sweep-крон дошлёт позже.
+        # Все каналы провалились — откатываем claim, чтобы sweep-крон дошлёт позже,
+        # и считаем попытку: на второй неудаче sweep предупредит собственника.
+        # План: plans/2026-08-04-алерт-рассылка-фишки-не-доставлена.md
         if not sent:
             db.release_agreed_notification(order_id)
+            try:
+                db.record_fishki_failure(order_id, order_name, agent_name, last_err)
+            except Exception as _db_e:
+                logger.warning(f"notifier: record_fishki_failure failed ({_db_e})")
             logger.error(
                 f"notifier: ❌ все каналы провалились для {agent_name}, claim откачен: {last_err}"
             )
@@ -847,7 +854,7 @@ async def sweep_missed_fishki(bot, db) -> dict:
 
     stats = {"checked": 0, "candidates": 0, "sent": 0,
              "retail": 0, "excluded": 0, "no_contact": 0,
-             "already": 0, "stale": 0, "errors": 0}
+             "already": 0, "stale": 0, "errors": 0, "alerted": 0}
 
     # 1) Тянем заказы, обновлённые за окно (пагинация).
     orders: list[dict] = []
@@ -918,7 +925,58 @@ async def sweep_missed_fishki(bot, db) -> dict:
         f"дослано={stats['sent']} розница={stats['retail']} исключ={stats['excluded']} "
         f"нет_контакта={stats['no_contact']} старых={stats['stale']} ошибок={stats['errors']}"
     )
+
+    # 3) Алерт собственнику по заказам, которые не доходят до клиента.
+    stats["alerted"] = await _alert_stuck_fishki(bot, db)
     return stats
+
+
+FISHKI_ALERT_MIN_ATTEMPTS = 2
+
+
+async def _alert_stuck_fishki(bot, db) -> int:
+    """Предупреждает собственника о заказах, по которым рассылка не уходит.
+
+    Порог — FISHKI_ALERT_MIN_ATTEMPTS попыток: первая обычно вебхук «Согласован»,
+    вторая — ближайший тик sweep. Разовый сбой Wazzup лечится дослыкой сам и
+    собственника не трогает; два провала подряд — уже повод посмотреть руками.
+    Алерт по заказу одноразовый (alerted_at), повторно не тревожим.
+    План: plans/2026-08-04-алерт-рассылка-фишки-не-доставлена.md
+    """
+    try:
+        db.purge_old_fishki_failures(7)
+        stuck = db.fishki_failures_to_alert(FISHKI_ALERT_MIN_ATTEMPTS)
+    except Exception as e:
+        logger.warning(f"fishki-sweep: не смог прочитать неудачи рассылки: {e}")
+        return 0
+
+    if not stuck:
+        return 0
+
+    owner_raw = os.getenv("OWNER_CHAT_ID", "").strip()
+    if not owner_raw.lstrip("-").isdigit():
+        logger.error("fishki-sweep: OWNER_CHAT_ID не задан, алерт о застрявшей рассылке некому слать")
+        return 0
+
+    lines = ["❗️ Рассылка «проверьте заказ + фишки» не доходит до клиента:", ""]
+    for row in stuck:
+        err = (row.get("last_error") or "")[:160]
+        lines.append(
+            f"• №{row.get('order_name') or '?'} — {row.get('agent_name') or '?'}\n"
+            f"  попыток: {row.get('attempts')}, последняя ошибка: {err}"
+        )
+    lines.append("")
+    lines.append("Дослать после починки: /reset_agreed [номер заказа]")
+
+    try:
+        await bot.send_message(chat_id=int(owner_raw), text="\n".join(lines))
+    except Exception as e:
+        logger.error(f"fishki-sweep: алерт собственнику не ушёл: {e}")
+        return 0
+
+    db.mark_fishki_failures_alerted([r["order_id"] for r in stuck])
+    logger.info(f"fishki-sweep: алерт собственнику по {len(stuck)} заказам отправлен")
+    return len(stuck)
 
 
 # ============================================================================

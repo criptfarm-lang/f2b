@@ -378,6 +378,20 @@ class Database:
                 order_id TEXT PRIMARY KEY,
                 sent_at TIMESTAMP DEFAULT NOW()
             )""",
+            # Неудачные попытки рассылки «проверьте заказ + фишки» (notifier.py).
+            # Строка появляется только на технических провалах (Wazzup отверг /
+            # недоступен) — розница, исключения и «нет контакта» сюда не попадают.
+            # Успешная отправка запись удаляет. alerted_at — одноразовый алерт
+            # собственнику при attempts >= 2. План 2026-08-04-алерт-рассылка-фишки.
+            """CREATE TABLE IF NOT EXISTS fishki_send_failures (
+                order_id TEXT PRIMARY KEY,
+                order_name TEXT,
+                agent_name TEXT,
+                attempts INT NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_try TIMESTAMPTZ NOT NULL DEFAULT now(),
+                alerted_at TIMESTAMPTZ
+            )""",
             """CREATE TABLE IF NOT EXISTS not_agreed_notifications (
                 order_id TEXT NOT NULL,
                 sum_hash BIGINT NOT NULL,
@@ -1374,6 +1388,63 @@ class Database:
         уведомлённым и sweep-крон его больше не дошлёт (тихий пропуск).
         """
         self._execute("DELETE FROM agreed_notifications WHERE order_id=%s", (order_id,))
+
+    # ── Учёт неудачных попыток FISHки-рассылки (алерт собственнику) ──────────
+    # План: plans/2026-08-04-алерт-рассылка-фишки-не-доставлена.md
+
+    def record_fishki_failure(
+        self, order_id: str, order_name: str, agent_name: str, last_error: str
+    ):
+        """Считает неудачную попытку рассылки по заказу.
+
+        Пишется только на технических провалах (Wazzup отверг или недоступен) —
+        розница, исключения и «нет контакта» до этого места не доходят.
+        """
+        self._execute(
+            """INSERT INTO fishki_send_failures
+                   (order_id, order_name, agent_name, attempts, last_error, last_try)
+               VALUES (%s, %s, %s, 1, %s, now())
+               ON CONFLICT (order_id) DO UPDATE SET
+                   attempts   = fishki_send_failures.attempts + 1,
+                   last_error = EXCLUDED.last_error,
+                   last_try   = now(),
+                   order_name = EXCLUDED.order_name,
+                   agent_name = EXCLUDED.agent_name""",
+            (order_id, order_name, agent_name, last_error[:500]),
+        )
+
+    def clear_fishki_failure(self, order_id: str):
+        """Рассылка по заказу всё-таки ушла — снимаем заказ с учёта неудач."""
+        self._execute("DELETE FROM fishki_send_failures WHERE order_id=%s", (order_id,))
+
+    def fishki_failures_to_alert(self, min_attempts: int = 2) -> list[dict]:
+        """Заказы, по которым пора предупредить собственника.
+
+        Условие: попыток >= min_attempts и алерт ещё не отправлялся.
+        """
+        return self._fetchall(
+            """SELECT order_id, order_name, agent_name, attempts, last_error
+                 FROM fishki_send_failures
+                WHERE attempts >= %s AND alerted_at IS NULL
+                ORDER BY last_try""",
+            (min_attempts,),
+        ) or []
+
+    def mark_fishki_failures_alerted(self, order_ids: list[str]):
+        """Проставляет alerted_at — второй раз по тому же заказу не тревожим."""
+        if not order_ids:
+            return
+        self._execute(
+            "UPDATE fishki_send_failures SET alerted_at=now() WHERE order_id = ANY(%s)",
+            (list(order_ids),),
+        )
+
+    def purge_old_fishki_failures(self, days: int = 7):
+        """Чистка: заказы, ушедшие из окна дослыки, висели бы вечно."""
+        self._execute(
+            "DELETE FROM fishki_send_failures WHERE last_try < now() - make_interval(days => %s)",
+            (days,),
+        )
 
     def try_claim_bulk_notification(self, order_id: str) -> bool:
         """Атомарный claim для алерта «крупный заказ готовой продукции».
