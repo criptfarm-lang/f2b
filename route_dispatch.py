@@ -119,6 +119,48 @@ def _sklad_kb(dstr, uid) -> InlineKeyboardMarkup:
         "🔄 Обновить (места)", callback_data=f"rd:sklrf:{dstr}:{uid}")]])
 
 
+async def _send_pdf(bot, chat_id, pdf_bytes, filename, caption, reply_markup=None):
+    """Отправка PDF-реестра с повтором и текстовым фолбэком.
+
+    Связь Amvera Москва_0 ↔ Telegram периодически деградирует, и именно отправка
+    ДОКУМЕНТА (сотни КБ) не укладывается даже в 30-секундный write_timeout:
+    04–05.08.2026 подтверждение маршрута писало `confirmed` в БД, а `cb_confirm
+    push logist group: Timed out` — реестр в группу так и не приходил.
+
+    Поэтому: 3 попытки с увеличенными таймаутами и паузами, а если файл так и не
+    прошёл — шлём хотя бы ТЕКСТ той же подписи (он лёгкий и проходит там, где
+    файл не проходит). В подписи есть ссылка на живой веб-реестр, так что склад и
+    логисты получают рабочую информацию, а не тишину.
+
+    Возвращает (ok: bool, msg или None, как_доставлено: 'pdf'|'text'|'нет')."""
+    last = None
+    for attempt, pause in ((1, 3), (2, 7), (3, 0)):
+        try:
+            msg = await bot.send_document(
+                chat_id, io.BytesIO(pdf_bytes), filename=filename, caption=caption,
+                parse_mode="HTML", reply_markup=reply_markup,
+                write_timeout=60, read_timeout=60, connect_timeout=30)
+            if attempt > 1:
+                logger.info("_send_pdf → %s: доставлено с попытки %s", chat_id, attempt)
+            return True, msg, "pdf"
+        except Exception as e:
+            last = e
+            logger.warning("_send_pdf → %s, попытка %s: %s", chat_id, attempt, e)
+            if pause:
+                await asyncio.sleep(pause)
+    try:
+        msg = await bot.send_message(
+            chat_id, f"{caption}\n\n⚠️ PDF-реестр не отправился (Telegram лагает) — "
+                     f"открой живой реестр по ссылке выше.",
+            parse_mode="HTML", reply_markup=reply_markup,
+            disable_web_page_preview=True, write_timeout=30, read_timeout=30)
+        logger.warning("_send_pdf → %s: PDF не прошёл (%s), ушёл текст", chat_id, last)
+        return True, msg, "text"
+    except Exception as e:
+        logger.error("_send_pdf → %s: не доставлено ни PDF, ни текст: %s", chat_id, e)
+        return False, None, "нет"
+
+
 def _h(s) -> str:
     """Экранирование для parse_mode=HTML.
 
@@ -356,14 +398,13 @@ async def cmd_sklad_push(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = _sklad_caption(unit_name, target.strftime("%d.%m.%Y"), note,
                                  _links_block(uid, stops, dstr),
                                  refreshed_at=datetime.now(_MSK), uid=uid)
-        try:
-            await context.bot.send_document(
-                sklad, io.BytesIO(pkg["pdf"]),
-                filename=f"reestr_{uid}_{dstr}.pdf", caption=caption,
-                parse_mode="HTML", reply_markup=_sklad_kb(dstr, uid))
-            sent.append(f"{unit_name}: {len(stops)}")
-        except Exception as e:
-            logger.warning("cmd_sklad_push send %s: %s", uid, e)
+        ok, _, how = await _send_pdf(context.bot, sklad, pkg["pdf"],
+                                     f"reestr_{uid}_{dstr}.pdf", caption,
+                                     reply_markup=_sklad_kb(dstr, uid))
+        if ok:
+            sent.append(f"{unit_name}: {len(stops)}" + ("" if how == "pdf" else " (без PDF)"))
+        else:
+            logger.warning("cmd_sklad_push send %s: не доставлено", uid)
     if sent:
         await update.message.reply_text("Отправлено в «Склад»: " + " / ".join(sent))
     else:
@@ -625,10 +666,9 @@ async def _collect_and_send(context, target_date, to_chat):
                                   callback_data=f"rd:conf:{target_date.isoformat()}:{uid}")],
             [InlineKeyboardButton("🔄 Пересобрать", callback_data=f"rd:col:{day_off}")],
         ])
-        await context.bot.send_document(
-            to_chat, document=io.BytesIO(pkg["pdf"]),
-            filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
-            caption=caption[:1024], parse_mode="HTML", reply_markup=kb)
+        await _send_pdf(context.bot, to_chat, pkg["pdf"],
+                        f"reestr_{uid}_{target_date.isoformat()}.pdf",
+                        caption[:1024], reply_markup=kb)
         sent += 1
     if sent == 0:
         await context.bot.send_message(
@@ -702,14 +742,16 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 body = _h(f"Маршрут — {left} из {len(stops)} точек (порядок выгрузки).\n\n{note}\n\n"
                           f"👉 Чеклист машины: {_route_link(uid, dstr)}")
-            msg = await context.bot.send_document(
-                logist_group, io.BytesIO(pkg["pdf"]),
-                filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
-                caption=f"{head}\n\n{body}{_h(ya_block)}", parse_mode="HTML")
-            if _DB is not None:
+            ok, msg, how = await _send_pdf(
+                context.bot, logist_group, pkg["pdf"],
+                f"reestr_{uid}_{target_date.isoformat()}.pdf",
+                f"{head}\n\n{body}{_h(ya_block)}")
+            if ok and msg is not None and _DB is not None:
                 _DB._execute("UPDATE route_dispatch SET driver_msg_id=%s WHERE snap_date=%s AND unit_id=%s",
                              (msg.message_id, dstr, uid))
-            driver_note = "логистика ✓"
+            driver_note = ("логистика ✓" if how == "pdf"
+                           else "логистика ✓ (без PDF, Telegram лагает)" if ok
+                           else "⚠️ в «Логистику» НЕ доставлено")
         except Exception as e:
             logger.warning("cb_confirm push logist group: %s", e)
             driver_note = "⚠️ в «Логистику» НЕ доставлено"
@@ -720,17 +762,14 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sklad_note = ""
     sklad = _sklad_chat_id()
     if sklad:
-        try:
-            await context.bot.send_document(
-                sklad, io.BytesIO(pkg["pdf"]),
-                filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
-                caption=_sklad_caption(unit_name, date_str, note,
-                                       _links_block(uid, stops, dstr), uid=uid),
-                parse_mode="HTML", reply_markup=_sklad_kb(dstr, uid))
-            sklad_note = "склад ✓"
-        except Exception as e:
-            logger.warning("cb_confirm push sklad: %s", e)
-            sklad_note = "⚠️ склад НЕ доставлено"
+        ok, _, how = await _send_pdf(
+            context.bot, sklad, pkg["pdf"],
+            f"reestr_{uid}_{target_date.isoformat()}.pdf",
+            _sklad_caption(unit_name, date_str, note, _links_block(uid, stops, dstr), uid=uid),
+            reply_markup=_sklad_kb(dstr, uid))
+        sklad_note = ("склад ✓" if how == "pdf"
+                      else "склад ✓ (без PDF, Telegram лагает)" if ok
+                      else "⚠️ склад НЕ доставлено")
 
     try:
         await q.edit_message_caption(
@@ -772,13 +811,10 @@ async def cb_sklad_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 1) Свежий лист склада — НОВЫМ сообщением (внизу группы), старое удаляем, чтобы
     #    устаревшие реестры не путались. Сначала шлём новый; только при успехе удаляем старый.
-    try:
-        await context.bot.send_document(
-            q.message.chat_id, io.BytesIO(pkg["pdf"]),
-            filename=f"reestr_{uid}_{dstr}.pdf", caption=caption,
-            parse_mode="HTML", reply_markup=_sklad_kb(dstr, uid))
-    except Exception as e:
-        logger.warning("cb_sklad_refresh send: %s", e)
+    ok, _, _ = await _send_pdf(context.bot, q.message.chat_id, pkg["pdf"],
+                               f"reestr_{uid}_{dstr}.pdf", caption,
+                               reply_markup=_sklad_kb(dstr, uid))
+    if not ok:
         await _safe_answer(q, "Не удалось обновить лист склада.", alert=True)
         return
     # удаляем предыдущее сообщение (то, под которым нажали «Обновить»)
@@ -791,17 +827,13 @@ async def cb_sklad_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     drv = ""
     logist_group = _logist_group_chat_id()
     if logist_group:
-        try:
-            await context.bot.send_document(
-                logist_group, io.BytesIO(pkg["pdf"]),
-                filename=f"reestr_{uid}_{dstr}.pdf",
-                caption=(f"🔄 Обновлённый реестр — <b>{_h(rr.unit_title(uid))}</b>, "
-                         f"{_h(date_str)}. Места уточнены."),
-                parse_mode="HTML")
-            drv = " В «Логистику» отправлено."
-        except Exception as e:
-            logger.warning("cb_sklad_refresh push logist group: %s", e)
-            drv = " ⚠️ В «Логистику» не доставлено."
+        ok, _, how = await _send_pdf(
+            context.bot, logist_group, pkg["pdf"], f"reestr_{uid}_{dstr}.pdf",
+            (f"🔄 Обновлённый реестр — <b>{_h(rr.unit_title(uid))}</b>, "
+             f"{_h(date_str)}. Места уточнены."))
+        drv = (" В «Логистику» отправлено." if how == "pdf"
+               else " В «Логистику» ушёл текст (PDF не прошёл)." if ok
+               else " ⚠️ В «Логистику» не доставлено.")
     await _safe_answer(q, f"Обновлено.{drv}")
 
 
