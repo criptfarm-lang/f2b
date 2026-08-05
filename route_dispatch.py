@@ -14,6 +14,7 @@ import json
 import math
 import asyncio
 import logging
+import html as _html_mod
 from datetime import datetime, date, timezone, timedelta
 
 import aiohttp
@@ -118,12 +119,23 @@ def _sklad_kb(dstr, uid) -> InlineKeyboardMarkup:
         "🔄 Обновить (места)", callback_data=f"rd:sklrf:{dstr}:{uid}")]])
 
 
+def _h(s) -> str:
+    """Экранирование для parse_mode=HTML.
+
+    Раньше подписи шли Markdown'ом и ломались на живых данных: в именах клиентов
+    попадаются `*` и `_` («Розничный покупатель*** (Ирина)») → Telegram отвечал
+    `Can't parse entities` и реестр по машине не уходил вовсе (05.08.2026).
+    HTML безопаснее: экранируем &, <, > — включая `&` внутри ссылок Яндекс.Карт."""
+    return _html_mod.escape(str(s if s is not None else ""), quote=False)
+
+
 def _sklad_caption(unit_name, date_str, note, links, refreshed_at=None, uid=None) -> str:
     """Подпись листа загрузки для группы Склад (макет собственника, 2026-08-04):
     шапка «марка — номер, дата» → объём/пробег → предупреждения → ссылки → подпись.
     Порядок загрузки («первая точка к дверям») из сообщения убран — он в самом PDF."""
     title = rr.unit_title(uid) if uid is not None else unit_name
-    head = f"🚚 *{title}*, {date_str}.\n\n{note}"
+    head = f"🚚 <b>{_h(title)}</b>, {_h(date_str)}.\n\n{_h(note)}"
+    links = _h(links)
     tail = ("\n\n✍️ Перед выездом водитель подписывает копию реестра и отдаёт "
             "оператору склада.")
     stamp = f"\n\n🔄 Обновлено {refreshed_at:%H:%M} — места актуальны." if refreshed_at else ""
@@ -348,7 +360,7 @@ async def cmd_sklad_push(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_document(
                 sklad, io.BytesIO(pkg["pdf"]),
                 filename=f"reestr_{uid}_{dstr}.pdf", caption=caption,
-                parse_mode="Markdown", reply_markup=_sklad_kb(dstr, uid))
+                parse_mode="HTML", reply_markup=_sklad_kb(dstr, uid))
             sent.append(f"{unit_name}: {len(stops)}")
         except Exception as e:
             logger.warning("cmd_sklad_push send %s: %s", uid, e)
@@ -603,10 +615,11 @@ async def _collect_and_send(context, target_date, to_chat):
         note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
         lines = [f"{i}. {(s.get('client') or s.get('order_no') or '?')[:35]} ({rr._hm(s.get('vt'))})"
                  for i, s in enumerate(stops, 1)]
-        caption = (f"🚚 *{rr.unit_title(uid)}*\n"
-                   f"{note}\n"
-                   f"Маршрут на {date_str} — {len(stops)} точек (порядок выгрузки):\n"
-                   + "\n".join(lines))
+        # Имена клиентов идут в подпись как есть — экранируем (в них бывают * и _).
+        caption = (f"🚚 <b>{_h(rr.unit_title(uid))}</b>\n"
+                   f"{_h(note)}\n"
+                   f"Маршрут на {_h(date_str)} — {len(stops)} точек (порядок выгрузки):\n"
+                   + _h("\n".join(lines)))
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Подтвердить",
                                   callback_data=f"rd:conf:{target_date.isoformat()}:{uid}")],
@@ -615,7 +628,7 @@ async def _collect_and_send(context, target_date, to_chat):
         await context.bot.send_document(
             to_chat, document=io.BytesIO(pkg["pdf"]),
             filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
-            caption=caption[:1024], parse_mode="Markdown", reply_markup=kb)
+            caption=caption[:1024], parse_mode="HTML", reply_markup=kb)
         sent += 1
     if sent == 0:
         await context.bot.send_message(
@@ -683,16 +696,16 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # `done` хранит ОЧИЩЕННЫЕ № документов (_doc_no) — сравниваем так же:
             # в сыром order_no бывают заметки логиста, и счётчик закрытых врал.
             left = len([s for s in stops if _doc_no(s.get("order_no")) not in done_prev])
-            head = f"🚚 *{rr.unit_title(uid)}*, {date_str}."
+            head = f"🚚 <b>{_h(rr.unit_title(uid))}</b>, {_h(date_str)}."
             if left == 0:
                 body = "Все точки уже закрыты. ✅"
             else:
-                body = (f"Маршрут — {left} из {len(stops)} точек (порядок выгрузки).\n\n{note}\n\n"
-                        f"👉 Чеклист машины: {_route_link(uid, dstr)}")
+                body = _h(f"Маршрут — {left} из {len(stops)} точек (порядок выгрузки).\n\n{note}\n\n"
+                          f"👉 Чеклист машины: {_route_link(uid, dstr)}")
             msg = await context.bot.send_document(
                 logist_group, io.BytesIO(pkg["pdf"]),
                 filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
-                caption=f"{head}\n\n{body}{ya_block}", parse_mode="Markdown")
+                caption=f"{head}\n\n{body}{_h(ya_block)}", parse_mode="HTML")
             if _DB is not None:
                 _DB._execute("UPDATE route_dispatch SET driver_msg_id=%s WHERE snap_date=%s AND unit_id=%s",
                              (msg.message_id, dstr, uid))
@@ -713,7 +726,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 filename=f"reestr_{uid}_{target_date.isoformat()}.pdf",
                 caption=_sklad_caption(unit_name, date_str, note,
                                        _links_block(uid, stops, dstr), uid=uid),
-                parse_mode="Markdown", reply_markup=_sklad_kb(dstr, uid))
+                parse_mode="HTML", reply_markup=_sklad_kb(dstr, uid))
             sklad_note = "склад ✓"
         except Exception as e:
             logger.warning("cb_confirm push sklad: %s", e)
@@ -763,7 +776,7 @@ async def cb_sklad_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_document(
             q.message.chat_id, io.BytesIO(pkg["pdf"]),
             filename=f"reestr_{uid}_{dstr}.pdf", caption=caption,
-            parse_mode="Markdown", reply_markup=_sklad_kb(dstr, uid))
+            parse_mode="HTML", reply_markup=_sklad_kb(dstr, uid))
     except Exception as e:
         logger.warning("cb_sklad_refresh send: %s", e)
         await _safe_answer(q, "Не удалось обновить лист склада.", alert=True)
@@ -782,8 +795,9 @@ async def cb_sklad_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_document(
                 logist_group, io.BytesIO(pkg["pdf"]),
                 filename=f"reestr_{uid}_{dstr}.pdf",
-                caption=f"🔄 Обновлённый реестр — *{rr.unit_title(uid)}*, {date_str}. Места уточнены.",
-                parse_mode="Markdown")
+                caption=(f"🔄 Обновлённый реестр — <b>{_h(rr.unit_title(uid))}</b>, "
+                         f"{_h(date_str)}. Места уточнены."),
+                parse_mode="HTML")
             drv = " В «Логистику» отправлено."
         except Exception as e:
             logger.warning("cb_sklad_refresh push logist group: %s", e)
