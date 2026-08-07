@@ -19,6 +19,7 @@ Wialon: ресурс заявок 26208, машины 26209 (В 970 СВ 797) / 
 import os
 import io
 import json
+import time
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
@@ -449,6 +450,17 @@ def _norm_name(s) -> str:
     return " ".join(s.upper().split())
 
 
+_PICKUP_CACHE = {}        # url заказов поставщику -> (mono_ts, rows)
+_PICKUP_CACHE_TTL = 300   # сек
+
+
+def _pickup_cache_get(key):
+    hit = _PICKUP_CACHE.get(key)
+    if hit and (time.monotonic() - hit[0]) < _PICKUP_CACHE_TTL:
+        return hit[1]
+    return None
+
+
 async def _ms_pickup_by_order(order_numbers, names=None) -> dict:
     """{order_no: pickup_dict} — точки ЗАБОРА (заказы поставщику с нашей машиной в «Автомобиль на
     Доверенность»). ОДИН пакетный запрос свежих ЗП (окно 14 дней). Матч точки к ЗП по НОМЕРУ, а если
@@ -478,16 +490,23 @@ async def _ms_pickup_by_order(order_numbers, names=None) -> dict:
             logger.warning("_ms_pickup_by_order fetch off=%s: %s", offset, e)
             return []
 
-    async with aiohttp.ClientSession() as session:
-        # Первая страница — синхронно; если она полная (100), остальные тянем ПАРАЛЛЕЛЬНО
-        # (последовательное листание было вторым источником долгой сборки реестра).
-        # На meta.size не опираемся — МС отдаёт его нестабильно и мы бы теряли заборы.
-        rows = await _page(session, 0)
-        all_rows = list(rows)
-        if len(rows) >= 100:
-            pages = await asyncio.gather(*(_page(session, o) for o in (100, 200, 300, 400)))
-            for chunk in pages:
-                all_rows.extend(chunk)
+    # Список ЗП кэшируем: это самый тяжёлый вызов реестра (до 5 страниц по 100 с expand), а
+    # заборы меняются редко. Без кэша каждый заход водителя на веб-чеклист тянул его заново и
+    # ловил 429 от МС — страница строилась десятками секунд (07.08.2026, план 2026-08-07).
+    all_rows = _pickup_cache_get(base)
+    if all_rows is None:
+        async with aiohttp.ClientSession() as session:
+            # Первая страница — синхронно; если она полная (100), остальные тянем ПАРАЛЛЕЛЬНО
+            # (последовательное листание было вторым источником долгой сборки реестра).
+            # На meta.size не опираемся — МС отдаёт его нестабильно и мы бы теряли заборы.
+            rows = await _page(session, 0)
+            all_rows = list(rows)
+            if len(rows) >= 100:
+                pages = await asyncio.gather(*(_page(session, o) for o in (100, 200, 300, 400)))
+                for chunk in pages:
+                    all_rows.extend(chunk)
+        if all_rows:   # пустой ответ (например, 429) не кэшируем — иначе заборы пропадут на 5 минут
+            _PICKUP_CACHE[base] = (time.monotonic(), all_rows)
 
     for po in all_rows:
         try:

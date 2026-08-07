@@ -1247,18 +1247,46 @@ async def web_pickup_submit(db, bot, uid, order_no, *, doc, accepted, claim_text
                   else "⚠️ Проблема зафиксирована, логист уведомлён.")
 
 
-async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, claim_text):
+# Сколько водитель ждёт МойСклад на сдаче, прежде чем сдача уходит в отложенную дозапись.
+_WEB_SUBMIT_MS_TIMEOUT = 12
+
+
+async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, claim_text,
+                     deferred=False):
     """Приёмка точки С ВЕБ-СТРАНИЦЫ, одним экраном, без telegram-контекста.
     money/doc/item — строки 'yes'/'no' (или None). accepted — 'ok'/'claim'.
     Пишет статус в МС (Сдан / Сдан с проблемой), помечает точку закрытой в
     route_dispatch.done по машине. Возвращает (ok: bool, msg: str). Бот — запаска,
-    поэтому логика записи зеркалит cb_accept/_finish_claim."""
+    поэтому логика записи зеркалит cb_accept/_finish_claim.
+
+    deferred=True — это уже фоновая дозапись (МС ждём сколько нужно, второй раз не откладываем)."""
     import route_dispatch
-    doc = route_dispatch._doc_no(order_no)  # чистим заметки логиста из № (как кнопки маршрута)
-    demand_id = await _resolve_deeplink_payload(doc)
+    # № документа держим ОТДЕЛЬНОЙ переменной: раньше он затирал `doc` — ответ водителя
+    # «Подписал документ?», и в `delivery_checklist.doc_signed` всегда уезжал null.
+    doc_no = route_dispatch._doc_no(order_no)  # чистим заметки логиста из № (как кнопки маршрута)
+    try:
+        # Резолв отгрузки — два запроса в МС. При 429-шторме они висят десятками секунд
+        # (троттл спит 30 с), телефон рвёт соединение и сдача выглядит несработавшей.
+        # Поэтому ждём ограниченно, а дальше принимаем точку и дописываем фоном.
+        async def _resolve():
+            did = await _resolve_deeplink_payload(doc_no)
+            return did, (await _fetch_demand_detail(did) if did else None)
+        if deferred:
+            demand_id, det = await _resolve()
+        else:
+            demand_id, det = await asyncio.wait_for(_resolve(), timeout=_WEB_SUBMIT_MS_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning("web_submit %s: МойСклад не ответил за %d с — принимаю точку отложенно",
+                       doc_no, _WEB_SUBMIT_MS_TIMEOUT)
+        try:
+            route_dispatch.mark_done_by_unit(uid, doc_no)
+        except Exception as e:
+            logger.warning("web_submit done (отложенно): %s", e)
+        asyncio.create_task(web_submit(db, bot, uid, order_no, money=money, doc=doc, items=items,
+                                       accepted=accepted, claim_text=claim_text, deferred=True))
+        return True, "✅ Точка закрыта. МойСклад тормозит — данные допишутся сами."
     if not demand_id:
         return False, "Точка ещё не отгружена складом — попробуй позже."
-    det = await _fetch_demand_detail(demand_id)
     if not det:
         return False, "Не удалось загрузить отгрузку. Попробуй ещё раз."
 
@@ -1301,28 +1329,55 @@ async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, cla
           money_val, _yn(doc), accepted_ok,
           ((claim_text or "").strip() or None) if not accepted_ok else None, status))
 
-    ms_target = "Сдан" if accepted_ok else "Сдан с проблемой"
-    wrote, write_on = False, False
     try:
-        import delivery_statuses as _dsx
-        write_on = _dsx._write_enabled()
-        wrote = await _dsx.write_ms_status(demand_id, ms_target)
-    except Exception as e:
-        logger.warning("web_submit МС-статус: %s", e)
-    try:
-        route_dispatch.mark_done_by_unit(uid, doc)
+        route_dispatch.mark_done_by_unit(uid, doc_no)
     except Exception as e:
         logger.warning("web_submit done: %s", e)
-    if not accepted_ok:
-        await _web_alert_claim(bot, _get_row(db, demand_id))
+
+    # Запись статуса в МС и алерт по претензии — ФОНОМ. При 429 глобальный троттл МС
+    # уходит в 30-секундный sleep, и водитель на телефоне видел сетевую ошибку, хотя
+    # сдача уже была принята (план 2026-08-07). Точка гаснет сразу, статус доезжает сам.
+    ms_target = "Сдан" if accepted_ok else "Сдан с проблемой"
+    asyncio.create_task(_web_finalize_bg(db, bot, demand_id, ms_target, accepted_ok))
 
     base = ("✅ Точка закрыта: сдано." if accepted_ok
             else "⚠️ Претензия зафиксирована, логист уведомлён.")
-    if wrote:
-        return True, f"{base} Статус в МС → «{ms_target}»."
-    if not write_on:
-        return True, f"{base} ⚠️ НО в МС статус НЕ записан: запись выключена (DELIVERY_STATUS_WRITE)."
-    return True, f"{base} ⚠️ НО статус «{ms_target}» в МС записать не удалось — сообщи логисту."
+    return True, f"{base} Статус в МС → «{ms_target}» проставляется."
+
+
+async def _web_finalize_bg(db, bot, demand_id, ms_target, accepted_ok):
+    """Хвост веб-сдачи, который водителю ждать незачем: статус в МС (с ретраями) и
+    алерт логистам по претензии. Если статус так и не записался — говорим логистам,
+    иначе отгрузка молча останется в старом статусе."""
+    try:
+        import delivery_statuses as _dsx
+        write_on = _dsx._write_enabled()
+        wrote = False
+        if write_on:
+            for attempt in range(3):
+                try:
+                    wrote = await _dsx.write_ms_status(demand_id, ms_target)
+                except Exception as e:
+                    logger.warning("web_submit МС-статус (попытка %d): %s", attempt + 1, e)
+                    wrote = False
+                if wrote:
+                    break
+                await asyncio.sleep(5 * (attempt + 1))
+        if not accepted_ok:
+            await _web_alert_claim(bot, _get_row(db, demand_id))
+        if write_on and not wrote:
+            row = _get_row(db, demand_id) or {}
+            text = (f"⚠️ Статус «{ms_target}» в МойСклад НЕ записался\n"
+                    f"Отгрузка {row.get('demand_name') or demand_id}"
+                    f"{' — ' + row.get('agent_name') if row.get('agent_name') else ''}\n"
+                    f"Водитель точку сдал, поставьте статус руками.")
+            for cid in _logist_chat_ids():
+                try:
+                    await bot.send_message(chat_id=cid, text=text)
+                except Exception as e:
+                    logger.warning("_web_finalize_bg → %s: %s", cid, e)
+    except Exception as e:
+        logger.error("_web_finalize_bg %s: %s", demand_id, e, exc_info=True)
 
 
 def register(app: Application, db):

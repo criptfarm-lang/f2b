@@ -13,6 +13,7 @@ deep-link'ом `t.me/<bot>?start=chk_<№заказа>` в существующ�
 import os
 import re
 import time
+import asyncio
 import hmac
 import hashlib
 import logging
@@ -157,18 +158,14 @@ async def _bot_username(bot) -> str:
 
 
 _ROUTE_CACHE = {}   # (uid, date_iso) -> (mono_ts, stops, ms_extra, order_routes)
-_ROUTE_TTL = 45     # сек: авто-refresh и повторные заходы бьют кэш, а не Wialon+МС
+_ROUTE_TASKS = {}   # (uid, date_iso) -> asyncio.Task построения снимка (single-flight)
+_ROUTE_TTL = 90     # сек: снимок свежий — отдаём как есть
+_COLD_WAIT = 25     # сек: сколько ждём ПЕРВОЕ построение, если снимка ещё нет вообще
 
 
-async def _route_data(uid: int, target: date):
-    """(stops, ms_extra, order_routes) с коротким TTL-кэшем — снимает тяжёлый живой
-    фетч Wialon+МС при авто-обновлении и повторных заходах. Закрытость точек (done) и
-    имя водителя берутся мимо кэша (дёшево, из БД) → статус сдачи всегда свежий."""
-    key = (uid, target.isoformat())
-    now = time.monotonic()
-    hit = _ROUTE_CACHE.get(key)
-    if hit and (now - hit[0]) < _ROUTE_TTL:
-        return hit[1], hit[2], hit[3]
+async def _build_route_data(uid: int, target: date):
+    """Тяжёлый живой фетч Wialon + МойСклад. Горячий путь HTTP-запроса его НЕ ждёт
+    (кроме самого первого раза) — см. `_route_data`."""
     routes, order_routes = await rr.fetch_routes(with_meta=True)
     stops = [s for s in (routes.get(uid) or []) if rd._stop_on_date(s, target)]
     # names — чтобы заборы (заказы поставщику) матчились ещё и по названию поставщика,
@@ -177,8 +174,76 @@ async def _route_data(uid: int, target: date):
         [s["order_no"] for s in stops],
         names={s["order_no"]: s.get("client") for s in stops},
     ) if stops else {}
-    _ROUTE_CACHE[key] = (now, stops, ms_extra, order_routes)
     return stops, ms_extra, order_routes
+
+
+async def _refresh(key, uid: int, target: date):
+    """Обновить снимок маршрута в кэше. Единственное место, которое ходит в Wialon/МС."""
+    t0 = time.monotonic()
+    try:
+        data = await _build_route_data(uid, target)
+        _ROUTE_CACHE[key] = (time.monotonic(),) + data
+        logger.info("route_web: снимок %s обновлён за %.1f с (%d точек)",
+                    key, time.monotonic() - t0, len(data[0]))
+        return data
+    except Exception as e:
+        logger.warning("route_web: снимок %s не собрался за %.1f с: %s", key, time.monotonic() - t0, e)
+        raise
+    finally:
+        _ROUTE_TASKS.pop(key, None)
+
+
+def _ensure_refresh(key, uid: int, target: date):
+    """Запустить обновление снимка, если оно ещё не идёт (single-flight: три водителя
+    на одной машине не должны запускать три одинаковых тяжёлых фетча)."""
+    task = _ROUTE_TASKS.get(key)
+    if task is None or task.done():
+        task = asyncio.ensure_future(_refresh(key, uid, target))
+        _ROUTE_TASKS[key] = task
+    return task
+
+
+async def _route_data(uid: int, target: date):
+    """(stops, ms_extra, order_routes, age_sec) из фонового снимка.
+
+    Страница водителя не должна зависеть от скорости МойСклад: при 429 глобальный
+    троттл (`moysklad.py`) уходит в 30-секундный sleep, и синхронный рендер висел
+    десятки секунд — телефон рвал соединение (07.08.2026: `200` с телом 0 байт).
+    Поэтому: свежий снимок отдаём сразу; протухший — тоже сразу, а обновление
+    крутится в фоне; ждём построение только если снимка нет вообще.
+    Закрытость точек (done) читается мимо снимка, из БД → статус сдачи всегда свежий."""
+    key = (uid, target.isoformat())
+    hit = _ROUTE_CACHE.get(key)
+    age = (time.monotonic() - hit[0]) if hit else None
+    if hit and age < _ROUTE_TTL:
+        return hit[1], hit[2], hit[3], age
+    task = _ensure_refresh(key, uid, target)
+    if hit:
+        return hit[1], hit[2], hit[3], age   # stale-while-revalidate
+    # Холодный старт: подождём построение, но задачу не отменяем — доедет для следующего захода.
+    await asyncio.wait([task], timeout=_COLD_WAIT)
+    hit = _ROUTE_CACHE.get(key)
+    if not hit:
+        raise TimeoutError("снимок маршрута ещё не готов")
+    return hit[1], hit[2], hit[3], time.monotonic() - hit[0]
+
+
+async def warm_all(target: date = None):
+    """Прогрев снимков всех машин — из фоновой джобы бота (bot.py). Водитель заходит
+    на готовое, а не запускает тяжёлый фетч своим кликом."""
+    target = target or datetime.now(_MSK).date()
+    for uid in rr.UNITS:
+        key = (uid, target.isoformat())
+        try:
+            await _refresh(key, uid, target)
+        except Exception:
+            pass   # причина уже в логе _refresh; остальные машины греем дальше
+
+
+def _age_note(age: float) -> str:
+    """Возраст снимка человеческим языком: «1 мин назад»."""
+    mins = int(age // 60)
+    return f"{mins} мин назад" if mins else f"{int(age)} сек назад"
 
 
 def _q_block(question: str, name: str, options) -> str:
@@ -200,7 +265,7 @@ async def render_page(uid: int, target: date, db, bot) -> str:
     date_iso = target.isoformat()
     token = make_token(uid, date_iso)
 
-    stops, ms_extra, order_routes = await _route_data(uid, target)
+    stops, ms_extra, order_routes, age = await _route_data(uid, target)
 
     # Закрытые точки. Имя водителя на странице больше не показываем (собственник,
     # 2026-08-04): маршрут привязан к машине, водители забирают свой рейс сами.
@@ -216,8 +281,11 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         except Exception as e:
             logger.warning("route_web done: %s", e)
 
+    # Возраст снимка показываем честно: страница отдаётся из фонового снимка (мгновенно),
+    # а не строится в момент захода — значит состав маршрута может отставать на минуту-другую.
+    stale = f" · данные {_age_note(age)}" if age and age >= _ROUTE_TTL else ""
     head = (f"<div class='head'><h1>🚚 {_e(rr.unit_title(uid))}</h1>"
-            f"<div class='sub'>{date_str} · {len(stops)} точек (порядок выгрузки)</div>")
+            f"<div class='sub'>{date_str} · {len(stops)} точек (порядок выгрузки){stale}</div>")
 
     if stops:
         km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
@@ -374,6 +442,20 @@ def _wrap(title: str, inner: str) -> str:
 
 # ─── aiohttp-хендлер ─────────────────────────────────────────────────────────
 
+def _waiting_page() -> web.Response:
+    """Маршрут ещё строится (холодный старт + тормоза МС) — страница сама перезагрузится."""
+    return web.Response(
+        text="<!doctype html><html lang='ru'><head><meta charset='utf-8'>"
+             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+             "<meta http-equiv='refresh' content='10'><title>Маршрут обновляется</title>"
+             "<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f2f4f7;"
+             "color:#334;margin:0;padding:48px 24px;text-align:center}"
+             "h2{font-size:19px;margin:0 0 8px}p{font-size:15px;color:#667}</style></head>"
+             "<body><h2>Маршрут обновляется…</h2>"
+             "<p>Страница откроется сама через несколько секунд.</p></body></html>",
+        content_type="text/html", charset="utf-8")
+
+
 def _err(text: str, status: int) -> web.Response:
     return web.Response(
         text=f"<html><body style='font-family:sans-serif;padding:40px;color:#6b7280'>"
@@ -392,9 +474,17 @@ async def handle(request, db, bot) -> web.Response:
         return _err("Неизвестная машина", 404)
     if not verify_token(uid, date_str, request.query.get("t", "")):
         return _err("Ссылка недействительна", 403)
+    t0 = time.monotonic()
     try:
         html_text = await render_page(uid, target, db, bot)
+        logger.info("route_web: страница uid=%s отдана за %.1f с", uid, time.monotonic() - t0)
         return web.Response(text=html_text, content_type="text/html", charset="utf-8")
+    except TimeoutError:
+        # Снимка ещё нет, а построение упёрлось в тормоза МС/Wialon. Отдаём лёгкую
+        # страницу с авто-перезагрузкой — водитель не смотрит в «вечную загрузку».
+        logger.warning("route_web: снимок uid=%s не готов за %.0f с — отдаю страницу ожидания",
+                       uid, time.monotonic() - t0)
+        return _waiting_page()
     except Exception as e:
         logger.error("route_web.handle: %s", e, exc_info=True)
         return _err("Не удалось собрать маршрут. Проверь доступ к Логистике.", 500)
