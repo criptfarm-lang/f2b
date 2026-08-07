@@ -27,6 +27,8 @@ from datetime import datetime, timedelta
 import httpx
 import psycopg2
 import psycopg2.extras
+
+from database import CONNECT_TIMEOUT_SEC, STATEMENT_TIMEOUT_MS
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
@@ -71,7 +73,9 @@ def _db():
     global _conn
     if _conn is None or _conn.closed:
         _conn = psycopg2.connect(os.environ["DATABASE_URL"],
-                                 cursor_factory=psycopg2.extras.RealDictCursor)
+                                 cursor_factory=psycopg2.extras.RealDictCursor,
+                                 connect_timeout=CONNECT_TIMEOUT_SEC,
+                                 options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS}")
         _conn.autocommit = True
         with _conn.cursor() as cur:
             cur.execute(LOG_DDL)

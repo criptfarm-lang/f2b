@@ -36,6 +36,8 @@ import requests
 import psycopg2
 import psycopg2.extras
 
+from database import CONNECT_TIMEOUT_SEC, STATEMENT_TIMEOUT_MS
+
 logger = logging.getLogger(__name__)
 
 # ── пороги правила (тюнятся) ──────────────────────────────────────────────────
@@ -70,7 +72,9 @@ def _db():
     global _conn
     if _conn is None or _conn.closed:
         _conn = psycopg2.connect(os.environ["DATABASE_URL"],
-                                 cursor_factory=psycopg2.extras.RealDictCursor)
+                                 cursor_factory=psycopg2.extras.RealDictCursor,
+                                 connect_timeout=CONNECT_TIMEOUT_SEC,
+                                 options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS}")
         _conn.autocommit = True
         with _conn.cursor() as cur:
             cur.execute(DDL)
@@ -129,7 +133,10 @@ def _bulk_upsert(rows: list):
     чтобы массовая запись в конце батча не зависела от состояния общего соединения."""
     if not rows:
         return
-    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    # Батчевая запись длиннее обычной — statement_timeout шире, но не безлимитный.
+    conn = psycopg2.connect(os.environ["DATABASE_URL"],
+                            connect_timeout=CONNECT_TIMEOUT_SEC,
+                            options="-c statement_timeout=120000")
     conn.autocommit = True
     try:
         with conn.cursor() as cur:

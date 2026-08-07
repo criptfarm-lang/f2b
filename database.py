@@ -10,6 +10,11 @@ from datetime import datetime, date, timedelta
 from typing import List, Dict, Optional
 
 
+# Лимиты на работу с БД. Держим единообразно во всех модулях, у которых свой коннект
+# (processing_svetofor, supply_svetofor, counterparty_svetofor).
+CONNECT_TIMEOUT_SEC = 10
+STATEMENT_TIMEOUT_MS = 30_000
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError(
@@ -25,40 +30,80 @@ class Database:
         self._create_tables()
 
     def _connect(self):
-        conn = psycopg2.connect(self._dsn, cursor_factory=psycopg2.extras.RealDictCursor)
+        # connect_timeout + statement_timeout: без них при деградации сети до Postgres
+        # вызов висит на системном TCP-таймауте (минуты) и блокирует весь event loop —
+        # бот перестаёт отвечать и на кнопки, и на health-check, k8s убивает контейнер.
+        conn = psycopg2.connect(
+            self._dsn,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+            connect_timeout=CONNECT_TIMEOUT_SEC,
+            options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS}",
+        )
         conn.autocommit = False
         return conn
 
-    def _ensure_connection(self):
-        """Переподключается если соединение закрыто или упало."""
+    def _reconnect(self):
         try:
-            self.conn.cursor().execute("SELECT 1")
+            self.conn.close()
         except Exception:
+            pass
+        self.conn = self._connect()
+
+    def _ensure_connection(self):
+        """Переподключается если соединение закрыто или упало.
+
+        Нужен внешним вызовам (bot.py, market_intel_processor, request_handler),
+        которые дальше работают с `db.conn` напрямую. Внутренние `_execute`/
+        `_fetchall`/`_fetchone` его НЕ используют — они переподключаются по факту
+        ошибки, экономя round-trip на каждом из 145 методов.
+        """
+        try:
+            with self.conn.cursor() as cur:   # без `with` курсор оставался открытым навсегда
+                cur.execute("SELECT 1")
+            self.conn.commit()                # не оставляем висящую транзакцию
+        except Exception:
+            self._reconnect()
+
+    def _run(self, sql: str, params, mode: str):
+        """Выполняет запрос с одной попыткой переподключения при обрыве.
+
+        mode: 'exec' — без результата, 'all' — список строк, 'one' — строка или None.
+        Транзакция закрывается всегда: commit при успехе, rollback при ошибке —
+        иначе соединение зависает в состоянии `idle in transaction`.
+        """
+        for attempt in (1, 2):
             try:
-                self.conn.close()
+                with self.conn.cursor() as cur:
+                    cur.execute(sql, params or ())
+                    if mode == "all":
+                        result = [dict(r) for r in cur.fetchall()]
+                    elif mode == "one":
+                        row = cur.fetchone()
+                        result = dict(row) if row else None
+                    else:
+                        result = None
+                self.conn.commit()
+                return result
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                # Соединение оборвалось (сеть, рестарт Postgres, таймаут) — один ретрай.
+                if attempt == 2:
+                    raise
+                self._reconnect()
             except Exception:
-                pass
-            self.conn = self._connect()
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    self._reconnect()
+                raise
 
     def _execute(self, sql: str, params=None):
-        self._ensure_connection()
-        with self.conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            self.conn.commit()
-            return cur
+        return self._run(sql, params, "exec")
 
     def _fetchall(self, sql: str, params=None) -> List[Dict]:
-        self._ensure_connection()
-        with self.conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            return [dict(r) for r in cur.fetchall()]
+        return self._run(sql, params, "all")
 
     def _fetchone(self, sql: str, params=None) -> Optional[Dict]:
-        self._ensure_connection()
-        with self.conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            row = cur.fetchone()
-            return dict(row) if row else None
+        return self._run(sql, params, "one")
 
     def save_channel_post(self, message_id, channel_chat_id, text,
                           photo_file_id, has_video, media_group_id=None):
