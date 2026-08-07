@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import re
+import time as _time
 from datetime import datetime
 
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
@@ -604,6 +605,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Кэш уже отправленных уведомлений об идентификации — chat_id → True
 _wazzup_notified: set = set()
+
+# Кэш «этого chat_id в МойСкладе нет» — chat_id → ts последней неудачной проверки.
+# Без него вебхук Wazzup шёл в МС на КАЖДОЕ сообщение непривязанного контакта
+# (191 чат / 1501 сообщение за неделю = ~215 запросов в день), потому что защита
+# `_wazzup_notified` пополняется внутри блока карточек, отключённого 2026-07-17.
+_wazzup_ms_miss: dict = {}
+_WAZZUP_MS_MISS_TTL = 6 * 3600
 
 _pending_links: dict = {}
 _user_awaiting: dict = {}  # user_id → "photo" | "contract" | "reconciliation" | "request_text"
@@ -8402,14 +8410,22 @@ def main():
                         )
                         if ignored:
                             continue
-                        # Проверяем есть ли уже chat_id в МойСклад — если да, идентификация не нужна
+                        # Проверяем есть ли уже chat_id в МойСклад — если да, идентификация не нужна.
+                        # Отрицательный результат кэшируем на _WAZZUP_MS_MISS_TTL: иначе каждое
+                        # сообщение непривязанного контакта = поход в МС без таймаута, а при
+                        # деградации сети такой вызов вешает обработку вебхука.
+                        _miss_ts = _wazzup_ms_miss.get(chat_id_val)
+                        _skip_ms = _miss_ts is not None and (_time.time() - _miss_ts) < _WAZZUP_MS_MISS_TTL
                         try:
                             from moysklad import get_headers
                             import aiohttp as _aiohttp
                             _attr_id = MS_ATTR_BY_TYPE.get(chat_type.lower(), "")
-                            if _attr_id:
+                            if _attr_id and not _skip_ms:
                                 _ms_url = f"https://api.moysklad.ru/api/remap/1.2/entity/counterparty"
-                                async with _aiohttp.ClientSession() as _s:
+                                _found = False
+                                async with _aiohttp.ClientSession(
+                                    timeout=_aiohttp.ClientTimeout(total=15)
+                                ) as _s:
                                     async with _s.get(
                                         _ms_url,
                                         headers=get_headers(),
@@ -8417,6 +8433,7 @@ def main():
                                     ) as _r:
                                         if _r.status == 200:
                                             _data = await _r.json()
+                                            _found = bool(_data.get("rows"))
                                             if _data.get("rows"):
                                                 _cp_name = _data["rows"][0].get("name", "")
                                                 logger.info(f"Wazzup: {chat_id_val} уже в МойСклад ({_cp_name}), идентификация не нужна")
@@ -8429,6 +8446,9 @@ def main():
                                                     role="рассылка",
                                                 )
                                                 continue
+                                if not _found:
+                                    # В МС нет — не спрашиваем повторно ближайшие 6 часов.
+                                    _wazzup_ms_miss[chat_id_val] = _time.time()
                         except Exception as _e:
                             logger.warning(f"Wazzup: проверка МойСклад не удалась: {_e}")
                         # Карточки идентификации новых Wazzup-контактов ОТКЛЮЧЕНЫ
