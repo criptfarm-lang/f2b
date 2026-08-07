@@ -536,14 +536,19 @@ def _existing_done(snap_date, unit_id):
 def mark_done_by_unit(unit_id, order_no):
     """Пометить точку закрытой в route_dispatch.done по МАШИНЕ (без TG-контекста).
     Для веб-приёмки: у веба нет driver_chat_id/driver_msg_id, зато есть unit_id из ссылки.
-    Только БД — TG-сообщение не трогаем (веб работает мимо Telegram)."""
+    Только БД — TG-сообщение не трогаем (веб работает мимо Telegram).
+
+    Статус маршрута (draft/confirmed) НЕ проверяем (собственник, 2026-08-07): веб-чеклист
+    читает живой маршрут из Логистики и работает независимо от подтверждения логистом.
+    Пока фильтр был, у неподтверждённых машин отметки водителя молча пропадали — статус в
+    МС ставился, а точка на странице оставалась открытой («чек-лист не реагирует»)."""
     if _DB is None:
         return
     try:
         today = datetime.now(_MSK).date()
         row = _DB._fetchone(
             "SELECT stops, done FROM route_dispatch "
-            "WHERE snap_date=%s AND unit_id=%s AND status='confirmed'", (today, unit_id))
+            "WHERE snap_date=%s AND unit_id=%s", (today, unit_id))
         if not row:
             return
         doc = _doc_no(order_no)
@@ -586,7 +591,7 @@ async def mark_done_and_refresh(context, driver_chat_id, demand_id):
         today = datetime.now(_MSK).date()
         row = _DB._fetchone(
             "SELECT unit_id, stops, done, driver_msg_id FROM route_dispatch "
-            "WHERE snap_date=%s AND driver_chat_id=%s AND status='confirmed'",
+            "WHERE snap_date=%s AND driver_chat_id=%s",   # без status: см. mark_done_by_unit
             (today, driver_chat_id))
         if not row or not row.get("driver_msg_id"):
             return
