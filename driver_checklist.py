@@ -1213,7 +1213,7 @@ async def _web_alert_claim(bot, row):
             logger.warning("_web_alert_claim → %s: %s", cid, e)
 
 
-async def web_pickup_submit(db, bot, uid, order_no, *, doc, accepted, claim_text, title=""):
+async def web_pickup_submit(db, bot, uid, order_no, *, doc, accepted, claim_text, title="", day=None):
     """Закрытие точки ЗАБОРА товара (заказ поставщику или ручная точка Логистики).
 
     У забора нет отгрузки в МС → резолвить demand и писать статус отгрузки нечего.
@@ -1223,7 +1223,7 @@ async def web_pickup_submit(db, bot, uid, order_no, *, doc, accepted, claim_text
     doc_no = route_dispatch._doc_no(order_no)
     ok_taken = (accepted == "ok")
     try:
-        route_dispatch.mark_done_by_unit(uid, doc_no)
+        route_dispatch.mark_done_by_unit(uid, doc_no, day)
     except Exception as e:
         logger.warning("web_pickup_submit done: %s", e)
         return False, "Не удалось отметить точку, повтори."
@@ -1252,7 +1252,7 @@ _WEB_SUBMIT_MS_TIMEOUT = 12
 
 
 async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, claim_text,
-                     deferred=False):
+                     day=None, deferred=False):
     """Приёмка точки С ВЕБ-СТРАНИЦЫ, одним экраном, без telegram-контекста.
     money/doc/item — строки 'yes'/'no' (или None). accepted — 'ok'/'claim'.
     Пишет статус в МС (Сдан / Сдан с проблемой), помечает точку закрытой в
@@ -1279,11 +1279,12 @@ async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, cla
         logger.warning("web_submit %s: МойСклад не ответил за %d с — принимаю точку отложенно",
                        doc_no, _WEB_SUBMIT_MS_TIMEOUT)
         try:
-            route_dispatch.mark_done_by_unit(uid, doc_no)
+            route_dispatch.mark_done_by_unit(uid, doc_no, day)
         except Exception as e:
             logger.warning("web_submit done (отложенно): %s", e)
         asyncio.create_task(web_submit(db, bot, uid, order_no, money=money, doc=doc, items=items,
-                                       accepted=accepted, claim_text=claim_text, deferred=True))
+                                       accepted=accepted, claim_text=claim_text, day=day,
+                                       deferred=True))
         return True, "✅ Точка закрыта. МойСклад тормозит — данные допишутся сами."
     if not demand_id:
         return False, "Точка ещё не отгружена складом — попробуй позже."
@@ -1330,7 +1331,7 @@ async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, cla
           ((claim_text or "").strip() or None) if not accepted_ok else None, status))
 
     try:
-        route_dispatch.mark_done_by_unit(uid, doc_no)
+        route_dispatch.mark_done_by_unit(uid, doc_no, day)
     except Exception as e:
         logger.warning("web_submit done: %s", e)
 

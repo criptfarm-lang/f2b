@@ -533,39 +533,55 @@ def _existing_done(snap_date, unit_id):
     return set()
 
 
-def mark_done_by_unit(unit_id, order_no):
+def mark_done_by_unit(unit_id, order_no, target_date=None):
     """Пометить точку закрытой в route_dispatch.done по МАШИНЕ (без TG-контекста).
     Для веб-приёмки: у веба нет driver_chat_id/driver_msg_id, зато есть unit_id из ссылки.
     Только БД — TG-сообщение не трогаем (веб работает мимо Telegram).
 
-    Статус маршрута (draft/confirmed) НЕ проверяем (собственник, 2026-08-07): веб-чеклист
-    читает живой маршрут из Логистики и работает независимо от подтверждения логистом.
-    Пока фильтр был, у неподтверждённых машин отметки водителя молча пропадали — статус в
-    МС ставился, а точка на странице оставалась открытой («чек-лист не реагирует»)."""
+    Ничего не фильтруем (собственник, 2026-08-07 — «доделывай всё»):
+    - статус маршрута (draft/confirmed) не проверяем: веб-чеклист читает живой маршрут из
+      Логистики и от подтверждения логистом не зависит;
+    - наличие точки в вечернем снапшоте `stops` не проверяем: точку, добавленную логистом
+      утром, снапшот не знает, и отметка водителя молча терялась («точка не гаснет»);
+    - строки за день ещё может не быть (сбор не отработал) — тогда создаём её.
+    Лишний № в `done` безвреден: страница сверяет `done` с живым составом маршрута."""
     if _DB is None:
         return
+    day = target_date or datetime.now(_MSK).date()
+    doc = _doc_no(order_no)
     try:
-        today = datetime.now(_MSK).date()
         row = _DB._fetchone(
             "SELECT stops, done FROM route_dispatch "
-            "WHERE snap_date=%s AND unit_id=%s", (today, unit_id))
+            "WHERE snap_date=%s AND unit_id=%s", (day, unit_id))
         if not row:
+            # Маршрут за день не собирался — заводим строку, иначе отметка потеряется.
+            _DB._execute(
+                "INSERT INTO route_dispatch (snap_date, unit_id, status, stops, done, updated_at) "
+                "VALUES (%s, %s, 'draft', '[]'::jsonb, %s, now()) "
+                "ON CONFLICT (snap_date, unit_id) DO UPDATE SET done=EXCLUDED.done, updated_at=now()",
+                (day, unit_id, json.dumps([doc], ensure_ascii=False)))
+            logger.info("mark_done_by_unit: %s — строки за %s не было, создал с done=[%s]",
+                        unit_id, day, doc)
             return
-        doc = _doc_no(order_no)
         stops = row.get("stops") or []
         done = row.get("done") or []
         if isinstance(stops, str):
             stops = json.loads(stops)
         if isinstance(done, str):
             done = json.loads(done)
+        if doc in done:
+            logger.info("mark_done_by_unit: %s/%s уже закрыта", unit_id, doc)
+            return
         if doc not in [_doc_no(s.get("order_no")) for s in stops]:
-            return  # точка не из этого маршрута
-        if doc not in done:
-            done.append(doc)
-            _DB._execute("UPDATE route_dispatch SET done=%s, updated_at=now() WHERE snap_date=%s AND unit_id=%s",
-                         (json.dumps(done, ensure_ascii=False), today, unit_id))
+            # Точка появилась в маршруте после вечернего снапшота — всё равно гасим.
+            logger.info("mark_done_by_unit: %s/%s нет в снапшоте stops — гашу по живому маршруту",
+                        unit_id, doc)
+        done.append(doc)
+        _DB._execute("UPDATE route_dispatch SET done=%s, updated_at=now() WHERE snap_date=%s AND unit_id=%s",
+                     (json.dumps(done, ensure_ascii=False), day, unit_id))
+        logger.info("mark_done_by_unit: %s/%s закрыта (%d из %d)", unit_id, doc, len(done), len(stops))
     except Exception as e:
-        logger.warning("mark_done_by_unit: %s", e)
+        logger.warning("mark_done_by_unit %s/%s: %s", unit_id, doc, e)
 
 
 async def _demand_order_no(demand_id):

@@ -495,7 +495,7 @@ async def handle_submit(request, db, bot) -> web.Response:
     try:
         uid = int(request.match_info["uid"])
         date_str = request.match_info["date"]
-        date.fromisoformat(date_str)
+        day = date.fromisoformat(date_str)
     except (ValueError, KeyError):
         return web.json_response({"ok": False, "msg": "Некорректная ссылка"}, status=400)
     if uid not in rr.UNITS:
@@ -516,13 +516,16 @@ async def handle_submit(request, db, bot) -> web.Response:
             ok, msg = await dc.web_pickup_submit(
                 db, bot, uid, order_no,
                 doc=body.get("doc"), accepted=(body.get("accepted") or ""),
-                claim_text=body.get("claim_text") or "", title=(body.get("title") or "").strip())
+                claim_text=body.get("claim_text") or "", title=(body.get("title") or "").strip(),
+                day=day)
             return web.json_response({"ok": ok, "msg": msg})
+        # day — дата ИЗ ССЫЛКИ, а не «сегодня»: сдача после полуночи должна гасить точку
+        # своего маршрута, а не следующего дня.
         ok, msg = await dc.web_submit(
             db, bot, uid, order_no,
             money=body.get("money"), doc=body.get("doc"),
             items=body.get("items") or {}, accepted=(body.get("accepted") or ""),
-            claim_text=body.get("claim_text") or "")
+            claim_text=body.get("claim_text") or "", day=day)
         return web.json_response({"ok": ok, "msg": msg})
     except Exception as e:
         logger.error("route_web.handle_submit: %s", e, exc_info=True)

@@ -226,6 +226,40 @@ async def _record_429() -> None:
             logger.warning(f"_record_429 alert_cb failed: {e}")
 
 
+_ms_429_headers_logged_ts = 0.0
+
+
+def _retry_after_sec(headers) -> float:
+    """Сколько ждать после 429 — по ответу МойСклад, с потолком `_MS_429_LONG_SLEEP_SEC`.
+
+    Точные имена заголовков МС на нашем тарифе не подтверждены, поэтому проверяем
+    известных кандидатов, а сам набор X-заголовков ответа пишем в лог (не чаще раза в
+    5 минут) — по нему уточним имя по факту, а не по догадке. Не распознали → 30 с.
+    """
+    global _ms_429_headers_logged_ts
+    import time as _t
+    now = _t.time()
+    if now - _ms_429_headers_logged_ts > 300:
+        _ms_429_headers_logged_ts = now
+        seen = {k: v for k, v in headers.items()
+                if k.lower().startswith(("x-ratelimit", "x-lognex", "retry-after"))}
+        logger.warning("МС 429: заголовки лимита = %s", seen or "нет")
+    for name, unit in (("X-Lognex-Retry-TimeInterval", 0.001),
+                       ("X-RateLimit-Reset", 0.001),
+                       ("X-Lognex-Reset", 0.001),
+                       ("Retry-After", 1.0)):
+        raw = headers.get(name)
+        if not raw:
+            continue
+        try:
+            sec = float(str(raw).strip()) * unit
+        except ValueError:
+            continue
+        if sec > 0:
+            return min(max(sec, 1.0), _MS_429_LONG_SLEEP_SEC)
+    return _MS_429_LONG_SLEEP_SEC
+
+
 def _install_ms_throttle_patch() -> None:
     if getattr(aiohttp.ClientSession, "_ms_throttle_installed", False):
         return
@@ -242,10 +276,14 @@ def _install_ms_throttle_patch() -> None:
             return resp
         # Получили 429 — учитываем в счётчике
         await _record_429()
-        # Один long-sleep и одна повторная попытка. Никаких циклов retry —
+        # Один sleep и одна повторная попытка. Никаких циклов retry —
         # каждый retry на 429 наращивает счётчик и ускоряет авто-блок.
+        # Длительность паузы берём ИЗ ОТВЕТА МС, если он её прислал: слепые 30 с
+        # держали вызывающего дольше, чем нужно, и это ломало интерактивные сценарии
+        # (веб-чеклист водителя, 07.08.2026). Заголовка нет → прежние 30 с.
+        pause = _retry_after_sec(resp.headers)
         resp.release()
-        await asyncio.sleep(_MS_429_LONG_SLEEP_SEC)
+        await asyncio.sleep(pause)
         await _ms_throttle()
         resp = await _orig_request(self, method, str_or_url, **kwargs)
         if resp.status == 429:
