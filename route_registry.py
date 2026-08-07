@@ -510,6 +510,35 @@ async def _ms_pickup_by_order(order_numbers, names=None) -> dict:
     return out
 
 
+def apply_pickup_info(stops, extra) -> None:
+    """Проставляет в точки маршрута данные ЗАБОРА из МС (поставщик, «Адрес забора», is_pickup).
+
+    Зачем: имя точки в Логистике логист заводит руками и часто оставляет от старой заявки
+    (07.08.2026: забор у ООО «АЙС ТРЕЙД» приехал в сводку как «ИП Котунова Кристина
+    Алексеевна» — точка была скопирована с клиентской). PDF и веб-чеклист имя поставщика
+    подставляли сами, а текстовые сводки логисту/водителю брали `client` из Wialon как есть.
+    Обогащаем сами точки — тогда все потребители (сводка, подписи, снапшот в БД) едины."""
+    for s in stops or []:
+        ex = (extra or {}).get(s.get("order_no")) or {}
+        if not ex.get("is_pickup"):
+            continue
+        s["is_pickup"] = True
+        if ex.get("client"):
+            s["client"] = ex["client"]
+        if ex.get("address"):
+            s["address"] = ex["address"]
+
+
+async def enrich_pickups(stops) -> None:
+    """apply_pickup_info с самостоятельным чтением заборов из МС — для мест, где полного
+    ms_extra нет (список точек водителю по /рейс). Один пакетный запрос ЗП за 14 дней."""
+    nos = [s.get("order_no") for s in (stops or []) if s.get("order_no")]
+    if not nos:
+        return
+    pickups = await _ms_pickup_by_order(nos, names={s["order_no"]: s.get("client") for s in stops})
+    apply_pickup_info(stops, pickups)
+
+
 # ─── PDF реестра ─────────────────────────────────────────────────────────────
 
 def _hm(ts):

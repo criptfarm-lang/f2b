@@ -446,6 +446,9 @@ async def _unit_package(routes, uid, target_date, bot_username=None):
     ms_extra = await rr._ms_extra_by_order(
         [s["order_no"] for s in stops],
         names={s["order_no"]: s.get("client") for s in stops})
+    # Заборы: имя точки в Логистике бывает от старой заявки — берём поставщика из ЗП,
+    # иначе в сводке логисту вылезает чужой клиент (см. apply_pickup_info).
+    rr.apply_pickup_info(stops, ms_extra)
     pdf = await asyncio.to_thread(  # reportlab CPU-sync → поток
         rr._build_registry_pdf, {uid: stops}, ms_extra,
         target_date.strftime("%d.%m.%Y"), target_date.isoformat())
@@ -489,8 +492,10 @@ def _btn_label(name, num):
 
 
 def _stop_label(s):
-    """Подпись точки маршрута из stop-словаря (client + № документа)."""
-    return _btn_label(s.get("client") or s.get("order_no"), _doc_no(s.get("order_no")))
+    """Подпись точки маршрута из stop-словаря (client + № документа).
+    У заборов (is_pickup) — префикс «🔄 ЗАБОР», как в PDF-реестре и веб-чеклисте."""
+    label = _btn_label(s.get("client") or s.get("order_no"), _doc_no(s.get("order_no")))
+    return f"🔄 ЗАБОР: {label}" if s.get("is_pickup") else label
 
 
 # _driver_kb (клавиатура точек водителю) удалена 2026-08-04: кнопки в Telegram
@@ -647,14 +652,15 @@ async def _collect_and_send(context, target_date, to_chat):
         if not pkg:
             continue
         stops = pkg["stops"]
-        snap = [{"order_no": s["order_no"], "client": s.get("client"), "seq": s.get("seq")}
-                for s in stops]
+        snap = [{"order_no": s["order_no"], "client": s.get("client"), "seq": s.get("seq"),
+                 "is_pickup": bool(s.get("is_pickup"))} for s in stops]
         _upsert_draft(target_date, uid, pkg["driver_id"], snap)
 
         km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
         _PKG_CACHE[(dstr, uid)] = (pkg, km)  # чтобы «Подтвердить» не пересобирал всё заново
         note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
-        lines = [f"{i}. {(s.get('client') or s.get('order_no') or '?')[:35]} ({rr._hm(s.get('vt'))})"
+        lines = [f"{i}. {'🔄 ЗАБОР: ' if s.get('is_pickup') else ''}"
+                 f"{(s.get('client') or s.get('order_no') or '?')[:35]} ({rr._hm(s.get('vt'))})"
                  for i, s in enumerate(stops, 1)]
         # Имена клиентов идут в подпись как есть — экранируем (в них бывают * и _).
         caption = (f"🚚 <b>{_h(rr.unit_title(uid))}</b>\n"
@@ -714,7 +720,8 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         ya_block = "\n" + "\n".join(
             f"🧭 Яндекс.Карты, часть {i + 1}/{len(ya_urls)}: {u}" for i, u in enumerate(ya_urls))
-    snap = [{"order_no": s["order_no"], "client": s.get("client"), "seq": s.get("seq")} for s in stops]
+    snap = [{"order_no": s["order_no"], "client": s.get("client"), "seq": s.get("seq"),
+             "is_pickup": bool(s.get("is_pickup"))} for s in stops]
     if _DB is not None:
         try:
             _DB._execute(
@@ -872,7 +879,8 @@ async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, drv = _driver_for_unit(uid)
         head = f"🚚 {rr.UNITS.get(uid, uid)} — {drv or 'без водителя'}: {ndone}/{total} закрыто"
         if remaining:
-            rem = "\n".join(f"  • {(s.get('client') or s.get('order_no') or '?')[:35]}"
+            rem = "\n".join(f"  • {'🔄 ЗАБОР: ' if s.get('is_pickup') else ''}"
+                            f"{(s.get('client') or s.get('order_no') or '?')[:35]}"
                             for s in remaining[:12])
             if len(remaining) > 12:
                 rem += f"\n  …и ещё {len(remaining) - 12}"

@@ -489,6 +489,13 @@ async def _render_points(send, page: int, driver_id: int = None):
             route_stops = sorted(
                 [s for s in (routes.get(unit_id) or []) if _stop_today(s)],
                 key=lambda s: (s.get("seq") if s.get("seq") is not None else 999))
+            # Заборы: подменяем имя точки на поставщика из заказа поставщику — в Логистике
+            # логист заводит точку забора поверх старой клиентской и имя остаётся чужое.
+            # Своим try: упавший МС не должен ронять уже собранный маршрут в фолбэк.
+            try:
+                await rr.enrich_pickups(route_stops)
+            except Exception as e:
+                logger.warning("enrich_pickups упал, имена точек как в Логистике: %s", e)
         except Exception as e:
             logger.warning("route filter упал, фолбэк на полный список: %s", e)
             route_stops = None
