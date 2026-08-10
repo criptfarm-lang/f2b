@@ -394,111 +394,89 @@ def rub(x: float) -> str:
     return f"{x:,.0f} ₽".replace(",", " ")
 
 
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """«1 заявка / 2 заявки / 5 заявок» — иначе отчёт читается коряво."""
+    n = abs(n)
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
 def block_balance(bal: dict, avg_daily: float) -> tuple[list[str], dict]:
     days_left = bal["amount"] / avg_daily if avg_daily else float("inf")
-    lines = [
-        f"БАЛАНС ({bal['login']})",
-        f"Остаток: {rub(bal['amount'])}",
-        f"В среднем в день: {rub(avg_daily)}",
-        f"Хватит на: ~{days_left:.1f} дн." if days_left != float("inf")
-        else "Хватит на: расхода за неделю не было",
-    ]
+    tail = (f"хватит на ~{days_left:.0f} дн."
+            if days_left != float("inf") else "расхода за неделю не было")
+    line = f"Баланс {rub(bal['amount'])} · {tail}"
     if days_left < 7:
-        lines.append("! Меньше недели – пополнить")
-    return lines, {"amount": bal["amount"], "days_left": days_left}
+        line += " · пополнить"
+    return [line], {"amount": bal["amount"], "days_left": days_left}
 
 
 def block_weekly(weekly: dict) -> list[str]:
+    """Одна строка на кампанию: клики, заявки, цена заявки, расход."""
     cf, ct = weekly["period_current"]
-    pf, pt = weekly["period_previous"]
-    lines = [f"ЭФФЕКТИВНОСТЬ {cf} – {ct}", f"(против {pf} – {pt})"]
+    lines = [f"Неделя {cf[8:10]}.{cf[5:7]}–{ct[8:10]}.{ct[5:7]} "
+             f"(в скобках – к прошлой)"]
     for blk in weekly["campaigns"].values():
         c, p = blk["current"], blk["previous"]
-        lines += [
-            "",
-            blk["name"],
-            f"  показы {c['imp']:,}".replace(",", " ")
-            + f" ({delta(c['imp'], p['imp'])})",
-            f"  клики {c['clk']} ({delta(c['clk'], p['clk'])})",
-            f"  CTR {c['ctr']:.2f}% ({delta(c['ctr'], p['ctr'])})",
-            f"  средний клик {c['avg_cpc']:.1f} ₽ "
-            f"({delta(c['avg_cpc'], p['avg_cpc'])})",
-            f"  расход {rub(c['cost'])} ({delta(c['cost'], p['cost'])})",
-            f"  конверсии {c['conv']} ({delta(c['conv'], p['conv'])})",
-            f"  CPA {rub(c['cpa']) if c['cpa'] else '–'} "
-            f"({delta(c['cpa'] or 0, p['cpa'] or 0)})",
-        ]
+        lines.append(
+            f"{blk['name']}: {c['clk']} "
+            f"{plural(c['clk'], 'клик', 'клика', 'кликов')} "
+            f"({delta(c['clk'], p['clk'])}), {c['conv']} "
+            f"{plural(c['conv'], 'заявка', 'заявки', 'заявок')} "
+            f"({delta(c['conv'], p['conv'])}), "
+            f"цена заявки {rub(c['cpa']) if c['cpa'] else '–'}, "
+            f"расход {rub(c['cost'])}")
     return lines
 
 
 def block_recommendations(weekly: dict, leads: dict,
                           balance_info: dict) -> list[str]:
-    lines = ["РЕКОМЕНДАЦИИ"]
     recs: list[str] = []
     for cid, blk in weekly["campaigns"].items():
         c, name = blk["current"], blk["name"]
         if c["ctr"] < 4 and c["imp"] > 100:
-            recs.append(f"{name}: CTR {c['ctr']:.1f}% ниже 4% – переписать "
-                        f"заголовки, проверить релевантность ключей.")
+            recs.append(f"{name}: CTR {c['ctr']:.1f}% ниже 4%")
         if c["cpa"] and c["cpa"] > 1.5 * PLAN_CPA_RUB:
-            recs.append(f"{name}: CPA {c['cpa']:.0f} ₽ выше плана "
-                        f"({PLAN_CPA_RUB} ₽) в 1.5 раза – снизить ставки "
-                        f"или сменить стратегию.")
+            recs.append(f"{name}: заявка {c['cpa']:.0f} ₽ при плане "
+                        f"{PLAN_CPA_RUB} ₽")
         if c["conv"] == 0 and c["clk"] >= 100:
-            recs.append(f"{name}: 0 конверсий при {c['clk']} кликах – "
-                        f"проверить цель «Заявка» в Метрике и посадочную.")
+            recs.append(f"{name}: 0 заявок при {c['clk']} кликах – "
+                        f"проверить цель в Метрике")
         if cid == "710295591" and c["conv"] >= 10:
-            recs.append(f"{name}: накоплено {c['conv']} конверсий – можно "
-                        f"переключать на среднюю цену конверсии.")
+            recs.append(f"{name}: {c['conv']} заявок – пора на среднюю цену "
+                        f"конверсии")
     if balance_info["days_left"] < 7:
-        recs.append(f"Баланс: {rub(balance_info['amount'])}, хватит на "
-                    f"~{balance_info['days_left']:.1f} дн. – пополнить.")
+        recs.append(f"Баланс кончается через "
+                    f"{balance_info['days_left']:.0f} дн.")
     if leads["total_site"] > 0 and leads["won"] == 0:
-        recs.append(f"Воронка: 0 «Реализовано» из {leads['total_site']} "
-                    f"сайт-лидов за {leads['days']} дн. – разобрать причины "
-                    f"отказов.")
+        recs.append(f"0 продаж из {leads['total_site']} "
+                    f"{plural(leads['total_site'], 'заявки', 'заявок', 'заявок')} "
+                    f"за {leads['days']} дн.")
     if not recs:
-        lines.append("Кампании в норме, эвристики не сработали.")
-    else:
-        lines += [f"{i}. {r}" for i, r in enumerate(recs, 1)]
-    return lines
+        return ["Проблем нет."]
+    return ["Главное:"] + [f"– {r}" for r in recs]
 
 
 def block_leads(leads: dict, weekly: dict) -> list[str]:
-    lines = [
-        f"САЙТ-ЛИДЫ amoCRM ({leads['days']} дн.)",
-        f"Всего в воронке «Привлечение»: {leads['total_in_pipeline']}",
-        f"С тегом сайт / сайт заявка: {leads['total_site']}",
-        f"Реализовано {leads['won']} · не реализовано {leads['lost']} · "
-        f"открыты {leads['open']}",
-    ]
-    if leads["by_responsible"]:
-        lines.append("По ответственному:")
-        lines += [f"  {name} – {cnt}"
-                  for name, cnt in leads["by_responsible"].items()]
-
+    """Заявки с сайта, продажи, зависшие — три числа и цена заявки."""
     total_cost = sum(b["current"]["cost"] for b in weekly["campaigns"].values())
-    if leads["total_site"]:
-        lines.append(f"Цена сайт-лида: {rub(total_cost)} / "
-                     f"{leads['total_site']} = "
-                     f"~{rub(total_cost / leads['total_site'])}")
-    return lines
+    cpl = (f", по ~{rub(total_cost / leads['total_site'])}"
+           if leads["total_site"] else "")
+    lines = [f"Заявки с сайта за {leads['days']} дн.: "
+             f"{leads['total_site']}{cpl} · продаж {leads['won']} · "
+             f"отказов {leads['lost']}"]
 
-
-def block_pings(leads: dict) -> list[str]:
-    lines = ["КАНДИДАТЫ НА ПИНГ"]
     stale = leads["stale"]
-    if not stale:
-        lines.append("Очередь чистая, лидов выше порога простоя нет.")
-        return lines
-    lines.append(f"Всего {len(stale)}, показываю до 8:")
-    for s in stale[:8]:
+    if stale:
+        worst = stale[0]
+        top = Counter(s["responsible"] for s in stale).most_common(1)[0]
         lines.append(
-            f"  {s['idle_hours']:.0f} ч · {s['status']} · {s['responsible']}\n"
-            f"    {s['name']}\n"
-            f"    https://{AMO_SUBDOMAIN}.amocrm.ru/leads/detail/{s['id']}")
-    if len(stale) > 8:
-        lines.append(f"  … и ещё {len(stale) - 8}")
+            f"Без движения: {len(stale)} · дольше всех "
+            f"{worst['idle_hours']:.0f} ч ({worst['responsible']}) · "
+            f"больше всех у одного: {top[0]} – {top[1]}")
     return lines
 
 
@@ -516,12 +494,10 @@ async def build_report() -> str:
 
     bal_lines, bal_info = block_balance(bal, avg_daily)
     parts = [
-        [f"Я.Директ · сводка на {today.strftime('%d.%m.%Y')}"],
-        bal_lines,
+        [f"Я.Директ · {today.strftime('%d.%m')}"] + bal_lines,
         block_weekly(weekly),
-        block_recommendations(weekly, leads, bal_info),
         block_leads(leads, weekly),
-        block_pings(leads),
+        block_recommendations(weekly, leads, bal_info),
     ]
     return "\n\n".join("\n".join(p) for p in parts)
 
