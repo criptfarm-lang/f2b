@@ -5459,10 +5459,68 @@ async def handle_doc_approval_callback(update: Update, context: ContextTypes.DEF
             f"Подписанный PDF доступен в приложении (архив).",
         )
     else:
+        note = await _claim_control_task_note(doc, cp)
         await query.message.reply_text(
             f"✅ Одобрено — письмо №{doc_id} ({cp}).\n"
-            f"Подписанный PDF доступен в приложении (архив, у создателя — сразу к скачиванию).",
+            f"Подписанный PDF доступен в приложении (архив, у создателя — сразу к скачиванию)."
+            + note,
         )
+
+
+async def _claim_control_task_note(doc: dict, cp: str) -> str:
+    """Для претензий по оплате ставит контрольную карточку на доску «Претензии»
+    и возвращает строку для ответа собственнику. Часы претензионной работы идут
+    с момента согласования — поэтому задача создаётся здесь, а не после отправки."""
+    import claim_tasks
+    letter_type = doc.get("letter_type") or ""
+    if letter_type not in claim_tasks.DEADLINE_WORKDAYS:
+        return ""
+
+    agent_id = doc.get("counterparty_id")
+    manager_tag, debt, ms_url = "", 0.0, ""
+    if agent_id:
+        ms_url = f"https://online.moysklad.ru/app/#counterparty/edit?id={agent_id}"
+        try:
+            import aiohttp
+            import moysklad
+            async with aiohttp.ClientSession() as s:
+                # Ответственный менеджер — тег контрагента (источник правды по МС).
+                async with s.get(f"{moysklad.MS_BASE}/entity/counterparty/{agent_id}",
+                                 headers=moysklad.get_headers()) as r:
+                    if r.status == 200:
+                        tags = [t.lower() for t in ((await r.json()).get("tags") or [])
+                                if t.lower() not in ("покупатели", "хорека", "опт", "поставщики")]
+                        manager_tag = tags[0] if tags else ""
+                # Долг — из взаиморасчётов, отрицательный баланс значит нам должны.
+                async with s.get(f"{moysklad.MS_BASE}/report/counterparty/{agent_id}",
+                                 headers=moysklad.get_headers()) as r:
+                    if r.status == 200:
+                        bal = ((await r.json()).get("balance") or 0) / 100
+                        debt = -bal if bal < 0 else 0.0
+        except Exception as e:
+            logger.error(f"claim control task: данные контрагента не получены: {e}")
+
+    res = await claim_tasks.create_claim_control_card(
+        letter_type, cp, manager_tag, debt, ms_url=ms_url)
+    if not res.get("ok"):
+        return f"\n⚠️ Контрольная задача не поставлена: {res.get('error')}. Поставь вручную."
+
+    # Реестр цикла: по нему идёт автозакрытие при погашении и эскалация по срокам.
+    try:
+        claim_tasks.ensure_schema(db)
+        db._execute(
+            """INSERT INTO claim_control
+                   (doc_id, agent_id, counterparty, letter_type, manager_tag, card_id, debt, deadline)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (doc_id) DO UPDATE SET card_id=EXCLUDED.card_id,
+                   deadline=EXCLUDED.deadline, debt=EXCLUDED.debt, closed_at=NULL""",
+            (doc.get("id"), agent_id, cp, letter_type, manager_tag,
+             res.get("id"), debt, res.get("deadline")))
+    except Exception as e:
+        logger.error(f"claim control task: реестр не обновлён: {e}")
+    who = f" на {manager_tag.capitalize()}" if res.get("assigned") else " (без исполнителя — проставь на доске)"
+    return (f"\n🗂 Контрольная задача{who} — доска «Претензии», "
+            f"срок {res['deadline']:%d.%m.%Y}. В МойСклад уедет на ближайшем тике коннектора.")
 
 
 # ── Претензии менеджеров (из quiz-game) ──────────────────────────────────────
@@ -8116,6 +8174,22 @@ def main():
             logger.error(f"supply_svetofor job wrapper: {e}", exc_info=True)
 
     app.job_queue.run_repeating(_supply_svetofor_wrapper, interval=600, first=90)
+
+    # ────────────────────────────────────────────────────────────────────
+    # Цикл претензионной работы — раз в час. Гасит цепочку задач при
+    # погашении долга и эскалирует на собственника, когда сроки по
+    # претензиям вышли, но не раньше порога ст. 91.1 (14 дней).
+    # План: 2026-08-10-регламент-претензионной-работы-по-оплатам.md, Фазы 5–6.
+    # ────────────────────────────────────────────────────────────────────
+    from claim_tasks import poll_job as _claim_poll
+
+    async def _claim_poll_wrapper(context):
+        try:
+            await _claim_poll(app, db)
+        except Exception as e:
+            logger.error(f"claim workflow job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_claim_poll_wrapper, interval=3600, first=180)
 
     # ────────────────────────────────────────────────────────────────────
     # Прогрев снимков живого реестра водителя — каждую минуту в рабочие часы.
