@@ -37,6 +37,11 @@ DEADLINE_WORKDAYS = {"claim_payment": 5, "claim_payment_final": 3}
 NOTARY_THRESHOLD_DAYS = 15
 
 
+def _money(v: float) -> str:
+    """Русский формат суммы: 12 345,67 (пробел разделяет тысячи, запятая — копейки)."""
+    return f"{v:,.2f}".replace(",", "\u00a0").replace(".", ",").replace("\u00a0", " ")
+
+
 def _key() -> str | None:
     return os.getenv("YOUGILE_KEY")
 
@@ -104,7 +109,7 @@ async def create_claim_control_card(letter_type: str, counterparty: str, manager
 
     is_final = letter_type == "claim_payment_final"
     deadline = workday_deadline(workdays)
-    title = f"Претензия {counterparty} – проверить оплату {debt:,.2f} ₽".replace(",", " ")
+    title = f"Претензия {counterparty} – проверить оплату {_money(debt)} ₽"
     action = ("Прихода нет – передать на взыскание: суд либо исполнительная надпись нотариуса."
               if is_final else
               "Прихода нет – сформировать вторую форму письма (повторная претензия).")
@@ -252,8 +257,8 @@ async def poll_job(app, db) -> None:
         if owner:
             await app.bot.send_message(
                 owner,
-                f"⚖️ {row.get('counterparty')}: сроки по претензии вышли, долг "
-                f"{debt:,.2f} ₽ не погашен.".replace(",", " ")
+                f"⚖️ {row.get('counterparty')}: сроки по претензии вышли, "
+                f"долг {_money(debt)} ₽ не погашен."
                 + f"\nПрошло {days_since} дн. с согласования — порог ст. 91.1 (14 дн.) пройден, "
                   f"можно к нотариусу или в суд."
                 + ("\n🗂 Карточка на доске «Претензии» поставлена." if card.get("ok")
