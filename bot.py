@@ -6232,6 +6232,26 @@ async def cmd_svetofor_batch(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.warning("cmd_svetofor_batch: ответ не ушёл (%s), батч уже запущен", e)
 
 
+async def cmd_direct_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/direct_report — сводка по рекламе Я.Директ по требованию.
+
+    Тот же расчёт, что уходит сам по ПН 09:30 (scheduler.direct_weekly_report_job).
+    План: 2026-08-10-еженедельная-сводка-директа-в-боте.md.
+    """
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    await update.message.reply_text("Собираю сводку по Я.Директ, минуту...")
+    try:
+        from direct_report import build_report, split_for_telegram
+        text = await build_report()
+        for chunk in split_for_telegram(text):
+            await update.message.reply_text(chunk, disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"cmd_direct_report: {e}", exc_info=True)
+        await update.message.reply_text(f"Не собралось: {e}")
+
+
 async def cmd_notifier_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/notifier_status — заказы за сегодня которым не ушла рассылка."""
     user = update.effective_user
@@ -7579,6 +7599,7 @@ def main():
     app.add_handler(CommandHandler("reset_agreed", cmd_reset_agreed))
     app.add_handler(CommandHandler("ms_attributes", cmd_ms_attributes))
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
+    app.add_handler(CommandHandler("direct_report", cmd_direct_report))
     app.add_handler(CommandHandler("svetofor", cmd_svetofor))
     app.add_handler(CommandHandler("svetofor_batch", cmd_svetofor_batch))
     app.add_handler(CommandHandler("digest_today", cmd_digest_today))

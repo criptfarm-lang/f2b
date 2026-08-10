@@ -178,6 +178,18 @@ def setup_scheduler(app: Application, db):
         misfire_grace_time=3600, coalesce=True,
     )
 
+    # ПН 09:30 МСК — еженедельная сводка по рекламе Я.Директ в ЛС собственнику.
+    # План: 2026-08-10-еженедельная-сводка-директа-в-боте.md, Фаза 4.
+    # 09:30, а не 09:00 — в 09:00 уже уходит dashamail_weekly_send_job, две
+    # рассылки в одну минуту сливаются в кашу.
+    scheduler.add_job(
+        direct_weekly_report_job,
+        CronTrigger(day_of_week='mon', hour=9, minute=30, timezone=MSK),
+        args=[app],
+        id="direct_weekly_report_mon_0930",
+        misfire_grace_time=3600, coalesce=True,
+    )
+
     # Автоподстановка «Дата планируемой оплаты» вынесена в PTB JobQueue в bot.py
     # (16.06.2026): AsyncIOScheduler пропускал tick 15:56 МСК даже при next_run_time
     # в job-листинге — тот же паттерн, что с market_intel 28-29.05.
@@ -1303,6 +1315,48 @@ async def op_new_share_snapshot_job(app: Application, db):
                 logger.error(
                     f"op_new_share_snapshot_job: TG-алерт не доставлен: {send_err}"
                 )
+        return {"status": "error", "error": str(e)}
+
+
+async def direct_weekly_report_job(app: Application):
+    """Шлёт собственнику сводку по Я.Директ. Cron: ПН 09:30 МСК.
+
+    План: 2026-08-10-еженедельная-сводка-директа-в-боте.md, Фаза 4.
+    Раньше это была cloud-routine, которая коммитила файл-маркер в git —
+    до собственника не доходило ничего, и сводку не делали неделями.
+
+    Ошибку не глотаем: если Директ не отдал данные или протух токен,
+    собственник должен увидеть это текстом, а не тишину вместо отчёта.
+    """
+    logger.info(
+        f"direct_weekly_report_job стартовала в "
+        f"{datetime.now(MSK):%Y-%m-%d %H:%M %Z}"
+    )
+    owner_raw = os.getenv("OWNER_CHAT_ID")
+    if not owner_raw:
+        logger.error("direct_weekly_report_job: OWNER_CHAT_ID не задан")
+        return {"status": "error", "error": "no OWNER_CHAT_ID"}
+    owner = int(owner_raw)
+
+    try:
+        from direct_report import build_report, split_for_telegram
+        text = await build_report()
+        for chunk in split_for_telegram(text):
+            await app.bot.send_message(chat_id=owner, text=chunk,
+                                       disable_web_page_preview=True)
+        logger.info("direct_weekly_report_job OK")
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"direct_weekly_report_job: {e}", exc_info=True)
+        try:
+            await app.bot.send_message(
+                chat_id=owner,
+                text=f"⚠️ Сводка Я.Директ не собралась: {e}\n"
+                     f"Попробовать вручную — команда /direct_report.",
+            )
+        except Exception as send_err:
+            logger.error(
+                f"direct_weekly_report_job: TG-алерт не доставлен: {send_err}")
         return {"status": "error", "error": str(e)}
 
 
