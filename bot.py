@@ -13,6 +13,7 @@ from datetime import datetime
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    ExtBot,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
@@ -21,7 +22,7 @@ from telegram.ext import (
     BusinessConnectionHandler,
     filters,
 )
-from telegram.error import TimedOut, NetworkError
+from telegram.error import TimedOut, NetworkError, BadRequest
 from telegram.request import HTTPXRequest
 
 from database import Database
@@ -7542,6 +7543,31 @@ class RetryingHTTPXRequest(HTTPXRequest):
         return httpx.AsyncClient(**kw)
 
 
+class SafeBot(ExtBot):
+    """Bot, у которого сломанная Markdown-разметка не съедает сообщение.
+
+    В текст подставляются данные из МойСклад и amoCRM — названия вроде
+    «Розничный покупатель*** (Инесса)» или SKU с подчёркиванием. Telegram
+    отвечает 400 «Can't parse entities», и одноразовое уведомление пропадает:
+    11.08.2026 так потерялись два алерта согласования заказа (в логе
+    `check_approval_needed: send to 360092495 failed: Can't parse entities`).
+    Отправок с parse_mode="Markdown" в проекте больше 170 — экранировать в каждой
+    невозможно, поэтому фолбэк один на всех: то же сообщение без разметки.
+    Лучше уведомление без звёздочек, чем никакого."""
+
+    async def send_message(self, *args, **kwargs):
+        try:
+            return await super().send_message(*args, **kwargs)
+        except BadRequest as e:
+            # parse_mode позиционным аргументом не передаём нигде — если он не в
+            # kwargs, снимать нечего, ошибка идёт наверх как раньше.
+            if "parse entities" not in str(e).lower() or not kwargs.get("parse_mode"):
+                raise
+            kwargs.pop("parse_mode")
+            logger.warning("SafeBot: разметка сломана (%s) — отправляю без Markdown", e)
+            return await super().send_message(*args, **kwargs)
+
+
 def _tg_request(**kwargs) -> HTTPXRequest:
     """Транспорт для Bot API с ретраями подключения. Если PTB при обновлении
     переименует внутренности (`_build_client` / `_client_kwargs`) — падаем на
@@ -7566,26 +7592,29 @@ def main():
     # Таймауты заданы внутри HTTPXRequest, а не сеттерами билдера: PTB запрещает
     # сочетать .request() с .connect_timeout()/.read_timeout() и т.п. Значения — те же,
     # что стояли сеттерами до 11.08.2026; добавились ретраи подключения.
-    app = (
-        Application.builder()
-        .token(token)
-        .concurrent_updates(256)      # дефолт PTB = последовательно: медленный МС-колбэк
-                                      # (тап по точке маршрута → запросы в МойСклад) блокировал
-                                      # очередь, тапы висели и Telegram их переотправлял →
-                                      # «кнопка срабатывает с 3–4 раза, бот зависает». Теперь
-                                      # апдейты обрабатываются параллельно, до 256 одновременно.
-        .request(_tg_request(
+    bot = SafeBot(
+        token=token,
+        request=_tg_request(
             connection_pool_size=64,  # дефолт 1; апдейты + scheduler конкурируют за пул
             connect_timeout=20.0,
             read_timeout=20.0,
             write_timeout=30.0,       # send_document (PDF-реестры) — с запасом
             pool_timeout=10.0,        # дефолт 1с → PoolTimeout под нагрузкой
-        ))
-        .get_updates_request(_tg_request(
+        ),
+        get_updates_request=_tg_request(
             connection_pool_size=1,
             connect_timeout=20.0,
             read_timeout=30.0,
-        ))
+        ),
+    )
+    app = (
+        Application.builder()
+        .bot(bot)                     # свой Bot → и токен, и транспорт задаются в нём
+        .concurrent_updates(256)      # дефолт PTB = последовательно: медленный МС-колбэк
+                                      # (тап по точке маршрута → запросы в МойСклад) блокировал
+                                      # очередь, тапы висели и Telegram их переотправлял →
+                                      # «кнопка срабатывает с 3–4 раза, бот зависает». Теперь
+                                      # апдейты обрабатываются параллельно, до 256 одновременно.
         .build()
     )
     app.add_error_handler(on_error)
