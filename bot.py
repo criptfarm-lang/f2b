@@ -22,6 +22,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import TimedOut, NetworkError
+from telegram.request import HTTPXRequest
 
 from database import Database
 from notifier import check_order_agreed  # рассылка при согласовании — не трогать!
@@ -5529,22 +5530,16 @@ async def _claim_control_task_note(doc: dict, cp: str) -> str:
 _CLAIM_STATUS_RU = {
     "pending": "ожидает решения", "resolved": "решено", "fix_docs": "исправление документов",
 }
-# tag → фамилия для резолва chat_id менеджера через manager_chats (LIKE по имени).
-_CLAIM_TAG_SURNAME = {
-    "баласанян": "Баласанян", "мерзлякова": "Мерзлякова", "скляр": "Скляр",
-    "дьяченко": "Дьяченко", "коликов": "Коликов",
-}
-
-
 def _resolve_manager_chat(tag: str):
-    """chat_id менеджера по тегу претензии (тег→фамилия→manager_chats). None если не нашли."""
-    surname = _CLAIM_TAG_SURNAME.get((tag or "").lower())
-    if not surname:
-        return None
-    try:
-        return db.get_manager_chat_id(surname)
-    except Exception:
-        return None
+    """chat_id менеджера по тегу претензии. None если тег неизвестен.
+
+    Источник — PDZ_MANAGER_TG_IDS (канон состава ОП, тег → chat_id). Раньше здесь
+    был резолв тег→фамилия→`manager_chats` LIKE по имени, и он молча промахивался:
+    у Ирины Дьяченко в TG-профиле фамилии нет, записи «Дьяченко» в manager_chats
+    не существует — решение по её претензии меняло статус, но пуш ей не уходил
+    (проверено 11.08.2026: резолвились 4 тега из 5)."""
+    from moysklad import PDZ_MANAGER_TG_IDS
+    return PDZ_MANAGER_TG_IDS.get((tag or "").lower())
 
 
 async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7514,6 +7509,49 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
                 pass  # если и это упало — сеть совсем легла, молча выходим
 
 
+TG_CONNECT_RETRIES = 3
+
+
+class RetryingHTTPXRequest(HTTPXRequest):
+    """HTTPXRequest, в котором httpx сам переустанавливает НЕудавшееся соединение.
+
+    Telegram-егресс Amvera из региона Москва_0 периодически отваливается
+    (`ConnectError: All connection attempts failed`, инцидент 11.08.2026 —
+    дашборд потерял уведомления о претензиях). У бота исходящих отправок больше
+    сотни, и обвешивать каждую ретраями смысла нет: `retries` у httpx-транспорта
+    лечит ровно этот класс сбоя один раз для всех.
+
+    Важно: httpx повторяет ТОЛЬКО неудачное установление соединения. Запрос,
+    который уже ушёл в Telegram, не переотправляется — двойных сообщений не будет.
+    """
+
+    def _build_client(self) -> "httpx.AsyncClient":
+        import httpx
+        kw = dict(self._client_kwargs)
+        if kw.get("transport") is None:
+            # limits/http-версию отдаём транспорту руками: свой transport
+            # отменяет одноимённые аргументы AsyncClient (иначе тихо потеряли бы
+            # настроенный пул на 64 соединения).
+            kw["transport"] = httpx.AsyncHTTPTransport(
+                retries=TG_CONNECT_RETRIES,
+                limits=kw.get("limits"),
+                http1=kw.get("http1", True),
+                http2=kw.get("http2", False),
+                proxy=kw.get("proxy"),
+            )
+        return httpx.AsyncClient(**kw)
+
+
+def _tg_request(**kwargs) -> HTTPXRequest:
+    """Транспорт для Bot API с ретраями подключения. Если PTB при обновлении
+    переименует внутренности (`_build_client` / `_client_kwargs`) — падаем на
+    штатный HTTPXRequest, но громко пишем в лог, чтобы не думать, что ретраи есть."""
+    if hasattr(HTTPXRequest, "_build_client") and hasattr(HTTPXRequest, "_client_kwargs"):
+        return RetryingHTTPXRequest(**kwargs)
+    logger.error("PTB изменил внутренности HTTPXRequest — ретраи подключения к Telegram ОТКЛЮЧЕНЫ")
+    return HTTPXRequest(**kwargs)
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -7525,6 +7563,9 @@ def main():
     # каждый send/answer: хендлеры отрабатывали, но ответ Telegram висел →
     # кнопки «не реагировали» весь день. Более щедрые таймауты + больший пул
     # сглаживают лаги (не лечат сам троттлинг, но убирают ложные фейлы).
+    # Таймауты заданы внутри HTTPXRequest, а не сеттерами билдера: PTB запрещает
+    # сочетать .request() с .connect_timeout()/.read_timeout() и т.п. Значения — те же,
+    # что стояли сеттерами до 11.08.2026; добавились ретраи подключения.
     app = (
         Application.builder()
         .token(token)
@@ -7533,13 +7574,18 @@ def main():
                                       # очередь, тапы висели и Telegram их переотправлял →
                                       # «кнопка срабатывает с 3–4 раза, бот зависает». Теперь
                                       # апдейты обрабатываются параллельно, до 256 одновременно.
-        .connect_timeout(20.0)
-        .read_timeout(20.0)
-        .write_timeout(30.0)          # send_document (PDF-реестры) — с запасом
-        .pool_timeout(10.0)           # дефолт 1с → PoolTimeout под нагрузкой
-        .connection_pool_size(64)     # дефолт 1; апдейты + scheduler конкурируют за пул
-        .get_updates_connect_timeout(20.0)
-        .get_updates_read_timeout(30.0)
+        .request(_tg_request(
+            connection_pool_size=64,  # дефолт 1; апдейты + scheduler конкурируют за пул
+            connect_timeout=20.0,
+            read_timeout=20.0,
+            write_timeout=30.0,       # send_document (PDF-реестры) — с запасом
+            pool_timeout=10.0,        # дефолт 1с → PoolTimeout под нагрузкой
+        ))
+        .get_updates_request(_tg_request(
+            connection_pool_size=1,
+            connect_timeout=20.0,
+            read_timeout=30.0,
+        ))
         .build()
     )
     app.add_error_handler(on_error)
