@@ -8406,6 +8406,27 @@ def main():
     )
 
     # ────────────────────────────────────────────────────────────────────
+    # Пинг по просроченным задачам МойСклад — 09:30 МСК Пн–Пт (в выходные
+    # молчит сам модуль). Личный список исполнителю по карте MS_TASK_PING_MAP
+    # (сейчас только Белякова), копия собственнику при просрочке > 3 дней.
+    # План: 2026-08-12-пинг-просроченных-задач-моисклад.
+    # ────────────────────────────────────────────────────────────────────
+    from ms_task_pings import poll_job as _ms_task_pings_poll
+
+    async def _ms_task_pings_job(context):
+        try:
+            stats = await _ms_task_pings_poll(app, owner_chat_id=OWNER_CHAT_ID)
+            if stats:
+                logger.info(f"ms_task_pings job: {stats}")
+        except Exception as e:
+            logger.error(f"ms_task_pings job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_daily(
+        _ms_task_pings_job,
+        time=_dt_time(hour=6, minute=30, tzinfo=_tz_for_job.utc),
+    )
+
+    # ────────────────────────────────────────────────────────────────────
     # Wazzup freshness watchdog: алерт собственнику если БД молчит >2ч в
     # рабочее время. Защита от повторного перехвата webhook AMGROUP-style
     # (см. retrospectives/2026-06-03-аудит-инфраструктуры-wazzup-amgbp.md).

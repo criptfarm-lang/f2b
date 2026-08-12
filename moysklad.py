@@ -4512,6 +4512,62 @@ def invalidate_employees_cache() -> None:
     logger.info("invalidate_employees_cache: кеш сотрудников сброшен")
 
 
+async def list_open_tasks(assignee_id: str) -> list:
+    """Открытые (done=false) задачи МойСклада по конкретному исполнителю.
+
+    Фильтр `assignee` по href сотрудника проверен на живом API 12.08.2026.
+
+    Args:
+        assignee_id: UUID сотрудника (из list_employees).
+
+    Returns:
+        Список словарей {"id", "description", "due", "created", "url"}, где
+        `due`/`created` — naive datetime в МСК (МС отдаёт время без TZ в МСК),
+        `due` может быть None у задач без дедлайна.
+
+    Raises:
+        ValueError: пустой assignee_id.
+        aiohttp.ClientResponseError: HTTP-ошибка от МС.
+    """
+    from datetime import datetime
+
+    if not assignee_id:
+        raise ValueError("list_open_tasks: пустой assignee_id")
+
+    href = f"{MS_BASE}/entity/employee/{assignee_id}"
+    params = {"limit": 100, "filter": f"done=false;assignee={href}"}
+    url = f"{MS_BASE}/entity/task"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url,
+            headers=get_headers(),
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+    def _parse(value):
+        if not value:
+            return None
+        try:
+            return datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            logger.warning(f"list_open_tasks: не разобрана дата «{value}»")
+            return None
+
+    tasks = []
+    for row in data.get("rows", []):
+        tasks.append({
+            "id": row.get("id"),
+            "description": (row.get("description") or "").strip(),
+            "due": _parse(row.get("dueToDate")),
+            "created": _parse(row.get("created")),
+            "url": MS_TASK_EDIT_URL.format(task_id=row.get("id")),
+        })
+    return tasks
+
+
 async def create_task(assignee_id: str, description: str, due_msk) -> dict:
     """Создать задачу в МойСкладе на конкретного сотрудника.
 
