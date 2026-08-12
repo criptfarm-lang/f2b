@@ -482,10 +482,10 @@ async def _render_points(send, page: int, driver_id: int = None):
             routes = await rr.fetch_routes()
             today = datetime.now(_MSK).date()
             def _stop_today(s):
-                ref = s.get("tf") or s.get("vt") or s.get("tt")
-                if not ref:
-                    return True
-                return datetime.fromtimestamp(ref, _MSK).date() == today
+                # rr.stop_days — день визита в раскладке ИЛИ день окна заявки; точка
+                # без времени вовсе остаётся (как и раньше), чтобы не терять её у водителя.
+                days = rr.stop_days(s)
+                return today in days if days else True
             route_stops = sorted(
                 [s for s in (routes.get(unit_id) or []) if _stop_today(s)],
                 key=lambda s: (s.get("seq") if s.get("seq") is not None else 999))

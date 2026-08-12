@@ -333,10 +333,10 @@ def _upsert_draft(snap_date, unit_id, driver_id, snap):
 
 
 def _stop_on_date(s, d) -> bool:
-    ref = s.get("tf") or s.get("vt") or s.get("tt")
-    if not ref:
-        return False
-    return datetime.fromtimestamp(ref, _MSK).date() == d
+    """Точка относится к дню d — по дню визита в раскладке ИЛИ по дню окна заявки
+    (rr.stop_days). Раньше смотрели только окно tf, и ручная заявка со вчерашним
+    окном, поставленная логистом в сегодняшний маршрут, до водителя не доезжала."""
+    return d in rr.stop_days(s)
 
 
 # ─── Сбор маршрутов → логисту ────────────────────────────────────────────────

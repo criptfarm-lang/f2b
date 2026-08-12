@@ -66,6 +66,43 @@ async def _wialon_call(session, svc, params, sid=None):
         return await r.json(content_type=None)
 
 
+def stop_day(s):
+    """Дата (МСК), к которой точка реально относится, или None если времени нет вовсе.
+
+    Приоритет: время визита в раскладке `vt` → окно заявки `tf` → `tt`. Именно vt, а
+    не tf: раскладка — решение логиста «эта точка едет сегодня», а окно у ручных
+    заявок часто остаётся от копии за прошлый день (кейс «Забрать масляную» 12.08.2026:
+    окно 11.08 00:00–23:59, визит в сегодняшнем маршруте В970 в 15:48 — точка выпадала
+    у водителя). У точек вне раскладки (в т.ч. Ларгус без GPS) vt нет → работает tf.
+    """
+    ref = s.get("vt") or s.get("tf") or s.get("tt")
+    return datetime.fromtimestamp(ref, _MSK).date() if ref else None
+
+
+def _order_key(s):
+    """Ключ порядка выгрузки: время визита в раскладке, иначе начало окна, иначе в конец."""
+    if s.get("vt") is not None:
+        return s["vt"]
+    if s.get("tf") is not None:
+        return s["tf"]
+    return 1 << 62
+
+
+def stop_days(s) -> set:
+    """Все дни (МСК), к которым точка может относиться: день визита в раскладке и
+    день окна заявки. Для фильтра «точки на дату» берём объединение, а не одну дату:
+    пропущенная точка = недоставленный клиент, а лишняя видна логисту в сводке до
+    подтверждения. Практика даёт обе рассинхронизации — ручная заявка со вчерашним
+    окном в сегодняшней раскладке (vt свежий, tf старый) и заказ на сегодня, чей vt
+    остался от вчерашней раскладки (tf свежий, vt старый). tt — только фолбэк, когда
+    ни vt, ни tf нет."""
+    days = {datetime.fromtimestamp(t, _MSK).date()
+            for t in (s.get("vt"), s.get("tf")) if t}
+    if not days and s.get("tt"):
+        days = {datetime.fromtimestamp(s["tt"], _MSK).date()}
+    return days
+
+
 async def fetch_routes(with_meta: bool = False):
     """Возвращает {unit_id: [stop,...]} по машинам, точки отсортированы по порядку выгрузки.
     stop = {seq, vt, tf, tt, client, address, phone, order_no, oid, ...}.
@@ -109,14 +146,37 @@ async def fetch_routes(with_meta: bool = False):
     # (c) Гард дублей. Мост всегда ставит cid = id заказа МС. Если у № есть мостовая
     # заявка (с cid) на какой-то машине, то ручные копии того же № БЕЗ cid — дубли
     # (риск двойной доставки). Отбрасываем их, оставляя мостовую как источник правды.
-    cid_numbers = {s["order_no"] for v in routes.values() for s in v if s.get("has_cid")}
+    # Ключ гарда — (№ заказа, ДЕНЬ), а не один №: заказ, не доставленный вчера и
+    # перевыставленный логистом вручную на сегодня, — не дубль, а перенос. Без даты
+    # вчерашняя мостовая заявка съедала сегодняшнюю ручную (кейс 03483 от 12.08.2026:
+    # заказ ушёл в статус «Отгружен» → мост новую заявку не создаёт, логист вбил руками).
+    cid_keys = {(s["order_no"], stop_day(s)) for v in routes.values() for s in v
+                if s.get("has_cid")}
     for uid in routes:
         kept = []
         for s in routes[uid]:
-            if (not s.get("has_cid")) and s.get("order_no") in cid_numbers:
-                logger.warning("fetch_routes: отброшен дубль-сирота №%s на unit %s (есть мостовая копия)",
+            if (not s.get("has_cid")) and (s.get("order_no"), stop_day(s)) in cid_keys:
+                logger.warning("fetch_routes: отброшен дубль-сирота №%s на unit %s (есть мостовая копия на тот же день)",
                                s.get("order_no"), uid)
                 continue
+            kept.append(s)
+        routes[uid] = kept
+
+    # (c2) Второй вид дубля — ДВЕ ручные копии одного № в один день на одной машине
+    # (логист копирует заявку и забывает удалить исходную; гард (c) их не ловит, там
+    # нужна мостовая копия). Один заказ на одну машину в один день едет один раз →
+    # оставляем первую по времени визита. Ключ по сырому order_no, без нормализации:
+    # логист дописывает в поле заметки («00371 (Истринский…)»), и склейка по числу
+    # схлопнула бы разные точки.
+    for uid in routes:
+        seen, kept = set(), []
+        for s in sorted(routes[uid], key=_order_key):
+            key = (s.get("order_no"), stop_day(s))
+            if (not s.get("has_cid")) and key in seen:
+                logger.warning("fetch_routes: отброшена вторая ручная копия №%s на unit %s (%s)",
+                               s.get("order_no"), uid, key[1])
+                continue
+            seen.add(key)
             kept.append(s)
         routes[uid] = kept
 
@@ -137,12 +197,6 @@ async def fetch_routes(with_meta: bool = False):
     # (b) Порядок выгрузки — по времени визита vt (монотонно, надёжно), а не по seq:
     # seq у сирот из разных раскладок коллизирует (несколько seq=0) и сбивает нумерацию.
     # После сортировки перенумеровываем seq 0..N — канон для списка/реестра/LIFO.
-    def _order_key(s):
-        if s.get("vt") is not None:
-            return s["vt"]
-        if s.get("tf") is not None:
-            return s["tf"]
-        return 1 << 62
     for uid in routes:
         routes[uid].sort(key=_order_key)
         for i, s in enumerate(routes[uid]):
