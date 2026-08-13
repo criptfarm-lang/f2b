@@ -326,18 +326,27 @@ async def _fetch_demand_detail(demand_id: str) -> dict:
     }
 
 
-async def _resolve_move_by_order(order_no: str):
-    """№ заказа → id ПЕРЕМЕЩЕНИЯ (entity/move), если заказ закрыт перемещением, а не отгрузкой.
+async def _resolve_stop_doc(doc_no: str):
+    """№ точки реестра → («demand»|«move», id) — документ, по которому сдаём точку.
 
-    Так уходит ГФС: товар едет на их склад ответственного хранения («Джи Эф Си
-    (ответ.хранение)»), в МС это entity/move со ссылкой на заказ, отгрузки (demand) нет.
-    Водитель такую точку сдать не мог — резолв искал только demand (собственник, 13.08.2026).
+    Точка в реестре кодируется номером ЗАКАЗА, поэтому идём от заказа, а не от отгрузки:
+
+    1. заказ по номеру → его отгрузка (`demands`);
+    2. отгрузки нет → ПЕРЕМЕЩЕНИЕ (`moves`). Так уходит ГФС: товар едет на их склад
+       ответственного хранения, в МС это `entity/move` со ссылкой на заказ, demand не создаётся —
+       водитель такую точку сдать не мог (собственник, 13.08.2026);
+    3. заказа с таким номером нет → трактуем номер как номер отгрузки (старые QR).
+
+    Порядок важен: у заказов и отгрузок в МС независимая сквозная нумерация, и номера
+    пересекаются (на 13.08.2026 — 819 совпадений с 01.06). Поиск отгрузки ПО НОМЕРУ ТОЧКИ,
+    как было раньше, на старом заказе даёт ЧУЖУЮ отгрузку: заказ ГФС 03150 → отгрузка 03150
+    ООО «БРЭД ФУД». Тогда водитель закрыл бы чужую доставку, а свою оставил висеть.
     """
-    order_no = (order_no or "").strip()
-    if not order_no:
-        return None
+    doc_no = (doc_no or "").strip()
+    if not doc_no:
+        return None, None
     import urllib.parse as _up
-    f = _up.quote(f"name={order_no}")
+    f = _up.quote(f"name={doc_no}")
     headers = get_headers()
     try:
         async with aiohttp.ClientSession() as session:
@@ -345,17 +354,29 @@ async def _resolve_move_by_order(order_no: str):
                 f"{MS_BASE}/entity/customerorder?filter={f}&limit=1", headers=headers
             ) as r:
                 rows = (await r.json()).get("rows", []) if r.status == 200 else []
-        if not rows:
-            return None
-        # Перемещений по заказу обычно одно; если их несколько — берём последнее
-        # (МС отдаёт связи в порядке создания, последнее = актуальная отгрузка со склада).
-        for mv in reversed(rows[0].get("moves") or []):
-            href = (mv.get("meta") or {}).get("href", "")
-            if href:
-                return href.rstrip("/").split("/")[-1]
+            if rows:
+                o = rows[0]
+                for dm in o.get("demands") or []:
+                    href = (dm.get("meta") or {}).get("href", "")
+                    if href:
+                        return "demand", href.rstrip("/").split("/")[-1]
+                # Перемещений по заказу обычно одно; если их несколько — берём последнее
+                # (МС отдаёт связи в порядке создания, последнее = актуальная отгрузка со склада).
+                for mv in reversed(o.get("moves") or []):
+                    href = (mv.get("meta") or {}).get("href", "")
+                    if href:
+                        return "move", href.rstrip("/").split("/")[-1]
+                return None, None
+            # Заказа с таким номером нет — значит на точке номер отгрузки (печатные QR).
+            async with session.get(
+                f"{MS_BASE}/entity/demand?filter={f}&order=moment,desc&limit=1", headers=headers
+            ) as r:
+                rows = (await r.json()).get("rows", []) if r.status == 200 else []
+            if rows:
+                return "demand", rows[0].get("id")
     except Exception as e:
-        logger.warning("_resolve_move_by_order %s: %s", order_no, e)
-    return None
+        logger.warning("_resolve_stop_doc %s: %s", doc_no, e)
+    return None, None
 
 
 async def _fetch_move_detail(move_id: str) -> dict:
@@ -715,57 +736,6 @@ async def cb_route_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text(
         f"👉 Сдача груза теперь здесь: {link}#o{doc}",
         disable_web_page_preview=True)
-
-
-_UUID_RE = _re.compile(r"^[0-9a-fA-F-]{36}$")
-
-
-async def _resolve_deeplink_payload(payload: str):
-    """QR может кодировать что угодно: id отгрузки, id заказа или номер документа.
-    Возвращает demand_id для карточки сдачи (или None)."""
-    payload = (payload or "").strip()
-    if not payload:
-        return None
-    headers = get_headers()
-    async with aiohttp.ClientSession() as session:
-        if _UUID_RE.match(payload):
-            # 1) это id отгрузки?
-            async with session.get(f"{MS_BASE}/entity/demand/{payload}", headers=headers) as r:
-                if r.status == 200:
-                    return payload
-            # 2) это id заказа → берём его отгрузку
-            async with session.get(
-                f"{MS_BASE}/entity/customerorder/{payload}", headers=headers
-            ) as r:
-                if r.status == 200:
-                    o = await r.json()
-                    for dm in o.get("demands", []) or []:
-                        href = (dm.get("meta") or {}).get("href", "")
-                        if href:
-                            return href.rstrip("/").split("/")[-1]
-            return None
-        # 3) это номер документа. Сначала как номер ОТГРУЗКИ, потом как номер ЗАКАЗА → его отгрузка.
-        import urllib.parse as _up
-        f = _up.quote(f"name={payload}")
-        async with session.get(
-            f"{MS_BASE}/entity/demand?filter={f}&order=moment,desc&limit=1", headers=headers
-        ) as r:
-            if r.status == 200:
-                rows = (await r.json()).get("rows", [])
-                if rows:
-                    return rows[0].get("id")
-        # номер заказа (реестр кодирует № заказа) → берём его отгрузку
-        async with session.get(
-            f"{MS_BASE}/entity/customerorder?filter={f}&limit=1", headers=headers
-        ) as r:
-            if r.status == 200:
-                rows = (await r.json()).get("rows", [])
-                if rows:
-                    for dm in rows[0].get("demands", []) or []:
-                        href = (dm.get("meta") or {}).get("href", "")
-                        if href:
-                            return href.rstrip("/").split("/")[-1]
-    return None
 
 
 async def open_from_deeplink(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: str):
@@ -1360,12 +1330,12 @@ async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, cla
         # (троттл спит 30 с), телефон рвёт соединение и сдача выглядит несработавшей.
         # Поэтому ждём ограниченно, а дальше принимаем точку и дописываем фоном.
         async def _resolve():
-            did = await _resolve_deeplink_payload(doc_no)
-            if did:
+            kind, did = await _resolve_stop_doc(doc_no)
+            if kind == "demand":
                 return did, await _fetch_demand_detail(did)
-            # Отгрузки нет — заказ мог уйти ПЕРЕМЕЩЕНИЕМ на склад ответхранения клиента (ГФС).
-            mid = await _resolve_move_by_order(doc_no)
-            return (mid, await _fetch_move_detail(mid)) if mid else (None, None)
+            if kind == "move":
+                return did, await _fetch_move_detail(did)
+            return None, None
         if deferred:
             demand_id, det = await _resolve()
         else:
