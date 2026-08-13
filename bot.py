@@ -205,9 +205,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=_user_menu_keyboard(include_task_button=is_author)
     )
 
-# Генерация договоров переехала из бота в дашборд менеджера (2026-07-14).
-# Все входы в боте («Эф, договор X», кнопка «Сформировать договор»,
+# Генерация договоров переехала из бота в дашборд менеджера (2026-07-14),
+# 12.08.2026 функция заглушена полностью — код визарда, переиздания и сборки
+# PDF из бота удалён. Все входы («Эф, договор X», кнопка «Сформировать договор»,
 # /reissue_contract, /refresh_contract) отвечают этой заглушкой.
+# Единственное, что осталось от договоров в боте — присвоение номера
+# (contract_generator.get_contract_number) при одобрении документа из сервиса.
 CONTRACT_MOVED_MSG = (
     "📄 Договоры теперь оформляются в *дашборде менеджера*.\n\n"
     "Открой свой дашборд → кнопка *«Сервисы»* → вкладка *«Документы»* — "
@@ -953,60 +956,6 @@ async def cmd_clear_wazzup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
-# Ожидающие данные для создания договора — user_id → {data, missing, missing_idx}
-_pending_contracts: dict = {}
-
-async def _create_and_send_contract(contract_data: dict, created_by: str,
-                                    message, context, force_number: str = None):
-    """Генерирует договор PDF и отправляет в группу."""
-    import io, sys, os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-    try:
-        from contract_generator import generate_contract_pdf, get_contract_number
-        from datetime import datetime
-
-        today = datetime.now()
-
-        if force_number:
-            contract_number = force_number
-        else:
-            contract_number = get_contract_number(today, db)
-
-        MONTHS_RU = ["января","февраля","марта","апреля","мая","июня",
-                     "июля","августа","сентября","октября","ноября","декабря"]
-        contract_data["contract_number"] = contract_number
-        contract_data["contract_date"] = f"{today.day} {MONTHS_RU[today.month-1]} {today.year} г."
-
-        pdf_bytes = generate_contract_pdf(contract_data)
-
-        # Сохраняем в БД с полными реквизитами
-        db.save_contract(contract_number, contract_data["buyer_name"], created_by,
-                         buyer_data=contract_data)
-
-        # Отправляем в группу
-        group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
-        target = group_chat_id or message.chat_id
-        caption = (
-            f"📄 *Договор поставки № {contract_number}*\n"
-            f"📅 {contract_data['contract_date']}\n"
-            f"🏢 {contract_data['buyer_name']}\n"
-            f"👤 Создал: {created_by}"
-        )
-        await context.bot.send_document(
-            chat_id=target,
-            document=io.BytesIO(pdf_bytes),
-            filename=f"Договор_{contract_number}_{contract_data['buyer_name'][:30]}.pdf",
-            caption=caption,
-            parse_mode="Markdown"
-        )
-        if target != message.chat_id:
-            await message.reply_text(f"✅ Договор № {contract_number} отправлен в группу.", parse_mode="Markdown")
-
-    except Exception as e:
-        logger.error(f"_create_and_send_contract: {e}", exc_info=True)
-        await message.reply_text(f"❌ Ошибка генерации договора: {e}")
-
 async def cmd_wazzup_enrich(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обогащает базу контактов тегами из МойСклад. /wazzup_enrich"""
     user = update.effective_user
@@ -1265,93 +1214,6 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     header = f"📊 Диагностика Эфа\n✅ {ok} ок  ⚠️ {warn} предупреждений  ❌ {err} ошибок\n\n"
     await update.message.reply_text(header + "\n".join(results))
-
-async def handle_contract_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок подтверждения создания договора."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "contract_cancel":
-        await query.message.edit_text("❌ Создание договора отменено.")
-        return
-
-    if data.startswith("contract_force|"):
-        cp_id = data.split("|")[1]
-        from moysklad import get_counterparty_requisites
-        await query.message.edit_text("🔍 Читаю реквизиты...")
-        reqs = await get_counterparty_requisites(cp_id)
-        contract_data = {
-            "buyer_name": reqs.get("buyer_legal_title") or reqs.get("buyer_name", ""),
-            "buyer_inn": reqs.get("buyer_inn", ""),
-            "buyer_ogrn": reqs.get("buyer_ogrn", ""),
-            "buyer_address": reqs.get("buyer_address", ""),
-            "buyer_bank": reqs.get("buyer_bank", ""),
-            "buyer_rs": reqs.get("buyer_rs", ""),
-            "buyer_bik": reqs.get("buyer_bik", ""),
-            "buyer_ks": reqs.get("buyer_ks", ""),
-            "buyer_phone": reqs.get("buyer_phone", ""),
-            "buyer_email": reqs.get("buyer_email", ""),
-            "buyer_representative": reqs.get("buyer_representative", ""),
-            "buyer_director_name": reqs.get("buyer_director_name", ""),
-            "buyer_basis": "Устава",
-        }
-        # Для ИП: собираем полное ФИО если в buyer_name нет фамилии
-        _ip_last = reqs.get("buyer_last_name", "")
-        _ip_first = reqs.get("buyer_first_name", "")
-        _ip_mid = reqs.get("buyer_middle_name", "")
-        if _ip_last and _ip_first and _ip_last not in contract_data["buyer_name"]:
-            _full_fio = " ".join(filter(None, [_ip_last, _ip_first, _ip_mid]))
-            if contract_data["buyer_name"]:
-                contract_data["buyer_name"] = contract_data["buyer_name"] + " " + _full_fio
-            else:
-                contract_data["buyer_name"] = _full_fio
-        # Проверяем недостающие поля
-        ASK_REQUIRED = {
-            "buyer_representative": "должность и полное ФИО директора (напр. 'генерального директора Иванову Марию Алексеевну' — обязательно с фамилией!)",
-            "buyer_basis": "основание полномочий",
-        }
-        INFO_REQUIRED = {
-            "buyer_inn": "ИНН", "buyer_ogrn": "ОГРН",
-            "buyer_address": "юридический адрес",
-            "buyer_rs": "расчётный счёт (р/с)", "buyer_bik": "БИК банка",
-            "buyer_bank": "название банка", "buyer_ks": "корреспондентский счёт (к/с)",
-        }
-        missing_ask = [(k, v) for k, v in ASK_REQUIRED.items() if not contract_data.get(k)]
-        missing_info = [(k, v) for k, v in INFO_REQUIRED.items() if not contract_data.get(k)]
-        user = query.from_user
-
-        # Если не хватает данных из МойСклад — останавливаемся
-        if missing_info:
-            names = "\n".join(f"   • {v}" for _, v in missing_info)
-            await query.message.edit_text(
-                f"📄 *{contract_data['buyer_name']}*\n\n"
-                f"❌ *Договор не сформирован* — в МойСклад отсутствуют:\n{names}\n\n"
-                f"Попроси клиента предоставить данные и внеси их в карточку МойСклад, "
-                f"затем запроси договор повторно.",
-                parse_mode="Markdown"
-            )
-            return
-
-        msg = f"📄 *{contract_data['buyer_name']}*\n"
-
-        if missing_ask:
-            _pending_contracts[user.id] = {
-                "data": contract_data,
-                "missing_keys": [m[0] for m in missing_ask],
-                "missing_labels": [m[1] for m in missing_ask],
-                "missing_idx": 0,
-            }
-            try:
-                import json as _j
-                db._execute("INSERT INTO pending_contracts (user_id, data) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET data=%s,created_at=NOW()", (user.id, _j.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str), _j.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str)))
-            except Exception: pass
-            msg += f"*{missing_ask[0][1]}*?"
-            await query.message.edit_text(msg, parse_mode="Markdown")
-        else:
-            await _create_and_send_contract(
-                contract_data, user.full_name, query.message, context
-            )
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Недельный отчёт по команде."""
@@ -1665,127 +1527,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         elif awaiting == "contract":
-            # Договоры переехали в дашборд менеджера (2026-07-14) — глушим в боте.
+            # Договоры оформляются только в сервисе «Документы» (см. CONTRACT_MOVED_MSG).
             await message.reply_text(CONTRACT_MOVED_MSG, parse_mode="Markdown")
             await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
-            return
-            await message.reply_chat_action("typing")
-            buyer_query = text
-            from moysklad import get_counterparty_requisites
-            from datetime import date as _date, datetime as _datetime
-            counterparties = await get_counterparty_balance(buyer_query)
-            if not counterparties:
-                await message.reply_text(
-                    f"❌ Компания *{buyer_query}* не найдена в МойСклад.",
-                    parse_mode="Markdown"
-                )
-                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
-                return
-            cp = counterparties[0]
-            cp_id = cp.get("id", "")
-            cp_name = cp.get("name", buyer_query)
-
-            # Проверяем дату создания клиента — если до 20.03.2026, договор не создаём
-            created_str = cp.get("created", "")
-            CUTOFF = _datetime(2026, 3, 20)
-            is_old_client = False
-            if created_str:
-                try:
-                    created_dt = _datetime.fromisoformat(created_str[:19])
-                    if created_dt < CUTOFF:
-                        is_old_client = True
-                except Exception:
-                    pass
-
-            if is_old_client:
-                await message.reply_text(
-                    f"⚠️ *{cp_name}* — действующий клиент.\n\n"
-                    f"Договор по этому клиенту уже существует или ведётся в работе.\n"
-                    f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
-                    parse_mode="Markdown",
-                    reply_markup=_user_menu_keyboard()
-                )
-                return
-
-            existing = db.find_contract_by_buyer(cp_name)
-            if existing:
-                await message.reply_text(
-                    f"📄 Договор с *{cp_name}* уже был сформирован.\n"
-                    f"Номер: *{existing['contract_number']}* от {existing['created_at'].strftime('%d.%m.%Y')}\n\n"
-                    f"Повторное формирование невозможно.\n"
-                    f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
-                    parse_mode="Markdown"
-                )
-                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
-                return
-            # (проверка по дате создания убрана — достаточно проверки CUTOFF выше)
-            await message.reply_text(f"🔍 Читаю реквизиты *{cp_name}*...", parse_mode="Markdown")
-            reqs = await get_counterparty_requisites(cp_id)
-            contract_data = {
-                "buyer_name": reqs.get("buyer_legal_title") or reqs.get("buyer_name", buyer_query),
-                "buyer_inn": reqs.get("buyer_inn", ""),
-                "buyer_ogrn": reqs.get("buyer_ogrn", ""),
-                "buyer_address": reqs.get("buyer_address", ""),
-                "buyer_bank": reqs.get("buyer_bank", ""),
-                "buyer_rs": reqs.get("buyer_rs", ""),
-                "buyer_bik": reqs.get("buyer_bik", ""),
-                "buyer_ks": reqs.get("buyer_ks", ""),
-                "buyer_phone": reqs.get("buyer_phone", ""),
-                "buyer_email": reqs.get("buyer_email", ""),
-                "buyer_representative": reqs.get("buyer_representative", ""),
-                "buyer_director_name": reqs.get("buyer_director_name", ""),
-                "buyer_basis": "Устава",
-            }
-            # Для ИП: собираем полное ФИО если в buyer_name нет фамилии
-            _ip_last = reqs.get("buyer_last_name", "")
-            _ip_first = reqs.get("buyer_first_name", "")
-            _ip_mid = reqs.get("buyer_middle_name", "")
-            if _ip_last and _ip_first and _ip_last not in contract_data["buyer_name"]:
-                _full_fio = " ".join(filter(None, [_ip_last, _ip_first, _ip_mid]))
-                if contract_data["buyer_name"]:
-                    contract_data["buyer_name"] = contract_data["buyer_name"] + " " + _full_fio
-                else:
-                    contract_data["buyer_name"] = _full_fio
-            INFO_REQUIRED = {
-                "buyer_inn": "ИНН", "buyer_ogrn": "ОГРН",
-                "buyer_address": "юридический адрес",
-                "buyer_rs": "расчётный счёт (р/с)", "buyer_bik": "БИК банка",
-                "buyer_bank": "название банка", "buyer_ks": "корреспондентский счёт (к/с)",
-            }
-            ASK_REQUIRED = {
-                "buyer_representative": "должность и полное ФИО директора (напр. 'генерального директора Иванову Марию Алексеевну' — обязательно с фамилией!)",
-                "buyer_basis": "основание полномочий",
-            }
-            missing_info = [(k, v) for k, v in INFO_REQUIRED.items() if not contract_data.get(k)]
-            missing_ask = [(k, v) for k, v in ASK_REQUIRED.items() if not contract_data.get(k)]
-
-            if missing_info:
-                names = "\n".join(f"   • {v}" for _, v in missing_info)
-                await message.reply_text(
-                    f"📄 *{contract_data['buyer_name']}*\n\n"
-                    f"❌ *Договор не сформирован* — в МойСклад отсутствуют:\n{names}\n\n"
-                    f"Внеси данные в карточку МойСклад и запроси договор повторно.",
-                    parse_mode="Markdown",
-                    reply_markup=_user_menu_keyboard()
-                )
-                return
-            if missing_ask:
-                _pending_contracts[user.id] = {
-                    "data": contract_data,
-                    "missing_keys": [m[0] for m in missing_ask],
-                    "missing_labels": [m[1] for m in missing_ask],
-                    "missing_idx": 0,
-                }
-                try:
-                    import json as _j
-                    db._execute("INSERT INTO pending_contracts (user_id, data) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET data=%s,created_at=NOW()", (user.id, _j.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str), _j.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str)))
-                except Exception: pass
-                await message.reply_text(
-                    f"📄 *{contract_data['buyer_name']}*\n\nУточни:\n*{missing_ask[0][1]}*?",
-                    parse_mode="Markdown"
-                )
-            else:
-                await _create_and_send_contract(contract_data, user.full_name, message, context)
             return
 
     # Ответ менеджера на алерт цены в личке — пересылаем Виктору
@@ -2061,90 +1805,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Проверяем ожидание данных для договора (ПОСЛЕ идентификации)
-    if user and user.id in _pending_contracts:
-        pending_c = _pending_contracts[user.id]
-        keys = pending_c["missing_keys"]
-        labels = pending_c["missing_labels"]
-        idx = pending_c["missing_idx"]
-        data = pending_c["data"]
-
-        # Чистим текст от обращения "Эф," если есть
-        answer_text = text.strip()
-        for prefix in ["эф,", "эф ", "ef,", "ef "]:
-            if answer_text.lower().startswith(prefix):
-                answer_text = answer_text[len(prefix):].strip()
-                break
-
-        field_key = keys[idx]
-        data[field_key] = answer_text
-
-        if field_key == "buyer_representative":
-            parts = answer_text.split()
-            # Слова которые являются частью должности (даже с заглавной буквы)
-            POSITION_WORDS = {
-                "генерального", "генеральный", "директора", "директор",
-                "индивидуального", "индивидуальный", "предпринимателя", "предприниматель",
-                "исполнительного", "исполнительный", "коммерческого", "коммерческий",
-                "финансового", "финансовый", "управляющего", "управляющий",
-                "президента", "президент", "председателя", "председатель",
-            }
-            # Ищем первое слово с заглавной буквы которое НЕ является словом должности
-            fio_start = 0
-            for i, w in enumerate(parts):
-                cleaned = w.strip(".,").lower()
-                if w.strip(".,") and w.strip(".,")[0].isupper() and i > 0 and cleaned not in POSITION_WORDS:
-                    fio_start = i
-                    break
-            if fio_start > 0:
-                data["buyer_director_name"] = " ".join(parts[fio_start:])
-            elif len(parts) >= 2:
-                data["buyer_director_name"] = " ".join(parts[-3:]) if len(parts) >= 3 else " ".join(parts)
-
-        idx += 1
-        pending_c["missing_idx"] = idx
-
-        if idx < len(keys):
-            try:
-                import json as _j
-                db._execute("INSERT INTO pending_contracts (user_id, data) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET data=%s,created_at=NOW()", (user.id, _j.dumps(pending_c, ensure_ascii=False, default=str), _j.dumps(pending_c, ensure_ascii=False, default=str)))
-            except Exception: pass
-            await message.reply_text(f"✅ Принято.\n\n*{labels[idx]}*?", parse_mode="Markdown")
-        else:
-            _pending_contracts.pop(user.id, None)
-            db._execute("DELETE FROM pending_contracts WHERE user_id=%s", (user.id,))
-
-            # Режим refresh — генерируем с сохранением номера и даты
-            if pending_c.get("mode") == "refresh":
-                await message.reply_text("✅ Данные получены. Генерирую договор...")
-                try:
-                    from contract_generator import generate_contract_pdf
-                    import io as _io_refresh
-                    pdf_bytes = generate_contract_pdf(data)
-                    db.save_contract(data["contract_number"], data["buyer_name"], user.full_name, buyer_data=data)
-                    group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
-                    target = group_chat_id or message.chat_id
-                    await context.bot.send_document(
-                        chat_id=target,
-                        document=_io_refresh.BytesIO(pdf_bytes),
-                        filename=f"Договор_{data['contract_number']}_{data['buyer_name'][:30]}.pdf",
-                        caption=(
-                            f"📄 *Договор поставки № {data['contract_number']}* (переиздан, данные обновлены)\n"
-                            f"📅 {data['contract_date']}\n"
-                            f"🏢 {data['buyer_name']}\n"
-                            f"👤 {user.full_name}"
-                        ),
-                        parse_mode="Markdown"
-                    )
-                    if target != message.chat_id:
-                        await message.reply_text(f"✅ Договор № {data['contract_number']} переиздан и отправлен в группу.")
-                except Exception as _e:
-                    logger.error(f"refresh pending generate: {_e}", exc_info=True)
-                    await message.reply_text(f"❌ Ошибка генерации: {_e}")
-            else:
-                await message.reply_text("✅ Все данные получены. Генерирую договор...")
-                await _create_and_send_contract(data, user.full_name, message, context)
-        return
 
     if not is_bot_addressed(text):
         return
@@ -2647,147 +2307,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif action == "generate_contract":
-        # Договоры переехали в дашборд менеджера (2026-07-14) — глушим генерацию в боте.
+        # Договоры оформляются только в сервисе «Документы» (см. CONTRACT_MOVED_MSG).
         await message.reply_text(CONTRACT_MOVED_MSG, parse_mode="Markdown")
         return
-
-        buyer_query = params.get("buyer", "")
-        await message.reply_chat_action("typing")
-
-        from moysklad import get_counterparty_requisites
-        from datetime import date as _date, datetime as _datetime
-
-        counterparties = await get_counterparty_balance(buyer_query)
-        if not counterparties:
-            await message.reply_text(
-                f"❌ Компания *{buyer_query}* не найдена в МойСклад.",
-                parse_mode="Markdown"
-            )
-            return
-
-        cp = counterparties[0]
-        cp_id = cp.get("id", "")
-        cp_name = cp.get("name", buyer_query)
-
-        # Запрет на договор для клиентов созданных до 20.03.2026
-        created_str = cp.get("created", "")
-        CUTOFF = _datetime(2026, 3, 20)
-        if created_str:
-            try:
-                if _datetime.fromisoformat(created_str[:19]) < CUTOFF:
-                    await message.reply_text(
-                        f"⚠️ *{cp_name}* — действующий клиент.\n\n"
-                        f"Договор по этому клиенту уже существует или ведётся в работе.\n"
-                        f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
-                        parse_mode="Markdown"
-                    )
-                    return
-            except Exception:
-                pass
-
-        # Проверяем — есть ли уже договор созданный Эфом
-        existing = db.find_contract_by_buyer(cp_name)
-        if existing:
-            await message.reply_text(
-                f"📄 Договор с *{cp_name}* уже был сформирован.\n"
-                f"Номер: *{existing['contract_number']}* от {existing['created_at'].strftime('%d.%m.%Y')}\n\n"
-                f"Повторное формирование договора невозможно.\n"
-                f"По вопросам договора обратитесь к *Юлии Гераськиной*.",
-                parse_mode="Markdown"
-            )
-            return
-
-        # (проверка по дате создания убрана — достаточно проверки CUTOFF выше)
-        if False:
-            await message.reply_text("placeholder")
-            return
-
-        # Читаем полные реквизиты
-        await message.reply_text(f"🔍 Читаю реквизиты *{cp.get('name','')}*...", parse_mode="Markdown")
-        reqs = await get_counterparty_requisites(cp_id)
-
-        contract_data = {
-            "buyer_name": reqs.get("buyer_legal_title") or reqs.get("buyer_name", buyer_query),
-            "buyer_inn": reqs.get("buyer_inn", ""),
-            "buyer_ogrn": reqs.get("buyer_ogrn", ""),
-            "buyer_address": reqs.get("buyer_address", ""),
-            "buyer_bank": reqs.get("buyer_bank", ""),
-            "buyer_rs": reqs.get("buyer_rs", ""),
-            "buyer_bik": reqs.get("buyer_bik", ""),
-            "buyer_ks": reqs.get("buyer_ks", ""),
-            "buyer_phone": reqs.get("buyer_phone", ""),
-            "buyer_email": reqs.get("buyer_email", ""),
-            "buyer_representative": reqs.get("buyer_representative", ""),
-            "buyer_director_name": reqs.get("buyer_director_name", ""),
-            "buyer_basis": "Устава",  # по умолчанию
-        }
-        # Для ИП: собираем полное ФИО если в buyer_name нет фамилии
-        _ip_last = reqs.get("buyer_last_name", "")
-        _ip_first = reqs.get("buyer_first_name", "")
-        _ip_mid = reqs.get("buyer_middle_name", "")
-        if _ip_last and _ip_first and _ip_last not in contract_data["buyer_name"]:
-            _full_fio = " ".join(filter(None, [_ip_last, _ip_first, _ip_mid]))
-            if contract_data["buyer_name"]:
-                contract_data["buyer_name"] = contract_data["buyer_name"] + " " + _full_fio
-            else:
-                contract_data["buyer_name"] = _full_fio
-
-        # Проверяем чего не хватает
-        # Разделяем: что спрашиваем у менеджера, что просто сообщаем как отсутствующее
-        ASK_REQUIRED = {
-            "buyer_representative": "должность и полное ФИО директора (напр. 'генерального директора Иванову Марию Алексеевну' — обязательно с фамилией!)",
-            "buyer_basis": "основание полномочий (напр. 'Устава' или 'доверенности № 1 от 01.01.2026')",
-        }
-        INFO_REQUIRED = {
-            "buyer_inn": "ИНН",
-            "buyer_ogrn": "ОГРН",
-            "buyer_address": "юридический адрес",
-            "buyer_rs": "расчётный счёт (р/с)",
-            "buyer_bik": "БИК банка",
-            "buyer_bank": "название банка",
-            "buyer_ks": "корреспондентский счёт (к/с)",
-        }
-
-        missing_ask = [(k, v) for k, v in ASK_REQUIRED.items() if not contract_data.get(k)]
-        missing_info = [(k, v) for k, v in INFO_REQUIRED.items() if not contract_data.get(k)]
-
-        if missing_ask or missing_info:
-            _pending_contracts[user.id] = {
-                "data": contract_data,
-                "missing_keys": [m[0] for m in missing_ask],
-                "missing_labels": [m[1] for m in missing_ask],
-                "missing_idx": 0,
-            }
-            try:
-                import json as _j
-                db._execute("INSERT INTO pending_contracts (user_id, data) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET data=%s,created_at=NOW()", (user.id, _j.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str), _j.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str)))
-            except Exception: pass
-            found_info = []
-            if contract_data["buyer_inn"]: found_info.append(f"ИНН: {contract_data['buyer_inn']}")
-            if contract_data["buyer_ogrn"]: found_info.append(f"ОГРН: {contract_data['buyer_ogrn']}")
-            if contract_data["buyer_bank"]: found_info.append(f"Банк: {contract_data['buyer_bank']}")
-            found_str = " · ".join(found_info) if found_info else "реквизиты не найдены"
-
-            msg = f"📄 *{contract_data['buyer_name']}*\n_{found_str}_\n\n"
-
-            if missing_info:
-                names = "\n".join(f"   • {v}" for _, v in missing_info)
-                await message.reply_text(
-                    f"📄 *{contract_data['buyer_name']}*\n\n"
-                    f"❌ *Договор не сформирован* — в МойСклад отсутствуют:\n{names}\n\n"
-                    f"Внеси данные в карточку МойСклад и запроси договор повторно.",
-                    parse_mode="Markdown"
-                )
-                return
-
-            if missing_ask:
-                msg += f"*{missing_ask[0][1]}*?"
-                await message.reply_text(msg, parse_mode="Markdown")
-                return
-
-        # Все данные есть — генерируем сразу
-        await message.reply_text("✅ Все реквизиты найдены. Генерирую договор...")
-        await _create_and_send_contract(contract_data, user.full_name, message, context)
 
     elif action == "manager_activity":
         days = int(params.get("days", 7))
@@ -4448,242 +3970,13 @@ async def cmd_refresh_history(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cmd_reissue_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/reissue_contract [название компании] — перегенерировать договор с теми же номером и датой."""
-    # Договоры переехали в дашборд менеджера (2026-07-14) — глушим и переиздание в боте.
+    """/reissue_contract — заглушка: переиздание договоров живёт в сервисе «Документы»."""
     await update.message.reply_text(CONTRACT_MOVED_MSG, parse_mode="Markdown")
-    return
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    allowed_ids = manager_ids + [OWNER_CHAT_ID]
-    if not user or user.id not in allowed_ids:
-        await update.message.reply_text("❌ У вас нет доступа к этой команде.")
-        return
-    if not context.args:
-        rows = db._fetchall(
-            "SELECT buyer_name, contract_number, created_at FROM contracts ORDER BY created_at DESC LIMIT 10"
-        )
-        if not rows:
-            await update.message.reply_text("📭 В базе нет сохранённых договоров.")
-            return
-        lines = ["📄 *Последние договоры в базе:*\n"]
-        for r in rows:
-            dt = r["created_at"].strftime("%d.%m.%Y") if r.get("created_at") else "—"
-            lines.append(f"• {r['buyer_name']} №{r['contract_number']} от {dt}")
-        lines.append("\nИспользование: /reissue_contract [название компании]")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-        return
-
-    buyer_query = " ".join(context.args)
-    existing = db.find_contract_by_buyer(buyer_query)
-    if not existing:
-        # Пробуем частичный поиск через LIKE
-        rows = db._fetchall(
-            "SELECT * FROM contracts WHERE LOWER(buyer_name) LIKE LOWER(%s) ORDER BY created_at DESC LIMIT 5",
-            (f"%{buyer_query}%",)
-        )
-        if not rows:
-            await update.message.reply_text(
-                f"❌ Договор с '{buyer_query}' не найден в базе.\n"
-                f"Попробуй часть названия, например: /reissue_contract ПРОДУКТЫ"
-            )
-            return
-        if len(rows) == 1:
-            existing = rows[0]
-        else:
-            lines = ["🔍 Найдено несколько договоров — уточни название:\n"]
-            for r in rows:
-                lines.append(f"• {r['buyer_name']} (№{r['contract_number']})")
-            await update.message.reply_text("\n".join(lines))
-            return
-
-    contract_number = existing["contract_number"]
-    created_at = existing["created_at"]
-    buyer_data = existing.get("buyer_data") or {}
-
-    await update.message.reply_text(
-        f"📄 Найден договор №{contract_number} от {created_at.strftime('%d.%m.%Y')}\n"
-        f"🏢 {existing['buyer_name']}\n\n"
-        f"Перегенерирую PDF с теми же номером и датой..."
-    )
-
-    try:
-        from contract_generator import generate_contract_pdf
-        import io
-
-        # Восстанавливаем данные из БД
-        if isinstance(buyer_data, str):
-            import json
-            buyer_data = json.loads(buyer_data)
-
-        MONTHS_RU = ["января","февраля","марта","апреля","мая","июня",
-                     "июля","августа","сентября","октября","ноября","декабря"]
-        buyer_data["contract_number"] = contract_number
-        buyer_data["contract_date"] = f"{created_at.day} {MONTHS_RU[created_at.month-1]} {created_at.year} г."
-
-        pdf_bytes = generate_contract_pdf(buyer_data)
-
-        group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
-        target = group_chat_id or update.message.chat_id
-        await context.bot.send_document(
-            chat_id=target,
-            document=io.BytesIO(pdf_bytes),
-            filename=f"Договор_{contract_number}_{existing['buyer_name'][:30]}.pdf",
-            caption=(
-                f"📄 *Договор поставки № {contract_number}* (переизданный)\n"
-                f"📅 {buyer_data['contract_date']}\n"
-                f"🏢 {existing['buyer_name']}"
-            ),
-            parse_mode="Markdown"
-        )
-        if target != update.message.chat_id:
-            await update.message.reply_text(f"✅ Договор № {contract_number} переиздан и отправлен в группу.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 async def cmd_refresh_contract(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/refresh_contract [название компании] — обновить реквизиты из МойСклад и переиздать договор с тем же номером и датой."""
-    # Договоры переехали в дашборд менеджера (2026-07-14) — глушим и переиздание в боте.
+    """/refresh_contract — заглушка: переиздание договоров живёт в сервисе «Документы»."""
     await update.message.reply_text(CONTRACT_MOVED_MSG, parse_mode="Markdown")
-    return
-    user = update.effective_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    allowed_ids = manager_ids + [OWNER_CHAT_ID]
-    if not user or user.id not in allowed_ids:
-        await update.message.reply_text("❌ У вас нет доступа к этой команде.")
-        return
-    if not context.args:
-        await update.message.reply_text(
-            "Использование: /refresh_contract [название компании]\n"
-            "Команда заново запросит реквизиты из МойСклад и переиздаст договор с сохранением номера и даты."
-        )
-        return
-
-    buyer_query = " ".join(context.args)
-    existing = db.find_contract_by_buyer(buyer_query)
-    if not existing:
-        await update.message.reply_text(f"❌ Договор с '{buyer_query}' не найден в базе.")
-        return
-
-    contract_number = existing["contract_number"]
-    created_at = existing["created_at"]
-
-    await update.message.reply_text(
-        f"🔍 Найден договор №{contract_number} от {created_at.strftime('%d.%m.%Y')}\n"
-        f"🏢 {existing['buyer_name']}\n\n"
-        f"Запрашиваю актуальные реквизиты из МойСклад..."
-    )
-
-    try:
-        from moysklad import get_counterparty_requisites, get_counterparty_balance
-        # Используем get_counterparty_balance для поиска контрагента по имени
-        _found_list = await get_counterparty_balance(buyer_query)
-        if not _found_list:
-            await update.message.reply_text(f"❌ Компания '{buyer_query}' не найдена в МойСклад.")
-            return
-        cp_id = _found_list[0]["id"]
-        reqs = await get_counterparty_requisites(cp_id)
-
-        MONTHS_RU_RC = ["января","февраля","марта","апреля","мая","июня",
-                        "июля","августа","сентября","октября","ноября","декабря"]
-
-        # Старые данные из БД — используем как fallback для полей которых нет в МойСклад
-        old_data = existing.get("buyer_data") or {}
-        if isinstance(old_data, str):
-            import json as _j2
-            old_data = _j2.loads(old_data)
-
-        contract_data = {
-            "buyer_name": reqs.get("buyer_legal_title") or reqs.get("buyer_name", buyer_query),
-            "buyer_legal_title": reqs.get("buyer_legal_title") or reqs.get("buyer_name", buyer_query),
-            "buyer_inn": reqs.get("buyer_inn", "") or old_data.get("buyer_inn", ""),
-            "buyer_ogrn": reqs.get("buyer_ogrn", "") or old_data.get("buyer_ogrn", ""),
-            "buyer_address": reqs.get("buyer_address", "") or old_data.get("buyer_address", ""),
-            "buyer_bank": reqs.get("buyer_bank", "") or old_data.get("buyer_bank", ""),
-            "buyer_rs": reqs.get("buyer_rs", "") or old_data.get("buyer_rs", ""),
-            "buyer_bik": reqs.get("buyer_bik", "") or old_data.get("buyer_bik", ""),
-            "buyer_ks": reqs.get("buyer_ks", "") or old_data.get("buyer_ks", ""),
-            "buyer_phone": reqs.get("buyer_phone", "") or old_data.get("buyer_phone", ""),
-            "buyer_email": reqs.get("buyer_email", "") or old_data.get("buyer_email", ""),
-            # ФИО директора — ТОЛЬКО из МойСклад, не из старых данных
-            # (старые данные могут содержать неполное ФИО без фамилии)
-            "buyer_representative": reqs.get("buyer_representative", ""),
-            "buyer_director_name": reqs.get("buyer_director_name", ""),
-            "buyer_basis": reqs.get("buyer_basis", "") or old_data.get("buyer_basis", "Устава"),
-            # Сохраняем ОРИГИНАЛЬНЫЕ номер и дату
-            "contract_number": contract_number,
-            "contract_date": f"{created_at.day} {MONTHS_RU_RC[created_at.month-1]} {created_at.year} г.",
-        }
-
-        # Для ИП: собираем полное ФИО если в buyer_name нет фамилии
-        _ip_last = reqs.get("buyer_last_name", "")
-        _ip_first = reqs.get("buyer_first_name", "")
-        _ip_mid = reqs.get("buyer_middle_name", "")
-        if _ip_last and _ip_first and _ip_last not in contract_data["buyer_name"]:
-            _full_fio = " ".join(filter(None, [_ip_last, _ip_first, _ip_mid]))
-            contract_data["buyer_name"] = (contract_data["buyer_name"] + " " + _full_fio).strip() if contract_data["buyer_name"] else _full_fio
-
-        # Если ФИО директора не нашли или нет фамилии — спрашиваем вручную
-        _director_ok = (
-            contract_data.get("buyer_director_name") and
-            len(contract_data["buyer_director_name"].split()) >= 2 and
-            contract_data.get("buyer_representative")
-        )
-        if not _director_ok:
-            # Сначала очищаем любую старую запись
-            _pending_contracts.pop(user.id, None)
-            db._execute("DELETE FROM pending_contracts WHERE user_id=%s", (user.id,))
-
-            _pending_contracts[user.id] = {
-                "data": contract_data,
-                "missing_keys": ["buyer_representative"],
-                "missing_labels": ["должность и полное ФИО директора (напр. 'генерального директора Иванову Марию Алексеевну' — обязательно с фамилией!)"],
-                "missing_idx": 0,
-                "mode": "refresh",
-            }
-            import json as _j_rc
-            db._execute(
-                "INSERT INTO pending_contracts (user_id, data) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET data=%s,created_at=NOW()",
-                (user.id, _j_rc.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str),
-                 _j_rc.dumps(_pending_contracts[user.id], ensure_ascii=False, default=str))
-            )
-            await update.message.reply_text(
-                f"📄 *{contract_data['buyer_name']}*\n\n"
-                f"В МойСклад не заполнено ФИО директора.\n\n"
-                f"*Напиши должность и полное ФИО директора*\n"
-                f"_(напр. 'генерального директора Иванову Марию Алексеевну')_",
-                parse_mode="Markdown"
-            )
-            return
-
-        from contract_generator import generate_contract_pdf
-        import io as _io_rc
-
-        pdf_bytes = generate_contract_pdf(contract_data)
-
-        # Обновляем данные в БД
-        import json as _j3
-        db.save_contract(contract_number, contract_data["buyer_name"], user.full_name, buyer_data=contract_data)
-
-        group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
-        target = group_chat_id or update.message.chat_id
-        await context.bot.send_document(
-            chat_id=target,
-            document=_io_rc.BytesIO(pdf_bytes),
-            filename=f"Договор_{contract_number}_{contract_data['buyer_name'][:30]}.pdf",
-            caption=(
-                f"📄 *Договор поставки № {contract_number}* (переиздан, данные обновлены)\n"
-                f"📅 {contract_data['contract_date']}\n"
-                f"🏢 {contract_data['buyer_name']}\n"
-                f"👤 {user.full_name}"
-            ),
-            parse_mode="Markdown"
-        )
-        if target != update.message.chat_id:
-            await update.message.reply_text(f"✅ Договор № {contract_number} переиздан с актуальными данными и отправлен в группу.")
-    except Exception as e:
-        logger.error(f"cmd_refresh_contract: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
 async def cmd_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7742,7 +7035,6 @@ def main():
     # План 2026-05-20-автоподстановка-исходной-даты-оплаты, Фазы 2-3
     app.add_handler(CommandHandler("payment_planned_autofill_test", cmd_payment_planned_autofill_test))
     app.add_handler(CommandHandler("payment_planned_history", cmd_payment_planned_history))
-    app.add_handler(CallbackQueryHandler(handle_contract_callback, pattern="^contract_"))
     app.add_handler(CallbackQueryHandler(handle_price_callback, pattern="^(price_|pdz_)"))
     app.add_handler(CallbackQueryHandler(handle_approval_callback, pattern="^appr_"))
     from processing_svetofor import handle_svetofor_callback
@@ -9127,16 +8419,6 @@ def main():
         logger.info("🤖 Бот запущен!")
         # Загружаем менеджеров Wazzup
         await load_wazzup_managers()
-        # Восстанавливаем pending_contracts из БД
-        try:
-            import json as _json
-            rows = db._fetchall("SELECT user_id, data FROM pending_contracts WHERE created_at > NOW() - INTERVAL '24 hours'")
-            for row in rows:
-                _pending_contracts[row["user_id"]] = _json.loads(row["data"])
-            if rows:
-                logger.info(f"Восстановлено {len(rows)} pending_contracts из БД")
-        except Exception as e:
-            logger.warning(f"Не удалось восстановить pending_contracts: {e}")
         # Восстанавливаем pending_links из БД после рестарта
         try:
             pending_rows = db.load_pending_links()
