@@ -326,6 +326,94 @@ async def _fetch_demand_detail(demand_id: str) -> dict:
     }
 
 
+async def _resolve_move_by_order(order_no: str):
+    """№ заказа → id ПЕРЕМЕЩЕНИЯ (entity/move), если заказ закрыт перемещением, а не отгрузкой.
+
+    Так уходит ГФС: товар едет на их склад ответственного хранения («Джи Эф Си
+    (ответ.хранение)»), в МС это entity/move со ссылкой на заказ, отгрузки (demand) нет.
+    Водитель такую точку сдать не мог — резолв искал только demand (собственник, 13.08.2026).
+    """
+    order_no = (order_no or "").strip()
+    if not order_no:
+        return None
+    import urllib.parse as _up
+    f = _up.quote(f"name={order_no}")
+    headers = get_headers()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder?filter={f}&limit=1", headers=headers
+            ) as r:
+                rows = (await r.json()).get("rows", []) if r.status == 200 else []
+        if not rows:
+            return None
+        # Перемещений по заказу обычно одно; если их несколько — берём последнее
+        # (МС отдаёт связи в порядке создания, последнее = актуальная отгрузка со склада).
+        for mv in reversed(rows[0].get("moves") or []):
+            href = (mv.get("meta") or {}).get("href", "")
+            if href:
+                return href.rstrip("/").split("/")[-1]
+    except Exception as e:
+        logger.warning("_resolve_move_by_order %s: %s", order_no, e)
+    return None
+
+
+async def _fetch_move_detail(move_id: str) -> dict:
+    """Перемещение + позиции в том же формате, что `_fetch_demand_detail`.
+
+    У перемещения нет контрагента и адреса доставки — их, как и чек-лист с окном,
+    берём из связанного заказа покупателя."""
+    headers = get_headers()
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{MS_BASE}/entity/move/{move_id}",
+            headers=headers, params={"expand": "customerOrder.agent"},
+        ) as r:
+            if r.status != 200:
+                return {}
+            m = await r.json()
+        async with session.get(
+            f"{MS_BASE}/entity/move/{move_id}/positions",
+            headers=headers, params={"expand": "assortment", "limit": 100},
+        ) as r:
+            pos = (await r.json()).get("rows", []) if r.status == 200 else []
+
+    co = m.get("customerOrder") or {}
+    ag = co.get("agent") or {}
+    prices = [(p.get("price", 0) or 0) / 100 for p in pos]
+    lines = []
+    for p in pos:
+        nm = (p.get("assortment") or {}).get("name", "?")
+        qty = p.get("quantity", 0) or 0
+        pr = (p.get("price", 0) or 0) / 100
+        lines.append(f"• {nm} — {qty:g} × {pr:,.0f}".replace(",", " "))
+    checklist_raw = None
+    win_from = win_to = ""
+    for a in co.get("attributes", []) or []:
+        nm = a.get("name")
+        if nm == _CHECKLIST_ATTR_NAME:
+            checklist_raw = a.get("value")
+        elif nm == "Окно доставки с (время)":
+            win_from = _attr_time_hm(a.get("value"))
+        elif nm == "Окно доставки до (время)":
+            win_to = _attr_time_hm(a.get("value"))
+    return {
+        "is_move": True,        # статус доставки писать некуда: у move статусов «Сдан» нет
+        "agent_id": ag.get("id"),
+        "agent_name": ag.get("name"),
+        "address": co.get("shipmentAddress"),
+        "sum_rub": (m.get("sum", 0) or 0) / 100,
+        "name": m.get("name"),           # № перемещения
+        "order_name": co.get("name"),    # № заказа — по нему сверяет логист
+        "max_price_rub": max(prices) if prices else 0,
+        "positions_text": "\n".join(lines),
+        "checklist_raw": checklist_raw,
+        "comment": ((co.get("shipmentAddressFull") or {}).get("comment") or "").strip(),
+        "win_from": win_from,
+        "win_to": win_to,
+    }
+
+
 async def _fetch_agent_tags(agent_id: str) -> list:
     if not agent_id:
         return []
@@ -1259,6 +1347,9 @@ async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, cla
     route_dispatch.done по машине. Возвращает (ok: bool, msg: str). Бот — запаска,
     поэтому логика записи зеркалит cb_accept/_finish_claim.
 
+    Документ точки — отгрузка (demand), а для ГФС — ПЕРЕМЕЩЕНИЕ на склад их
+    ответхранения (move): у такой точки чеклист пишется, статус в МС — нет.
+
     deferred=True — это уже фоновая дозапись (МС ждём сколько нужно, второй раз не откладываем)."""
     import route_dispatch
     # № документа держим ОТДЕЛЬНОЙ переменной: раньше он затирал `doc` — ответ водителя
@@ -1270,7 +1361,11 @@ async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, cla
         # Поэтому ждём ограниченно, а дальше принимаем точку и дописываем фоном.
         async def _resolve():
             did = await _resolve_deeplink_payload(doc_no)
-            return did, (await _fetch_demand_detail(did) if did else None)
+            if did:
+                return did, await _fetch_demand_detail(did)
+            # Отгрузки нет — заказ мог уйти ПЕРЕМЕЩЕНИЕМ на склад ответхранения клиента (ГФС).
+            mid = await _resolve_move_by_order(doc_no)
+            return (mid, await _fetch_move_detail(mid)) if mid else (None, None)
         if deferred:
             demand_id, det = await _resolve()
         else:
@@ -1339,20 +1434,30 @@ async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, cla
     # уходит в 30-секундный sleep, и водитель на телефоне видел сетевую ошибку, хотя
     # сдача уже была принята (план 2026-08-07). Точка гаснет сразу, статус доезжает сам.
     ms_target = "Сдан" if accepted_ok else "Сдан с проблемой"
-    asyncio.create_task(_web_finalize_bg(db, bot, demand_id, ms_target, accepted_ok))
+    # Перемещение (ГФС, ответхранение) — статус доставки писать некуда: в справочнике
+    # статусов move только Новый / Внутреннее / Внешнее. Решение собственника 13.08.2026:
+    # статусы в МС под это не заводим, точка живёт в чеклисте и гаснет в реестре.
+    is_move = bool(det.get("is_move"))
+    asyncio.create_task(_web_finalize_bg(db, bot, demand_id, ms_target, accepted_ok,
+                                         write_status=not is_move))
 
     base = ("✅ Точка закрыта: сдано." if accepted_ok
             else "⚠️ Претензия зафиксирована, логист уведомлён.")
+    if is_move:
+        return True, base
     return True, f"{base} Статус в МС → «{ms_target}» проставляется."
 
 
-async def _web_finalize_bg(db, bot, demand_id, ms_target, accepted_ok):
+async def _web_finalize_bg(db, bot, demand_id, ms_target, accepted_ok, write_status=True):
     """Хвост веб-сдачи, который водителю ждать незачем: статус в МС (с ретраями) и
     алерт логистам по претензии. Если статус так и не записался — говорим логистам,
-    иначе отгрузка молча останется в старом статусе."""
+    иначе отгрузка молча останется в старом статусе.
+
+    write_status=False — документ не отгрузка (перемещение на ответхранение): статуса
+    «Сдан» у него в МС не бывает, пишем только чеклист и, если надо, алерт по претензии."""
     try:
         import delivery_statuses as _dsx
-        write_on = _dsx._write_enabled()
+        write_on = _dsx._write_enabled() and write_status
         wrote = False
         if write_on:
             for attempt in range(3):
