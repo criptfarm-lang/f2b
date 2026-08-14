@@ -522,18 +522,19 @@ def insert_request(db, parsed: ParsedRequest, created_by_tg: int,
 
 # ─── Валидация полноты заявки ──────────────────────────────────────────────
 
-# Обязательные поля: без них «Подтвердить» недоступен. Решено собственником
-# 2026-05-26: «не пропускаем без цены как минимум» + species + объём как фундамент.
-REQUIRED_FIELDS = [
-    ("species",              "вид/категория"),
-    ("volume_kg",             "месячная потребность (кг)"),
-    ("target_price_rub_kg",   "цена для клиента (₽/кг)"),
-]
+# Обязательных полей НЕТ. Решено собственником 2026-08-14: заявка уходит
+# закупщику в любом виде, даже если ничего не распозналось. Прежняя жёсткая
+# блокировка (2026-05-26, «не пропускаем без цены») мешала менеджерам оформить
+# заявку, когда цена клиенту ещё не согласована.
+REQUIRED_FIELDS: list[tuple[str, str]] = []
 
-# Желательные: при отсутствии — preview покажет рекомендацию, но «Подтвердить»
-# доступно (для морепродуктов калибр не всегда применим).
+# Желательные: при отсутствии — preview покажет подсказку, но «Подтвердить»
+# доступно всегда.
 RECOMMENDED_FIELDS = [
-    ("weight_class",   "навеска"),
+    ("species",              "вид/категория"),
+    ("volume_kg",            "месячная потребность (кг)"),
+    ("target_price_rub_kg",  "цена для клиента (₽/кг)"),
+    ("weight_class",         "навеска"),
 ]
 
 
@@ -543,15 +544,14 @@ def validate_request(parsed: "ParsedRequest") -> tuple[list[str], list[str]]:
     for field, label in REQUIRED_FIELDS:
         if getattr(parsed, field) in (None, "", "unspecified"):
             missing_req.append(label)
-    # Подвид обязателен только для креветки (разные подвиды — разные ценовые
-    # классы: ваннамей ~450 ₽, карабинера ~5000 ₽). Без подвида matcher не
-    # отличит лоты.
-    if (parsed.species or "").lower() == "креветка" and not (parsed.subspecies or "").strip():
-        missing_req.append("подвид креветки (Карабинера / Ваннамей / Северная / Тигровая / ...)")
     missing_rec = []
     for field, label in RECOMMENDED_FIELDS:
         if getattr(parsed, field) in (None, "", "unspecified"):
             missing_rec.append(label)
+    # Подвид креветки — только подсказка (разные подвиды — разные ценовые классы:
+    # ваннамей ~450 ₽, карабинера ~5000 ₽), заявку не блокирует.
+    if (parsed.species or "").lower() == "креветка" and not (parsed.subspecies or "").strip():
+        missing_rec.append("подвид креветки (Карабинера / Ваннамей / Северная / Тигровая / ...)")
     return missing_req, missing_rec
 
 
