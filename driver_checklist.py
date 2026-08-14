@@ -526,7 +526,7 @@ def _parse_checklist_items(raw, money_required: bool = False) -> list:
 # поля меняется редко. Ключ — хэш самого текста (+ версия промпта), а НЕ № заказа:
 # страница и приёмка обязаны получить один и тот же список в одном порядке, иначе
 # ответы лягут не к тем пунктам (сопоставление идёт по индексу).
-_TASKS_PROMPT_VERSION = "v2-2026-08-14"
+_TASKS_PROMPT_VERSION = "v3-2026-08-14"
 _TASKS_MODEL = "claude-haiku-4-5-20251001"
 _TASKS_LLM_TIMEOUT = 8
 
@@ -538,7 +538,18 @@ _TASKS_SYSTEM = """Ты разбираешь поручения водителю
 поручения, а одно поручение может быть разбито на две строки) и переписать каждое
 короткой командой водителю в повелительной форме.
 
+ВАЖНО: менеджеры пишут в это поле не только поручения. Часто там просто ПОМЕТКА —
+чей это заказ, как называется ресторан, телефон приёмки, номер накладной, кличка точки.
+В таком фрагменте НЕТ действия для водителя. Глагол в него дописывать НЕЛЬЗЯ: «рест
+Ухват» это не «Забери заказ для ресторана Ухват» (водитель заказ сдаёт, а не забирает).
+Такие фрагменты кладутся в «notes» как есть — водитель увидит их справкой, отмечать их
+не нужно. Если действия нет ни в одном фрагменте — «tasks» пустой.
+
 Правила:
+- Поручение = есть действие, которое водитель должен выполнить на точке (забрать, отдать,
+  подписать, позвонить, проверить, пересчитать). Нет действия — это заметка, не поручение.
+- Не превращай в поручение название клиента/ресторана, телефон, номер заказа или УПД,
+  ссылку на дату поставки, состав груза.
 - Повелительное наклонение, обращение к водителю: «Забери», «Отдай», «Проверь», «Позвони».
 - Не вопрос. «забрать нал 33,300р» → «Забери наличными 33 300 ₽», НЕ «Забрал деньги?».
 - Сохраняй все конкретные детали: суммы, количества, названия товара, имена, телефоны.
@@ -552,7 +563,13 @@ _TASKS_SYSTEM = """Ты разбираешь поручения водителю
 - Пункты про приёмку денег с розничного клиента, подпись документов и итог сдачи НЕ
   включай, если они уже перечислены во входном списке «уже спрашиваем».
 
-Ответ — только JSON: {"tasks": ["...", "..."]}. Пустой текст или ничего осмысленного → {"tasks": []}."""
+Примеры:
+- «рест Ухват» → {"tasks": [], "notes": ["рест Ухват"]}
+- «Китайские новости 74951396998» → {"tasks": [], "notes": ["Китайские новости 74951396998"]}
+- «забрать тару, рест Ухват» → {"tasks": ["Забери тару"], "notes": ["рест Ухват"]}
+
+Ответ — только JSON: {"tasks": ["...", "..."], "notes": ["...", "..."]}.
+Пустой текст → {"tasks": [], "notes": []}."""
 
 
 def _tasks_key(raw: str, money_required: bool) -> str:
@@ -576,7 +593,13 @@ def _tasks_from_cache(db, key):
             tasks = json.loads(tasks)
         except Exception:
             return None
-    return tasks if isinstance(tasks, list) else None
+    # с v3 в кэше лежит {"tasks": [...], "notes": [...]}; список — формат v2, читаем и его
+    if isinstance(tasks, list):
+        return {"tasks": tasks, "notes": []}
+    if isinstance(tasks, dict):
+        return {"tasks": list(tasks.get("tasks") or []),
+                "notes": list(tasks.get("notes") or [])}
+    return None
 
 
 def _tasks_to_cache(db, key, raw, tasks):
@@ -592,8 +615,11 @@ def _tasks_to_cache(db, key, raw, tasks):
         logger.warning("_tasks_to_cache: %s", e)
 
 
-async def _tasks_via_llm(raw: str, money_required: bool) -> list:
-    """Текст поля → список поручений-распоряжений. Ошибка/таймаут → [] (решает вызывающий)."""
+async def _tasks_via_llm(raw: str, money_required: bool) -> dict:
+    """Текст поля → {"tasks": [распоряжения], "notes": [пометки без действия]}.
+
+    Заметки — то, что менеджер написал справкой («рест Ухват», телефон, номер): водителю
+    показываем строкой, но чекбокса не даём. Ошибка/таймаут — решает вызывающий."""
     from claude_ai import get_client
     already = ["забрать деньги с розничного покупателя"] if money_required else []
     already += ["подписать документы", "итог сдачи"]
@@ -620,29 +646,41 @@ async def _tasks_via_llm(raw: str, money_required: bool) -> list:
         out.append(t[:_MAX_ITEM_LEN])
         if len(out) >= _MAX_ITEMS:
             break
-    return out
+    notes = []
+    for n in (data.get("notes") or []):
+        n = _re.sub(r"\s{2,}", " ", str(n)).strip()
+        if n:
+            notes.append(n[:_MAX_ITEM_LEN])
+        if len(notes) >= _MAX_ITEMS:
+            break
+    return {"tasks": out, "notes": notes}
 
 
-async def driver_tasks(db, raw, money_required: bool = False) -> list:
-    """Доп.поле «Чек-лист водителя» → пункты-распоряжения для чеклиста.
+async def driver_tasks_ex(db, raw, money_required: bool = False) -> dict:
+    """Доп.поле «Чек-лист водителя» → {"tasks": [пункты], "notes": [пометки]}.
 
     Один источник для СТРАНИЦЫ и для ПРИЁМКИ: список и его порядок должны совпадать,
     ответы водителя сопоставляются по индексу. Кэш в БД по хэшу текста; если модель
     недоступна — фолбэк на построчный разбор (лучше сырые строки, чем пустой чеклист)."""
     raw = (raw or "").strip()
     if not raw:
-        return []
+        return {"tasks": [], "notes": []}
     key = _tasks_key(raw, money_required)
     cached = _tasks_from_cache(db, key)
     if cached is not None:
         return cached
     try:
-        tasks = await _tasks_via_llm(raw, money_required)
+        res = await _tasks_via_llm(raw, money_required)
     except Exception as e:
         logger.warning("driver_tasks LLM: %s — фолбэк на построчный разбор", e)
-        return _parse_checklist_items(raw, money_required)
-    _tasks_to_cache(db, key, raw, tasks)
-    return tasks
+        return {"tasks": _parse_checklist_items(raw, money_required), "notes": []}
+    _tasks_to_cache(db, key, raw, res)
+    return res
+
+
+async def driver_tasks(db, raw, money_required: bool = False) -> list:
+    """Только пункты с действием — их водитель отмечает «Сделал/Не сделал»."""
+    return (await driver_tasks_ex(db, raw, money_required))["tasks"]
 
 
 def _money_required(det) -> bool:

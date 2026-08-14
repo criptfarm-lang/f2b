@@ -268,7 +268,11 @@ def _q_block(question: str, name: str, options) -> str:
 
 
 async def _tasks_for_stops(stops, ms_extra, done_set, db) -> dict:
-    """{order_no: [поручение, …]} для незакрытых точек сдачи.
+    """{order_no: {"tasks": [поручение, …], "notes": [пометка, …]}} для незакрытых точек сдачи.
+
+    notes — то, что менеджер написал в поле справкой, без действия («рест Ухват», телефон):
+    показываем строкой, чекбокса не даём. Раньше модель дописывала к таким пометкам глагол
+    и водитель получал выдуманное поручение «Забери заказ для ресторана …» (14.08.2026).
 
     money_needed считаем ровно как в карточке — этот флаг входит в ключ кэша и в промпт
     (для розницы денежный пункт не дублируем, его закрывает шаг «Забери деньги»)."""
@@ -290,14 +294,14 @@ async def _tasks_for_stops(stops, ms_extra, done_set, db) -> dict:
     if not targets:
         return {}
     res = await asyncio.gather(
-        *(dc.driver_tasks(db, raw, money) for _, raw, money in targets),
+        *(dc.driver_tasks_ex(db, raw, money) for _, raw, money in targets),
         return_exceptions=True)
     out = {}
     for (order_no, _, _), r in zip(targets, res):
         if isinstance(r, Exception):
             logger.warning("route_web tasks %s: %s", order_no, r)
             continue
-        if r:
+        if r and (r.get("tasks") or r.get("notes")):
             out[order_no] = r
     return out
 
@@ -424,8 +428,14 @@ async def render_page(uid: int, target: date, db, bot) -> str:
             # Поручения менеджера из доп.поля заказа «Чек-лист водителя» — отдельными
             # пунктами. Разбор по смыслу и кэш — driver_checklist.driver_tasks; приёмка
             # берёт тот же список тем же вызовом, ответы сопоставляются по индексу.
+            # Пометки без действия («рест Ухват», телефон приёмки) — строкой над формой:
+            # отмечать там нечего, а раньше модель дописывала им глагол и получалось
+            # выдуманное поручение (собственник, 14.08.2026).
+            _tn = tasks_by_order.get(order_no) or {}
+            for ntext in (_tn.get("notes") or []):
+                rows.append(f"<div class='meta'>📋 {_e(ntext)}</div>")
             tasks_q = ""
-            for ti, ttext in enumerate(tasks_by_order.get(order_no) or []):
+            for ti, ttext in enumerate(_tn.get("tasks") or []):
                 tasks_q += _q_block(f"📋 {ttext}", f"item_{ti}",
                                     [("yes", "Сделал"), ("no", "Не сделал")])
             # Запасной вход «или через бот» убран (собственник, 2026-08-04): кнопки в
