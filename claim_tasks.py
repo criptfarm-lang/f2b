@@ -279,6 +279,37 @@ async def _close_chain(app, db, chain: list, owner: int) -> None:
             owner, f"✅ {cp} погасил просроченную задолженность — претензионная работа закрыта." + note)
 
 
+async def _escalate(app, db, agent_id: str, cp: str, active: dict,
+                    debt: float, days_since: int, owner: int) -> None:
+    """Претензионный порядок исчерпан: комплект юристу + карточка на собственника.
+
+    Комплект отправляется до карточки — в сообщении собственнику должен быть
+    виден результат отправки, а не обещание."""
+    db._execute("UPDATE claim_control SET escalated_at=NOW() WHERE doc_id=%s", (active["doc_id"],))
+    sent = await _send_to_lawyer(agent_id, cp)
+    if sent.get("ok"):
+        db._execute("UPDATE claim_control SET lawyer_sent_at=NOW() WHERE doc_id=%s",
+                    (active["doc_id"],))
+    card = await create_claim_control_card(
+        "claim_payment_final", cp, "васильев", float(debt),
+        details="Сроки по претензиям вышли, оплата не поступила. Комплект документов передан "
+                "юристу. Решение: суд либо исполнительная надпись нотариуса (п. 7.10 Договора).")
+    if not owner:
+        return
+    lawyer_line = (f"\n📮 Комплект ушёл юристу ({sent.get('to')}): "
+                   f"{sent.get('claims')} претензии, {sent.get('attachments')} вложений."
+                   if sent.get("ok")
+                   else f"\n⚠️ Комплект юристу НЕ ушёл: {sent.get('error')}. Отправь вручную.")
+    await app.bot.send_message(
+        owner,
+        f"⚖️ {cp}: сроки по претензии вышли, просрочка {_money(debt)} ₽ не погашена."
+        f"\nПрошло {days_since} дн. с первой претензии — порог ст. 91.1 (14 дн.) пройден, "
+        f"можно к нотариусу или в суд."
+        + lawyer_line
+        + ("\n🗂 Карточка на доске «Претензии» поставлена." if card.get("ok")
+           else f"\n⚠️ Карточку поставить не удалось: {card.get('error')}"))
+
+
 async def poll_job(app, db) -> None:
     """Ведёт цепочки претензионной работы: письмо №1 → автосборка письма №2 по
     сроку контроля → передача комплекта юристу; в любой момент — закрытие при
@@ -323,9 +354,16 @@ async def poll_job(app, db) -> None:
         if not deadline or now < deadline:
             continue
 
+        days_since = (now - started).days
+
         # 2. Срок по письму №1 вышел, денег нет — система сама собирает письмо №2.
         if active.get("letter_type") == "claim_payment":
             if active.get("final_requested_at"):
+                # Письмо №2 запрошено, но цепочка так и стоит на письме №1 — значит
+                # собственник его отклонил. Дело всё равно должно дойти до юриста,
+                # иначе цепочка зависает навсегда: ветка эскалации ждёт письма №2.
+                if (not active.get("escalated_at")) and days_since >= NOTARY_THRESHOLD_DAYS:
+                    await _escalate(app, db, agent_id, cp, active, debt, days_since, owner)
                 continue
             res = await _request_final_claim(agent_id, cp)
             if not res.get("ok"):
@@ -351,34 +389,6 @@ async def poll_job(app, db) -> None:
 
         # 3. Срок по письму №2 вышел — комплект юристу, но не раньше порога ст. 91.1.
         if active.get("letter_type") == "claim_payment_final":
-            if active.get("escalated_at"):
+            if active.get("escalated_at") or days_since < NOTARY_THRESHOLD_DAYS:
                 continue
-            days_since = (now - started).days
-            if days_since < NOTARY_THRESHOLD_DAYS:
-                continue
-            db._execute("UPDATE claim_control SET escalated_at=NOW() WHERE doc_id=%s",
-                        (active["doc_id"],))
-            # Комплект юристу — до карточки: в сообщении собственнику должен быть
-            # виден результат отправки, а не обещание.
-            sent = await _send_to_lawyer(agent_id, cp)
-            if sent.get("ok"):
-                db._execute("UPDATE claim_control SET lawyer_sent_at=NOW() WHERE doc_id=%s",
-                            (active["doc_id"],))
-            card = await create_claim_control_card(
-                "claim_payment_final", cp, "васильев", float(debt),
-                details="Сроки по обеим претензиям вышли, оплата не поступила. Комплект документов "
-                        "передан юристу. Решение: суд либо исполнительная надпись нотариуса "
-                        "(п. 7.10 Договора).")
-            if owner:
-                lawyer_line = (f"\n📮 Комплект ушёл юристу ({sent.get('to')}): "
-                               f"{sent.get('claims')} претензии, {sent.get('attachments')} вложений."
-                               if sent.get("ok")
-                               else f"\n⚠️ Комплект юристу НЕ ушёл: {sent.get('error')}. Отправь вручную.")
-                await app.bot.send_message(
-                    owner,
-                    f"⚖️ {cp}: сроки по повторной претензии вышли, просрочка {_money(debt)} ₽ не погашена."
-                    f"\nПрошло {days_since} дн. с первой претензии — порог ст. 91.1 (14 дн.) пройден, "
-                    f"можно к нотариусу или в суд."
-                    + lawyer_line
-                    + ("\n🗂 Карточка на доске «Претензии» поставлена." if card.get("ok")
-                       else f"\n⚠️ Карточку поставить не удалось: {card.get('error')}"))
+            await _escalate(app, db, agent_id, cp, active, debt, days_since, owner)
