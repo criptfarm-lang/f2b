@@ -34,8 +34,11 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 logger = logging.getLogger(__name__)
 
 # MS_BASE/get_headers определены локально (не импортируем moysklad.py — у него import-time
-# зависимость от YANDEX_GEOCODER_KEY). Глобальный httpx-throttle бота патчит AsyncClient
-# в процессе (moysklad импортируется в bot.py), поэтому наши вызовы тоже троттлятся.
+# зависимость от YANDEX_GEOCODER_KEY). Лимитер МС стоит глобально в moysklad.py, который
+# импортируется в bot.py: он патчит и aiohttp.ClientSession, и httpx.AsyncClient, поэтому
+# наши вызовы тоже проходят через общий бюджет единиц.
+# До 14.08.2026 здесь было написано то же самое, но httpx на деле НЕ патчился —
+# все запросы светофора шли мимо ограничителя.
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 
 

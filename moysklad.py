@@ -7,6 +7,8 @@
 """
 
 import os
+import collections
+import datetime as _dt
 import logging
 import re
 import aiohttp
@@ -145,16 +147,30 @@ MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 #     МС ниже 10. Серия retry-backoff после 429 ВРЕДНА: каждый retry тоже считается
 #     ошибкой 429 и приближает блок (пороги поддержки МС: >200/min или >400/hour).
 #
-# Новые меры:
-#   - Throttle 5 req/sec (запас ~30% к наблюдаемому скрытому порогу ~7).
+#   14.08.2026 — разобрались, что «скрытого порога» нет: МС считает не запросы, а
+#     ЕДИНИЦЫ. Корзина 45 единиц за 3 секунды, и с 16.02.2026 она считается на
+#     ПОЛЬЗОВАТЕЛЯ, а не на аккаунт — то есть бот делит её с f2b-production,
+#     f2b-publisher, MCP-сервером и локальными скриптами под тем же токеном «Эф».
+#     Вес одного запроса по пользовательскому токену растёт по расписанию МС:
+#     2 сейчас, 3 с 01.09.2026, 4 с 01.12.2026; отчёты по остаткам весят 5 всегда.
+#     Замер на живом аккаунте: обычный GET 45→43, /report/stock/bystore 45→40.
+#     Прежние 5 req/sec — это ровно 45 единиц за 3 секунды после 1 сентября, то есть
+#     потолок без запаса, а любой запрос остатков выбивает за него.
+#
+# Меры:
+#   - Бюджет 30 единиц из 45 за скользящее окно 3 с (остальное — другим сервисам).
 #   - На 429 НЕ retry-в-цикле. Один long-sleep 30 с и одна повторная попытка.
 #   - Счётчик 429/min и /hour: при подходе к порогам поддержки МС (50/min, 100/hour
 #     — 4× запас) пишем ERROR в лог + опционально шлём TG-алерт через зарегистрированный
 #     callback из bot.py (см. set_429_alert_callback).
-_MS_MIN_INTERVAL_SEC = 0.20  # 5 req/sec
+#   - Уступаем окно по заголовку x-ratelimit-remaining: свой счётчик видит только
+#     собственный расход, а заголовок — общий, вместе с чужим.
+_MS_WINDOW_SEC = 3.0
+_MS_UNITS_BUDGET = 30
+_MS_YIELD_BELOW = 12
 _MS_429_LONG_SLEEP_SEC = 30.0
 _ms_throttle_lock = asyncio.Lock()
-_ms_last_call_ts = 0.0
+_ms_spent: "collections.deque[tuple[float, int]]" = collections.deque()
 
 # Счётчики 429 — кольца timestamp'ов
 _ms_429_timestamps: list[float] = []
@@ -181,15 +197,42 @@ def set_429_alert_callback(cb) -> None:
     _ms_429_alert_cb = cb
 
 
-async def _ms_throttle() -> None:
-    global _ms_last_call_ts
+def _request_weight(url: str) -> int:
+    """Во сколько единиц лимита обойдётся запрос (раздел «Ограничения» доки МС)."""
+    if "/report/stock/all" in url or "/report/stock/bystore" in url:
+        return 5
+    today = _dt.date.today()
+    if today >= _dt.date(2026, 12, 1):
+        return 4
+    if today >= _dt.date(2026, 9, 1):
+        return 3
+    return 2
+
+
+async def _ms_throttle(weight: int = 2) -> None:
+    """Держим расход в пределах бюджета единиц за скользящее окно."""
     async with _ms_throttle_lock:
         loop = asyncio.get_event_loop()
-        now = loop.time()
-        wait = _MS_MIN_INTERVAL_SEC - (now - _ms_last_call_ts)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _ms_last_call_ts = loop.time()
+        while True:
+            now = loop.time()
+            cutoff = now - _MS_WINDOW_SEC
+            while _ms_spent and _ms_spent[0][0] < cutoff:
+                _ms_spent.popleft()
+            if not _ms_spent or sum(w for _, w in _ms_spent) + weight <= _MS_UNITS_BUDGET:
+                break
+            await asyncio.sleep(max(0.0, _ms_spent[0][0] + _MS_WINDOW_SEC - now))
+        _ms_spent.append((loop.time(), weight))
+
+
+async def _ms_yield_if_low(headers) -> None:
+    """Уступить окно, если общая корзина почти пуста."""
+    try:
+        remaining = int(headers.get("x-ratelimit-remaining", ""))
+    except (TypeError, ValueError):
+        return
+    if remaining < _MS_YIELD_BELOW:
+        logger.info("МС: в корзине лимита осталось %s единиц, ждём окно", remaining)
+        await asyncio.sleep(_MS_WINDOW_SEC)
 
 
 async def _record_429() -> None:
@@ -232,9 +275,10 @@ _ms_429_headers_logged_ts = 0.0
 def _retry_after_sec(headers) -> float:
     """Сколько ждать после 429 — по ответу МойСклад, с потолком `_MS_429_LONG_SLEEP_SEC`.
 
-    Точные имена заголовков МС на нашем тарифе не подтверждены, поэтому проверяем
-    известных кандидатов, а сам набор X-заголовков ответа пишем в лог (не чаще раза в
-    5 минут) — по нему уточним имя по факту, а не по догадке. Не распознали → 30 с.
+    Имена заголовков подтверждены замером на живом аккаунте 14.08.2026:
+    `x-ratelimit-limit: 45`, `x-ratelimit-remaining`, `x-lognex-retry-timeinterval: 3000`,
+    `x-lognex-retry-after`, `x-lognex-reset`. Кандидатов всё равно проверяем списком —
+    МС меняет правила без предупреждения. Не распознали → 30 с.
     """
     global _ms_429_headers_logged_ts
     import time as _t
@@ -270,9 +314,11 @@ def _install_ms_throttle_patch() -> None:
         if not is_ms:
             return await _orig_request(self, method, str_or_url, **kwargs)
         # Первая попытка
-        await _ms_throttle()
+        weight = _request_weight(str(str_or_url))
+        await _ms_throttle(weight)
         resp = await _orig_request(self, method, str_or_url, **kwargs)
         if resp.status != 429:
+            await _ms_yield_if_low(resp.headers)
             return resp
         # Получили 429 — учитываем в счётчике
         await _record_429()
@@ -284,7 +330,7 @@ def _install_ms_throttle_patch() -> None:
         pause = _retry_after_sec(resp.headers)
         resp.release()
         await asyncio.sleep(pause)
-        await _ms_throttle()
+        await _ms_throttle(weight)
         resp = await _orig_request(self, method, str_or_url, **kwargs)
         if resp.status == 429:
             await _record_429()
@@ -294,7 +340,47 @@ def _install_ms_throttle_patch() -> None:
     aiohttp.ClientSession._ms_throttle_installed = True
 
 
+def _install_httpx_ms_throttle_patch() -> None:
+    """То же самое для httpx.
+
+    Патч на aiohttp закрывал не весь трафик: светофор техопераций
+    (`processing_svetofor.py`) ходит в МС через httpx и до 14.08.2026 шёл мимо
+    лимитера вообще — при том, что в его же комментарии было написано обратное.
+    Корзина лимита общая, поэтому и второй клиент должен спрашивать разрешения.
+    """
+    try:
+        import httpx
+    except ImportError:
+        return
+    if getattr(httpx.AsyncClient, "_ms_throttle_installed", False):
+        return
+    _orig_send = httpx.AsyncClient.send
+
+    async def _patched_send(self, request, **kwargs):
+        if "api.moysklad.ru" not in str(request.url):
+            return await _orig_send(self, request, **kwargs)
+        weight = _request_weight(str(request.url))
+        await _ms_throttle(weight)
+        resp = await _orig_send(self, request, **kwargs)
+        if resp.status_code != 429:
+            await _ms_yield_if_low(resp.headers)
+            return resp
+        await _record_429()
+        pause = _retry_after_sec(resp.headers)
+        await resp.aclose()
+        await asyncio.sleep(pause)
+        await _ms_throttle(weight)
+        resp = await _orig_send(self, request, **kwargs)
+        if resp.status_code == 429:
+            await _record_429()
+        return resp
+
+    httpx.AsyncClient.send = _patched_send
+    httpx.AsyncClient._ms_throttle_installed = True
+
+
 _install_ms_throttle_patch()
+_install_httpx_ms_throttle_patch()
 
 
 def get_headers():
