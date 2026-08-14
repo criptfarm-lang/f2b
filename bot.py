@@ -4803,14 +4803,20 @@ async def _claim_control_task_note(doc: dict, cp: str) -> str:
     # Реестр цикла: по нему идёт автозакрытие при погашении и эскалация по срокам.
     try:
         claim_tasks.ensure_schema(db)
+        # Начало цепочки наследуется от открытой претензии того же контрагента:
+        # порог ст. 91.1 отсчитывается от ПЕРВОЙ претензии, а не от письма №2.
         db._execute(
             """INSERT INTO claim_control
-                   (doc_id, agent_id, counterparty, letter_type, manager_tag, card_id, debt, deadline)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                   (doc_id, agent_id, counterparty, letter_type, manager_tag, card_id, debt,
+                    deadline, chain_started_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,
+                       COALESCE((SELECT MIN(COALESCE(chain_started_at, approved_at))
+                                   FROM claim_control
+                                  WHERE agent_id=%s AND closed_at IS NULL), NOW()))
                ON CONFLICT (doc_id) DO UPDATE SET card_id=EXCLUDED.card_id,
                    deadline=EXCLUDED.deadline, debt=EXCLUDED.debt, closed_at=NULL""",
             (doc.get("id"), agent_id, cp, letter_type, manager_tag,
-             res.get("id"), debt, res.get("deadline")))
+             res.get("id"), debt, res.get("deadline"), agent_id))
     except Exception as e:
         logger.error(f"claim control task: реестр не обновлён: {e}")
     who = f" на {manager_tag.capitalize()}" if res.get("assigned") else " (без исполнителя — проставь на доске)"

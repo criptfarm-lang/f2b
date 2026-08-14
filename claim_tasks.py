@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS claim_control (
     closed_at     TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS claim_control_open_idx ON claim_control (closed_at, agent_id);
+ALTER TABLE claim_control ADD COLUMN IF NOT EXISTS chain_started_at TIMESTAMPTZ;
+ALTER TABLE claim_control ADD COLUMN IF NOT EXISTS final_requested_at TIMESTAMPTZ;
+ALTER TABLE claim_control ADD COLUMN IF NOT EXISTS lawyer_sent_at TIMESTAMPTZ;
 """
 
 
@@ -168,17 +171,57 @@ async def create_claim_control_card(letter_type: str, counterparty: str, manager
 
 # ── Цикл претензионной работы ────────────────────────────────────────────────
 
-async def _agent_debt(agent_id: str) -> float:
-    """Текущий долг контрагента по взаиморасчётам МС (отрицательный баланс = нам должны)."""
-    import aiohttp
-    import moysklad
-    async with aiohttp.ClientSession() as s:
-        async with s.get(f"{moysklad.MS_BASE}/report/counterparty/{agent_id}",
-                         headers=moysklad.get_headers()) as r:
-            if r.status != 200:
-                raise RuntimeError(f"МС {r.status}")
-            bal = ((await r.json()).get("balance") or 0) / 100
-    return -bal if bal < 0 else 0.0
+async def _overdue_debt(agent_id: str) -> float:
+    """Просроченная часть долга контрагента (сервис «Документы», docs_overdue).
+
+    Именно просрочка, а не сальдо: по сальдо новая поставка держала бы цепочку
+    открытой после погашения просроченных накладных, а аванс по новой сделке —
+    закрывал бы её при неоплаченной старой. Логика та же, что у ПДЗ."""
+    base = (os.getenv("QUIZ_BASE_URL") or "").rstrip("/")
+    if not base:
+        raise RuntimeError("QUIZ_BASE_URL не настроен")
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.get(f"{base}/api/docs/claim/overdue/{agent_id}")
+        if r.status_code != 200:
+            raise RuntimeError(f"сервис документов {r.status_code}")
+        return float((r.json() or {}).get("overdue_sum") or 0)
+
+
+async def _send_to_lawyer(agent_id: str, counterparty: str) -> dict:
+    """Просит сервис «Документы» собрать комплект и отправить юристу письмом.
+
+    Юрист контрактный: в сотрудниках МойСклад и в стикере «Исполнитель» доски
+    его нет, задачу поставить некому — поэтому почта, а контроль остаётся
+    карточкой на собственника."""
+    base = (os.getenv("QUIZ_BASE_URL") or "").rstrip("/")
+    if not base:
+        return {"ok": False, "error": "QUIZ_BASE_URL не настроен"}
+    try:
+        async with httpx.AsyncClient(timeout=300) as c:
+            r = await c.post(f"{base}/api/docs/claim/to-lawyer",
+                             json={"agent_id": agent_id, "counterparty_name": counterparty})
+            if r.status_code >= 400:
+                return {"ok": False, "error": f"{r.status_code}: {r.text[:150]}"}
+            return r.json() or {"ok": False, "error": "пустой ответ сервиса"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def _request_final_claim(agent_id: str, counterparty: str) -> dict:
+    """Просит сервис «Документы» собрать письмо №2 и отдать собственнику на
+    согласование. Сборка идёт там фоном (чтение сканов договора до 150 с)."""
+    base = (os.getenv("QUIZ_BASE_URL") or "").rstrip("/")
+    if not base:
+        return {"ok": False, "error": "QUIZ_BASE_URL не настроен"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(f"{base}/api/docs/claim/auto-final",
+                             json={"agent_id": agent_id, "counterparty_name": counterparty})
+            if r.status_code >= 400:
+                return {"ok": False, "error": f"{r.status_code}: {r.text[:150]}"}
+            return {"ok": True, **(r.json() or {})}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 async def _close_linked_ms_task(db, card_id: str) -> bool:
@@ -199,67 +242,143 @@ async def _close_linked_ms_task(db, card_id: str) -> bool:
             return r.status < 400
 
 
-async def poll_job(app, db) -> None:
-    """Обходит открытые претензии: гасит цепочку при погашении долга и
-    эскалирует на собственника, когда сроки вышли.
+async def _notify_manager(app, manager_tag: str, text: str) -> None:
+    """Пуш менеджеру по тегу контрагента. Тег неизвестен — молча пропускаем:
+    собственник о том же событии узнаёт своим каналом."""
+    try:
+        from moysklad import PDZ_MANAGER_TG_IDS
+        chat_id = PDZ_MANAGER_TG_IDS.get((manager_tag or "").strip().lower())
+        if chat_id:
+            await app.bot.send_message(chat_id, text)
+    except Exception as e:
+        logger.error("claim poll: пуш менеджеру «%s» не ушёл: %s", manager_tag, e)
 
-    План: plans/2026-08-10-регламент-претензионной-работы-по-оплатам.md, Фазы 5–6.
+
+async def _close_chain(app, db, chain: list, owner: int) -> None:
+    """Просрочка погашена — закрываем все письма цепочки разом.
+
+    Именно все, а не только последнее: письма №1 и №2 живут отдельными строками
+    по одному контрагенту, и обход их поодиночке слал бы дубли уведомлений."""
+    manual = []
+    for row in chain:
+        if row.get("card_id"):
+            try:
+                if not await _close_linked_ms_task(db, row["card_id"]):
+                    manual.append(row["doc_id"])
+            except Exception as e:
+                logger.error("claim poll: закрытие задачи не удалось: %s", e)
+                manual.append(row["doc_id"])
+    db._execute("UPDATE claim_control SET closed_at=NOW() WHERE doc_id = ANY(%s)",
+                ([r["doc_id"] for r in chain],))
+    cp = chain[-1].get("counterparty")
+    # Менеджеру не пишем: событие штатное, а его задача закроется сама
+    # (правило «TG-пуш менеджеру — только по тревоге»).
+    if owner:
+        note = "" if not manual else " Задачи в МойСкладе закрой вручную — связь с карточкой не найдена."
+        await app.bot.send_message(
+            owner, f"✅ {cp} погасил просроченную задолженность — претензионная работа закрыта." + note)
+
+
+async def poll_job(app, db) -> None:
+    """Ведёт цепочки претензионной работы: письмо №1 → автосборка письма №2 по
+    сроку контроля → передача комплекта юристу; в любой момент — закрытие при
+    погашении просрочки.
+
+    Обход идёт по контрагентам, а не по письмам: у одной цепочки бывает две
+    открытые строки (письма №1 и №2), и независимый обход слал бы дубли.
+
+    План: plans/2026-08-10-регламент-претензионной-работы-по-оплатам.md, Фазы 5–9.
     """
     ensure_schema(db)
-    rows = db._fetchall("SELECT * FROM claim_control WHERE closed_at IS NULL ORDER BY doc_id")
+    rows = db._fetchall("SELECT * FROM claim_control WHERE closed_at IS NULL "
+                        "ORDER BY agent_id, doc_id")
     if not rows:
         return
 
     owner = int(os.getenv("OWNER_CHAT_ID") or 0)
     now = datetime.now(MSK)
 
+    chains: dict = {}
     for row in rows:
-        agent_id = row.get("agent_id")
-        if not agent_id:
-            continue
+        if row.get("agent_id"):
+            chains.setdefault(row["agent_id"], []).append(row)
+
+    for agent_id, chain in chains.items():
+        active = chain[-1]                       # последнее письмо цепочки
+        cp = active.get("counterparty") or "—"
+        # Порог ст. 91.1 отсчитывается от ПЕРВОЙ претензии, а не от последнего письма.
+        started = min((r.get("chain_started_at") or r.get("approved_at")) for r in chain)
         try:
-            debt = await _agent_debt(agent_id)
+            debt = await _overdue_debt(agent_id)
         except Exception as e:
-            logger.error("claim poll: долг по %s не получен: %s", row.get("counterparty"), e)
+            logger.error("claim poll: просрочка по %s не получена: %s", cp, e)
             continue
 
-        # 1. Долг погашен — закрываем цепочку.
+        # 1. Просрочка погашена — закрываем цепочку целиком.
         if debt <= 0:
-            closed = False
-            if row.get("card_id"):
-                try:
-                    closed = await _close_linked_ms_task(db, row["card_id"])
-                except Exception as e:
-                    logger.error("claim poll: закрытие задачи не удалось: %s", e)
-            db._execute("UPDATE claim_control SET closed_at=NOW() WHERE doc_id=%s", (row["doc_id"],))
+            await _close_chain(app, db, chain, owner)
+            continue
+
+        deadline = active.get("deadline")
+        if not deadline or now < deadline:
+            continue
+
+        # 2. Срок по письму №1 вышел, денег нет — система сама собирает письмо №2.
+        if active.get("letter_type") == "claim_payment":
+            if active.get("final_requested_at"):
+                continue
+            res = await _request_final_claim(agent_id, cp)
+            if not res.get("ok"):
+                logger.error("claim poll: автосборка письма №2 по %s не удалась: %s", cp, res.get("error"))
+                if owner:
+                    await app.bot.send_message(
+                        owner, f"⚠️ {cp}: срок по претензии вышел, но собрать повторную "
+                               f"не удалось ({res.get('error')}). Собери вручную в «Документах».")
+                continue
+            db._execute("UPDATE claim_control SET final_requested_at=NOW() WHERE doc_id=%s",
+                        (active["doc_id"],))
+            if res.get("queued") is False:
+                continue                          # письмо №2 уже ждёт решения
             if owner:
-                note = "" if closed else " Задачу в МойСкладе закрой вручную — связь с карточкой не найдена."
+                await app.bot.send_message(
+                    owner, f"📄 {cp}: срок по претензии вышел, просрочка {_money(debt)} ₽ не погашена. "
+                           f"Собираю повторную претензию — придёт на согласование через пару минут.")
+            await _notify_manager(app, active.get("manager_tag"),
+                                  f"📄 {cp}: оплата по претензии не поступила, просрочка "
+                                  f"{_money(debt)} ₽. Собрана повторная (окончательная) претензия, "
+                                  f"ждёт согласования собственника — после одобрения отправь клиенту.")
+            continue
+
+        # 3. Срок по письму №2 вышел — комплект юристу, но не раньше порога ст. 91.1.
+        if active.get("letter_type") == "claim_payment_final":
+            if active.get("escalated_at"):
+                continue
+            days_since = (now - started).days
+            if days_since < NOTARY_THRESHOLD_DAYS:
+                continue
+            db._execute("UPDATE claim_control SET escalated_at=NOW() WHERE doc_id=%s",
+                        (active["doc_id"],))
+            # Комплект юристу — до карточки: в сообщении собственнику должен быть
+            # виден результат отправки, а не обещание.
+            sent = await _send_to_lawyer(agent_id, cp)
+            if sent.get("ok"):
+                db._execute("UPDATE claim_control SET lawyer_sent_at=NOW() WHERE doc_id=%s",
+                            (active["doc_id"],))
+            card = await create_claim_control_card(
+                "claim_payment_final", cp, "васильев", float(debt),
+                details="Сроки по обеим претензиям вышли, оплата не поступила. Комплект документов "
+                        "передан юристу. Решение: суд либо исполнительная надпись нотариуса "
+                        "(п. 7.10 Договора).")
+            if owner:
+                lawyer_line = (f"\n📮 Комплект ушёл юристу ({sent.get('to')}): "
+                               f"{sent.get('claims')} претензии, {sent.get('attachments')} вложений."
+                               if sent.get("ok")
+                               else f"\n⚠️ Комплект юристу НЕ ушёл: {sent.get('error')}. Отправь вручную.")
                 await app.bot.send_message(
                     owner,
-                    f"✅ {row.get('counterparty')} погасил задолженность — претензионная работа закрыта."
-                    + note)
-            continue
-
-        # 2. Срок вышел и пройден порог ст. 91.1 — эскалация на собственника, один раз.
-        deadline = row.get("deadline")
-        approved = row.get("approved_at")
-        if row.get("escalated_at") or not deadline or not approved:
-            continue
-        days_since = (now - approved).days
-        if now < deadline or days_since < NOTARY_THRESHOLD_DAYS:
-            continue
-
-        db._execute("UPDATE claim_control SET escalated_at=NOW() WHERE doc_id=%s", (row["doc_id"],))
-        card = await create_claim_control_card(
-            "claim_payment_final", row.get("counterparty") or "—", "васильев", float(debt),
-            details="Сроки по претензиям вышли, оплата не поступила. Решение: суд либо "
-                    "исполнительная надпись нотариуса (п. 7.10 Договора).")
-        if owner:
-            await app.bot.send_message(
-                owner,
-                f"⚖️ {row.get('counterparty')}: сроки по претензии вышли, "
-                f"долг {_money(debt)} ₽ не погашен."
-                + f"\nПрошло {days_since} дн. с согласования — порог ст. 91.1 (14 дн.) пройден, "
-                  f"можно к нотариусу или в суд."
-                + ("\n🗂 Карточка на доске «Претензии» поставлена." if card.get("ok")
-                   else f"\n⚠️ Карточку поставить не удалось: {card.get('error')}"))
+                    f"⚖️ {cp}: сроки по повторной претензии вышли, просрочка {_money(debt)} ₽ не погашена."
+                    f"\nПрошло {days_since} дн. с первой претензии — порог ст. 91.1 (14 дн.) пройден, "
+                    f"можно к нотариусу или в суд."
+                    + lawyer_line
+                    + ("\n🗂 Карточка на доске «Претензии» поставлена." if card.get("ok")
+                       else f"\n⚠️ Карточку поставить не удалось: {card.get('error')}"))
