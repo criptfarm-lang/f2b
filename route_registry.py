@@ -351,6 +351,7 @@ async def _ms_extra_by_order(order_numbers, names=None) -> dict:
     def _parse(co):
         places = None
         win_from = win_to = ""
+        checklist_raw = ""
         for a in co.get("attributes", []) or []:
             nm = a.get("name")
             if nm == "Количество мест":
@@ -359,6 +360,8 @@ async def _ms_extra_by_order(order_numbers, names=None) -> dict:
                 win_from = _attr_time(a.get("value"))
             elif nm == ATTR_WINDOW_TO:
                 win_to = _attr_time(a.get("value"))
+            elif nm == ATTR_DRIVER_CHECKLIST:
+                checklist_raw = (a.get("value") or "").strip()
         # вес = сумма количеств позиций (рыба/морепродукты продаются в кг)
         weight = 0.0
         max_price = 0.0   # макс. цена позиции, ₽ — по ней веб-приёмка узнаёт образцы (≤ 1 ₽)
@@ -386,6 +389,9 @@ async def _ms_extra_by_order(order_numbers, names=None) -> dict:
             "zdraste": "здрасте" in tags,
             "max_price_rub": max_price,
             "sum_rub": (co.get("sum") or 0) / 100.0,
+            # Поручения водителю на точке (сырой текст доп.поля) — веб-чеклист делает
+            # из них отдельные пункты-распоряжения (driver_checklist.driver_tasks).
+            "checklist_raw": checklist_raw,
         }
 
     # Заказы тянем ПАЧКАМИ: условия по одному полю в фильтре МС объединяются по ИЛИ,
@@ -626,6 +632,10 @@ def _hm(ts):
 # Имена доп.полей заказа МС с окном приёмки (тип «дата-время», значащая часть — ВРЕМЯ).
 ATTR_WINDOW_FROM = "Окно доставки с (время)"
 ATTR_WINDOW_TO = "Окно доставки до (время)"
+# Доп.поле заказа с поручениями водителю на точке (тип text). То же имя, что в
+# driver_checklist._CHECKLIST_ATTR_NAME — дублируем константу, а не импортируем,
+# чтобы не заводить циклический импорт (driver_checklist сам тянет route_registry).
+ATTR_DRIVER_CHECKLIST = "Чек-лист водителя"
 
 import re as _re_rr
 

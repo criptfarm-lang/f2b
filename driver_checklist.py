@@ -20,6 +20,7 @@ import io
 import re as _re
 import json
 import asyncio
+import hashlib
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -205,6 +206,17 @@ def ensure_schema(db):
     # order_name — номер ЗАКАЗА покупателя (по нему сверяет логист и реестр развозки).
     # demand_name — номер расходной/отгрузки; логист по нему не сверяет → показываем оба.
     db._execute("ALTER TABLE delivery_checklist ADD COLUMN IF NOT EXISTS order_name TEXT")
+    # Кэш разбора доп.поля «Чек-лист водителя» на пункты-распоряжения (модель зовём
+    # один раз на текст, а не на каждое открытие страницы маршрута). Ключ — хэш текста
+    # + версия промпта, поэтому смена формулировок промпта сама инвалидирует кэш.
+    db._execute("""
+        CREATE TABLE IF NOT EXISTS driver_task_cache (
+            raw_key    TEXT PRIMARY KEY,
+            raw_text   TEXT,
+            tasks      JSONB DEFAULT '[]'::jsonb,
+            updated_at TIMESTAMPTZ DEFAULT now()
+        )
+    """)
     logger.info("delivery_checklist: схема готова")
 
 
@@ -479,7 +491,9 @@ def _fmt_window(win_from: str, win_to: str) -> str:
 # Ведущая нумерация пункта: «1. », «2) », «3 -» → срезаем, оставляем текст задачи.
 _NUM_PREFIX_RE = _re.compile(r"^\s*\d+\s*[.)\-]\s*")
 # Денежный пункт: для розницы деньги уже спрашиваем авто-шагом → не дублируем вопросом.
-_MONEY_RE = _re.compile(r"налич|деньг", _re.IGNORECASE)
+# «нал» и «кэш» ловим как отдельные слова: менеджеры пишут «забрать нал 33,300р», и по
+# одному «налич» такая строка проходила мимо фильтра — водитель видел деньги дважды.
+_MONEY_RE = _re.compile(r"налич|деньг|\bнал\b|\bкэш", _re.IGNORECASE)
 
 
 def _parse_checklist_items(raw, money_required: bool = False) -> list:
@@ -498,6 +512,127 @@ def _parse_checklist_items(raw, money_required: bool = False) -> list:
         if len(items) >= _MAX_ITEMS:
             break
     return items
+
+
+# ─── Поручения водителю «по смыслу» (LLM + кэш) ──────────────────────────────
+#
+# Менеджеры пишут доп.поле «Чек-лист водителя» вольным текстом: «забрать нал 33,300р !!
+# забрать тунец и скумбрию 1 шт». Построчный разбор врёт (в одной строке бывает два
+# поручения, а бывает и перенос одной мысли), поэтому текст делит модель — и сразу
+# переписывает каждый пункт РАСПОРЯЖЕНИЕМ («Забери …»), а не вопросом: водитель должен
+# видеть, что от него требуется на точке, а не угадывать смысл вопроса.
+#
+# Кэш обязателен: страницу маршрута водитель за день открывает десятки раз, а текст
+# поля меняется редко. Ключ — хэш самого текста (+ версия промпта), а НЕ № заказа:
+# страница и приёмка обязаны получить один и тот же список в одном порядке, иначе
+# ответы лягут не к тем пунктам (сопоставление идёт по индексу).
+_TASKS_PROMPT_VERSION = "v1-2026-08-14"
+_TASKS_MODEL = "claude-haiku-4-5-20251001"
+_TASKS_LLM_TIMEOUT = 8
+
+_TASKS_SYSTEM = """Ты разбираешь поручения водителю-экспедитору компании F2B (оптовая
+поставка рыбы ресторанам Москвы). На вход — текст доп.поля заказа «Чек-лист водителя»,
+написанный менеджером в спешке, без пунктуации, с сокращениями.
+
+Задача: разбить текст на отдельные поручения ПО СМЫСЛУ (одна строка может содержать два
+поручения, а одно поручение может быть разбито на две строки) и переписать каждое
+короткой командой водителю в повелительной форме.
+
+Правила:
+- Повелительное наклонение, обращение к водителю: «Забери», «Отдай», «Проверь», «Позвони».
+- Не вопрос. «забрать нал 33,300р» → «Забери наличными 33 300 ₽», НЕ «Забрал деньги?».
+- Сохраняй все конкретные детали: суммы, количества, названия товара, имена, телефоны.
+- Суммы пиши по-русски: 33 300 ₽. Количество оставляй как в тексте: «1 шт».
+- Не придумывай поручений, которых нет в тексте. Не объединяй разные поручения в одно.
+- Максимум 12 пунктов, каждый до 200 символов.
+- Пункты про приёмку денег с розничного клиента, подпись документов и итог сдачи НЕ
+  включай, если они уже перечислены во входном списке «уже спрашиваем».
+
+Ответ — только JSON: {"tasks": ["...", "..."]}. Пустой текст или ничего осмысленного → {"tasks": []}."""
+
+
+def _tasks_key(raw: str, money_required: bool) -> str:
+    h = hashlib.sha256(f"{_TASKS_PROMPT_VERSION}|{int(money_required)}|{raw}".encode("utf-8"))
+    return h.hexdigest()
+
+
+def _tasks_from_cache(db, key):
+    if db is None:
+        return None
+    try:
+        row = db._fetchone("SELECT tasks FROM driver_task_cache WHERE raw_key=%s", (key,))
+    except Exception as e:
+        logger.warning("_tasks_from_cache: %s", e)
+        return None
+    if not row:
+        return None
+    tasks = row.get("tasks")
+    if isinstance(tasks, str):
+        try:
+            tasks = json.loads(tasks)
+        except Exception:
+            return None
+    return tasks if isinstance(tasks, list) else None
+
+
+def _tasks_to_cache(db, key, raw, tasks):
+    if db is None:
+        return
+    try:
+        db._execute(
+            "INSERT INTO driver_task_cache (raw_key, raw_text, tasks, updated_at) "
+            "VALUES (%s,%s,%s, now()) ON CONFLICT (raw_key) DO UPDATE SET "
+            "tasks=EXCLUDED.tasks, raw_text=EXCLUDED.raw_text, updated_at=now()",
+            (key, raw[:4000], json.dumps(tasks, ensure_ascii=False)))
+    except Exception as e:
+        logger.warning("_tasks_to_cache: %s", e)
+
+
+async def _tasks_via_llm(raw: str, money_required: bool) -> list:
+    """Текст поля → список поручений-распоряжений. Ошибка/таймаут → [] (решает вызывающий)."""
+    from claude_ai import get_client
+    already = ["забрать деньги с розничного покупателя"] if money_required else []
+    already += ["подписать документы", "итог сдачи"]
+    user = (f"Уже спрашиваем отдельными шагами: {', '.join(already)}.\n\n"
+            f"Текст поля «Чек-лист водителя»:\n{raw}")
+    resp = await asyncio.wait_for(
+        get_client().messages.create(
+            model=_TASKS_MODEL, max_tokens=800, system=_TASKS_SYSTEM,
+            messages=[{"role": "user", "content": user}]),
+        timeout=_TASKS_LLM_TIMEOUT)
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+    m = _re.search(r"\{.*\}", text, _re.S)
+    data = json.loads(m.group(0) if m else text)
+    out = []
+    for t in (data.get("tasks") or []):
+        t = _re.sub(r"\s{2,}", " ", str(t)).strip()
+        if t:
+            out.append(t[:_MAX_ITEM_LEN])
+        if len(out) >= _MAX_ITEMS:
+            break
+    return out
+
+
+async def driver_tasks(db, raw, money_required: bool = False) -> list:
+    """Доп.поле «Чек-лист водителя» → пункты-распоряжения для чеклиста.
+
+    Один источник для СТРАНИЦЫ и для ПРИЁМКИ: список и его порядок должны совпадать,
+    ответы водителя сопоставляются по индексу. Кэш в БД по хэшу текста; если модель
+    недоступна — фолбэк на построчный разбор (лучше сырые строки, чем пустой чеклист)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    key = _tasks_key(raw, money_required)
+    cached = _tasks_from_cache(db, key)
+    if cached is not None:
+        return cached
+    try:
+        tasks = await _tasks_via_llm(raw, money_required)
+    except Exception as e:
+        logger.warning("driver_tasks LLM: %s — фолбэк на построчный разбор", e)
+        return _parse_checklist_items(raw, money_required)
+    _tasks_to_cache(db, key, raw, tasks)
+    return tasks
 
 
 def _money_required(det) -> bool:
@@ -1271,6 +1406,40 @@ async def _web_alert_claim(bot, row):
             logger.warning("_web_alert_claim → %s: %s", cid, e)
 
 
+async def _web_alert_undone(bot, row):
+    """Невыполненные пункты сдачи с веб-страницы → логистам и менеджеру точки.
+
+    В telegram-флоу «Нет» по пункту сразу сигналило (_signal_item_not_done), а веб-сдача
+    молчала: водитель мог отметить «не забрал деньги» и точка тихо гасла. Собираем все
+    «нет» одной сводкой — деньги, подпись, поручения из доп.поля заказа."""
+    if not row:
+        return
+    bad = []
+    if row.get("money_required") and row.get("money_received") is False:
+        bad.append("💵 деньги НЕ забрал")
+    if row.get("doc_signed") is False:
+        bad.append("✍️ документ НЕ подписан")
+    for it in _load_items(row):
+        if it.get("answer") is False:
+            bad.append(f"📋 не сделал: {it.get('text') or '(пункт)'}")
+    if not bad:
+        return
+    tag = (row.get("manager_tag") or "").strip().lower()
+    text = ("⚠️ Сдача точки — есть невыполненное\n"
+            f"{_point_head_plain(row)}\n\n" + "\n".join(bad))
+    if row.get("manager_tag"):
+        text += f"\n\nМенеджер: {row.get('manager_tag')}"
+    seen = set()
+    for cid in (*_logist_chat_ids(), PDZ_MANAGER_TG_IDS.get(tag)):
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.warning("_web_alert_undone → %s: %s", cid, e)
+
+
 async def web_pickup_submit(db, bot, uid, order_no, *, doc, accepted, claim_text, title="", day=None):
     """Закрытие точки ЗАБОРА товара (заказ поставщику или ручная точка Логистики).
 
@@ -1365,7 +1534,9 @@ async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, cla
     def _yn(v):
         return True if v == "yes" else (False if v == "no" else None)
 
-    base_items = _parse_checklist_items(det.get("checklist_raw"), money_required)
+    # Тот же резолвер, что рисовал пункты на странице (кэш по хэшу текста) — иначе
+    # порядок разъедется и ответы водителя лягут не к тем поручениям.
+    base_items = await driver_tasks(db, det.get("checklist_raw"), money_required)
     ci = [{"idx": i, "text": t, "answer": _yn((items or {}).get(str(i)))}
           for i, t in enumerate(base_items)]
 
@@ -1441,6 +1612,7 @@ async def _web_finalize_bg(db, bot, demand_id, ms_target, accepted_ok, write_sta
                 await asyncio.sleep(5 * (attempt + 1))
         if not accepted_ok:
             await _web_alert_claim(bot, _get_row(db, demand_id))
+        await _web_alert_undone(bot, _get_row(db, demand_id))
         if write_on and not wrote:
             row = _get_row(db, demand_id) or {}
             text = (f"⚠️ Статус «{ms_target}» в МойСклад НЕ записался\n"

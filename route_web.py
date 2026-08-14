@@ -95,6 +95,14 @@ def _looks_like_pickup(order_no, client) -> bool:
 _SAMPLE_MAX_PRICE_RUB = 1.0
 
 
+def _rub(v) -> str:
+    """12480.5 → «12 480 ₽». Копейки водителю не нужны — деньги он берёт купюрами."""
+    try:
+        return f"{round(float(v)):,} ₽".replace(",", " ")
+    except (TypeError, ValueError):
+        return ""
+
+
 _PAGE_CSS = """
 *{box-sizing:border-box}
 body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f2f4f7;color:#111}
@@ -259,6 +267,41 @@ def _q_block(question: str, name: str, options) -> str:
             f"<div class='opts'>{opts}</div></div>")
 
 
+async def _tasks_for_stops(stops, ms_extra, done_set, db) -> dict:
+    """{order_no: [поручение, …]} для незакрытых точек сдачи.
+
+    money_needed считаем ровно как в карточке — этот флаг входит в ключ кэша и в промпт
+    (для розницы денежный пункт не дублируем, его закрывает шаг «Забери деньги»)."""
+    import driver_checklist as dc
+    targets = []
+    for s in stops:
+        order_no = s.get("order_no")
+        ex = ms_extra.get(order_no, {})
+        raw = (ex.get("checklist_raw") or "").strip()
+        if not raw or rd._doc_no(order_no) in done_set:
+            continue
+        if ex.get("is_pickup") or _looks_like_pickup(order_no, s.get("client")):
+            continue   # у забора документа в МС нет → поручений заказа тоже нет
+        client = s.get("client") or ""
+        _mp = ex.get("max_price_rub")
+        is_sample = (_mp is not None and (ex.get("weight") or 0) > 0
+                     and _mp <= _SAMPLE_MAX_PRICE_RUB)
+        targets.append((order_no, raw, client.startswith("Рознич") and not is_sample))
+    if not targets:
+        return {}
+    res = await asyncio.gather(
+        *(dc.driver_tasks(db, raw, money) for _, raw, money in targets),
+        return_exceptions=True)
+    out = {}
+    for (order_no, _, _), r in zip(targets, res):
+        if isinstance(r, Exception):
+            logger.warning("route_web tasks %s: %s", order_no, r)
+            continue
+        if r:
+            out[order_no] = r
+    return out
+
+
 async def render_page(uid: int, target: date, db, bot) -> str:
     unit_name = rr.UNITS.get(uid, str(uid))
     date_str = target.strftime("%d.%m.%Y")
@@ -295,6 +338,11 @@ async def render_page(uid: int, target: date, db, bot) -> str:
     if not stops:
         body = "<div class='empty'>Маршрут по этой машине ещё не построен в Логистике.</div>"
         return _wrap(unit_name, head + body)
+
+    # Поручения из доп.поля заказа «Чек-лист водителя» — считаем ОДНИМ заходом на всю
+    # страницу и параллельно: на кэш-промахе каждый текст идёт в модель, по очереди это
+    # были бы секунды ожидания у водителя. Незакрытые точки — только они и рисуют форму.
+    tasks_by_order = await _tasks_for_stops(stops, ms_extra, done_set, db)
 
     cards = []
     for i, s in enumerate(stops, 1):
@@ -345,7 +393,8 @@ async def render_page(uid: int, target: date, db, bot) -> str:
             rows.append(
                 f"<form class='sd' data-uid='{uid}' data-date='{date_iso}' data-kind='pickup' "
                 f"data-order='{_e(order_no)}' data-token='{_e(token)}'>"
-                + _q_block("✍️ Забрал документы?", "doc", [("yes", "Да"), ("no", "Нет")])
+                + _q_block("✍️ Забери документы у поставщика", "doc",
+                           [("yes", "Забрал"), ("no", "Не забрал")])
                 + _q_block("📦 Итог забора:", "accepted",
                            [("ok", "Забрал"), ("claim", "Проблема")])
                 + "<textarea name='claim_text' class='claim' placeholder='Что не так: чего не хватило, что не отдали' hidden></textarea>"
@@ -361,19 +410,32 @@ async def render_page(uid: int, target: date, db, bot) -> str:
             is_sample = (_mp is not None and (ex.get("weight") or 0) > 0
                          and _mp <= _SAMPLE_MAX_PRICE_RUB)
             money_needed = is_retail and not is_sample
-            # Чеклист — колонкой: вопрос строкой, ответы под ним (собственник, 2026-08-04).
+            # Чеклист — колонкой: пункт строкой, ответы под ним (собственник, 2026-08-04).
             # В строку не помещалось на телефоне и водитель промахивался по варианту.
-            money_q = _q_block("💵 Забрал деньги?", "money",
-                               [("yes", "Да"), ("no", "Нет")]) if money_needed else ""
+            # Формулировка — РАСПОРЯЖЕНИЕ, а не вопрос (собственник, 2026-08-14): «Забрал
+            # деньги?» водитель читал как опрос, а не как задачу на точке. Сумму заказа
+            # подставляем — водитель видит, сколько ждать с розничной точки.
+            _sum = ex.get("sum_rub") or 0
+            money_q = _q_block(
+                "💵 Забери деньги" + (f" — {_rub(_sum)}" if _sum else ""), "money",
+                [("yes", "Забрал"), ("no", "Не забрал")]) if money_needed else ""
             if is_sample:
                 rows.append("<div class='meta sample'>🎁 Образцы — деньги не берём</div>")
+            # Поручения менеджера из доп.поля заказа «Чек-лист водителя» — отдельными
+            # пунктами. Разбор по смыслу и кэш — driver_checklist.driver_tasks; приёмка
+            # берёт тот же список тем же вызовом, ответы сопоставляются по индексу.
+            tasks_q = ""
+            for ti, ttext in enumerate(tasks_by_order.get(order_no) or []):
+                tasks_q += _q_block(f"📋 {ttext}", f"item_{ti}",
+                                    [("yes", "Сделал"), ("no", "Не сделал")])
             # Запасной вход «или через бот» убран (собственник, 2026-08-04): кнопки в
             # Telegram не нажимались/подвисали, сдача закрывается только здесь.
             rows.append(
                 f"<form class='sd' data-uid='{uid}' data-date='{date_iso}' "
                 f"data-order='{_e(order_no)}' data-token='{_e(token)}'>"
-                f"{money_q}"
-                + _q_block("✍️ Подписал документ?", "doc", [("yes", "Да"), ("no", "Нет")])
+                f"{money_q}{tasks_q}"
+                + _q_block("✍️ Подпиши документ и забери свой экземпляр", "doc",
+                           [("yes", "Подписал"), ("no", "Не подписал")])
                 + _q_block("📦 Итог сдачи:", "accepted",
                            [("ok", "Сдано"), ("claim", "Претензия")])
                 + "<textarea name='claim_text' class='claim' placeholder='Опиши претензию' hidden></textarea>"
@@ -402,12 +464,26 @@ _FORM_CSS = (".sd{margin-top:10px;padding-top:10px;border-top:1px solid #eee}"
              ".claim{width:100%;box-sizing:border-box;margin:6px 0;min-height:54px;"
              "font-size:15px;padding:8px;border:1px solid #d7dbe0;border-radius:10px}"
              ".sd .btn{display:block;width:100%;margin-top:12px;border:0;cursor:pointer}"
+             # Неотвеченный пункт при попытке отправить сдачу.
+             ".q.unans .qt{color:#b91c1c}"
+             ".q.unans .opt{border-color:#b91c1c}"
              ".msg{color:#b91c1c;font-size:14px;margin-top:6px}")
 
 _FORM_JS = (
+    # Ни один пункт нельзя пропустить: раньше проверялся только «Итог сдачи», и поручения
+    # менеджера водитель мог оставить неотвеченными. Незакрытый пункт подсвечиваем красным
+    # и подкручиваем к нему экран, а не просто ругаемся alert'ом в пустоту.
+    "function needAll(f){var rs=f.querySelectorAll('input[type=radio]');var seen=[],g={};"
+    "for(var i=0;i<rs.length;i++){var n=rs[i].name;if(!g[n]){g[n]=[];seen.push(n);}g[n].push(rs[i]);}"
+    "for(var k=0;k<seen.length;k++){var arr=g[seen[k]],ok=false;"
+    "for(var j=0;j<arr.length;j++){if(arr[j].checked)ok=true;}"
+    "if(!ok){var q=arr[0].closest('.q');if(q){q.classList.add('unans');"
+    "q.scrollIntoView({block:'center',behavior:'smooth'});"
+    "var t=q.querySelector('.qt');alert('Отметь пункт: '+((t&&t.textContent)||''));}return false;}}"
+    "return true;}"
     "function sendSd(f){var pk=f.dataset.kind==='pickup';"
+    "if(!needAll(f))return;"
     "var acc=(f.accepted&&f.accepted.value)||'';"
-    "if(!acc){alert(pk?'Отметь: Забрал или Проблема':'Отметь: Сдано или Претензия');return;}"
     "var body={order_no:f.dataset.order,items:{}};"
     "if(pk){body.kind='pickup';body.title=(f.closest('.pt').querySelector('.cli')||{}).textContent||'';}"
     "new FormData(f).forEach(function(v,k){if(k.indexOf('item_')===0){body.items[k.slice(5)]=v;}else{body[k]=v;}});"
@@ -428,7 +504,8 @@ _FORM_JS = (
     # Подсветка выбранного варианта — на случай браузера без поддержки CSS :has().
     "var grp=el.form.querySelectorAll(\"input[name='\"+el.name+\"']\");"
     "for(var i=0;i<grp.length;i++){var lab=grp[i].closest('.opt');"
-    "if(lab)lab.className=grp[i].checked?'opt sel':'opt';}});")
+    "if(lab)lab.className=grp[i].checked?'opt sel':'opt';}"
+    "var q=el.closest('.q');if(q)q.classList.remove('unans');});")
 
 
 def _wrap(title: str, inner: str) -> str:
