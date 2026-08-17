@@ -4825,10 +4825,48 @@ async def _claim_control_task_note(doc: dict, cp: str) -> str:
 
 
 # ── Претензии менеджеров (из quiz-game) ──────────────────────────────────────
-# Callbacks: mclaim_resolved:{id} | mclaim_fix:{id}. Таблица manager_claims в общей
+# Callbacks: mclaim_finance | mclaim_fix | mclaim_resolved (претензия) и mclaim_ack
+# (замечание), везде :{id}. Таблица manager_claims в общей
 # f2b-postgres (создаёт дашборд). План: 2026-07-29-претензии-вкладка-в-сервисах.md (v2).
 _CLAIM_STATUS_RU = {
-    "pending": "ожидает решения", "resolved": "решено", "fix_docs": "исправление документов",
+    "pending": "ожидает решения", "resolved": "решено без последствий",
+    "fix_docs": "исправление документов", "finance": "финансовое решение",
+    "acked": "принято",
+}
+
+# Решение по кнопке: статус, заметка менеджеру в дашборде, подпись в чате
+# руководителя, ТГ-пуш менеджеру. Претензия требует выбора, что делаем
+# (деньги / документы / ничего), замечание руководитель просто принимает.
+_CLAIM_DECISIONS = {
+    "mclaim_finance": {
+        "status": "finance",
+        "note": ("Принято решение: финансовое. Согласуйте с руководителем сумму и форму "
+                 "компенсации (возврат, скидка, кредит-нота) и отразите договорённость в amoCRM."),
+        "label": "💰 Финансовое решение",
+        "push": ("💰 По вашей претензии №{id} (клиент «{cli}») принято решение: *финансовое*.\n\n"
+                 "Согласуйте с руководителем сумму и форму компенсации (возврат, скидка, "
+                 "кредит-нота) и отразите договорённость в amoCRM."),
+    },
+    "mclaim_fix": {
+        "status": "fix_docs",
+        "note": ("Принято решение: исправить документы. "
+                 "Напишите в amoCRM согласование на исправление документов."),
+        "label": "📝 Исправление документов",
+        "push": ("📝 По вашей претензии №{id} (клиент «{cli}») принято решение: "
+                 "*исправить документы*.\n\nНапишите в amoCRM согласование на исправление документов."),
+    },
+    "mclaim_resolved": {
+        "status": "resolved",
+        "note": "Принято решение: претензия решена без последствий.",
+        "label": "✅ Решено без последствий",
+        "push": "✅ По вашей претензии №{id} (клиент «{cli}») принято решение: *решено без последствий*.",
+    },
+    "mclaim_ack": {
+        "status": "acked",
+        "note": "Замечание принято к сведению руководством.",
+        "label": "✅ Принято",
+        "push": "✅ Ваше замечание №{id} (клиент «{cli}») принято к сведению руководством.",
+    },
 }
 def _resolve_manager_chat(tag: str):
     """chat_id менеджера по тегу претензии. None если тег неизвестен.
@@ -4857,14 +4895,20 @@ async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TY
     except (ValueError, TypeError):
         return
 
+    decision = _CLAIM_DECISIONS.get(action)
+    if not decision:
+        return
+
     row = db._fetchone("SELECT * FROM manager_claims WHERE id=%s", (claim_id,))
     if not row:
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await query.message.reply_text(f"⚠️ Претензия №{claim_id} не найдена в базе.")
+        await query.message.reply_text(f"⚠️ Обращение №{claim_id} не найдено в базе.")
         return
+
+    what = "Замечание" if (row.get("kind") or "claim") == "remark" else "Претензия"
 
     if row.get("status") != "pending":
         await query.answer(
@@ -4877,12 +4921,7 @@ async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     decided_by = "Виктор" if uid == OWNER_CHAT_ID else "Маланчук"
-    if action == "mclaim_resolved":
-        new_status, note = "resolved", "Принято решение: претензия решена."
-    else:
-        new_status, note = "fix_docs", (
-            "Принято решение: исправить документы. "
-            "Напишите в amoCRM согласование на исправление документов.")
+    new_status, note = decision["status"], decision["note"]
 
     # Идемпотентно: меняем только из pending (защита от двойного клика второй копией).
     db._execute(
@@ -4892,7 +4931,7 @@ async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
     cli = row.get("client_name") or "—"
-    label = "✅ Решено" if new_status == "resolved" else "📝 Исправление документов"
+    label = decision["label"]
 
     # Снимаем кнопки во всех копиях сообщения (Виктор + Маланчук).
     tg_messages = row.get("tg_messages") or []
@@ -4909,16 +4948,13 @@ async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
 
-    await query.message.reply_text(f"{label} — претензия №{claim_id} ({cli}). Решил: {decided_by}.")
+    await query.message.reply_text(
+        f"{label} — {what.lower()} №{claim_id} ({cli}). Решил: {decided_by}.")
 
     # Уведомляем менеджера (в дашборде статус уже сменился, плюс ТГ-пуш).
     mgr_chat = _resolve_manager_chat(row.get("manager_tag"))
     if mgr_chat:
-        if new_status == "resolved":
-            mtext = f"✅ По вашей претензии №{claim_id} (клиент «{cli}») принято решение: *Решено*."
-        else:
-            mtext = (f"📝 По вашей претензии №{claim_id} (клиент «{cli}») принято решение: "
-                     f"*исправить документы*.\n\nНапишите в amoCRM согласование на исправление документов.")
+        mtext = decision["push"].format(id=claim_id, cli=cli)
         try:
             await context.bot.send_message(chat_id=mgr_chat, text=mtext, parse_mode="Markdown")
         except Exception as e:
@@ -7048,7 +7084,8 @@ def main():
     from supply_svetofor import handle_supply_approval_callback
     app.add_handler(CallbackQueryHandler(handle_supply_approval_callback, pattern="^sappr:"))
     app.add_handler(CallbackQueryHandler(handle_doc_approval_callback, pattern="^doc_(approve|reject):"))
-    app.add_handler(CallbackQueryHandler(handle_claim_callback, pattern="^mclaim_(resolved|fix):"))
+    app.add_handler(CallbackQueryHandler(handle_claim_callback,
+                                         pattern="^mclaim_(resolved|fix|finance|ack):"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing|wazzup_later)"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
