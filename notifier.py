@@ -1732,3 +1732,187 @@ async def check_approval_needed(order_href: str, bot, db):
 
     except Exception as e:
         logger.error(f"notifier.check_approval_needed: {e}", exc_info=True)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Алерт «отгрузка создана не на основании заказа» → группа «Склад».
+#
+# МойСклад снимает резерв заказа ТОЛЬКО когда растёт positions.shipped, то есть
+# только при отгрузке, созданной из заказа. Отдельный документ списывает остаток,
+# но резерв остаётся навсегда — «Доступно» уходит в минус, менеджеры видят
+# несуществующий дефицит (разбор 19.08.2026: 490 кг мёртвого резерва).
+# План: 2026-08-19-алерт-отгрузка-без-заказа.md
+# ────────────────────────────────────────────────────────────────────────────
+
+# Группа «Склад» — chat_id из памяти reference_f2b_telegram_chat_ids (бот в ней
+# с 16.07.2026, получатель PDF-реестров и листа загрузки).
+WAREHOUSE_GROUP_CHAT_ID = -4750423130
+
+# Окно свежести: берём отгрузки, созданные за последние N минут. Джоба ходит
+# каждые 10 мин, окно 20 — перекрытие на случай пропуска прогона. Повторы гасит
+# атомарный claim demand_no_order_notifications.
+DEMAND_NO_ORDER_WINDOW_MIN = 20
+
+
+def _warehouse_chat_id() -> int:
+    """Куда шлём: WAREHOUSE_CHAT_ID (env) → константа группы «Склад»."""
+    raw = os.getenv("WAREHOUSE_CHAT_ID", "").strip()
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    return WAREHOUSE_GROUP_CHAT_ID
+
+
+async def _candidate_orders_for_agent(agent_href: str, headers: dict) -> list:
+    """Заказы этого контрагента с плановой отгрузкой ±3 дня — подсказка складу.
+
+    Что именно надо было взять основанием, бот не знает; отдаёт короткий список,
+    решение за кладовщиком.
+    """
+    from datetime import timedelta
+    import aiohttp
+    if not agent_href:
+        return []
+    lo = (_now_msk_naive() - timedelta(days=3)).strftime("%Y-%m-%d 00:00:00")
+    hi = (_now_msk_naive() + timedelta(days=3)).strftime("%Y-%m-%d 23:59:59")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder",
+                headers=headers,
+                params={
+                    "filter": (
+                        f"agent={agent_href};"
+                        f"deliveryPlannedMoment>={lo};deliveryPlannedMoment<={hi}"
+                    ),
+                    "expand": "state",
+                    "limit": 5,
+                    "order": "deliveryPlannedMoment,asc",
+                },
+            ) as r:
+                if r.status != 200:
+                    return []
+                data = await r.json()
+    except Exception as e:
+        logger.warning(f"_candidate_orders_for_agent: {e}")
+        return []
+    out = []
+    for o in data.get("rows", []) or []:
+        out.append({
+            "name": o.get("name", ""),
+            "state": (o.get("state") or {}).get("name", ""),
+            "date": (o.get("deliveryPlannedMoment") or "")[:10],
+        })
+    return out
+
+
+async def _send_demand_no_order_alert(bot, *, demand_id: str, demand_name: str,
+                                      agent_name: str, owner_name: str,
+                                      store_name: str, total: float,
+                                      moment, candidates: list):
+    """Сообщение в группу «Склад». Только HTML с экранированием — имена товаров
+    и контрагентов из МС ломают Markdown (см. память по алертам PRO)."""
+    import html as _html
+
+    chat_id = _warehouse_chat_id()
+    if not chat_id:
+        logger.error("demand_no_order: некому слать (нет WAREHOUSE_CHAT_ID)")
+        return
+
+    def h(v) -> str:
+        return _html.escape(str(v), quote=False)
+
+    url = f"https://online.moysklad.ru/app/#demand/edit?id={demand_id}"
+    sum_str = f"{total:,.0f}".replace(",", " ")
+    lines = [
+        "⚠️ Отгрузка создана не на основании заказа",
+        "",
+        f"📄 Отгрузка <a href=\"{url}\">{h(demand_name)}</a> · {moment.strftime('%H:%M')}",
+        f"🏢 {h(agent_name)}",
+        f"🏬 {h(store_name)} · {sum_str} ₽",
+        f"🧍 Оформил: {h(owner_name)}",
+        "",
+        "Если это отгрузка по заказу — переделайте её из карточки заказа:",
+        "иначе резерв не снимется и «Доступно» уйдёт в минус.",
+    ]
+    if candidates:
+        lines.append("")
+        lines.append("Подходящие заказы клиента:")
+        for c in candidates:
+            lines.append(f"• {h(c['name'])} · {h(c['state'])} · отгрузка {h(c['date'])}")
+    text = "\n".join(lines)
+    try:
+        await bot.send_message(
+            chat_id=chat_id, text=text, parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        logger.info(f"demand_no_order: {demand_name} ({agent_name}) → Склад")
+    except Exception as e:
+        logger.error(f"demand_no_order: отправка упала для {demand_name}: {e}", exc_info=True)
+
+
+async def sweep_demands_without_order(bot, db):
+    """Свежие отгрузки без привязки к заказу → предупреждение в группу «Склад».
+
+    Вебхуков на demand у нас нет, а вебхуки МС теряются окнами по 30+ минут,
+    поэтому детект — периодический скан по created. Дедуп — атомарный claim
+    demand_no_order_notifications (одна отгрузка = один алерт навсегда).
+    """
+    try:
+        from moysklad import get_headers
+        from datetime import timedelta
+        import aiohttp
+
+        headers = get_headers()
+        since = (_now_msk_naive() - timedelta(minutes=DEMAND_NO_ORDER_WINDOW_MIN)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/demand",
+                headers=headers,
+                params={
+                    "filter": f"created>={since}",
+                    "expand": "agent,store,owner",
+                    "limit": 50,
+                    "order": "created,desc",
+                },
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    logger.warning(f"sweep_demands_without_order: список {r.status}: {body[:200]}")
+                    return
+                data = await r.json()
+
+        sent = 0
+        for d in data.get("rows", []) or []:
+            if d.get("customerOrder"):
+                continue
+            demand_id = d.get("id") or ""
+            if not demand_id:
+                continue
+            if not db.try_claim_demand_no_order(demand_id):
+                continue
+
+            agent = d.get("agent") or {}
+            moment = _parse_ms_moment(d.get("moment", "")) or _now_msk_naive()
+            candidates = await _candidate_orders_for_agent(
+                (agent.get("meta") or {}).get("href", "").split("?")[0], headers
+            )
+            await _send_demand_no_order_alert(
+                bot,
+                demand_id=demand_id,
+                demand_name=d.get("name", demand_id),
+                agent_name=agent.get("name", "—"),
+                owner_name=(d.get("owner") or {}).get("name", "—"),
+                store_name=(d.get("store") or {}).get("name", "—"),
+                total=(d.get("sum") or 0) / 100,
+                moment=moment,
+                candidates=candidates,
+            )
+            sent += 1
+
+        if sent:
+            logger.info(f"sweep_demands_without_order: отправлено {sent}")
+    except Exception as e:
+        logger.error(f"sweep_demands_without_order: {e}", exc_info=True)

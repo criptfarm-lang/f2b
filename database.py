@@ -454,6 +454,14 @@ class Database:
                 sent_at TIMESTAMP DEFAULT NOW(),
                 PRIMARY KEY (order_id, event_key)
             )""",
+            # Алерт «отгрузка создана не на основании заказа» → группа «Склад».
+            # Одна строка = одна отгрузка. Резерв в МС снимается только при
+            # отгрузке из заказа, отдельный документ оставляет мёртвый резерв.
+            # План: 2026-08-19-алерт-отгрузка-без-заказа.md
+            """CREATE TABLE IF NOT EXISTS demand_no_order_notifications (
+                demand_id TEXT PRIMARY KEY,
+                sent_at TIMESTAMP DEFAULT NOW()
+            )""",
             """CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -1550,6 +1558,23 @@ class Database:
                 "INSERT INTO position_removed_notifications (order_id, event_key) "
                 "VALUES (%s, %s) ON CONFLICT DO NOTHING RETURNING order_id",
                 (order_id, event_key)
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row is not None
+
+    def try_claim_demand_no_order(self, demand_id: str) -> bool:
+        """Атомарный claim для алерта «отгрузка без заказа».
+
+        True — вставили этой транзакцией, мы первые → шлём. False — уже слали
+        на прошлом прогоне джобы → молчим.
+        """
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO demand_no_order_notifications (demand_id) "
+                "VALUES (%s) ON CONFLICT DO NOTHING RETURNING demand_id",
+                (demand_id,)
             )
             row = cur.fetchone()
             self.conn.commit()

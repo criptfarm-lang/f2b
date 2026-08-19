@@ -7670,6 +7670,22 @@ def main():
     app.job_queue.run_repeating(_positions_removed_sweep_wrapper, interval=900, first=240)
 
     # ────────────────────────────────────────────────────────────────────
+    # Алерт «отгрузка создана не на основании заказа» → группа «Склад»,
+    # каждые 10 мин. Такой документ не снимает резерв заказа, «Доступно»
+    # уходит в минус. Дедуп — demand_no_order_notifications.
+    # План: 2026-08-19-алерт-отгрузка-без-заказа.
+    # ────────────────────────────────────────────────────────────────────
+    from notifier import sweep_demands_without_order as _sweep_demands_no_order
+
+    async def _demands_no_order_wrapper(context):
+        try:
+            await _sweep_demands_no_order(app.bot, db)
+        except Exception as e:
+            logger.error(f"demands_no_order job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_demands_no_order_wrapper, interval=600, first=120)
+
+    # ────────────────────────────────────────────────────────────────────
     # Wazzup classifier — дневная сводка собственнику 17:00 МСК.
     # Счётчик за день + топ-5 срочных. Если 0 — «0 запросов, всё тихо».
     # ────────────────────────────────────────────────────────────────────
