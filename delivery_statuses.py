@@ -56,7 +56,8 @@ R_STOP_M = 300       # радиус «прибыл на точку»
 DELAY_BUFFER_MIN = 30
 LAG_ALERT_MIN = 120        # отставание от плана ≥ этого (даже при плавающих окнах) → тревога
 LAG_ALERT_POINTS = 2       # ...и хотя бы столько непосещённых точек позади плана
-IDLE_MIN = 60              # простой: машина стоит на месте ≥ этого → тревога логисту
+IDLE_MIN = int(os.getenv("IDLE_MIN", "40"))   # простой вне точек: стоит ≥ этого → тревога
+DEPART_DEADLINE_HM = os.getenv("DEPART_DEADLINE_HM", "09:00")  # позже — алерт «поздний выезд»
 ROUTE_END_MIN = 10         # на точке ночёвки ≥ этого → фиксируем «конец маршрута» в моменте
 IDLE_RADIUS_M = 150        # «на месте»: не отходит дальше этого от точки стоянки
 DELIVERY_HOURS = (7, 21)   # МСК, в эти часы крон активен
@@ -67,7 +68,7 @@ DWELL_UNLOAD_MIN = 5       # стоянка у точки клиента ≥ э�
 UNLOAD_SPEED_KMH = 5       # «стоит»: мгновенная скорость ≤ этого (иначе — проезд мимо, не выгрузка)
 # Долгая стоянка у клиента: норма выгрузки 5–30 мин; стоит дольше — аномалия, эскалация
 # с повтором (в отличие от unload-без-подтверждения — не ждём отъезда). План 2026-07-27.
-LONG_DWELL_MIN = int(os.getenv("LONG_DWELL_MIN", "60"))           # ≥ этого на точке = долгая стоянка
+LONG_DWELL_MIN = int(os.getenv("LONG_DWELL_MIN", "40"))           # ≥ этого на точке = долгая стоянка
 LONG_DWELL_REPEAT_MIN = int(os.getenv("LONG_DWELL_REPEAT_MIN", "60"))  # повтор эскалации, мин
 # Повтор лаг-алерта при РОСТЕ отставания на ≥ этого (иначе — раз в сутки на машину). Фаза 3.
 LAG_REPEAT_GROWTH_MIN = int(os.getenv("LAG_REPEAT_GROWTH_MIN", "60"))
@@ -159,6 +160,44 @@ def ensure_schema(db):
     """)
 
 
+    # Журнал срабатываний алертов — источник для недельного протокола по логистике
+    # (сколько раз, по каким клиентам, в какие даты). Пишется в момент отправки.
+    db._execute("""
+        CREATE TABLE IF NOT EXISTS logi_alert_log (
+            id          BIGSERIAL PRIMARY KEY,
+            fired_at    TIMESTAMPTZ DEFAULT now(),
+            kind        TEXT NOT NULL,
+            unit_id     BIGINT,
+            unit_name   TEXT,
+            order_no    TEXT,
+            client      TEXT,
+            detail      TEXT
+        )
+    """)
+    db._execute("CREATE INDEX IF NOT EXISTS logi_alert_log_fired_idx ON logi_alert_log (fired_at)")
+    # Выезд со склада: первый момент дня, когда машина оказалась дальше R_BASE_M от базы.
+    db._execute("""
+        CREATE TABLE IF NOT EXISTS unit_departure (
+            unit_id     BIGINT,
+            snap_date   DATE,
+            first_out   TIMESTAMPTZ,
+            alerted     BOOLEAN DEFAULT FALSE,
+            PRIMARY KEY (unit_id, snap_date)
+        )
+    """)
+
+
+def _log_alert(db, kind, unit_id=None, unit_name=None, order_no=None, client=None, detail=None):
+    """Одна запись в журнал на одно отправленное сообщение."""
+    try:
+        db._execute(
+            """INSERT INTO logi_alert_log (kind,unit_id,unit_name,order_no,client,detail)
+               VALUES (%s,%s,%s,%s,%s,%s)""",
+            (kind, unit_id, unit_name, order_no, client, detail))
+    except Exception as e:   # журнал не должен ломать развоз
+        logger.warning("logi_alert_log: не записал %s (%s)", kind, e)
+
+
 def _st_get(db, order_no):
     return db._fetchone("SELECT * FROM route_status_state WHERE order_no=%s", (order_no,))
 
@@ -207,9 +246,13 @@ def _near_any_client(lat, lon, stops) -> bool:
     return False
 
 
-def _check_idle(db, uid, name, pos, stops, now_ts, preview):
+def _check_idle(db, uid, name, pos, stops, now_ts, preview, has_open=True):
     """Сторож простоя: машина стоит на месте ≥ IDLE_MIN, не на базе и не у клиента → тревога.
-    Возвращает строку-описание, если простой обнаружен (для превью/лога), иначе None."""
+
+    `has_open` — остались ли на сегодня незакрытые точки. Когда развоз доехан,
+    стоянка машины — это уже не простой, а вечер: точки ночёвки новых водителей в
+    HOME_POINTS не заведены, и без этого гейта порог в 40 минут давал бы ложный
+    алерт каждый вечер. Возвращает описание простоя (для превью/лога) либо None."""
     if not pos or not pos.get("lat"):
         return None
     lat, lon = pos["lat"], pos["lon"]
@@ -226,6 +269,8 @@ def _check_idle(db, uid, name, pos, stops, now_ts, preview):
     if _near_base(lat, lon) or _near_any_client(lat, lon, stops):
         return None
     on_home = _near_home(uid, lat, lon)
+    if not on_home and not has_open:
+        return None    # все точки закрыты — это конец дня, а не простой
     # Дом/гараж → «конец маршрута» с коротким порогом (фиксируем время финиша в моменте);
     # прочие точки → «ПРОСТОЙ» с длинным порогом.
     threshold = ROUTE_END_MIN if on_home else IDLE_MIN
@@ -242,6 +287,62 @@ def _check_idle(db, uid, name, pos, stops, now_ts, preview):
         return {"line": line, "fire": fire, "since": since, "idle_min": idle_min,
                 "lat": lat, "lon": lon, "anchor": (row["lat"], row["lon"]), "kind": kind}
     return None
+
+
+# ─── Выезд со склада (поздний старт развоза) ─────────────────────────────────
+
+def _dep_deadline_ts(now_ts: int) -> int:
+    """Дедлайн выезда — сегодняшние DEPART_DEADHM по МСК в epoch."""
+    hh, mm = (DEPART_DEADLINE_HM.split(":") + ["0"])[:2]
+    d = datetime.fromtimestamp(now_ts, _MSK)
+    return int(d.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0).timestamp())
+
+
+def _check_departure(db, uid, name, pos, stops, left_base, now_ts, preview):
+    """Фиксирует первый выезд машины с базы за день и алертит, если он позже дедлайна.
+
+    Два случая одного события: машина уже уехала, но позже 09:00 — сообщаем факт со
+    временем; машина в 09:00 всё ещё на базе — сообщаем, что развоз не начат. Один
+    алерт на машину в день (`unit_departure.alerted`)."""
+    if not pos or not stops:
+        return None    # нет позиции или нечего развозить — не наш случай
+    today = datetime.fromtimestamp(now_ts, _MSK).date()
+    row = db._fetchone("SELECT * FROM unit_departure WHERE unit_id=%s AND snap_date=%s",
+                       (uid, today)) or {}
+    if not row:
+        if not preview:
+            db._execute("INSERT INTO unit_departure (unit_id,snap_date) VALUES (%s,%s) "
+                        "ON CONFLICT DO NOTHING", (uid, today))
+        row = {}
+    first_out = row.get("first_out")
+    if left_base and not first_out and not preview:
+        db._execute("UPDATE unit_departure SET first_out=now() WHERE unit_id=%s AND snap_date=%s",
+                    (uid, today))
+        first_out = datetime.now(_MSK)
+    deadline = _dep_deadline_ts(now_ts)
+    if row.get("alerted") or now_ts < deadline:
+        return None
+    out_hm = first_out.astimezone(_MSK).strftime("%H:%M") if first_out else None
+    if first_out and first_out.astimezone(_MSK).timestamp() <= deadline:
+        return None    # выехала вовремя — алерта нет
+    line = (f"{name}: выезд со склада в {out_hm} — позже {DEPART_DEADLINE_HM}" if out_hm
+            else f"{name}: в {datetime.fromtimestamp(now_ts, _MSK):%H:%M} ещё на базе, "
+                 f"развоз не начат (дедлайн {DEPART_DEADLINE_HM})")
+    return {"line": line, "fire": not preview, "out_hm": out_hm,
+            "points": len(stops), "date": today}
+
+
+async def _departure_alert(bot, unit_name, info):
+    text = (f"🕗 Поздний выезд со склада\n{unit_name}\n"
+            + (f"Выехала в {info['out_hm']} (дедлайн {DEPART_DEADLINE_HM}).\n"
+               if info["out_hm"] else
+               f"Ещё не выехала, дедлайн {DEPART_DEADLINE_HM} прошёл.\n")
+            + f"Точек в маршруте на сегодня: {info['points']}. Весь день сдвигается.")
+    for cid in _unload_recipients():
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.warning("departure alert %s: %s", cid, e)
 
 
 async def _idle_alert(bot, unit_name, info):
@@ -652,6 +753,9 @@ async def run_check(db, bot=None, preview=False) -> list:
                         logger.warning("МС-запись №%s %s→%s не прошла (meta=%s)", order_no, cur, target, bool(meta))
                         if bot and st.get("write_fail_target") != target:
                             await _write_fail_alert(bot, name, order_no, s.get("client"), cur, target, bool(meta))
+                            _log_alert(db, "ms_write_fail", unit_id=uid, unit_name=name,
+                                       order_no=order_no, client=s.get("client"),
+                                       detail=f"{cur} → {target} не записан")
                             _st_upsert(db, order_no, write_fail_target=target,
                                        demand_id=info["demand_id"], unit_id=uid)
 
@@ -664,6 +768,11 @@ async def run_check(db, bot=None, preview=False) -> list:
                 if bot and not preview:
                     await _route_conflict_alert(bot, name, [d["s"] for d in route_conflicts],
                                                 lag_sec, now_ts, _logist_chat_ids())
+                    for d in route_conflicts:
+                        _log_alert(db, "route_conflict", unit_id=uid, unit_name=name,
+                                   order_no=d["order_no"], client=d["s"].get("client"),
+                                   detail=f"прогноз: не успеваем в окно, отставание "
+                                          f"~{int(lag_sec / 60)} мин")
                 if not preview:
                     for d in route_conflicts:
                         _st_upsert(db, d["order_no"], prognosis_alerted=True,
@@ -681,6 +790,9 @@ async def run_check(db, bot=None, preview=False) -> list:
                         if mgr:
                             recips.append(mgr)
                         await _window_passed_alert(bot, name, d["s"], now_ts, recips)
+                        _log_alert(db, "window_passed", unit_id=uid, unit_name=name,
+                                   order_no=d["order_no"], client=d["s"].get("client"),
+                                   detail="окно приёмки прошло, точка не сдана")
                 if not preview:
                     for d in fact_misses:
                         _st_upsert(db, d["order_no"], fact_alerted=True,
@@ -697,6 +809,9 @@ async def run_check(db, bot=None, preview=False) -> list:
                     for uf in unload_flips:
                         await _unload_driver_alert(bot, name, uf)
                         await _unload_control_alert(bot, name, uf, controllers)
+                        _log_alert(db, "unload_unconfirmed", unit_id=uid, unit_name=name,
+                                   order_no=uf["order_no"], client=uf["s"].get("client"),
+                                   detail=f"стоянка ~{uf['dwell_min']} мин, точка не закрыта")
                 if not preview:
                     for uf in unload_flips:
                         _st_upsert(db, uf["order_no"], unload_alerted=True,
@@ -709,6 +824,9 @@ async def run_check(db, bot=None, preview=False) -> list:
                 lines.append(f"{name}: долгая стоянка у клиента — точек: {len(long_dwell_flips)}")
                 if bot and not preview:
                     for lf in long_dwell_flips:
+                        _log_alert(db, "long_dwell", unit_id=uid, unit_name=name,
+                                   order_no=lf["order_no"], client=lf["s"].get("client"),
+                                   detail=f"стоит ~{lf['dwell_min']} мин у точки")
                         await _long_dwell_alert(bot, name, lf, _unload_recipients())
                 if not preview:
                     for lf in long_dwell_flips:
@@ -733,9 +851,26 @@ async def run_check(db, bot=None, preview=False) -> list:
                         await _lag_alert(bot, name, risk["lag_min"], behind, now_ts)
                         _st_upsert(db, lkey, delay_alerted=True,
                                    lag_min_alerted=risk["lag_min"], unit_id=uid)
+                        _log_alert(db, "lag", unit_id=uid, unit_name=name,
+                                   detail=f"отставание ~{risk['lag_min']} мин, "
+                                          f"точек позади плана {len(behind)}",
+                                   client="; ".join((b["s"].get("client") or "")[:30]
+                                                    for b in behind[:5]))
+
+            # ── Поздний выезд со склада (дедлайн DEPART_DEADLINE_HM) ──
+            dep = _check_departure(db, uid, name, pos, stops, left_base, now_ts, preview)
+            if dep:
+                lines.append(dep["line"])
+                if dep["fire"] and bot:
+                    await _departure_alert(bot, name, dep)
+                    db._execute("UPDATE unit_departure SET alerted=TRUE "
+                                "WHERE unit_id=%s AND snap_date=%s", (uid, dep["date"]))
+                    _log_alert(db, "late_departure", unit_id=uid, unit_name=name,
+                               detail=dep["line"])
 
             # ── Простой машины (стоит на месте ≥ IDLE_MIN, не база и не клиент) ──
-            idle = _check_idle(db, uid, name, pos, stops, now_ts, preview)
+            open_now = sum(1 for r in recs if r["cur"] in MANAGED)
+            idle = _check_idle(db, uid, name, pos, stops, now_ts, preview, has_open=bool(open_now))
             if idle:
                 lines.append(idle["line"])
                 if idle["fire"] and bot:
@@ -744,6 +879,8 @@ async def run_check(db, bot=None, preview=False) -> list:
                     else:
                         await _idle_alert(bot, name, idle)
                     _dwell_set(db, uid, idle["anchor"][0], idle["anchor"][1], idle["since"], True)
+                    _log_alert(db, "route_end" if idle["kind"] == "route_end" else "idle",
+                               unit_id=uid, unit_name=name, detail=idle["line"])
     return lines
 
 
