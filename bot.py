@@ -7654,6 +7654,22 @@ def main():
     app.job_queue.run_repeating(_fishki_sweep_wrapper, interval=7200, first=180)
 
     # ────────────────────────────────────────────────────────────────────
+    # Safety-net к алерту «позиция удалена при сборке» — каждые 15 мин.
+    # Ловит удаления, по которым webhook МС потерялся. Дедуп общий с
+    # webhook-путём (position_removed_notifications) → без задвоений.
+    # План: 2026-08-19-алерт-удалена-позиция-при-сборке.
+    # ────────────────────────────────────────────────────────────────────
+    from notifier import sweep_positions_removed as _sweep_positions_removed
+
+    async def _positions_removed_sweep_wrapper(context):
+        try:
+            await _sweep_positions_removed(app.bot, db)
+        except Exception as e:
+            logger.error(f"positions_removed_sweep job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_positions_removed_sweep_wrapper, interval=900, first=240)
+
+    # ────────────────────────────────────────────────────────────────────
     # Wazzup classifier — дневная сводка собственнику 17:00 МСК.
     # Счётчик за день + топ-5 срочных. Если 0 — «0 запросов, всё тихо».
     # ────────────────────────────────────────────────────────────────────
@@ -8615,6 +8631,20 @@ async def process_ms_webhook(data: dict, bot):
                     except Exception as ex_app:
                         logger.warning(f"delayed check_approval_needed({order_id}): {ex_app}")
                 asyncio.create_task(_delayed_approval())
+
+            # Позиция удалена из заказа, который уже собирается → в группу PRO.
+            # Задержка 45 сек: аудит МС пишется чуть позже webhook'а. Дедуп —
+            # position_removed_notifications (order_id + момент правки + позиция).
+            # План: 2026-08-19-алерт-удалена-позиция-при-сборке.md
+            if action == "UPDATE":
+                from notifier import check_positions_removed
+                async def _delayed_removed(href=order_href, oid=order_id):
+                    try:
+                        await asyncio.sleep(45)
+                        await check_positions_removed(href, bot, db)
+                    except Exception as ex_pr:
+                        logger.warning(f"delayed check_positions_removed({oid}): {ex_pr}")
+                asyncio.create_task(_delayed_removed())
 
             # Проверяем логистику — только при создании заказа
             if action == "CREATE":

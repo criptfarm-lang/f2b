@@ -443,6 +443,17 @@ class Database:
                 sent_at TIMESTAMP DEFAULT NOW(),
                 PRIMARY KEY (order_id, sum_hash)
             )""",
+            # Алерт «позиция удалена из заказа при сборке» → группа PRO.
+            # Одна строка = одно удаление (заказ + ключ события аудита МС).
+            # event_key = момент правки в аудите + имя позиции — повторный
+            # webhook по тому же заказу дубль не создаёт.
+            # План: 2026-08-19-алерт-удалена-позиция-при-сборке.md
+            """CREATE TABLE IF NOT EXISTS position_removed_notifications (
+                order_id TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                sent_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (order_id, event_key)
+            )""",
             """CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -1521,6 +1532,24 @@ class Database:
                 "INSERT INTO not_agreed_notifications (order_id, sum_hash) VALUES (%s, %s) "
                 "ON CONFLICT DO NOTHING RETURNING order_id",
                 (order_id, sum_hash)
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row is not None
+
+    def try_claim_position_removed(self, order_id: str, event_key: str) -> bool:
+        """Атомарный claim для алерта «позиция удалена из заказа при сборке».
+
+        Дедуп по (order_id, event_key), где event_key = момент правки в аудите
+        МС + имя позиции. True — вставили этой транзакцией, мы первые → шлём.
+        False — уже слали (повторный webhook / safety-net cron) → молчим.
+        """
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO position_removed_notifications (order_id, event_key) "
+                "VALUES (%s, %s) ON CONFLICT DO NOTHING RETURNING order_id",
+                (order_id, event_key)
             )
             row = cur.fetchone()
             self.conn.commit()

@@ -733,6 +733,279 @@ async def check_bulk_production_order(order_href: str, bot, db):
         logger.error(f"notifier.check_bulk_production_order: {e}", exc_info=True)
 
 
+# ─── Алерт «позиция удалена из заказа при сборке» → группа PRO ──────────────
+# План: plans/2026-08-19-алерт-удалена-позиция-при-сборке.md
+# Кладовщик не нашёл товар при сборке и удалил позицию — менеджер об этом не
+# знает, а клиенту обещано. Ловим через пер-документный аудит МС (общий /audit
+# отдаёт 403, а /entity/customerorder/{id}/audit под токеном «Эф» — 200).
+# Статусы, при которых удаление считается «удалением при сборке» (согласовано
+# 19.08.2026): всё, начиная со «Собирается». Удаления на «Согласован» и раньше —
+# нормальная работа менеджера, молчим.
+PICKING_STATE_IDS = {
+    "267fdfbc-a2a7-11f0-0a80-0f640047fcaa",  # Собирается
+    "70999fb0-a2b6-11f0-0a80-1c830049f367",  # Собран без охл
+    "005f376a-9a9a-11f0-0a80-03a900027475",  # Собран
+    "6edbfa00-dfdb-11f0-0a80-104e0008a4d4",  # Документы готовы
+    "005f383a-9a9a-11f0-0a80-03a900027476",  # Отгружен
+}
+# Сколько минут назад произошедшие правки ещё считаем «свежими». Окно широкое
+# (аудит МС пишется с задержкой, вебхуки теряются) — от повторов защищает
+# атомарный claim position_removed_notifications.
+POSITION_REMOVED_WINDOW_MIN = 30
+
+# Кеш uid сотрудника МС → ФИО (uid в аудите, ФИО в /entity/employee).
+_employee_names_cache: dict = {}
+_employee_names_ts: float = 0.0
+
+
+async def _employee_name_by_uid(uid: str, headers: dict) -> str:
+    """ФИО сотрудника МС по uid из аудита (`yulia@vicpure` → «Руднева Е.»).
+
+    Кеш на час. При недоступности справочника возвращает сам uid — сигнал
+    важнее красоты подписи.
+    """
+    global _employee_names_cache, _employee_names_ts
+    import time
+    import aiohttp
+    if not uid:
+        return "—"
+    now = time.time()
+    if not _employee_names_cache or now - _employee_names_ts > 3600:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{MS_BASE}/entity/employee",
+                    headers=headers,
+                    params={"limit": 100},
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        _employee_names_cache = {
+                            row.get("uid"): row.get("name")
+                            for row in data.get("rows", []) if row.get("uid")
+                        }
+                        _employee_names_ts = now
+        except Exception as e:
+            logger.warning(f"_employee_name_by_uid({uid}): {e}")
+    return _employee_names_cache.get(uid) or uid
+
+
+def _parse_ms_moment(raw: str):
+    """«2026-08-19 09:47:41.631» → datetime (наивный, время аккаунта = МСК)."""
+    from datetime import datetime
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+async def check_positions_removed(order_href: str, bot, db):
+    """Удалили позицию из заказа, который уже собирается → сообщение в PRO.
+
+    Триггер — только ПОЛНОЕ удаление позиции (в diff аудита элемент с oldValue
+    и без newValue). Обнуление резерва и уменьшение количества (недовес) —
+    ежедневная норма сборки, не алертим (решение собственника 19.08.2026).
+
+    Статус берём на момент правки: если в том же audit-событии менялся state,
+    смотрим его oldValue, иначе текущий статус заказа.
+
+    Дедуп — атомарный claim по (order_id, момент правки + имя позиции).
+    """
+    try:
+        from moysklad import get_headers
+        from datetime import datetime, timedelta
+        import aiohttp
+
+        headers = get_headers()
+        order_id = order_href.split("?")[0].rstrip("/").split("/")[-1]
+
+        order = await _load_order(order_href.split("?")[0], headers)
+        if not order:
+            return
+        order_name = order.get("name", order_id)
+        agent_name = (order.get("agent") or {}).get("name", "—")
+        manager_name = (order.get("owner") or {}).get("name", "—")
+        cur_state = (order.get("state") or {})
+        cur_state_id = cur_state.get("meta", {}).get("href", "").split("/")[-1]
+        cur_state_name = cur_state.get("name", "")
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder/{order_id}/audit",
+                headers=headers,
+                params={"limit": 20},
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    logger.warning(
+                        f"check_positions_removed({order_name}): audit {r.status}: {body[:200]}"
+                    )
+                    return
+                audit = await r.json()
+
+        border = datetime.now() - timedelta(minutes=POSITION_REMOVED_WINDOW_MIN)
+
+        for ev in audit.get("rows", []) or []:
+            moment_raw = ev.get("moment", "")
+            moment = _parse_ms_moment(moment_raw)
+            if not moment or moment < border:
+                continue
+            diff = ev.get("diff") or {}
+            positions_diff = diff.get("positions")
+            if not isinstance(positions_diff, list):
+                continue
+
+            # Статус на момент правки: если state менялся этим же событием —
+            # берём, что было ДО (кладовщик часто удаляет позицию и сразу
+            # двигает статус одним сохранением).
+            state_diff = diff.get("state") or {}
+            old_state = (state_diff.get("oldValue") or {})
+            state_id_at_edit = old_state.get("meta", {}).get("href", "").split("/")[-1] or cur_state_id
+            state_name_at_edit = old_state.get("name") or cur_state_name
+            if state_id_at_edit not in PICKING_STATE_IDS:
+                continue
+
+            for item in positions_diff:
+                if not isinstance(item, dict):
+                    continue
+                # Удаление = есть oldValue, нет newValue. Изменение количества/
+                # резерва даёт обе половины — такие пропускаем.
+                if "newValue" in item:
+                    continue
+                old = item.get("oldValue") or {}
+                if not old:
+                    continue
+                pos_name = (old.get("assortment") or {}).get("name") or "—"
+                qty = old.get("quantity") or 0
+                uom = old.get("uom") or ""
+
+                event_key = f"{moment_raw}|{pos_name}"
+                if not db.try_claim_position_removed(order_id, event_key):
+                    continue
+
+                who = await _employee_name_by_uid(ev.get("uid", ""), headers)
+                await _send_position_removed_alert(
+                    bot,
+                    order_id=order_id,
+                    order_name=order_name,
+                    agent_name=agent_name,
+                    manager_name=manager_name,
+                    state_name=state_name_at_edit,
+                    pos_name=pos_name,
+                    qty=qty,
+                    uom=uom,
+                    who=who,
+                    moment=moment,
+                )
+    except Exception as e:
+        logger.error(f"check_positions_removed: {e}", exc_info=True)
+
+
+# Группа продажников «F2B PRO» — сверено с Telegram getChat 19.08.2026.
+PRO_GROUP_CHAT_ID = -4824850517
+
+
+def _pro_chat_id() -> int:
+    """Куда шлём алерт: PRO_CHAT_ID (env) → GROUP_CHAT_ID (env) → константа PRO."""
+    raw = os.getenv("PRO_CHAT_ID", "").strip() or os.getenv("GROUP_CHAT_ID", "").strip()
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    return PRO_GROUP_CHAT_ID
+
+
+async def _send_position_removed_alert(
+    bot, *, order_id: str, order_name: str, agent_name: str, manager_name: str,
+    state_name: str, pos_name: str, qty: float, uom: str,
+    who: str, moment,
+):
+    """Сообщение в группу PRO. Только HTML с экранированием — имена товаров и
+    контрагентов из МС содержат `***`, на Markdown Telegram отвечает 400
+    (см. память feedback_bot_no_markdown_on_ms_names)."""
+    import html as _html
+
+    chat_id = _pro_chat_id()
+    if not chat_id:
+        logger.error("position_removed: некому слать (нет PRO_CHAT_ID/GROUP_CHAT_ID)")
+        return
+
+    def h(v) -> str:
+        return _html.escape(str(v), quote=False)
+
+    qty_str = f"{qty:,.3f}".rstrip("0").rstrip(".").replace(",", " ").replace(".", ",")
+    url = f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}"
+    text = (
+        f"❗️ Позиция удалена из заказа при сборке\n\n"
+        f"📦 Заказ <a href=\"{url}\">{h(order_name)}</a> · {h(state_name)}\n"
+        f"🏢 {h(agent_name)}\n"
+        f"👔 Менеджер: {h(manager_name)}\n\n"
+        f"❌ {h(pos_name)}\n"
+        f"➖ {qty_str} {h(uom)}\n\n"
+        f"🧍 Удалил: {h(who)} в {moment.strftime('%H:%M')}\n"
+        f"Проверьте: заменить, перенести или предупредить клиента."
+    )
+    try:
+        await bot.send_message(
+            chat_id=chat_id, text=text, parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        logger.info(f"position_removed: заказ {order_name} — «{pos_name}» {qty_str} {uom} → PRO")
+    except Exception as e:
+        logger.error(f"position_removed: отправка упала для {order_name}: {e}", exc_info=True)
+
+
+async def sweep_positions_removed(bot, db):
+    """Safety-net к webhook-пути: раз в 15 мин прогоняет свежие заказы.
+
+    Вебхуки МС теряются окнами по 30+ минут (память reference_f2b_ms_webhook_loss_known),
+    поэтому недостаточно одного webhook-триггера. Берём заказы, обновлённые за
+    последние 25 минут и стоящие в сборочных статусах, и прогоняем через ту же
+    проверку. Повторы гасит атомарный claim position_removed_notifications.
+    """
+    try:
+        from moysklad import get_headers
+        from datetime import datetime, timedelta
+        import aiohttp
+
+        headers = get_headers()
+        since = (datetime.now() - timedelta(minutes=25)).strftime("%Y-%m-%d %H:%M:%S")
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder",
+                headers=headers,
+                params={
+                    "filter": f"updated>={since}",
+                    "expand": "state",
+                    "limit": 100,
+                    "order": "updated,desc",
+                },
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    logger.warning(f"sweep_positions_removed: список {r.status}: {body[:200]}")
+                    return
+                data = await r.json()
+
+        rows = data.get("rows", []) or []
+        checked = 0
+        for order in rows:
+            state_id = (order.get("state") or {}).get("meta", {}).get("href", "").split("/")[-1]
+            if state_id not in PICKING_STATE_IDS:
+                continue
+            href = (order.get("meta") or {}).get("href", "")
+            if not href:
+                continue
+            await check_positions_removed(href, bot, db)
+            checked += 1
+        logger.info(f"sweep_positions_removed: заказов в окне {len(rows)}, проверено {checked}")
+    except Exception as e:
+        logger.error(f"sweep_positions_removed: {e}", exc_info=True)
+
+
 async def check_order_not_agreed(order_href: str, bot, db):
     """При переводе заказа в статус «НЕ СОГЛАСОВАН» — пинг ответственному менеджеру.
 
