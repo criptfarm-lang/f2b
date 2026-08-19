@@ -1805,6 +1805,41 @@ async def _candidate_orders_for_agent(agent_href: str, headers: dict) -> list:
     return out
 
 
+# Типы позиций, которые вообще могут держать резерв. Отгрузки, где только
+# услуги (авиаперевозка, терминальная обработка, ветконтроль — коды 800xx),
+# резерв не трогают и заказом не оформляются: по ним молчим (собственник,
+# 19.08.2026, после первых двух алертов по 03287/03288 ГК Фугу).
+GOODS_ASSORTMENT_TYPES = {"product", "variant", "bundle", "consignment"}
+
+
+async def _demand_has_goods(demand_id: str, headers: dict) -> bool:
+    """Есть ли в отгрузке хоть одна товарная позиция (не только услуги).
+
+    При недоступности позиций возвращает True — лучше лишний алерт, чем
+    пропущенная отгрузка мимо заказа.
+    """
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/demand/{demand_id}/positions",
+                headers=headers,
+                params={"expand": "assortment", "limit": 100},
+            ) as r:
+                if r.status != 200:
+                    logger.warning(f"_demand_has_goods({demand_id}): {r.status}")
+                    return True
+                data = await r.json()
+    except Exception as e:
+        logger.warning(f"_demand_has_goods({demand_id}): {e}")
+        return True
+    for pos in data.get("rows", []) or []:
+        a_type = ((pos.get("assortment") or {}).get("meta") or {}).get("type", "")
+        if a_type in GOODS_ASSORTMENT_TYPES:
+            return True
+    return False
+
+
 async def _send_demand_no_order_alert(bot, *, demand_id: str, demand_name: str,
                                       agent_name: str, owner_name: str,
                                       store_name: str, total: float,
@@ -1890,6 +1925,10 @@ async def sweep_demands_without_order(bot, db):
                 continue
             demand_id = d.get("id") or ""
             if not demand_id:
+                continue
+            # Только услуги (логистика ГК Фугу и т.п.) — резерва не держат, молчим.
+            if not await _demand_has_goods(demand_id, headers):
+                logger.info(f"demand_no_order: {d.get('name')} — только услуги, пропуск")
                 continue
             if not db.try_claim_demand_no_order(demand_id):
                 continue
