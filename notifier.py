@@ -790,6 +790,19 @@ async def _employee_name_by_uid(uid: str, headers: dict) -> str:
     return _employee_names_cache.get(uid) or uid
 
 
+def _now_msk_naive():
+    """Сейчас по МСК, наивный datetime — в одной шкале с `moment` из аудита МС.
+
+    ВАЖНО: контейнер на Amvera живёт в UTC, а МойСклад отдаёт время аккаунта
+    (МСК) без таймзоны. Голый datetime.now() внутри контейнера даёт сдвиг на
+    3 часа, и окно «последние 30 минут» превращается в «последние 3,5 часа»
+    (поймано на проде 19.08.2026: утренние удаления 07:49–08:46 улетели в PRO
+    в 10:25).
+    """
+    from datetime import datetime, timezone, timedelta
+    return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3))).replace(tzinfo=None)
+
+
 def _parse_ms_moment(raw: str):
     """«2026-08-19 09:47:41.631» → datetime (наивный, время аккаунта = МСК)."""
     from datetime import datetime
@@ -847,7 +860,7 @@ async def check_positions_removed(order_href: str, bot, db):
                     return
                 audit = await r.json()
 
-        border = datetime.now() - timedelta(minutes=POSITION_REMOVED_WINDOW_MIN)
+        border = _now_msk_naive() - timedelta(minutes=POSITION_REMOVED_WINDOW_MIN)
 
         for ev in audit.get("rows", []) or []:
             moment_raw = ev.get("moment", "")
@@ -971,7 +984,7 @@ async def sweep_positions_removed(bot, db):
         import aiohttp
 
         headers = get_headers()
-        since = (datetime.now() - timedelta(minutes=25)).strftime("%Y-%m-%d %H:%M:%S")
+        since = (_now_msk_naive() - timedelta(minutes=25)).strftime("%Y-%m-%d %H:%M:%S")
 
         async with aiohttp.ClientSession() as session:
             async with session.get(
