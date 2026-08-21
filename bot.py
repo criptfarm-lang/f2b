@@ -7336,6 +7336,37 @@ def main():
 
     app.add_handler(CallbackQueryHandler(handle_dashamail_callback, pattern="^dashamail:"))
 
+    # ─── Патруль камер: выбор пункта для публикации ──────────────────────────
+    async def handle_patrol_callback(update, context):
+        """Кнопка «Публикуем N» под кадром патруля.
+
+        Бот только записывает выбор: кадр, отрисовку и публикацию в САНКОНТРОЛЬ
+        делает f2b-production (модуль cctv_patrol), он же следит за таблицей.
+        """
+        q = update.callback_query
+        if not q.from_user or q.from_user.id != OWNER_CHAT_ID:
+            await q.answer("⛔ Только для руководителя.", show_alert=True)
+            return
+        try:
+            _, pid_str, choice_str = q.data.split(":", 2)
+            pid, choice = int(pid_str), int(choice_str)
+        except Exception:
+            await q.answer("Не разобрал кнопку")
+            return
+        try:
+            db._execute(
+                "UPDATE production.cctv_patrol SET chosen = %s, chosen_at = now() "
+                "WHERE id = %s AND chosen IS NULL",
+                (choice, pid),
+            )
+        except Exception as exc:
+            logger.exception("патруль: не записал выбор")
+            await q.answer(f"Не записал выбор: {exc}", show_alert=True)
+            return
+        await q.answer("Ничего не публикуем" if choice == 0 else f"Публикую пункт {choice}")
+
+    app.add_handler(CallbackQueryHandler(handle_patrol_callback, pattern=r"^patrol:\d+:\d+$"))
+
     # ─── Алармы amoCRM ───────────────────────────────────────────────────────
     app.add_handler(CommandHandler("myamoid", lambda u, c: cmd_myamoid(u, c, db)))
     app.add_handler(CommandHandler("amo_setup", cmd_amo_setup))
