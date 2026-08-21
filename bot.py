@@ -7767,10 +7767,13 @@ def main():
 
     # 17:00 МСК = 14:00 UTC
     from datetime import time as _dt_time, timezone as _tz_for_job
-    app.job_queue.run_daily(
-        _wazzup_daily_summary,
-        time=_dt_time(hour=14, minute=0, tzinfo=_tz_for_job.utc),
-    )
+    # ОТКЛЮЧЕНО 2026-08-21 по просьбе собственника: дневная сводка Wazzup
+    # оказалась шумом (список запросов без действия). Сам классификатор и
+    # алерты закупщикам/менеджерам продолжают работать.
+    # app.job_queue.run_daily(
+    #     _wazzup_daily_summary,
+    #     time=_dt_time(hour=14, minute=0, tzinfo=_tz_for_job.utc),
+    # )
 
     # Анализ переписок — ежедневный дайджест проблемных сигналов Виктору.
     # 08:00 МСК = 05:00 UTC. План: 2026-04-29-анализ-переписок-фундамент.
