@@ -48,8 +48,10 @@ _MSK = timezone(timedelta(hours=3))
 BASE_LAT, BASE_LON = 55.6323, 38.1038
 
 # Точки ночёвки/гаражи водителей: простой здесь = не проблема, а «конец маршрута».
-# 26209 (В 970 СВ 797, Мага) → гараж Химки. 26210 (К 459 ХК) ночует на базе (см. _near_base).
-HOME_POINTS = {26209: (55.9033, 37.4062)}
+# 26209 (В 970 СВ 797, КИА) — гараж Химки и Люберцы, ул С.П.Попова 44/46 (с августа машина
+# ночует там; координата усреднена по трекам 11–18.08.2026, решение совещания 24.08).
+# 26210 (К 459 ХК) ночует на базе (см. _near_base). У машины может быть несколько мест.
+HOME_POINTS = {26209: [(55.9033, 37.4062), (55.69755, 37.90371)]}
 R_HOME_M = 300
 R_BASE_M = 500       # «В пути» — удаление транспорта на 500 м от склада (спека собственника)
 R_STOP_M = 300       # радиус «прибыл на точку»
@@ -235,8 +237,8 @@ def _near_base(lat, lon) -> bool:
 
 
 def _near_home(uid, lat, lon) -> bool:
-    h = HOME_POINTS.get(uid)
-    return bool(h) and _haversine(lat, lon, h[0], h[1]) <= R_HOME_M
+    return any(_haversine(lat, lon, hlat, hlon) <= R_HOME_M
+               for hlat, hlon in HOME_POINTS.get(uid) or [])
 
 
 def _near_any_client(lat, lon, stops) -> bool:
