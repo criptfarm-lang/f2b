@@ -454,6 +454,19 @@ class Database:
                 sent_at TIMESTAMP DEFAULT NOW(),
                 PRIMARY KEY (order_id, event_key)
             )""",
+            # Алерт «заказ сформирован с нарушением логистики» → группа.
+            # Две проверки в одной таблице: маршрутный день города (issue_kind
+            # 'day') и протухшая граница «Окна доставки» (issue_kind 'window').
+            # fingerprint = дата отгрузки + данные проверки: правка данных
+            # снимает дедуп (новый алерт), повторные webhook UPDATE молчат.
+            # План: 2026-08-25-логистика-валидация-формирования-заказов.md
+            """CREATE TABLE IF NOT EXISTS logistics_validity_notifications (
+                order_id TEXT NOT NULL,
+                issue_kind TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                sent_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (order_id, issue_kind, fingerprint)
+            )""",
             # Алерт «отгрузка создана не на основании заказа» → группа «Склад».
             # Одна строка = одна отгрузка. Резерв в МС снимается только при
             # отгрузке из заказа, отдельный документ оставляет мёртвый резерв.
@@ -1575,6 +1588,29 @@ class Database:
                 "INSERT INTO demand_no_order_notifications (demand_id) "
                 "VALUES (%s) ON CONFLICT DO NOTHING RETURNING demand_id",
                 (demand_id,)
+            )
+            row = cur.fetchone()
+            self.conn.commit()
+            return row is not None
+
+    def try_claim_logistics_validity(self, order_id: str, issue_kind: str,
+                                     fingerprint: str) -> bool:
+        """Атомарный claim для алерта «заказ сформирован с нарушением логистики».
+
+        issue_kind: 'day' (город vs маршрутный день) | 'window' (протухшая
+        граница окна доставки). fingerprint — дата отгрузки + проверяемые данные:
+        менеджер поправил заказ → новый fingerprint → алерт может прийти снова;
+        повторные webhook UPDATE по тем же данным молчат.
+
+        True — вставили этой транзакцией, мы первые → шлём. False — уже слали.
+        """
+        self._ensure_connection()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO logistics_validity_notifications "
+                "(order_id, issue_kind, fingerprint) "
+                "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING RETURNING order_id",
+                (order_id, issue_kind, fingerprint)
             )
             row = cur.fetchone()
             self.conn.commit()

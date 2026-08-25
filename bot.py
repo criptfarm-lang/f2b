@@ -8696,9 +8696,17 @@ async def process_ms_webhook(data: dict, bot):
                         logger.warning(f"delayed check_positions_removed({oid}): {ex_pr}")
                 asyncio.create_task(_delayed_removed())
 
-            # Проверяем логистику — только при создании заказа
-            if action == "CREATE":
-                await check_logistics_alert(order_href, bot, group_chat_id)
+            # Проверяем логистику — при создании И при правках заказа.
+            # CREATE-only не работал: при создании адрес и дата отгрузки обычно
+            # ещё пустые, менеджер заполняет их следующим сохранением.
+            # Дедуп внутри (logistics_validity_notifications) гасит повторы.
+            if action in ("CREATE", "UPDATE"):
+                async def _logi_check(href=order_href):
+                    try:
+                        await check_order_logistics_validity(href, bot, group_chat_id)
+                    except Exception as ex_lg:
+                        logger.warning(f"check_order_logistics_validity({order_id}): {ex_lg}")
+                asyncio.create_task(_logi_check())
 
             # Реактивная автоподстановка «Даты планируемой оплаты» — сразу
             # после сохранения заказа (16.06.2026). Cron в JobQueue остаётся
@@ -9065,8 +9073,29 @@ async def cmd_payment_planned_history(update: Update, context: ContextTypes.DEFA
         )
     await update.message.reply_text("\n".join(lines))
 
-async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
-    """Проверяет адрес доставки заказа на соответствие расписанию логистики."""
+async def check_order_logistics_validity(order_href: str, bot, group_chat_id: int):
+    """Проверяет заказ при сохранении на две ошибки формирования логистики.
+
+    (1) Маршрутный день — город адреса доставки vs день недели даты отгрузки
+        (Истра/Красногорск/Звенигород едут по понедельникам и т.д., справочник
+        DELIVERY_SCHEDULE_RAW в moysklad.py).
+    (2) Протухшая граница «Окна доставки с/до (время)» — дата в поле не равна
+        дате отгрузки, значит значение осталось от прошлого заказа клиента
+        (кейс 03729: окно «с» 14.07 при отгрузке 25.08). Мост логистики такую
+        границу игнорирует и разворачивает окно на весь день — узкий слот
+        приёмки теряется и у логиста, и у водителя. Править поле в МойСкладе
+        агенту нельзя (МС read-only), поэтому лечим пингом менеджеру.
+
+    Висит на CREATE и UPDATE. Раньше проверка дня стояла только на CREATE, а
+    при создании заказа адрес и дата отгрузки, как правило, ещё пустые —
+    менеджер заполняет их следующим сохранением, и проверка молча выходила.
+
+    Дедуп — logistics_validity_notifications, ключ (заказ, вид проверки,
+    отпечаток данных): повторные UPDATE по тем же данным молчат, а правка
+    даты/адреса/окна меняет отпечаток — при новой ошибке алерт придёт снова.
+
+    План: 2026-08-25-логистика-валидация-формирования-заказов.md
+    """
     try:
         from moysklad import check_delivery_schedule, get_headers, MS_BASE
         import aiohttp
@@ -9081,11 +9110,10 @@ async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
         address = order.get("shipmentAddress", "")
         delivery_date = order.get("deliveryPlannedMoment", "")
         order_name = order.get("name", "")
+        order_id = order.get("id", "")
 
-        logger.info(f"check_logistics_alert: заказ={order_name} address='{address}' delivery_date='{delivery_date}'")
-
-        if not address or not delivery_date:
-            logger.info(f"check_logistics_alert: заказ {order_name} — нет адреса или даты, пропускаем (address={bool(address)}, date={bool(delivery_date)})")
+        if not delivery_date:
+            logger.info(f"logistics_validity: заказ {order_name} — нет даты отгрузки, пропускаем")
             return
 
         # Не алертим старые заказы (старше 3 дней)
@@ -9095,16 +9123,101 @@ async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
             if delivery_dt.tzinfo is None:
                 delivery_dt = delivery_dt.replace(tzinfo=timezone.utc)
             if delivery_dt < datetime.now(timezone.utc) - timedelta(days=3):
-                logger.info(f"check_logistics_alert: заказ {order_name} слишком старый ({delivery_date}), пропускаем")
+                logger.info(f"logistics_validity: заказ {order_name} старый ({delivery_date}), пропускаем")
                 return
         except Exception:
             pass
 
-        result = await check_delivery_schedule(address, delivery_date)
-        if result.get("ok"):
+        deliv_day = delivery_date[:10]
+        MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
+
+        def _fmt_day(iso_day: str) -> str:
+            from datetime import date as _date
+            try:
+                d = _date.fromisoformat(iso_day)
+                return f"{d.day} {MONTHS[d.month-1]}"
+            except Exception:
+                return iso_day
+
+        blocks = []          # тексты блоков алерта
+        claims = []          # (issue_kind, fingerprint) — клеймим только если есть что слать
+
+        # --- Проверка 1: маршрутный день города ---
+        if address:
+            day_res = await check_delivery_schedule(address, delivery_date)
+            if not day_res.get("ok"):
+                city = day_res["city"].capitalize()
+                weekday = day_res["weekday"]
+                # «по понедельникам» вместо склонения названия города: падежи
+                # городов из справочника не нагибаем, дни — фиксированный набор.
+                WEEKDAY_PLURAL = {
+                    "понедельник": "понедельникам",
+                    "вторник": "вторникам",
+                    "среда": "средам",
+                    "четверг": "четвергам",
+                    "пятница": "пятницам",
+                    "суббота": "субботам",
+                    "воскресенье": "воскресеньям",
+                }
+                allowed_pl = ", ".join(WEEKDAY_PLURAL.get(d.lower(), d)
+                                       for d in day_res["allowed_days"])
+                allowed_txt = (f"возим по {allowed_pl}" if allowed_pl
+                               else "маршрутный день не задан")
+                blocks.append(
+                    f"📅 Отгрузка: *{_fmt_day(day_res['date'])}, {weekday}*\n"
+                    f"❌ {city} — {allowed_txt}"
+                )
+                claims.append(("day", f"{deliv_day}|{address.strip().lower()}"))
+
+        # --- Проверка 2: границы окна доставки на чужую дату ---
+        # Значения атрибутов МС — строки вида «2026-07-14 08:01:00.000».
+        win_raw = {}
+        for a in order.get("attributes", []) or []:
+            nm = a.get("name")
+            if nm == "Окно доставки с (время)":
+                win_raw["с"] = (a.get("value") or "")
+            elif nm == "Окно доставки до (время)":
+                win_raw["до"] = (a.get("value") or "")
+
+        stale = []
+        for label in ("с", "до"):
+            val = (win_raw.get(label) or "").strip()
+            if not val:
+                continue
+            if val[:10] != deliv_day:
+                stale.append((label, val))
+
+        if stale:
+            lines = [f"⏰ *Окно доставки стоит на другую дату*"]
+            # Показываем только ДАТУ границы: время в атрибутах МС приходит из
+            # API в своей таймзоне и может расходиться с тем, что менеджер видит
+            # в вебе на час — суть алерта в дате, её и печатаем.
+            for label, val in stale:
+                lines.append(f"«{label}»: {_fmt_day(val[:10])}")
+            lines.append(f"Отгрузка: *{_fmt_day(deliv_day)}*")
+            lines.append("Поле осталось от прошлого заказа. Логистика такую границу "
+                         "не берёт — окно разворачивается на весь день, слот приёмки теряется.")
+            blocks.append("\n".join(lines))
+            claims.append(("window", f"{deliv_day}|{win_raw.get('с','')}|{win_raw.get('до','')}"))
+
+        if not blocks:
             return
 
-        # Получаем имя клиента и менеджера
+        # Клеймим — шлём, только если хотя бы один вид проверки ещё не отправлялся
+        fresh = []
+        for kind, fp in claims:
+            try:
+                if db.try_claim_logistics_validity(order_id, kind, fp):
+                    fresh.append(kind)
+            except Exception as ex_db:
+                logger.warning(f"logistics_validity claim({order_name}, {kind}): {ex_db}")
+                fresh.append(kind)   # БД недоступна — лучше продублировать, чем промолчать
+        if not fresh:
+            logger.info(f"logistics_validity: заказ {order_name} — уже алертили, молчим")
+            return
+        blocks = [b for (kind, _), b in zip(claims, blocks) if kind in fresh]
+
+        # Имя клиента и менеджера — только когда алерт реально уходит
         agent_href = order.get("agent", {}).get("meta", {}).get("href", "")
         owner_href = order.get("owner", {}).get("meta", {}).get("href", "")
         client_name = ""
@@ -9123,48 +9236,23 @@ async def check_logistics_alert(order_href: str, bot, group_chat_id: int):
                         d = await r.json()
                         manager_name = d.get("name", "")
 
-        city = result["city"].capitalize()
-        weekday = result["weekday"]  # строка: "среда", "пятница" и т.д.
-        allowed = ", ".join(result["allowed_days"]) or "не запланирован"
-
-        # Винительный падеж для "не едем в ..."
-        WEEKDAY_ACCUSATIVE = {
-            "понедельник": "понедельник",
-            "вторник": "вторник",
-            "среда": "среду",
-            "четверг": "четверг",
-            "пятница": "пятницу",
-            "суббота": "субботу",
-            "воскресенье": "воскресенье",
-        }
-        weekday_acc = WEEKDAY_ACCUSATIVE.get(weekday.lower(), weekday)
-        from datetime import date
-        MONTHS = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-        try:
-            d = date.fromisoformat(result["date"])
-            date_str = f"{d.day} {MONTHS[d.month-1]}"
-        except Exception:
-            date_str = result["date"]
-
-        text = (
+        head = (
             f"🚛 *Несоответствие логистики*\n\n"
             f"👤 {client_name} | Заказ №{order_name}\n"
             f"👔 Менеджер: {manager_name}\n"
-            f"📍 Адрес: {address}\n\n"
-            f"📅 Дата отгрузки: *{date_str} ({weekday})*\n"
-            f"❌ В {city} мы не едем в {weekday_acc}\n"
-            f"✅ {city} доступен: *{allowed}*"
+            f"📍 Адрес: {address or '—'}"
         )
+        text = head + "\n\n" + "\n\n".join(blocks)
 
         await bot.send_message(
             chat_id=group_chat_id,
             text=text,
             parse_mode="Markdown"
         )
-        logger.info(f"Логистика алерт: заказ {order_name}, {city}, {weekday}")
+        logger.info(f"Логистика алерт: заказ {order_name}, виды: {', '.join(fresh)}")
 
     except Exception as e:
-        logger.error(f"check_logistics_alert: {e}", exc_info=True)
+        logger.error(f"check_order_logistics_validity: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
