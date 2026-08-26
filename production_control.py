@@ -213,8 +213,9 @@ _NUM_RE = re.compile(r"^[+-]?\d{1,3}(?:[.,]\d{1,2})?$")
 # стоит после пробела или в начале: «-12» — знак, «тушка- 6» и «00620- 12» — дефис
 # как разделитель, а не минус. Ошибка стоила бы инверсии значений: 26.08 «Лосось
 # тушка- 6» разбиралось как −6.
+_UNIT = r"(?:°\s*[cCсС]?|[cCсС]\b|градус\w*|град\w*|гр\b)"
 _TAIL_NUM_RE = re.compile(
-    r"(?:(?<=\s)|^)([-+−])?(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:°\s*[cCсС]?|[cCсС])?\s*$"
+    r"(?:(?<=\s)|^)([-+−])?(\d{1,3}(?:[.,]\d{1,2})?)\s*" + _UNIT + r"?\s*[.!]?\s*$"
 )
 # Номер партии МойСклад: 5 цифр (00615, 00618, 00620).
 _BATCH_RE = re.compile(r"\b(\d{5})\b")
@@ -236,6 +237,7 @@ def sign_answer(text: str):
 
 def _to_float(token: str):
     token = (token or "").strip().replace(",", ".").replace("−", "-")
+    token = re.sub(_UNIT + r"\s*[.!]?\s*$", "", token, flags=re.IGNORECASE).strip()
     token = token.rstrip("°cCсС ").strip()
     if not _NUM_RE.match(token):
         return None
@@ -299,6 +301,9 @@ def parse_lines(text: str, window: dict):
     # Карточка: 2–3 строки, последняя — голое число, ни одна не содержит «/».
     if 2 <= len(lines) <= 3 and not any("/" in l for l in lines):
         tail = _to_float(lines[-1])
+        if tail is None:
+            m_tail = _TAIL_NUM_RE.search(lines[-1])
+            tail = _to_float((m_tail.group(1) or "") + m_tail.group(2)) if m_tail else None
         if tail is not None and T_MIN <= tail <= T_MAX:
             batch = None
             descr_parts = []
@@ -469,6 +474,10 @@ def _make_reply_handler(db):
             return
         text = (msg.text or msg.caption or "").strip()
         if not text:
+            # Фото без подписи: машина его не разберёт, подсказываем сразу —
+            # 26.08 технолог прислала «Фото с верху!», и цифру пришлось диктовать.
+            if msg.photo and _active_window(db, msg):
+                await msg.reply_text("Фото я не разберу. Напишите числом: партия / сырьё / температура.")
             return
         ensure_tables(db)
 
