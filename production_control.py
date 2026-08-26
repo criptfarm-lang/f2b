@@ -173,6 +173,27 @@ def ensure_tables(db):
             f"ALTER TABLE quality.temp_readings ADD COLUMN IF NOT EXISTS {col} {ddl}"
         )
     db._execute(
+        """
+        CREATE TABLE IF NOT EXISTS quality.chat_log (
+            chat_id        BIGINT      NOT NULL,
+            message_id     BIGINT      NOT NULL,
+            sent_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            author_tg_id   BIGINT,
+            author_name    TEXT,
+            is_bot         BOOLEAN     NOT NULL DEFAULT FALSE,
+            text           TEXT,
+            reply_to       BIGINT,
+            window_id      BIGINT,
+            window_key     TEXT,
+            parsed_count   INT         NOT NULL DEFAULT 0,
+            PRIMARY KEY (chat_id, message_id)
+        )
+        """
+    )
+    db._execute(
+        "CREATE INDEX IF NOT EXISTS chat_log_sent_at_idx ON quality.chat_log (sent_at DESC)"
+    )
+    db._execute(
         "CREATE INDEX IF NOT EXISTS temp_readings_measured_at_idx "
         "ON quality.temp_readings (measured_at DESC)"
     )
@@ -447,7 +468,7 @@ def _make_reply_handler(db):
         if not msg or msg.chat_id != chat_id():
             return
         text = (msg.text or msg.caption or "").strip()
-        if not text or text.startswith("/"):
+        if not text:
             return
         ensure_tables(db)
 
@@ -456,6 +477,29 @@ def _make_reply_handler(db):
             x for x in [getattr(author, "first_name", None), getattr(author, "last_name", None)] if x
         ) or getattr(author, "username", None) or str(getattr(author, "id", ""))
         author_id = getattr(author, "id", None)
+
+        # Сырой лог. Пишем ДО всякого разбора и независимо от того, распознали мы
+        # что-нибудь или нет: пока технолог не привыкла к формату, правда живёт в
+        # переписке — в поправках собственника, уточнениях и переспросах. Парсер
+        # берёт что может, остальное восстанавливается по этому логу.
+        try:
+            db._execute(
+                """
+                INSERT INTO quality.chat_log
+                    (chat_id, message_id, author_tg_id, author_name, is_bot, text, reply_to)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (chat_id, message_id) DO NOTHING
+                """,
+                (msg.chat_id, msg.message_id, author_id, author_name,
+                 bool(getattr(author, "is_bot", False)), text,
+                 msg.reply_to_message.message_id if msg.reply_to_message else None),
+            )
+            db.conn.commit()
+        except Exception as e:
+            logger.warning("production_control: сырой лог не записан: %s", e)
+
+        if text.startswith("/"):
+            return
 
         # Ответ на переспрос знака: «минус» / «плюс» / «-» / «+».
         sign = sign_answer(text)
@@ -479,7 +523,7 @@ def _make_reply_handler(db):
 
         row = _active_window(db, msg)
         if not row:
-            return  # вне окна — обычная переписка группы, не трогаем
+            return  # вне окна — в сыром логе уже сохранено, разбирать нечего
         window = WINDOW_BY_KEY.get(row["window_key"])
         if not window:
             return
@@ -493,11 +537,16 @@ def _make_reply_handler(db):
             await msg.reply_text("Принято.")
             return
 
+        db._execute(
+            "UPDATE quality.chat_log SET window_id=%s, window_key=%s "
+            "WHERE chat_id=%s AND message_id=%s",
+            (row["id"], row["window_key"], msg.chat_id, msg.message_id),
+        )
+        db.conn.commit()
+
         readings, errors = parse_lines(text, window)
-        if not readings and not errors:
-            return
         if not readings:
-            return  # мусор или обычная реплика — молчим, чтобы не шуметь в группе
+            return  # реплика без чисел — молчим, чтобы не шуметь; текст уже в логе
 
         pending = 0
         for r in readings:
@@ -524,6 +573,10 @@ def _make_reply_handler(db):
         db._execute(
             "UPDATE quality.control_windows SET answered_at=NOW(), status='done' WHERE id=%s",
             (row["id"],),
+        )
+        db._execute(
+            "UPDATE quality.chat_log SET parsed_count=%s WHERE chat_id=%s AND message_id=%s",
+            (len(readings), msg.chat_id, msg.message_id),
         )
         db.conn.commit()
 
@@ -573,7 +626,9 @@ def register(app, db):
     ensure_tables(db)
     app.add_handler(
         MessageHandler(
-            filters.Chat(chat_id()) & filters.TEXT & ~filters.COMMAND,
+            # ~COMMAND обязателен: хендлер зарегистрирован раньше CommandHandler,
+            # и без фильтра он проглотит /qc и остальные команды в этой группе.
+            filters.Chat(chat_id()) & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
             _make_reply_handler(db),
         )
     )
