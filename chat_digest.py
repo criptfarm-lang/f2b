@@ -65,8 +65,11 @@ SYSTEM_PROMPT = """Ты — аналитик отдела продаж рыбн�
 
 Правила:
 - Верни сигнал ТОЛЬКО если уверен (confidence 0..1). Порог отсечения применит код.
+- summary — КОРОТКИЙ тезис по-русски, максимум 70 знаков, без вводных слов и без
+  повтора имени клиента/менеджера. Только суть: «недовоз льда, повторно»,
+  «форель сдвинули на чт, клиента не предупредили», «документы не дошли, оплата стоит». Тире только короткое (\u2013).
 - quote — короткая обезличенная цитата (как в диалоге, с масками [VOLUME]/[AMOUNT]/…),
-  подтверждающая сигнал. summary — одна фраза по-русски, что произошло.
+  подтверждающая сигнал (хранится в базе, в дайджест не выводится).
 - Один диалог может дать несколько сигналов разных типов, но не дублируй один и тот
   же смысл. Если диалог штатный — не возвращай по нему ничего.
 - Не выдумывай: опирайся только на текст диалога."""
@@ -398,34 +401,47 @@ _TYPE_ORDER = ["our_failure", "complaint", "sla_miss", "missed_request",
 _SEV_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
+MAX_PER_TYPE = 8
+_HEAD_LIMIT = 30
+_SUMMARY_LIMIT = 80
+
+
+def _short(text: str, limit: int) -> str:
+    """Обрезать по границе слова, без хвостовой пунктуации."""
+    text = " ".join((text or "").replace("\u2014", "\u2013").split())
+    if len(text) <= limit:
+        return text.rstrip(" .,;:")
+    cut = text[:limit]
+    if " " in cut:
+        cut = cut[:cut.rindex(" ")]
+    return cut.rstrip(" .,;:") + "…"
+
+
 def render_digest(signals: list[dict], day_label: str = "за сутки") -> str:
-    """Собрать markdown-дайджест из сигналов, сгруппированных по типам."""
+    """Сжатый markdown-дайджест: одна строка на сигнал — тезис + ссылка на сделку."""
     if not signals:
         return f"📊 *Анализ переписок {day_label}*\n\nПроблемных сигналов не найдено — всё штатно."
 
-    lines = [f"📊 *Анализ переписок {day_label}*", f"Найдено сигналов: *{len(signals)}*", ""]
     by_type: dict[str, list[dict]] = {}
     for s in signals:
         by_type.setdefault(s["type"], []).append(s)
 
+    lines = [f"📊 *Анализ переписок {day_label}* \u2013 сигналов: {len(signals)}", ""]
     for t in _TYPE_ORDER:
         group = by_type.get(t)
         if not group:
             continue
         group.sort(key=lambda x: (_SEV_RANK.get(x.get("severity"), 1), -(x.get("confidence") or 0)))
         lines.append(f"*{_TYPE_LABELS[t]}* ({len(group)})")
-        for s in group:
-            who = s.get("company_name") or s.get("contact_name") or "клиент неизв."
-            mgr = s.get("manager_name") or "менеджер неизв."
-            head = f"{who} — {mgr}"
+        for s in group[:MAX_PER_TYPE]:
+            who = _short(s.get("company_name") or s.get("contact_name") or "клиент неизв.", _HEAD_LIMIT)
+            thesis = _short(s.get("summary", ""), _SUMMARY_LIMIT)
             lead_id = s.get("lead_id")
-            if lead_id:
-                # markdown-ссылка → провал прямо в карточку сделки amoCRM
-                lines.append(f"• [{head}]({_LEAD_URL.format(lead_id)})")
-            else:
-                lines.append(f"• {head}")
-            lines.append(f"  {s.get('summary','')}")
-            if s.get("quote"):
-                lines.append(f"  _«{s['quote'][:160]}»_")
+            head = f"[{who}]({_LEAD_URL.format(lead_id)})" if lead_id else who
+            mgr = s.get("manager_name")
+            tail = f" · {_short(mgr, 20)}" if mgr else ""
+            lines.append(f"• {head} \u2013 {thesis}{tail}")
+        if len(group) > MAX_PER_TYPE:
+            lines.append(f"  …ещё {len(group) - MAX_PER_TYPE} того же типа")
         lines.append("")
     return "\n".join(lines).strip()
