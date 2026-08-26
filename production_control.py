@@ -277,6 +277,33 @@ def _to_float(token: str):
         return None
 
 
+# Словарь этапов. Люди пишут по-разному — «финишная зачистка» и «стол финишной
+# зачистки» это один этап (замечание собственника 26.08). Без сведения к канону
+# ряд рассыпается на псевдоэтапы и по нему нельзя посчитать ни одну кривую.
+STAGE_CANON = [
+    ("дефрост", ("дефрост", "дефростац", "разморозк", "оттаив")),
+    ("перед порезкой", ("перед порезк", "перед разделк", "до порезк", "до разделк")),
+    ("разделка", ("разделк", "порезк", "филетир")),
+    ("финишная зачистка", ("финиш", "зачистк")),
+    ("порционирование", ("порцион", "нарезк", "ломтик")),
+    ("посол", ("посол", "инъект", "инъекц", "тузлук", "рассол")),
+    ("вакуум", ("вакуум",)),
+    ("упаковка", ("упаковк", "фасовк")),
+    ("охл. камера", ("охл камер", "охл. камер", "охлажд камер", "холодильник", "в камере")),
+]
+
+
+def norm_stage(text: str):
+    """Свободное название этапа → канонический. Неизвестное возвращаем как есть."""
+    if not text:
+        return None
+    low = re.sub(r"\s+", " ", text.strip().lower())
+    for canon, keys in STAGE_CANON:
+        if any(k in low for k in keys):
+            return canon
+    return text.strip()
+
+
 def _hhmm(token: str):
     m = _TIME_RE.match(token or "")
     return (int(m.group(1)), int(m.group(2))) if m else None
@@ -330,7 +357,7 @@ def parse_lines(text: str, window: dict):
             "point_key": pt,
             "batch_no": batch,
             "descr": descr,
-            "stage": stage or (None if pt == "тузлук" else default_stage),
+            "stage": norm_stage(stage) or (None if pt == "тузлук" else default_stage),
             "hhmm": hhmm,
             "value_c": value,
             "raw_line": raw,
