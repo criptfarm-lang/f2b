@@ -173,7 +173,8 @@ def ensure_tables(db):
             ms_product     TEXT,
             ms_state       TEXT,
             stage          TEXT,
-            reported_at    TIMESTAMPTZ
+            reported_at    TIMESTAMPTZ,
+            cut_note       TEXT
         )
         """
     )
@@ -184,6 +185,7 @@ def ensure_tables(db):
         ("ms_state", "TEXT"),
         ("stage", "TEXT"),
         ("reported_at", "TIMESTAMPTZ"),
+        ("cut_note", "TEXT"),
     ):
         db._execute(
             f"ALTER TABLE quality.temp_readings ADD COLUMN IF NOT EXISTS {col} {ddl}"
@@ -293,6 +295,36 @@ STAGE_CANON = [
 ]
 
 
+# Как пошёл нож. Ставить эксперимент в производственном режиме нельзя (собственник,
+# 26.08), поэтому норматив «при какой температуре брать в разделку» выводится не
+# пробами каждые три часа, а одной пометкой к замеру 09:00, который и так делается.
+CUT_CANON = [
+    ("легко", ("легко", "нормальн", "хорошо", "отлично", "как обычно")),
+    ("тяжело", ("тяжело", "туго", "трудно", "плохо", "с усилием")),
+    ("не идёт", ("не идет", "не идёт", "не режет", "не порезал", "не удалось", "твёрд", "тверд", "крошит", "рвёт", "рвет")),
+]
+
+
+def cut_note(text: str):
+    """Оценка разделки из свободного слова в строке."""
+    if not text:
+        return None
+    low = text.lower()
+    for canon, keys in CUT_CANON:
+        if any(k in low for k in keys):
+            return canon
+    return None
+
+
+def _num_and_note(token: str):
+    """«-0,5 тяжело» → (-0.5, 'тяжело'). Число впереди, оценка словом сзади."""
+    m = re.match(r"^\s*([-+−]?\d{1,3}(?:[.,]\d{1,2})?)\s*" + _UNIT + r"?\s*(.*)$",
+                 token or "", flags=re.IGNORECASE)
+    if not m:
+        return None, None
+    return _to_float(m.group(1)), cut_note(m.group(2))
+
+
 def norm_stage(text: str):
     """Свободное название этапа → канонический. Неизвестное возвращаем как есть."""
     if not text:
@@ -349,6 +381,7 @@ def parse_lines(text: str, window: dict):
     default_stage = window.get("stage")
 
     def _mk(batch, descr, value, explicit_sign, raw, stage=None, hhmm=None):
+        cut = cut_note(raw)
         head = (descr or "").lower()
         pt = "тузлук" if head.startswith("тузлук") or head.startswith("рассол") else point
         if batch is None and (head.startswith("тузлук") or head.startswith("рассол")):
@@ -359,6 +392,7 @@ def parse_lines(text: str, window: dict):
             "descr": descr,
             "stage": norm_stage(stage) or (None if pt == "тузлук" else default_stage),
             "hhmm": hhmm,
+            "cut_note": cut,
             "value_c": value,
             "raw_line": raw,
             "sign_pending": (not explicit_sign) and pt in SIGN_STRICT_POINTS,
@@ -392,10 +426,14 @@ def parse_lines(text: str, window: dict):
             hhmm = _hhmm(parts[-1])
             if hhmm:
                 parts = parts[:-1]
-                if len(parts) < 2:
-                    errors.append(line)
-                    continue
-            value = _to_float(parts[-1])
+            # Хвостовое слово-оценка отдельным полем: «… / -1,0 / не идёт»
+            if (len(parts) >= 3 and _num_and_note(parts[-1])[0] is None
+                    and cut_note(parts[-1])):
+                parts = parts[:-1]
+            if len(parts) < 2:
+                errors.append(line)
+                continue
+            value, _ = _num_and_note(parts[-1])
             if value is None or not (T_MIN <= value <= T_MAX):
                 errors.append(line)
                 continue
@@ -446,6 +484,9 @@ def _question_text(window: dict) -> str:
         f"Например:\n<code>{window['example']}</code>\n\n"
         "Если замер сделан раньше — допишите время последним полем: "
         "<code>… / -1,5 / 09:20</code>.\n"
+        + ("Как пошёл нож — допишите словом: <code>легко</code>, <code>тяжело</code> "
+           "или <code>не идёт</code>.\n" if window.get("point") == "тушка-перед-порезкой" else "")
+        +
         f"Ответьте в ответ на это сообщение.{tail}"
     )
 
@@ -718,8 +759,8 @@ def _make_reply_handler(db):
                 INSERT INTO quality.temp_readings
                     (window_id, window_key, point_key, batch_no, descr, value_c,
                      author_tg_id, author_name, chat_id, answer_msg_id, raw_line,
-                     sign_pending, ms_product, ms_state, stage, reported_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                     sign_pending, ms_product, ms_state, stage, cut_note, reported_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                         CASE WHEN %s::int IS NULL THEN NULL
                              ELSE (((NOW() AT TIME ZONE 'Europe/Moscow')::date
                                     + make_time(%s::int, %s::int, 0))
@@ -728,7 +769,7 @@ def _make_reply_handler(db):
                 (row["id"], row["window_key"], r["point_key"], r["batch_no"], r["descr"],
                  r["value_c"], author_id, author_name, msg.chat_id, msg.message_id,
                  r["raw_line"], r["sign_pending"], r.get("ms_product"), r.get("ms_state"),
-                 r.get("stage"),
+                 r.get("stage"), r.get("cut_note"),
                  (r["hhmm"][0] if r.get("hhmm") else None),
                  (r["hhmm"][0] if r.get("hhmm") else None),
                  (r["hhmm"][1] if r.get("hhmm") else None)),
