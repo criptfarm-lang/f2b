@@ -13,6 +13,8 @@
 import logging
 import os
 import re
+
+import aiohttp
 from datetime import datetime, timedelta, timezone
 
 from telegram import Update
@@ -161,17 +163,33 @@ def ensure_tables(db):
             device         TEXT        NOT NULL DEFAULT 'thermopro',
             is_preliminary BOOLEAN     NOT NULL DEFAULT TRUE,
             sign_pending   BOOLEAN     NOT NULL DEFAULT FALSE,
-            superseded     BOOLEAN     NOT NULL DEFAULT FALSE
+            superseded     BOOLEAN     NOT NULL DEFAULT FALSE,
+            ms_product     TEXT,
+            ms_state       TEXT
         )
         """
     )
     for col, ddl in (
         ("sign_pending", "BOOLEAN NOT NULL DEFAULT FALSE"),
         ("superseded", "BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("ms_product", "TEXT"),
+        ("ms_state", "TEXT"),
     ):
         db._execute(
             f"ALTER TABLE quality.temp_readings ADD COLUMN IF NOT EXISTS {col} {ddl}"
         )
+    db._execute(
+        """
+        CREATE TABLE IF NOT EXISTS quality.batches (
+            batch_no    TEXT PRIMARY KEY,
+            moment      TIMESTAMPTZ,
+            description TEXT,
+            products    TEXT,
+            state       TEXT,
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
     db._execute(
         """
         CREATE TABLE IF NOT EXISTS quality.chat_log (
@@ -444,6 +462,76 @@ async def close_open(app, db, window_key: str):
 # Приём ответа
 # ─────────────────────────────────────────────────────────────────────────────
 
+MS_MOVE_URL = "https://api.moysklad.ru/api/remap/1.2/entity/move"
+
+
+def _state_of(names) -> str:
+    """Состояние сырья по наименованию МойСклад: ОХЛ против СМ/ЗАМОРОЖ.
+
+    Различать обязательно: 0 °C у охлаждённого во льду сырья и 0 °C после
+    дефроста — разные величины, и смешивать их в одном ряду нельзя
+    (замечание собственника 26.08 по партии 00626, лосось Мурманск ОХЛ).
+    """
+    up = " ".join(names).upper()
+    chilled = "ОХЛ" in up
+    frozen = ("СМ," in up) or ("С/М" in up) or ("ЗАМОРОЖ" in up) or (" СМ " in up)
+    if chilled and frozen:
+        return "смешанное"
+    if chilled:
+        return "охл"
+    if frozen:
+        return "мороженое"
+    return "не определено"
+
+
+async def resolve_batch(db, batch_no: str):
+    """Наименования из перемещения МойСклад по номеру партии. Кэш в quality.batches."""
+    if not batch_no:
+        return None, None
+    row = db._fetchone(
+        "SELECT products, state FROM quality.batches WHERE batch_no=%s", (batch_no,)
+    )
+    if row:
+        return row["products"], row["state"]
+    try:
+        import moysklad
+        params = {"filter": f"name={batch_no}", "expand": "positions.assortment", "limit": "5"}
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(MS_MOVE_URL, headers=moysklad.get_headers(),
+                                params=params, timeout=aiohttp.ClientTimeout(total=25)) as r:
+                if r.status != 200:
+                    logger.warning("resolve_batch %s: HTTP %s", batch_no, r.status)
+                    return None, None
+                data = await r.json()
+        rows = data.get("rows") or []
+        if not rows:
+            db._execute(
+                "INSERT INTO quality.batches (batch_no, state) VALUES (%s,'нет перемещения') "
+                "ON CONFLICT (batch_no) DO NOTHING", (batch_no,)
+            )
+            db.conn.commit()
+            return None, "нет перемещения"
+        m = rows[0]
+        names = [
+            (p.get("assortment") or {}).get("name", "")
+            for p in ((m.get("positions") or {}).get("rows") or [])
+        ]
+        names = [n for n in names if n]
+        products = "; ".join(names)
+        state = _state_of(names)
+        db._execute(
+            "INSERT INTO quality.batches (batch_no, moment, description, products, state) "
+            "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (batch_no) DO UPDATE "
+            "SET products=EXCLUDED.products, state=EXCLUDED.state, updated_at=NOW()",
+            (batch_no, m.get("moment"), (m.get("description") or "")[:500], products, state),
+        )
+        db.conn.commit()
+        return products, state
+    except Exception as e:
+        logger.warning("resolve_batch %s: %s", batch_no, e)
+        return None, None
+
+
 # Сколько минут после отправки окна считаем, что ответы относятся к нему.
 WINDOW_TTL_MIN = int(os.getenv("QC_WINDOW_TTL_MIN", "90"))
 
@@ -558,6 +646,7 @@ def _make_reply_handler(db):
 
         pending = 0
         for r in readings:
+            r["ms_product"], r["ms_state"] = await resolve_batch(db, r["batch_no"])
             # Повторный замер по той же партии в том же окне — исправление.
             if r["batch_no"]:
                 db._execute(
@@ -569,12 +658,13 @@ def _make_reply_handler(db):
                 """
                 INSERT INTO quality.temp_readings
                     (window_id, window_key, point_key, batch_no, descr, value_c,
-                     author_tg_id, author_name, chat_id, answer_msg_id, raw_line, sign_pending)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     author_tg_id, author_name, chat_id, answer_msg_id, raw_line,
+                     sign_pending, ms_product, ms_state)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (row["id"], row["window_key"], r["point_key"], r["batch_no"], r["descr"],
                  r["value_c"], author_id, author_name, msg.chat_id, msg.message_id,
-                 r["raw_line"], r["sign_pending"]),
+                 r["raw_line"], r["sign_pending"], r.get("ms_product"), r.get("ms_state")),
             )
             if r["sign_pending"]:
                 pending += 1
@@ -588,7 +678,26 @@ def _make_reply_handler(db):
         )
         db.conn.commit()
 
-        parts = [f"Записал: {len(readings)}."]
+        named = [r for r in readings if r.get("ms_product")]
+        if named:
+            parts = ["Записал: " + "; ".join(
+                f"{r['batch_no']} {r['ms_product'][:40]} — {r['value_c']:g} °C"
+                for r in named[:3]
+            ) + "."]
+            unknown = [r for r in readings if not r.get("ms_product") and r.get("batch_no")]
+            if unknown:
+                parts.append(
+                    "Не нашёл перемещения: " + ", ".join(sorted({r["batch_no"] for r in unknown}))
+                    + " — проверьте номер партии."
+                )
+        else:
+            parts = [f"Записал: {len(readings)}."]
+            unknown = [r for r in readings if r.get("batch_no")]
+            if unknown:
+                parts.append(
+                    "Перемещения " + ", ".join(sorted({r["batch_no"] for r in unknown}))
+                    + " в МойСкладе нет — проверьте номер."
+                )
         if pending:
             vals = ", ".join(
                 f"{r['descr'] or r['batch_no'] or 'замер'} {r['value_c']:g}"
