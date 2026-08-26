@@ -159,10 +159,19 @@ def ensure_tables(db):
             answer_msg_id  BIGINT,
             raw_line       TEXT,
             device         TEXT        NOT NULL DEFAULT 'thermopro',
-            is_preliminary BOOLEAN     NOT NULL DEFAULT TRUE
+            is_preliminary BOOLEAN     NOT NULL DEFAULT TRUE,
+            sign_pending   BOOLEAN     NOT NULL DEFAULT FALSE,
+            superseded     BOOLEAN     NOT NULL DEFAULT FALSE
         )
         """
     )
+    for col, ddl in (
+        ("sign_pending", "BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("superseded", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ):
+        db._execute(
+            f"ALTER TABLE quality.temp_readings ADD COLUMN IF NOT EXISTS {col} {ddl}"
+        )
     db._execute(
         "CREATE INDEX IF NOT EXISTS temp_readings_measured_at_idx "
         "ON quality.temp_readings (measured_at DESC)"
@@ -178,11 +187,35 @@ def ensure_tables(db):
 # Разбор ответа
 # ─────────────────────────────────────────────────────────────────────────────
 
-_NUM_RE = re.compile(r"^-?\d{1,3}(?:[.,]\d{1,2})?$")
+_NUM_RE = re.compile(r"^[+-]?\d{1,3}(?:[.,]\d{1,2})?$")
+# Число в конце строки. Знак засчитывается ТОЛЬКО если прилеплен к цифрам и сам
+# стоит после пробела или в начале: «-12» — знак, «тушка- 6» и «00620- 12» — дефис
+# как разделитель, а не минус. Ошибка стоила бы инверсии значений: 26.08 «Лосось
+# тушка- 6» разбиралось как −6.
+_TAIL_NUM_RE = re.compile(
+    r"(?:(?<=\s)|^)([-+−])?(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:°\s*[cCсС]?|[cCсС])?\s*$"
+)
+# Номер партии МойСклад: 5 цифр (00615, 00618, 00620).
+_BATCH_RE = re.compile(r"\b(\d{5})\b")
+# Ответ на переспрос знака.
+_SIGN_RE = re.compile(r"^\s*(минус|плюс|[-+−])\s*$", re.IGNORECASE)
+
+# Окна, где продукт может быть ещё мороженым: число без знака двусмысленно
+# (Инна 26.08 написала «12», имея в виду −12). Переспрашиваем.
+SIGN_STRICT_POINTS = {"тушка-перед-порезкой", "дефрост-толща"}
+
+
+def sign_answer(text: str):
+    """«минус» / «плюс» / «-» / «+» → -1 / +1, иначе None."""
+    m = _SIGN_RE.match(text or "")
+    if not m:
+        return None
+    return -1 if m.group(1).lower() in ("минус", "-", "−") else 1
 
 
 def _to_float(token: str):
-    token = token.strip().replace(",", ".").replace("−", "-").rstrip("°cCсС ").strip()
+    token = (token or "").strip().replace(",", ".").replace("−", "-")
+    token = token.rstrip("°cCсС ").strip()
     if not _NUM_RE.match(token):
         return None
     try:
@@ -191,42 +224,102 @@ def _to_float(token: str):
         return None
 
 
-def parse_lines(text: str, window: dict):
-    """Разбирает ответ мастера. Возвращает (readings, errors).
+def _clean(text: str) -> str:
+    text = re.sub(r"[()\[\]]", " ", text or "")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" .,;:-–").strip()
 
-    Формат строки: «партия / описание / температура» либо «тузлук / температура».
-    Терпим к лишним пробелам и к разделителю десятых.
+
+def _parse_free_line(line: str):
+    """«Форель Иран 00620- 12», «Форель Кар. 00618 ( пласт) 4» → (batch, descr, value, explicit_sign)."""
+    m = _TAIL_NUM_RE.search(line)
+    if not m:
+        return None
+    value = _to_float((m.group(1) or "") + m.group(2))
+    if value is None:
+        return None
+    head = line[: m.start()]
+    b = _BATCH_RE.search(head)
+    batch = b.group(1) if b else None
+    if b:
+        head = head[: b.start()] + " " + head[b.end():]
+    return batch, _clean(head) or None, value, bool(m.group(1))
+
+
+def parse_lines(text: str, window: dict):
+    """Разбирает сообщение мастера. Возвращает (readings, errors).
+
+    Понимает три вида записи, потому что человек пишет по-разному:
+      1) «00615 / филе на шкуре / 6,0» — формат из подсказки;
+      2) карточка из строк: «00620», «Форель Иран», «4»;
+      3) свободная строка: «Форель Иран 00620- 12», «Лосось тушка- 6».
     """
-    readings, errors = [], []
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        parts = [p.strip() for p in line.split("/")]
-        if len(parts) < 2:
-            errors.append(line)
-            continue
-        value = _to_float(parts[-1])
-        if value is None or not (T_MIN <= value <= T_MAX):
-            errors.append(line)
-            continue
-        head = parts[0].lower()
-        if head.startswith("тузлук") or head.startswith("рассол"):
-            readings.append({
-                "point_key": "тузлук",
-                "batch_no": None,
-                "descr": " / ".join(parts[1:-1]) or None,
-                "value_c": value,
-                "raw_line": line,
-            })
-            continue
-        readings.append({
-            "point_key": window.get("point") or "филе-этап",
-            "batch_no": parts[0] or None,
-            "descr": " / ".join(parts[1:-1]) or None,
+    raw_lines = [l.strip() for l in (text or "").replace(";", "\n").splitlines()]
+    lines = [l for l in raw_lines if l]
+    if not lines:
+        return [], []
+
+    point = window.get("point") or "филе-этап"
+
+    def _mk(batch, descr, value, explicit_sign, raw):
+        head = (descr or "").lower()
+        pt = "тузлук" if head.startswith("тузлук") or head.startswith("рассол") else point
+        if batch is None and (head.startswith("тузлук") or head.startswith("рассол")):
+            descr = None
+        return {
+            "point_key": pt,
+            "batch_no": batch,
+            "descr": descr,
             "value_c": value,
-            "raw_line": line,
-        })
+            "raw_line": raw,
+            "sign_pending": (not explicit_sign) and pt in SIGN_STRICT_POINTS,
+        }
+
+    # Карточка: 2–3 строки, последняя — голое число, ни одна не содержит «/».
+    if 2 <= len(lines) <= 3 and not any("/" in l for l in lines):
+        tail = _to_float(lines[-1])
+        if tail is not None and T_MIN <= tail <= T_MAX:
+            batch = None
+            descr_parts = []
+            for l in lines[:-1]:
+                b = _BATCH_RE.fullmatch(l.strip())
+                if b and batch is None:
+                    batch = b.group(1)
+                else:
+                    descr_parts.append(l)
+            explicit = bool(re.match(r"^[-+−]\d", lines[-1].strip()))
+            return [_mk(batch, _clean(" ".join(descr_parts)) or None, tail, explicit, text.strip())], []
+
+    readings, errors = [], []
+    for line in lines:
+        if "/" in line:
+            parts = [p.strip() for p in line.split("/")]
+            if len(parts) < 2:
+                errors.append(line)
+                continue
+            value = _to_float(parts[-1])
+            if value is None or not (T_MIN <= value <= T_MAX):
+                errors.append(line)
+                continue
+            explicit = bool(re.match(r"^[-+−]\d", parts[-1].strip()))
+            head = parts[0]
+            b = _BATCH_RE.search(head)
+            batch = b.group(1) if b else (head if head and head[0].isdigit() else None)
+            descr = " / ".join(parts[1:-1]) or None
+            if not b and batch is None:
+                descr = " / ".join(parts[:-1]) or None
+            readings.append(_mk(batch, descr, value, explicit, line))
+            continue
+
+        parsed = _parse_free_line(line)
+        if not parsed:
+            errors.append(line)
+            continue
+        batch, descr, value, explicit = parsed
+        if not (T_MIN <= value <= T_MAX):
+            errors.append(line)
+            continue
+        readings.append(_mk(batch, descr, value, explicit, line))
     return readings, errors
 
 
@@ -241,11 +334,17 @@ def _question_text(window: dict) -> str:
             f"<b>{window['key']} · {window['title']}</b>\n\n{items}\n\n"
             "Ответьте «готово» в ответ на это сообщение."
         )
+    strict = (window.get("point") in SIGN_STRICT_POINTS)
+    tail = (
+        "\n\n<b>Температуру пишите со знаком</b>: <code>-12</code> или <code>+4</code>."
+        if strict else ""
+    )
     return (
         f"<b>{window['key']} · {window['title']}</b>\n\n"
         f"Формат: <code>{window['fields']}</code>\n"
         f"Например:\n<code>{window['example']}</code>\n\n"
-        "Ответьте в ответ на это сообщение."
+        "Можно писать и просто текстом, например "
+        f"<code>Форель Иран 00620 -12</code> — я разберу.{tail}"
     )
 
 
@@ -320,28 +419,70 @@ async def close_open(app, db, window_key: str):
 # Приём ответа
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _make_reply_handler(db):
-    async def handler(update: Update, context):
-        msg = update.effective_message
-        if not msg or not msg.reply_to_message:
-            return
-        if msg.chat_id != chat_id():
-            return
-        parent_id = msg.reply_to_message.message_id
+# Сколько минут после отправки окна считаем, что ответы относятся к нему.
+WINDOW_TTL_MIN = int(os.getenv("QC_WINDOW_TTL_MIN", "90"))
+
+
+def _active_window(db, msg):
+    """Окно, к которому относится сообщение: по reply — точно, иначе по времени."""
+    if msg.reply_to_message:
         row = db._fetchone(
             "SELECT id, window_key FROM quality.control_windows "
             "WHERE chat_id=%s AND message_id=%s",
-            (msg.chat_id, parent_id),
+            (msg.chat_id, msg.reply_to_message.message_id),
         )
-        if not row:
-            return  # reply не на наше сообщение — не наше дело
-        window = WINDOW_BY_KEY.get(row["window_key"])
-        if not window:
+        if row:
+            return row
+    return db._fetchone(
+        "SELECT id, window_key FROM quality.control_windows "
+        "WHERE chat_id=%s AND asked_at >= NOW() - make_interval(mins => %s) "
+        "ORDER BY asked_at DESC LIMIT 1",
+        (msg.chat_id, WINDOW_TTL_MIN),
+    )
+
+
+def _make_reply_handler(db):
+    async def handler(update: Update, context):
+        msg = update.effective_message
+        if not msg or msg.chat_id != chat_id():
             return
+        text = (msg.text or msg.caption or "").strip()
+        if not text or text.startswith("/"):
+            return
+        ensure_tables(db)
+
         author = update.effective_user
         author_name = " ".join(
             x for x in [getattr(author, "first_name", None), getattr(author, "last_name", None)] if x
         ) or getattr(author, "username", None) or str(getattr(author, "id", ""))
+        author_id = getattr(author, "id", None)
+
+        # Ответ на переспрос знака: «минус» / «плюс» / «-» / «+».
+        sign = sign_answer(text)
+        if sign is not None:
+            rows = db._fetchall(
+                "SELECT id, value_c FROM quality.temp_readings "
+                "WHERE sign_pending AND author_tg_id=%s AND chat_id=%s "
+                "AND measured_at >= NOW() - INTERVAL '2 hours'",
+                (author_id, msg.chat_id),
+            )
+            if not rows:
+                return
+            for r in rows:
+                db._execute(
+                    "UPDATE quality.temp_readings SET value_c=%s, sign_pending=FALSE WHERE id=%s",
+                    (abs(float(r["value_c"])) * sign, r["id"]),
+                )
+            db.conn.commit()
+            await msg.reply_text(f"Уточнил знак, поправил записей: {len(rows)}.")
+            return
+
+        row = _active_window(db, msg)
+        if not row:
+            return  # вне окна — обычная переписка группы, не трогаем
+        window = WINDOW_BY_KEY.get(row["window_key"])
+        if not window:
+            return
 
         if window["kind"] == "checklist":
             db._execute(
@@ -352,39 +493,50 @@ def _make_reply_handler(db):
             await msg.reply_text("Принято.")
             return
 
-        readings, errors = parse_lines(msg.text or msg.caption or "", window)
+        readings, errors = parse_lines(text, window)
+        if not readings and not errors:
+            return
+        if not readings:
+            return  # мусор или обычная реплика — молчим, чтобы не шуметь в группе
+
+        pending = 0
         for r in readings:
+            # Повторный замер по той же партии в том же окне — исправление.
+            if r["batch_no"]:
+                db._execute(
+                    "UPDATE quality.temp_readings SET superseded=TRUE "
+                    "WHERE window_id=%s AND batch_no=%s AND NOT superseded",
+                    (row["id"], r["batch_no"]),
+                )
             db._execute(
                 """
                 INSERT INTO quality.temp_readings
                     (window_id, window_key, point_key, batch_no, descr, value_c,
-                     author_tg_id, author_name, chat_id, answer_msg_id, raw_line)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     author_tg_id, author_name, chat_id, answer_msg_id, raw_line, sign_pending)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (row["id"], row["window_key"], r["point_key"], r["batch_no"], r["descr"],
-                 r["value_c"], getattr(author, "id", None), author_name,
-                 msg.chat_id, msg.message_id, r["raw_line"]),
+                 r["value_c"], author_id, author_name, msg.chat_id, msg.message_id,
+                 r["raw_line"], r["sign_pending"]),
             )
-        if readings:
-            db._execute(
-                "UPDATE quality.control_windows SET answered_at=NOW(), status='done' WHERE id=%s",
-                (row["id"],),
-            )
+            if r["sign_pending"]:
+                pending += 1
+        db._execute(
+            "UPDATE quality.control_windows SET answered_at=NOW(), status='done' WHERE id=%s",
+            (row["id"],),
+        )
         db.conn.commit()
 
-        if readings and not errors:
-            await msg.reply_text(f"Записал: {len(readings)}.")
-        elif readings and errors:
-            bad = "\n".join(f"• {e}" for e in errors[:5])
-            await msg.reply_text(
-                f"Записал: {len(readings)}. Не разобрал строки:\n{bad}\n\n"
-                f"Формат: {window['fields']}"
+        parts = [f"Записал: {len(readings)}."]
+        if pending:
+            vals = ", ".join(
+                f"{r['descr'] or r['batch_no'] or 'замер'} {r['value_c']:g}"
+                for r in readings if r["sign_pending"]
             )
-        else:
-            await msg.reply_text(
-                "Не разобрал ни одной строки.\n"
-                f"Формат: {window['fields']}\nНапример: {window['example'].splitlines()[0]}"
-            )
+            parts.append(f"Уточните знак — минус или плюс? ({vals})")
+        if errors:
+            parts.append("Не разобрал: " + "; ".join(errors[:3]))
+        await msg.reply_text(" ".join(parts))
 
     return handler
 
@@ -397,7 +549,7 @@ def _make_status_cmd(db):
             SELECT window_key, point_key, batch_no, descr, value_c,
                    measured_at AT TIME ZONE 'Europe/Moscow' AS t, author_name
             FROM quality.temp_readings
-            WHERE measured_at >= NOW() - INTERVAL '2 days'
+            WHERE measured_at >= NOW() - INTERVAL '2 days' AND NOT superseded
             ORDER BY measured_at DESC LIMIT 40
             """
         )
@@ -420,7 +572,10 @@ def register(app, db):
     """Хендлер ответов и команда сводки. Вызывать ДО catch-all MessageHandler."""
     ensure_tables(db)
     app.add_handler(
-        MessageHandler(filters.REPLY & filters.Chat(chat_id()), _make_reply_handler(db))
+        MessageHandler(
+            filters.Chat(chat_id()) & filters.TEXT & ~filters.COMMAND,
+            _make_reply_handler(db),
+        )
     )
     app.add_handler(CommandHandler("qc", _make_status_cmd(db)))
     logger.info("production_control: зарегистрирован, чат %s", chat_id())
