@@ -7432,6 +7432,13 @@ def main():
         driver_checklist.register(app, db)
     except Exception as e:
         logger.exception(f"driver_checklist.register упал: {e}")
+    # Контроль производства: замеры температуры по расписанию в группе.
+    # План: 2026-08-25-сбор-ручных-замеров-температуры-в-тг (репо «второй мозг»).
+    try:
+        import production_control
+        production_control.register(app, db)
+    except Exception as e:
+        logger.exception(f"production_control.register упал: {e}")
     try:
         import route_registry
         route_registry.register(app)
@@ -7826,6 +7833,17 @@ def main():
         _ms_task_pings_job,
         time=_dt_time(hour=6, minute=30, tzinfo=_tz_for_job.utc),
     )
+
+    # ────────────────────────────────────────────────────────────────────
+    # Контроль производства — окна замеров температуры в группе.
+    # 09:00 / 11:00 / 12:50 (регламент) / 14:30 / 16:00 / 17:30 МСК, Пн–Пт.
+    # Ответ мастера reply'ем разбирается в quality.temp_readings.
+    # ────────────────────────────────────────────────────────────────────
+    try:
+        import production_control
+        production_control.schedule(app, db)
+    except Exception as e:
+        logger.exception(f"production_control.schedule упал: {e}")
 
     # ────────────────────────────────────────────────────────────────────
     # Wazzup freshness watchdog: алерт собственнику если БД молчит >2ч в
