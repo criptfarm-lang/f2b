@@ -277,7 +277,7 @@ async def send_window(app, db, window_key: str):
 
 
 async def remind_open(app, db, window_key: str):
-    """Один повтор по неотвеченному окну, дальше окно закрывается пропуском."""
+    """Один повтор по неотвеченному окну. Закрывает окно отдельная джоба close_open."""
     ensure_tables(db)
     now = datetime.now(MSK)
     row = db._fetchone(
@@ -285,13 +285,7 @@ async def remind_open(app, db, window_key: str):
         "WHERE window_key=%s AND asked_on=%s AND chat_id=%s AND status='open'",
         (window_key, now.date(), chat_id()),
     )
-    if not row:
-        return
-    if row["reminded"]:
-        db._execute(
-            "UPDATE quality.control_windows SET status='missed' WHERE id=%s", (row["id"],)
-        )
-        db.conn.commit()
+    if not row or row["reminded"]:
         return
     try:
         await app.bot.send_message(
@@ -302,6 +296,23 @@ async def remind_open(app, db, window_key: str):
     except Exception as e:
         logger.warning("production_control: напоминание %s не ушло: %s", window_key, e)
     db._execute("UPDATE quality.control_windows SET reminded=TRUE WHERE id=%s", (row["id"],))
+    db.conn.commit()
+
+
+async def close_open(app, db, window_key: str):
+    """Закрывает неотвеченное окно пропуском.
+
+    Отдельная джоба, а не второй заход remind_open: повтор ставится один раз в
+    сутки, поэтому внутри него окно никогда бы не перешло в missed и висело бы
+    open вечно (замечено на первом же окне 26.08.2026).
+    """
+    ensure_tables(db)
+    now = datetime.now(MSK)
+    db._execute(
+        "UPDATE quality.control_windows SET status='missed' "
+        "WHERE window_key=%s AND asked_on=%s AND chat_id=%s AND status='open'",
+        (window_key, now.date(), chat_id()),
+    )
     db.conn.commit()
 
 
@@ -436,12 +447,22 @@ def schedule(app, db):
                 except Exception as e:
                     logger.error("production_control remind %s: %s", window_key, e, exc_info=True)
 
-            return _job, _remind
+            async def _close(context):
+                try:
+                    await close_open(app, db, window_key)
+                except Exception as e:
+                    logger.error("production_control close %s: %s", window_key, e, exc_info=True)
 
-        job, remind = _mk(key)
+            return _job, _remind, _close
+
+        job, remind, close = _mk(key)
         app.job_queue.run_daily(job, time=_time(hour=h, minute=m, tzinfo=timezone.utc))
         rh, rm = divmod(h * 60 + m + REMIND_AFTER_MIN, 60)
         app.job_queue.run_daily(
             remind, time=_time(hour=rh % 24, minute=rm, tzinfo=timezone.utc)
+        )
+        ch, cm = divmod(h * 60 + m + REMIND_AFTER_MIN * 2, 60)
+        app.job_queue.run_daily(
+            close, time=_time(hour=ch % 24, minute=cm, tzinfo=timezone.utc)
         )
     logger.info("production_control: расписание поставлено, окон %d", len(WINDOWS))
