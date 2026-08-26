@@ -52,21 +52,23 @@ def chat_id() -> int:
 WINDOWS = [
     {
         "key": "09:00",
+        "stage": "перед порезкой",
         "utc": (6, 0),
         "kind": "measure",
         "point": "тушка-перед-порезкой",
         "title": "Температура в тушке перед началом порезки",
-        "fields": "номер партии / вид сырья / температура",
-        "example": "00615 / форель ПСГ Карелия 3,5+ / -1,5",
+        "fields": "партия / продукт / этап / температура",
+        "example": "00614 / лосось Чили / перед порезкой / -1,5",
     },
     {
         "key": "11:00",
+        "stage": "финишная зачистка",
         "utc": (8, 0),
         "kind": "measure",
         "point": "филе-финиш-зачистка",
         "title": "Температура филе на столе финишной зачистки",
-        "fields": "номер партии / вид разделки / температура",
-        "example": "00615 / филе на шкуре / 6,0",
+        "fields": "партия / продукт / этап / температура",
+        "example": "00614 / лосось Чили / финишная зачистка / 6,0",
     },
     {
         "key": "12:50",
@@ -81,41 +83,45 @@ WINDOWS = [
     },
     {
         "key": "14:30",
+        "stage": "финишная зачистка",
         "utc": (11, 30),
         "kind": "measure",
         "point": "филе-этап",
         "with_brine": True,
         "title": "Температура филе на столе финишной зачистки и на прочих этапах, где идут работы, плюс тузлук",
-        "fields": "номер партии / этап / температура — по строке на каждый этап",
-        "example": "00615 / финишная зачистка / 8,0\n00615 / порционирование / 11,5\nтузлук / 6,0",
+        "fields": "партия / продукт / этап / температура — по строке на каждый этап",
+        "example": "00614 / лосось Чили / финишная зачистка / 8,0\n00614 / лосось Чили / порционирование / 11,5\nтузлук / 6,0",
     },
     {
         "key": "16:00",
+        "stage": "в работе",
         "utc": (13, 0),
         "kind": "measure",
         "point": "филе-этап",
         "with_brine": True,
         "title": "Температура филе на этапах, где идут работы, плюс тузлук",
-        "fields": "номер партии / этап / температура — по строке на каждый этап",
-        "example": "00615 / финишная зачистка / 9,0\nтузлук / 6,5",
+        "fields": "партия / продукт / этап / температура — по строке на каждый этап",
+        "example": "00614 / лосось Чили / упаковка / 9,0\nтузлук / 6,5",
     },
     {
         "key": "17:30",
+        "stage": "в работе",
         "utc": (14, 30),
         "kind": "measure",
         "point": "филе-этап",
         "title": "Температура филе на этапах, где идут работы",
-        "fields": "номер партии / этап / температура — по строке на каждый этап",
-        "example": "00615 / упаковка / 10,0",
+        "fields": "партия / продукт / этап / температура — по строке на каждый этап",
+        "example": "00614 / лосось Чили / упаковка / 10,0",
     },
     {
         "key": "18:00",
+        "stage": "дефрост",
         "utc": (15, 0),
         "kind": "measure",
         "point": "дефрост-толща",
         "title": "Температура в толще рыбы, лежащей на дефросте",
-        "fields": "номер партии / вид сырья / температура — по строке на каждую рыбу",
-        "example": "00615 / форель Карелия 3,5+ / -2,5\n00616 / лосось / -2,0",
+        "fields": "партия / продукт / этап / температура — по строке на каждую рыбу",
+        "example": "00615 / форель Осетия / дефрост / -1,0\n00614 / лосось Чили / дефрост / -2,0",
     },
 ]
 
@@ -165,7 +171,9 @@ def ensure_tables(db):
             sign_pending   BOOLEAN     NOT NULL DEFAULT FALSE,
             superseded     BOOLEAN     NOT NULL DEFAULT FALSE,
             ms_product     TEXT,
-            ms_state       TEXT
+            ms_state       TEXT,
+            stage          TEXT,
+            reported_at    TIMESTAMPTZ
         )
         """
     )
@@ -174,6 +182,8 @@ def ensure_tables(db):
         ("superseded", "BOOLEAN NOT NULL DEFAULT FALSE"),
         ("ms_product", "TEXT"),
         ("ms_state", "TEXT"),
+        ("stage", "TEXT"),
+        ("reported_at", "TIMESTAMPTZ"),
     ):
         db._execute(
             f"ALTER TABLE quality.temp_readings ADD COLUMN IF NOT EXISTS {col} {ddl}"
@@ -238,6 +248,8 @@ _TAIL_NUM_RE = re.compile(
 # Номер партии МойСклад: 5 цифр (00615, 00618, 00620).
 _BATCH_RE = re.compile(r"\b(\d{5})\b")
 # Ответ на переспрос знака.
+# Время замера, если названо: «09:20», «9.20». Даёт reported_at.
+_TIME_RE = re.compile(r"^\s*([01]?\d|2[0-3])[:.]([0-5]\d)\s*$")
 _SIGN_RE = re.compile(r"^\s*(минус|плюс|[-+−])\s*$", re.IGNORECASE)
 
 # Окна, где продукт может быть ещё мороженым: число без знака двусмысленно
@@ -263,6 +275,11 @@ def _to_float(token: str):
         return float(token)
     except ValueError:
         return None
+
+
+def _hhmm(token: str):
+    m = _TIME_RE.match(token or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def _clean(text: str) -> str:
@@ -302,7 +319,9 @@ def parse_lines(text: str, window: dict):
 
     point = window.get("point") or "филе-этап"
 
-    def _mk(batch, descr, value, explicit_sign, raw):
+    default_stage = window.get("stage")
+
+    def _mk(batch, descr, value, explicit_sign, raw, stage=None, hhmm=None):
         head = (descr or "").lower()
         pt = "тузлук" if head.startswith("тузлук") or head.startswith("рассол") else point
         if batch is None and (head.startswith("тузлук") or head.startswith("рассол")):
@@ -311,6 +330,8 @@ def parse_lines(text: str, window: dict):
             "point_key": pt,
             "batch_no": batch,
             "descr": descr,
+            "stage": stage or (None if pt == "тузлук" else default_stage),
+            "hhmm": hhmm,
             "value_c": value,
             "raw_line": raw,
             "sign_pending": (not explicit_sign) and pt in SIGN_STRICT_POINTS,
@@ -337,10 +358,16 @@ def parse_lines(text: str, window: dict):
     readings, errors = [], []
     for line in lines:
         if "/" in line:
-            parts = [p.strip() for p in line.split("/")]
+            parts = [p.strip() for p in line.split("/") if p.strip() != ""]
             if len(parts) < 2:
                 errors.append(line)
                 continue
+            hhmm = _hhmm(parts[-1])
+            if hhmm:
+                parts = parts[:-1]
+                if len(parts) < 2:
+                    errors.append(line)
+                    continue
             value = _to_float(parts[-1])
             if value is None or not (T_MIN <= value <= T_MAX):
                 errors.append(line)
@@ -349,10 +376,13 @@ def parse_lines(text: str, window: dict):
             head = parts[0]
             b = _BATCH_RE.search(head)
             batch = b.group(1) if b else (head if head and head[0].isdigit() else None)
-            descr = " / ".join(parts[1:-1]) or None
-            if not b and batch is None:
-                descr = " / ".join(parts[:-1]) or None
-            readings.append(_mk(batch, descr, value, explicit, line))
+            mid = parts[1:-1]
+            if batch is None and not b:
+                mid = parts[:-1]
+            # «партия / продукт / этап / температура» — этап последним из середины
+            stage = mid[-1] if len(mid) >= 2 else None
+            descr = " / ".join(mid[:-1]) if len(mid) >= 2 else (" / ".join(mid) or None)
+            readings.append(_mk(batch, descr or None, value, explicit, line, stage, hhmm))
             continue
 
         parsed = _parse_free_line(line)
@@ -387,6 +417,8 @@ def _question_text(window: dict) -> str:
         f"<b>{window['key']} · {window['title']}</b>\n\n"
         f"Формат: <code>{window['fields']}</code>\n"
         f"Например:\n<code>{window['example']}</code>\n\n"
+        "Если замер сделан раньше — допишите время последним полем: "
+        "<code>… / -1,5 / 09:20</code>.\n"
         f"Ответьте в ответ на это сообщение.{tail}"
     )
 
@@ -659,12 +691,20 @@ def _make_reply_handler(db):
                 INSERT INTO quality.temp_readings
                     (window_id, window_key, point_key, batch_no, descr, value_c,
                      author_tg_id, author_name, chat_id, answer_msg_id, raw_line,
-                     sign_pending, ms_product, ms_state)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     sign_pending, ms_product, ms_state, stage, reported_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                        CASE WHEN %s::int IS NULL THEN NULL
+                             ELSE (((NOW() AT TIME ZONE 'Europe/Moscow')::date
+                                    + make_time(%s::int, %s::int, 0))
+                                   AT TIME ZONE 'Europe/Moscow') END)
                 """,
                 (row["id"], row["window_key"], r["point_key"], r["batch_no"], r["descr"],
                  r["value_c"], author_id, author_name, msg.chat_id, msg.message_id,
-                 r["raw_line"], r["sign_pending"], r.get("ms_product"), r.get("ms_state")),
+                 r["raw_line"], r["sign_pending"], r.get("ms_product"), r.get("ms_state"),
+                 r.get("stage"),
+                 (r["hhmm"][0] if r.get("hhmm") else None),
+                 (r["hhmm"][0] if r.get("hhmm") else None),
+                 (r["hhmm"][1] if r.get("hhmm") else None)),
             )
             if r["sign_pending"]:
                 pending += 1
@@ -681,7 +721,10 @@ def _make_reply_handler(db):
         named = [r for r in readings if r.get("ms_product")]
         if named:
             parts = ["Записал: " + "; ".join(
-                f"{r['batch_no']} {r['ms_product'][:40]} — {r['value_c']:g} °C"
+                f"{r['batch_no']} {r['ms_product'][:34]}"
+                + (f", {r['stage']}" if r.get("stage") else "")
+                + f" — {r['value_c']:g} °C"
+                + (f" в {r['hhmm'][0]:02d}:{r['hhmm'][1]:02d}" if r.get("hhmm") else "")
                 for r in named[:3]
             ) + "."]
             unknown = [r for r in readings if not r.get("ms_product") and r.get("batch_no")]
@@ -716,8 +759,9 @@ def _make_status_cmd(db):
         ensure_tables(db)
         rows = db._fetchall(
             """
-            SELECT window_key, point_key, batch_no, descr, value_c,
-                   measured_at AT TIME ZONE 'Europe/Moscow' AS t, author_name
+            SELECT window_key, point_key, batch_no, descr, stage, ms_product, value_c,
+                   COALESCE(reported_at, measured_at) AT TIME ZONE 'Europe/Moscow' AS t,
+                   author_name
             FROM quality.temp_readings
             WHERE measured_at >= NOW() - INTERVAL '2 days' AND NOT superseded
             ORDER BY measured_at DESC LIMIT 40
@@ -727,9 +771,10 @@ def _make_status_cmd(db):
             await update.effective_message.reply_text("Замеров за двое суток нет.")
             return
         lines = [
-            f"{r['t']:%d.%m %H:%M} · {r['point_key']}"
+            f"{r['t']:%d.%m %H:%M}"
             f"{' · ' + r['batch_no'] if r['batch_no'] else ''}"
-            f"{' · ' + r['descr'] if r['descr'] else ''} — {r['value_c']} °C"
+            f"{' · ' + (r['ms_product'] or r['descr'] or '')[:32] if (r['ms_product'] or r['descr']) else ''}"
+            f"{' · ' + r['stage'] if r['stage'] else ''} — {r['value_c']} °C"
             for r in rows
         ]
         await update.effective_message.reply_text(
