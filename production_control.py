@@ -369,8 +369,7 @@ def _question_text(window: dict) -> str:
         f"<b>{window['key']} · {window['title']}</b>\n\n"
         f"Формат: <code>{window['fields']}</code>\n"
         f"Например:\n<code>{window['example']}</code>\n\n"
-        "Можно писать и просто текстом, например "
-        f"<code>Форель Иран 00620 -12</code> — я разберу.{tail}"
+        f"Ответьте в ответ на это сообщение.{tail}"
     )
 
 
