@@ -14,6 +14,7 @@ from datetime import datetime
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     ExtBot,
     CommandHandler,
     MessageHandler,
@@ -198,18 +199,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         except Exception as e:
             logger.warning(f"cmd_start: проверка водителя упала, отдаю общее меню: {e}")
-    # Сотруднику предлагать «спроси меня» нельзя — он спросит и получит отказ.
-    # Приветствие с приглашением к диалогу видят только руководители.
-    if user is None or user.id not in {OWNER_CHAT_ID, PARTNER_CHAT_ID}:
-        await update.message.reply_text(
-            f"👋 Привет, *{user.full_name if user else 'друг'}*! Я Эф — ассистент F2B PRO.\n\n"
-            f"{BOT_NOTIFY_ONLY_MSG}",
-            parse_mode="Markdown",
-        )
-        return
+    # Единственный ответ, который бот вообще даёт на обращение (27.08.2026).
     await update.message.reply_text(
-        f"👋 Привет, *{user.full_name}*! Я Эф — ассистент F2B PRO.\n\n"
-        f"Спрашивай так: *Эф, [вопрос]*",
+        f"👋 Привет, *{user.full_name if user else 'друг'}*! Я Эф.\n\n"
+        f"{BOT_NOTIFY_ONLY_MSG}",
         parse_mode="Markdown",
     )
 
@@ -275,11 +268,7 @@ def _user_menu_keyboard(include_task_button: bool = False) -> None:
     """
     return None
 
-BOT_NOTIFY_ONLY_MSG = (
-    "Я больше не отвечаю на вопросы — работаю только на уведомления: "
-    "задачи, напоминания, заказы.\n\n"
-    "Рабочие вопросы — руководителю, отчёты — в дашборде."
-)
+BOT_NOTIFY_ONLY_MSG = "Я только присылаю уведомления. Вопросы не принимаю."
 
 MENU_RETIRED_MSG = (
     "Меню отключено — всё переехало.\n\n"
@@ -306,9 +295,8 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
         return
 
     # Кнопок больше нет, но старые сообщения с ними остались в чатах.
-    if not user or user.id not in {OWNER_CHAT_ID, PARTNER_CHAT_ID}:
-        await query.message.reply_text(BOT_NOTIFY_ONLY_MSG, parse_mode="Markdown")
-        return
+    await query.message.reply_text(BOT_NOTIFY_ONLY_MSG, parse_mode="Markdown")
+    return
 
     if action == "user_photo":
         await query.message.reply_text(
@@ -1820,18 +1808,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Логируем ID для диагностики
     logger.info(f"Message from user.id={user.id}, name={user.full_name}, chat_id={message.chat_id}, manager_ids={manager_ids}")
 
-    # ── Интерактив закрыт для всех, кроме руководителей (27.08.2026) ────────
-    # Решение собственника: у бота остаётся только оповещение сотрудников.
-    # Гейтов на CommandHandler оказалось мало — «Эф, отчет оп» идёт свободным
-    # текстом через диспетчер Claude и вызывает cmd_op_report в обход них.
-    # Гейт стоит ПОСЛЕ сохранения истории и медиа: сводки и база документов
-    # питаются из сообщений в группах, их ломать нельзя.
-    # Водителей это не касается — у них свои handler'ы (driver_checklist),
-    # они отрабатывают раньше общего.
-    if not user or user.id not in {OWNER_CHAT_ID, PARTNER_CHAT_ID}:
-        if chat_id == user.id:          # в группах молчим, чтобы не сорить
-            await safe_reply(BOT_NOTIFY_ONLY_MSG, parse_mode="Markdown")
-        return
+    # ── Ассистент выключен для ВСЕХ, включая собственника (27.08.2026) ──────
+    # Решение собственника: бот только рассылает согласованные уведомления,
+    # на обращения не отвечает никому. Диспетчер Claude, интент-роутер и все
+    # ответы ниже больше не вызываются — код оставлен, чтобы включение было
+    # снятием этого блока, а не восстановлением по истории.
+    # Стоит ПОСЛЕ сохранения истории и медиа: утренние сводки, дайджест
+    # переписок и база документов питаются из сообщений в группах.
+    # Водителей и логистов не касается — у них свои handler'ы
+    # (driver_checklist, route_*), они отрабатывают раньше общего.
+    if chat_id == (user.id if user else 0):   # в личке — одна строка, в группах молчим
+        await safe_reply(BOT_NOTIFY_ONLY_MSG, parse_mode="Markdown")
+    return
 
     # 4. Реагируем на обращение к боту
     # Автоматически реагируем на IT-проблемы даже без обращения "Эф,"
@@ -7016,6 +7004,33 @@ def main():
             logger.info(f"Восстановлено {len(pending_rows)} ожидающих идентификаций из БД")
     except Exception as e:
         logger.warning(f"Не удалось восстановить pending_idents: {e}")
+
+    # ─── Команды выключены (27.08.2026) ─────────────────────────────────────
+    # Решение собственника: бот только рассылает согласованные уведомления.
+    # Перехват стоит в группе -1, то есть срабатывает раньше всех остальных
+    # handler'ов и прерывает обработку (ApplicationHandlerStop). Так не нужно
+    # снимать полсотни регистраций по одной: включение обратно — снятие блока.
+    # Исключения — /start (им сотрудник регистрирует chat_id, без этого пуши
+    # до него не дойдут) и команды водителей: рейс и лист отгрузок это не
+    # «ответы ассистента», а рабочий инструмент развозки.
+    ALLOWED_COMMANDS = {"/start", "/reis", "/рейс", "/shipmentlist", "/лист"}
+
+    async def _commands_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = update.effective_message
+        if not msg or not msg.text:
+            return
+        cmd = msg.text.split(maxsplit=1)[0].split("@")[0].lower()
+        if cmd in ALLOWED_COMMANDS:
+            return
+        if msg.chat_id == (msg.from_user.id if msg.from_user else 0):
+            await msg.reply_text(BOT_NOTIFY_ONLY_MSG)
+        raise ApplicationHandlerStop
+
+    # Фильтр по «/» в начале, а не filters.COMMAND: Telegram размечает как
+    # bot_command только латиницу, а в боте есть кириллические входы
+    # (/задача, /поставить, /отмена, /дебиторка) — через COMMAND они бы
+    # проскочили мимо перехвата.
+    app.add_handler(MessageHandler(filters.Regex(r"^/"), _commands_disabled), group=-1)
 
     # Telegram Business: подключение бота к бизнес-аккаунту (Stories Publisher)
     app.add_handler(BusinessConnectionHandler(handle_business_connection))
