@@ -135,25 +135,18 @@ _EGRUL_STATUS_RU = {
 
 
 def _lawsuit_warning(flags: dict) -> str:
-    """Особое предупреждение: контрагент — ответчик по иску конкурента о взыскании долга.
+    """Особое предупреждение: контрагент – ответчик по иску конкурента о взыскании долга.
+
     Отдельной строкой, потому что смысл другой, чем у цвета: не «нельзя работать»,
-    а «только по предоплате». Источник — kad.arbitr, справочник competitor_court_debtors."""
-    cl = flags.get("competitor_lawsuit")
-    if not cl:
+    а «только по предоплате». Источник – kad.arbitr, справочник competitor_court_debtors.
+
+    Ни конкурента, ни номер дела, ни вывод про предоплату в алерт не выводим
+    (решение собственника 27.08.2026): в согласовании нужен сам факт, детали –
+    в справочнике. Флаг competitor_lawsuit при этом хранит их целиком.
+    """
+    if not flags.get("competitor_lawsuit"):
         return ""
-    case = cl.get("case_no")
-    dt = cl.get("case_date")
-    tail = ""
-    if case:
-        tail = f" — дело {case}"
-        if dt:
-            try:
-                d = dt if isinstance(dt, str) else dt.isoformat()
-                tail += f" от {'.'.join(reversed(d[:10].split('-')))}"
-            except Exception:
-                pass
-    return (f"\n⛔ *Судится с конкурентом:* {cl.get('competitor')} взыскивает с него долг{tail}."
-            f"\n   Не платил им — не заплатит и нам. Только предоплата.")
+    return "\n⛔ *Судится с конкурентом*"
 
 
 def format_reliability_line(res: dict | None) -> tuple[str, str]:
