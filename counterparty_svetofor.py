@@ -8,11 +8,15 @@
                           чистые активы / капитал (1300) по годам.
   №3 иски-ответчик     — kad.arbitr: бесплатного API нет → пока «не проверено» (заглушка, best-effort).
   №2 долги ФССП        — источник мёртв (api-ip.fssp.gov.ru отдаёт 410) → «не проверено», ручная досверка.
+  №5 суды конкурентов  — таблица public.competitor_court_debtors: контрагенты, на которых НАВАФИШ/АНФИШ
+                          подали иски о взыскании (kad.arbitr, собрано 26.08.2026). Особое предупреждение:
+                          не платил конкуренту — не заплатит и нам, работать только по предоплате.
 
 Правило цвета:
   🔴 red    — статус ЕГРЮЛ не ACTIVE (ликвидация/банкротство/реорг) ИЛИ руководитель дисквалифицирован
               ИЛИ чистые активы < 0.
-  🟡 yellow — (не red) и: убыток/прибыль≈0 (маржа < 1%) ИЛИ падение выручки год-к-году ≥ 15%.
+  🟡 yellow — (не red) и: убыток/прибыль≈0 (маржа < 1%) ИЛИ падение выручки год-к-году ≥ 15%
+              ИЛИ контрагент — ответчик по иску конкурента о взыскании долга.
   🟢 green  — всё чисто.
   ⚪ unknown — ЕГРЮЛ не отдал данные (нет ИНН/не найдено).
 
@@ -65,6 +69,16 @@ create table if not exists public.counterparty_svetofor (
     checked_at timestamptz not null default now()
 );
 """
+DDL_DEBTORS = """
+create table if not exists public.competitor_court_debtors (
+    inn        text primary key,
+    name       text,
+    competitor text not null,
+    case_no    text,
+    case_date  date,
+    added_at   timestamptz not null default now()
+);
+"""
 _conn = None
 
 
@@ -78,6 +92,7 @@ def _db():
         _conn.autocommit = True
         with _conn.cursor() as cur:
             cur.execute(DDL)
+            cur.execute(DDL_DEBTORS)
     return _conn
 
 
@@ -94,6 +109,23 @@ def upsert_svetofor(inn: str, name: str | None, color: str, flags: dict):
         """, (inn, name, color, json.dumps(flags, ensure_ascii=False)))
 
 
+def get_court_debtor(inn: str) -> dict | None:
+    """Есть ли контрагент среди ответчиков по искам конкурентов (НАВАФИШ/АНФИШ).
+    Источник — kad.arbitr, справочник public.competitor_court_debtors.
+    Возвращает {competitor, case_no, case_date} или None. Сбой БД → None (мягкая деградация)."""
+    inn = (inn or "").strip()
+    if not inn:
+        return None
+    try:
+        with _db().cursor() as cur:
+            cur.execute("""select name, competitor, case_no, case_date
+                             from public.competitor_court_debtors where inn = %s""", (inn,))
+            return cur.fetchone()
+    except Exception as e:
+        logger.warning("competitor_court_debtors: чтение %s → %s", inn, e)
+        return None
+
+
 _EGRUL_STATUS_RU = {
     "LIQUIDATING": "в стадии ликвидации",
     "LIQUIDATED": "ликвидирована",
@@ -102,15 +134,39 @@ _EGRUL_STATUS_RU = {
 }
 
 
+def _lawsuit_warning(flags: dict) -> str:
+    """Особое предупреждение: контрагент — ответчик по иску конкурента о взыскании долга.
+    Отдельной строкой, потому что смысл другой, чем у цвета: не «нельзя работать»,
+    а «только по предоплате». Источник — kad.arbitr, справочник competitor_court_debtors."""
+    cl = flags.get("competitor_lawsuit")
+    if not cl:
+        return ""
+    case = cl.get("case_no")
+    dt = cl.get("case_date")
+    tail = ""
+    if case:
+        tail = f" — дело {case}"
+        if dt:
+            try:
+                d = dt if isinstance(dt, str) else dt.isoformat()
+                tail += f" от {'.'.join(reversed(d[:10].split('-')))}"
+            except Exception:
+                pass
+    return (f"\n⛔ *Судится с конкурентом:* {cl.get('competitor')} взыскивает с него долг{tail}."
+            f"\n   Не платил им — не заплатит и нам. Только предоплата.")
+
+
 def format_reliability_line(res: dict | None) -> tuple[str, str]:
     """Короткая строка «Надёжность» для алертов согласования (заказ/договор).
-    Возвращает (color, markdown-строка). color ∈ green|yellow|red|unknown."""
+    Возвращает (color, markdown-строка). color ∈ green|yellow|red|unknown.
+    При наличии иска конкурента добавляет отдельную строку-предупреждение."""
     icon_map = {"green": "🟢", "yellow": "🟡", "red": "🔴", "unknown": "⚪"}
     if not res or res.get("color") == "unknown":
         return "unknown", "⚪ *Надёжность:* не проверено (нет ИНН / источник недоступен)"
     color = res.get("color", "unknown")
     flags = res.get("flags") or {}
     icon = icon_map.get(color, "⚪")
+    warn = _lawsuit_warning(flags)
     if color == "red":
         reasons = []
         for r in (flags.get("red_reasons") or []):
@@ -120,12 +176,12 @@ def format_reliability_line(res: dict | None) -> tuple[str, str]:
                 reasons.append(_EGRUL_STATUS_RU.get(code, code))
             else:
                 reasons.append(r)
-        return color, f"{icon} *Надёжность:* " + "; ".join(reasons[:2] or ["стоп-флаг ЕГРЮЛ"])
+        return color, f"{icon} *Надёжность:* " + "; ".join(reasons[:2] or ["стоп-флаг ЕГРЮЛ"]) + warn
     if color == "yellow":
         prefix = "ЕГРЮЛ действующая, но " if flags.get("egrul_status") == "ACTIVE" else ""
         ys = flags.get("yellow_reasons") or ["есть тревожные признаки"]
-        return color, f"{icon} *Надёжность:* {prefix}" + "; ".join(ys[:2])
-    return color, f"{icon} *Надёжность:* ЕГРЮЛ действующая, финансы ОК"
+        return color, f"{icon} *Надёжность:* {prefix}" + "; ".join(ys[:2]) + warn
+    return color, f"{icon} *Надёжность:* ЕГРЮЛ действующая, финансы ОК" + warn
 
 
 def _bulk_upsert(rows: list):
@@ -287,7 +343,8 @@ async def _bo_finance(session: aiohttp.ClientSession, inn: str) -> dict | None:
 
 
 # ── расчёт цвета ──────────────────────────────────────────────────────────────
-def _compute_color(egrul: dict | None, finance: dict | None) -> tuple[str, dict]:
+def _compute_color(egrul: dict | None, finance: dict | None,
+                   debtor: dict | None = None) -> tuple[str, dict]:
     flags: dict = {}
     if not egrul:
         return "unknown", {"egrul": "не найдено"}
@@ -331,6 +388,18 @@ def _compute_color(egrul: dict | None, finance: dict | None) -> tuple[str, dict]
     # №2/№3 — вне бесплатной автоматизации
     flags["fssp"] = "не проверено (источник недоступен)"
     flags["arbitrage_defendant"] = "не проверено"
+
+    # №5 — иск конкурента о взыскании: не платил им, не заплатит и нам
+    if debtor:
+        case = (debtor.get("case_no") or "").strip()
+        dt = debtor.get("case_date")
+        flags["competitor_lawsuit"] = {
+            "competitor": debtor.get("competitor"),
+            "case_no": case or None,
+            "case_date": dt.isoformat() if hasattr(dt, "isoformat") else dt,
+        }
+        tail = f" ({case} от {dt:%d.%m.%Y})" if case and hasattr(dt, "strftime") else ""
+        yellow.append(f"иск от конкурента {debtor.get('competitor')} о взыскании долга{tail}")
 
     if red:
         flags["red_reasons"] = red
@@ -513,7 +582,8 @@ async def check_counterparty(inn: str, save: bool = True, with_finance: bool = T
         egrul = await _dadata_party(session, inn)
         logger.info("DIAG check DaData ok %s egrul=%s", inn, bool(egrul))
         finance = await _bo_finance(session, inn) if (egrul and with_finance) else None
-    color, flags = _compute_color(egrul, finance)
+    debtor = get_court_debtor(inn)
+    color, flags = _compute_color(egrul, finance, debtor)
     name = egrul.get("name") if egrul else None
     if save:
         try:
