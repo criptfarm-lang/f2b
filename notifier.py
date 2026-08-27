@@ -816,6 +816,34 @@ def _parse_ms_moment(raw: str):
     return None
 
 
+def _norm_goods_key(name: str) -> str:
+    """Ключ «что за товар» из наименования МС: первые два значимых слова, без
+    пунктуации и регистра. «Лосось (сёмга) филе, ОХЛ., Трим С (без ПИН-БОН)» →
+    «лосось сёмга». Хватает, чтобы понять, что удалённое и добавленное — один и
+    тот же товар в другой обработке/фасовке."""
+    import re as _re
+    words = _re.sub(r"[^\w\s]", " ", (name or "").lower()).split()
+    return " ".join(words[:2])
+
+
+def _replacement_for(removed: dict, added: list) -> dict | None:
+    """Есть ли среди добавленных этим же сохранением позиций замена удалённой.
+
+    Замена — то же количество (менеджер перевыбрал SKU, объём не тронул) либо
+    тот же товар по первым словам наименования. Проверено на живых кейсах
+    26.08.2026 (03774/03775: «Трим С (без ПИН-БОН)» 15 кг → «Трим С Мурманск»
+    15 кг) и 20.08.2026 (03684: «МРМ, ЗАМОРОЖ., Трим Д» 2 кг → «ЗАМОРОЖ., Трим Д» 2 кг).
+    """
+    qty = removed.get("quantity")
+    key = _norm_goods_key((removed.get("assortment") or {}).get("name") or "")
+    for a in added:
+        if qty and a.get("quantity") == qty:
+            return a
+        if key and _norm_goods_key((a.get("assortment") or {}).get("name") or "") == key:
+            return a
+    return None
+
+
 async def check_positions_removed(order_href: str, bot, db):
     """Удалили позицию из заказа, который уже собирается → сообщение в PRO.
 
@@ -882,6 +910,14 @@ async def check_positions_removed(order_href: str, bot, db):
             if state_id_at_edit not in PICKING_STATE_IDS:
                 continue
 
+            # Добавленные этим же сохранением позиции (есть newValue, нет oldValue).
+            # Нужны, чтобы отличить ЗАМЕНУ SKU от настоящей потери позиции.
+            added = [
+                item.get("newValue") or {}
+                for item in positions_diff
+                if isinstance(item, dict) and "oldValue" not in item and item.get("newValue")
+            ]
+
             for item in positions_diff:
                 if not isinstance(item, dict):
                     continue
@@ -895,6 +931,19 @@ async def check_positions_removed(order_href: str, bot, db):
                 pos_name = (old.get("assortment") or {}).get("name") or "—"
                 qty = old.get("quantity") or 0
                 uom = old.get("uom") or ""
+
+                # Замена SKU: в том же сохранении добавлена сопоставимая позиция
+                # (то же количество или тот же товар другой обработки/фасовки).
+                # Менеджер меняет «Трим С (без ПИН-БОН)» на «Трим С Мурманск» —
+                # позиция не потеряна, клиенту ничего не грозит, алерт лишний.
+                swap = _replacement_for(old, added)
+                if swap:
+                    logger.info(
+                        "position_removed: %s — «%s» заменена на «%s», алерт не шлём",
+                        order_name, pos_name,
+                        (swap.get("assortment") or {}).get("name", "?"),
+                    )
+                    continue
 
                 event_key = f"{moment_raw}|{pos_name}"
                 if not db.try_claim_position_removed(order_id, event_key):
