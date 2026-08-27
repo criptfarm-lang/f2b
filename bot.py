@@ -198,12 +198,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         except Exception as e:
             logger.warning(f"cmd_start: проверка водителя упала, отдаю общее меню: {e}")
-    is_author = user is not None and _is_task_author(user.id)
+    # Сотруднику предлагать «спроси меня» нельзя — он спросит и получит отказ.
+    # Приветствие с приглашением к диалогу видят только руководители.
+    if user is None or user.id not in {OWNER_CHAT_ID, PARTNER_CHAT_ID}:
+        await update.message.reply_text(
+            f"👋 Привет, *{user.full_name if user else 'друг'}*! Я Эф — ассистент F2B PRO.\n\n"
+            f"{BOT_NOTIFY_ONLY_MSG}",
+            parse_mode="Markdown",
+        )
+        return
     await update.message.reply_text(
-        f"👋 Привет, *{user.full_name if user else 'друг'}*! Я Эф — ассистент F2B PRO.\n\n"
+        f"👋 Привет, *{user.full_name}*! Я Эф — ассистент F2B PRO.\n\n"
         f"Спрашивай так: *Эф, [вопрос]*",
         parse_mode="Markdown",
-        reply_markup=_user_menu_keyboard(include_task_button=is_author)
     )
 
 # Генерация договоров переехала из бота в дашборд менеджера (2026-07-14),
