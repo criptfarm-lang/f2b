@@ -268,6 +268,12 @@ def _user_menu_keyboard(include_task_button: bool = False) -> None:
     """
     return None
 
+BOT_NOTIFY_ONLY_MSG = (
+    "Я больше не отвечаю на вопросы — работаю только на уведомления: "
+    "задачи, напоминания, заказы.\n\n"
+    "Рабочие вопросы — руководителю, отчёты — в дашборде."
+)
+
 MENU_RETIRED_MSG = (
     "Меню отключено — всё переехало.\n\n"
     "• фото товара — команда /photo\n"
@@ -290,6 +296,11 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
 
     if user and db.is_user_blocked(user.id):
         await query.message.reply_text("⛔ Доступ ограничен. Обратитесь к руководителю.")
+        return
+
+    # Кнопок больше нет, но старые сообщения с ними остались в чатах.
+    if not user or user.id not in {OWNER_CHAT_ID, PARTNER_CHAT_ID}:
+        await query.message.reply_text(BOT_NOTIFY_ONLY_MSG, parse_mode="Markdown")
         return
 
     if action == "user_photo":
@@ -469,13 +480,7 @@ async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📋 *Команды:*\n\n"
-        "/photo — фото товара\n"
-        "/price — актуальный прайс\n"
-        "/contact — поиск контакта\n"
-        "/mychatid — мой chat ID\n\n"
-        "Вопрос ко мне: *Эф, [вопрос]*\n"
-        "_Отчёты и служебные команды — у руководителей._",
+        BOT_NOTIFY_ONLY_MSG,
         parse_mode="Markdown"
     )
 
@@ -1807,6 +1812,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Логируем ID для диагностики
     logger.info(f"Message from user.id={user.id}, name={user.full_name}, chat_id={message.chat_id}, manager_ids={manager_ids}")
+
+    # ── Интерактив закрыт для всех, кроме руководителей (27.08.2026) ────────
+    # Решение собственника: у бота остаётся только оповещение сотрудников.
+    # Гейтов на CommandHandler оказалось мало — «Эф, отчет оп» идёт свободным
+    # текстом через диспетчер Claude и вызывает cmd_op_report в обход них.
+    # Гейт стоит ПОСЛЕ сохранения истории и медиа: сводки и база документов
+    # питаются из сообщений в группах, их ломать нельзя.
+    # Водителей это не касается — у них свои handler'ы (driver_checklist),
+    # они отрабатывают раньше общего.
+    if not user or user.id not in {OWNER_CHAT_ID, PARTNER_CHAT_ID}:
+        if chat_id == user.id:          # в группах молчим, чтобы не сорить
+            await safe_reply(BOT_NOTIFY_ONLY_MSG, parse_mode="Markdown")
+        return
 
     # 4. Реагируем на обращение к боту
     # Автоматически реагируем на IT-проблемы даже без обращения "Эф,"
@@ -7008,8 +7026,8 @@ def main():
     app.add_handler(CommandHandler("test_group", cmd_test_group))
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
     app.add_handler(CommandHandler("refresh_history", cmd_refresh_history))
-    app.add_handler(CommandHandler("reissue_contract", cmd_reissue_contract))
-    app.add_handler(CommandHandler("refresh_contract", cmd_refresh_contract))
+    app.add_handler(CommandHandler("reissue_contract", leads_only(cmd_reissue_contract)))
+    app.add_handler(CommandHandler("refresh_contract", leads_only(cmd_refresh_contract)))
     app.add_handler(CommandHandler("refresh_cache", cmd_refresh_cache))
     app.add_handler(CommandHandler("web_report", cmd_web_report))
     app.add_handler(CommandHandler("lost_clients", cmd_lost_clients))
@@ -7044,9 +7062,9 @@ def main():
     app.add_handler(CommandHandler("test", owner_only(cmd_test)))
     app.add_handler(MessageHandler(filters.StatusUpdate.MESSAGE_AUTO_DELETE_TIMER_CHANGED, handle_message))
     app.add_handler(CommandHandler("report", leads_only(cmd_report)))
-    app.add_handler(CommandHandler("photo", cmd_photo))
-    app.add_handler(CommandHandler("price", cmd_price))
-    app.add_handler(CommandHandler("contact", cmd_contact))
+    app.add_handler(CommandHandler("photo", leads_only(cmd_photo)))
+    app.add_handler(CommandHandler("price", leads_only(cmd_price)))
+    app.add_handler(CommandHandler("contact", leads_only(cmd_contact)))
     app.add_handler(CommandHandler("memory", owner_only(cmd_memory)))
     app.add_handler(CommandHandler("remember", owner_only(cmd_remember)))
     app.add_handler(CommandHandler("add_webhook", owner_only(cmd_add_webhook)))
@@ -7389,7 +7407,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_patrol_callback, pattern=r"^patrol:\d+:\d+$"))
 
     # ─── Алармы amoCRM ───────────────────────────────────────────────────────
-    app.add_handler(CommandHandler("myamoid", lambda u, c: cmd_myamoid(u, c, db)))
+    app.add_handler(CommandHandler("myamoid", leads_only(lambda u, c: cmd_myamoid(u, c, db))))
     app.add_handler(CommandHandler("amo_setup", cmd_amo_setup))
     app.add_handler(CallbackQueryHandler(
         lambda u, c: handle_take_callback(u.callback_query, db),
