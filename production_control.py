@@ -174,7 +174,8 @@ def ensure_tables(db):
             ms_state       TEXT,
             stage          TEXT,
             reported_at    TIMESTAMPTZ,
-            cut_note       TEXT
+            cut_note       TEXT,
+            stage_source   TEXT
         )
         """
     )
@@ -186,6 +187,7 @@ def ensure_tables(db):
         ("stage", "TEXT"),
         ("reported_at", "TIMESTAMPTZ"),
         ("cut_note", "TEXT"),
+        ("stage_source", "TEXT"),
     ):
         db._execute(
             f"ALTER TABLE quality.temp_readings ADD COLUMN IF NOT EXISTS {col} {ddl}"
@@ -269,6 +271,8 @@ def sign_answer(text: str):
 
 def _to_float(token: str):
     token = (token or "").strip().replace(",", ".").replace("−", "-")
+    # «+ 7.5» внутри поля — знак с пробелом. 27.08 такая строка потерялась целиком.
+    token = re.sub(r"^([-+])\s+", r"\1", token)
     token = re.sub(_UNIT + r"\s*[.!]?\s*$", "", token, flags=re.IGNORECASE).strip()
     token = token.rstrip("°cCсС ").strip()
     if not _NUM_RE.match(token):
@@ -318,7 +322,7 @@ def cut_note(text: str):
 
 def _num_and_note(token: str):
     """«-0,5 тяжело» → (-0.5, 'тяжело'). Число впереди, оценка словом сзади."""
-    m = re.match(r"^\s*([-+−]?\d{1,3}(?:[.,]\d{1,2})?)\s*" + _UNIT + r"?\s*(.*)$",
+    m = re.match(r"^\s*([-+−]?\s*\d{1,3}(?:[.,]\d{1,2})?)\s*" + _UNIT + r"?\s*(.*)$",
                  token or "", flags=re.IGNORECASE)
     if not m:
         return None, None
@@ -386,11 +390,16 @@ def parse_lines(text: str, window: dict):
         pt = "тузлук" if head.startswith("тузлук") or head.startswith("рассол") else point
         if batch is None and (head.startswith("тузлук") or head.startswith("рассол")):
             descr = None
+        named_stage = norm_stage(stage)
+        if named_stage == "дефрост":
+            pt = "дефрост-толща"
         return {
             "point_key": pt,
             "batch_no": batch,
             "descr": descr,
-            "stage": norm_stage(stage) or (None if pt == "тузлук" else default_stage),
+            "stage": named_stage or (None if pt == "тузлук" else default_stage),
+            "stage_source": ("строка" if named_stage
+                             else (None if pt == "тузлук" or not default_stage else "окно")),
             "hhmm": hhmm,
             "cut_note": cut,
             "value_c": value,
@@ -413,7 +422,7 @@ def parse_lines(text: str, window: dict):
                     batch = b.group(1)
                 else:
                     descr_parts.append(l)
-            explicit = bool(re.match(r"^[-+−]\d", lines[-1].strip()))
+            explicit = bool(re.match(r"^[-+−]\s*\d", lines[-1].strip()))
             return [_mk(batch, _clean(" ".join(descr_parts)) or None, tail, explicit, text.strip())], []
 
     readings, errors = [], []
@@ -437,7 +446,7 @@ def parse_lines(text: str, window: dict):
             if value is None or not (T_MIN <= value <= T_MAX):
                 errors.append(line)
                 continue
-            explicit = bool(re.match(r"^[-+−]\d", parts[-1].strip()))
+            explicit = bool(re.match(r"^[-+−]\s*\d", parts[-1].strip()))
             head = parts[0]
             b = _BATCH_RE.search(head)
             batch = b.group(1) if b else (head if head and head[0].isdigit() else None)
@@ -574,7 +583,9 @@ def _state_of(names) -> str:
     """
     up = " ".join(names).upper()
     chilled = "ОХЛ" in up
-    frozen = ("СМ," in up) or ("С/М" in up) or ("ЗАМОРОЖ" in up) or (" СМ " in up)
+    frozen = bool(
+        re.search(r"(?<![А-ЯЁA-Z])(СМ|С/М|С\\М)(?![А-ЯЁA-Z])", up) or "ЗАМОРОЖ" in up
+    )
     if chilled and frozen:
         return "смешанное"
     if chilled:
@@ -744,6 +755,26 @@ def _make_reply_handler(db):
         if not readings:
             return  # реплика без чисел — молчим, чтобы не шуметь; текст уже в логе
 
+        if (len(readings) == 1 and not readings[0]["batch_no"]
+                and not readings[0]["descr"]):
+            dup = db._fetchone(
+                "SELECT id FROM quality.temp_readings "
+                "WHERE window_id=%s AND author_tg_id=%s AND NOT superseded "
+                "AND ABS(value_c) = ABS(%s::numeric) "
+                "AND measured_at >= NOW() - INTERVAL '15 minutes' "
+                "ORDER BY id DESC LIMIT 1",
+                (row["id"], author_id, readings[0]["value_c"]),
+            )
+            if dup:
+                db._execute(
+                    "UPDATE quality.temp_readings "
+                    "SET value_c=%s, sign_pending=FALSE WHERE id=%s",
+                    (readings[0]["value_c"], dup["id"]),
+                )
+                db.conn.commit()
+                await msg.reply_text("Принял как уточнение знака к предыдущему замеру.")
+                return
+
         pending = 0
         for r in readings:
             r["ms_product"], r["ms_state"] = await resolve_batch(db, r["batch_no"])
@@ -759,8 +790,9 @@ def _make_reply_handler(db):
                 INSERT INTO quality.temp_readings
                     (window_id, window_key, point_key, batch_no, descr, value_c,
                      author_tg_id, author_name, chat_id, answer_msg_id, raw_line,
-                     sign_pending, ms_product, ms_state, stage, cut_note, reported_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                     sign_pending, ms_product, ms_state, stage, stage_source,
+                     cut_note, reported_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                         CASE WHEN %s::int IS NULL THEN NULL
                              ELSE (((NOW() AT TIME ZONE 'Europe/Moscow')::date
                                     + make_time(%s::int, %s::int, 0))
@@ -769,7 +801,7 @@ def _make_reply_handler(db):
                 (row["id"], row["window_key"], r["point_key"], r["batch_no"], r["descr"],
                  r["value_c"], author_id, author_name, msg.chat_id, msg.message_id,
                  r["raw_line"], r["sign_pending"], r.get("ms_product"), r.get("ms_state"),
-                 r.get("stage"), r.get("cut_note"),
+                 r.get("stage"), r.get("stage_source"), r.get("cut_note"),
                  (r["hhmm"][0] if r.get("hhmm") else None),
                  (r["hhmm"][0] if r.get("hhmm") else None),
                  (r["hhmm"][1] if r.get("hhmm") else None)),
