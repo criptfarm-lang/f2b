@@ -4,6 +4,7 @@ F2B PRO — Telegram Bot
 """
 
 import asyncio
+import functools
 import logging
 import os
 import re
@@ -200,7 +201,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_author = user is not None and _is_task_author(user.id)
     await update.message.reply_text(
         f"👋 Привет, *{user.full_name if user else 'друг'}*! Я Эф — ассистент F2B PRO.\n\n"
-        f"Используй меню ниже или обращайся: *Эф, [вопрос]*",
+        f"Спрашивай так: *Эф, [вопрос]*",
         parse_mode="Markdown",
         reply_markup=_user_menu_keyboard(include_task_button=is_author)
     )
@@ -218,35 +219,67 @@ CONTRACT_MOVED_MSG = (
 )
 
 
-def _user_menu_keyboard(include_task_button: bool = False) -> InlineKeyboardMarkup:
-    """Общее меню для всех пользователей.
+def leads_only(handler):
+    """Команда только для руководителей (Виктор, Александр).
 
-    Если include_task_button=True (только для whitelist Виктор/Александр) —
-    добавляется кнопка «📋 Поставить задачу».
+    До 27.08.2026 половина команд не проверяла права вообще: `/op_report` отдавал
+    любому написавшему боту часовую ссылку на выручку, планы и АКБ отдела,
+    `/aging` — список стареющих клиентов, `/wazzup_export` — выгрузку базы
+    контактов в Excel. В боте при этом 26 зарегистрированных чатов, и далеко не
+    все они сотрудники.
     """
-    rows = [
-        [
-            InlineKeyboardButton("📸 Запросить фото товара", callback_data="user_photo"),
-        ],
-        # Генерация договоров переехала в дашборд менеджера → «Сервисы» → «Документы»
-        # (2026-07-14). Кнопка убрана, callback user_contract отвечает CONTRACT_MOVED_MSG.
-        [
-            InlineKeyboardButton("📊 Отчёт ОП", callback_data="user_op_report"),
-        ],
-        [
-            InlineKeyboardButton("📝 Новая заявка на закупку", callback_data="user_req_new"),
-        ],
-    ]
-    if include_task_button:
-        rows.append([InlineKeyboardButton("📋 Поставить задачу", callback_data="menu_task")])
-    return InlineKeyboardMarkup(rows)
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if not user or user.id not in {OWNER_CHAT_ID, PARTNER_CHAT_ID}:
+            msg = update.effective_message
+            if msg:
+                await msg.reply_text("⛔ Команда доступна только руководителям.")
+            return
+        return await handler(update, context)
+    return wrapper
+
+
+def owner_only(handler):
+    """Служебная команда — только собственник (настройка вебхуков, выгрузки, память бота)."""
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if not user or user.id != OWNER_CHAT_ID:
+            msg = update.effective_message
+            if msg:
+                await msg.reply_text("⛔ Служебная команда.")
+            return
+        return await handler(update, context)
+    return wrapper
+
+
+def _user_menu_keyboard(include_task_button: bool = False) -> None:
+    """Кнопок у обычных пользователей больше нет (27.08.2026).
+
+    Меню собирало три входа, каждый из которых давно живёт в другом месте:
+    фото товара — команда `/photo`, заявка на закупку — вкладка «Сервисы» в
+    дашборде менеджера, задачи — доска YouGile. А «Отчёт ОП» вообще не спрашивал
+    прав: кнопку видел каждый, кто написал боту, и получал часовую ссылку на
+    выручку, планы и АКБ всего отдела. Вскрылось, когда бота запустил Дубинин.
+
+    Функция оставлена и возвращает None, чтобы не переписывать десяток
+    `reply_markup=...` по коду: None — это «без клавиатуры».
+    """
+    return None
+
+MENU_RETIRED_MSG = (
+    "Меню отключено — всё переехало.\n\n"
+    "• фото товара — команда /photo\n"
+    "• заявка на закупку — дашборд менеджера → «Сервисы»\n"
+    "• задачи — доска руководителей\n\n"
+    "Вопрос ко мне пиши так: *Эф, [вопрос]*"
+)
+
 
 async def cmd_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/usermenu — общее меню."""
-    await update.message.reply_text(
-        "Выбери действие:",
-        reply_markup=_user_menu_keyboard()
-    )
+    """/usermenu — меню упразднено 27.08.2026, отвечаем куда идти."""
+    await update.message.reply_text(MENU_RETIRED_MSG, parse_mode="Markdown")
 
 async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик общего меню пользователей."""
@@ -272,6 +305,10 @@ async def handle_user_menu_callback(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text(CONTRACT_MOVED_MSG, parse_mode="Markdown")
 
     elif action == "user_op_report":
+        # Кнопки больше нет, но старые сообщения с ней остались в чатах.
+        if not user or user.id not in {OWNER_CHAT_ID, PARTNER_CHAT_ID}:
+            await query.message.reply_text("⛔ Отчёт доступен только руководителям.")
+            return
         await cmd_op_report(update, context)
 
     elif action == "user_req_new":
@@ -432,12 +469,13 @@ async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📋 *Все команды:*\n\n"
-        "*Отчёты:*\n"
-        "/report — недельный отчёт\n\n"
-        "*Управление:*\n"
-        "/menu — панель управления\n"
-        "/mychatid — мой chat ID",
+        "📋 *Команды:*\n\n"
+        "/photo — фото товара\n"
+        "/price — актуальный прайс\n"
+        "/contact — поиск контакта\n"
+        "/mychatid — мой chat ID\n\n"
+        "Вопрос ко мне: *Эф, [вопрос]*\n"
+        "_Отчёты и служебные команды — у руководителей._",
         parse_mode="Markdown"
     )
 
@@ -452,40 +490,23 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # Не-руководитель — общее меню. Кнопка задач только для whitelist (Александр).
+    # Не-руководитель — кнопок нет вовсе (27.08.2026).
     if user.id != OWNER_CHAT_ID:
-        await update.message.reply_text(
-            "Выбери действие:",
-            reply_markup=_user_menu_keyboard(include_task_button=_is_task_author(user.id))
-        )
+        await update.message.reply_text(MENU_RETIRED_MSG, parse_mode="Markdown")
         return
 
-    # OWNER — расширенное меню с кнопкой задач в персональном блоке.
-    keyboard = InlineKeyboardMarkup([
-        # ── Доступно всем ──────────────────────────────────────────
-        [InlineKeyboardButton("── Общие функции ──", callback_data="menu_noop")],
-        [
-            InlineKeyboardButton("📸 Фото товара", callback_data="user_photo"),
-        ],
-        # Договоры переехали в дашборд менеджера → «Сервисы» → «Документы» (2026-07-14).
-        [
-            InlineKeyboardButton("📊 Отчёт ОП", callback_data="menu_evening"),
-        ],
-        [
-            InlineKeyboardButton("📝 Новая заявка на закупку", callback_data="user_req_new"),
-        ],
-        # ── Только руководитель ────────────────────────────────────
-        [InlineKeyboardButton("── Только для меня ──", callback_data="menu_noop")],
-        [
-            InlineKeyboardButton("⏳ Стареющие", callback_data="menu_aging"),
-        ],
-        # ── Постановка задач в МойСклад ────────────────────────────
-        [InlineKeyboardButton("── Постановка задач ──", callback_data="menu_noop")],
-        [InlineKeyboardButton("📋 Поставить задачу", callback_data="menu_task")],
-    ])
+    # OWNER — кнопок тоже нет (27.08.2026, решение собственника «убрать все»).
+    # Всё, что они запускали, вызывается командой; постановка задач переехала на
+    # доску руководителей, заявка на закупку — в «Сервисы» дашборда.
+    keyboard = None
 
     await update.message.reply_text(
-        "🎛 *Панель управления Эф*\n\nВыбери действие:",
+        "🎛 *Панель управления Эф*\n\n"
+        "/op_report — отчёт ОП\n"
+        "/aging — стареющие клиенты\n"
+        "/photo — фото товара\n"
+        "/report — недельный отчёт\n\n"
+        "_Задачи — доска руководителей, заявка на закупку — «Сервисы» в дашборде._",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
@@ -1423,7 +1444,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if awaiting == "photo":
             await message.reply_chat_action("upload_photo")
             await search_and_send_photo(update, context, text)
-            await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+            await message.reply_text(MENU_RETIRED_MSG, parse_mode="Markdown")
             return
 
         elif awaiting in ("request_text", "request_text_amend"):
@@ -1445,7 +1466,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await message.reply_text(
                     f"⚠️ Не удалось разобрать заявку: {e}\n\nПопробуй ещё раз через меню.",
                 )
-                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+                await message.reply_text(MENU_RETIRED_MSG, parse_mode="Markdown")
                 return
             drafts = [(p, route_request(p.species)) for p in parsed_list]
             _draft_requests[user.id] = drafts
@@ -1477,7 +1498,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"❌ Компания *{buyer_query}* не найдена в МойСклад.",
                     parse_mode="Markdown"
                 )
-                await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+                await message.reply_text(MENU_RETIRED_MSG, parse_mode="Markdown")
                 return
             cp = counterparties[0]
             cp_id = cp.get("id", "")
@@ -1523,13 +1544,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"reconciliation awaiting error: {e}", exc_info=True)
                 await message.reply_text(f"❌ Ошибка формирования акта: {e}")
-            await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+            await message.reply_text(MENU_RETIRED_MSG, parse_mode="Markdown")
             return
 
         elif awaiting == "contract":
             # Договоры оформляются только в сервисе «Документы» (см. CONTRACT_MOVED_MSG).
             await message.reply_text(CONTRACT_MOVED_MSG, parse_mode="Markdown")
-            await message.reply_text("Выбери действие:", reply_markup=_user_menu_keyboard())
+            await message.reply_text(MENU_RETIRED_MSG, parse_mode="Markdown")
             return
 
     # Ответ менеджера на алерт цены в личке — пересылаем Виктору
@@ -6983,7 +7004,7 @@ def main():
     ))
 
     # Команды
-    app.add_handler(CommandHandler("op_report", cmd_op_report))
+    app.add_handler(CommandHandler("op_report", leads_only(cmd_op_report)))
     app.add_handler(CommandHandler("test_group", cmd_test_group))
     app.add_handler(CommandHandler("test_fact", cmd_test_fact))
     app.add_handler(CommandHandler("refresh_history", cmd_refresh_history))
@@ -6999,7 +7020,7 @@ def main():
     app.add_handler(CommandHandler("sync_managers", cmd_sync_managers))
     app.add_handler(CommandHandler("managers", cmd_managers))
     app.add_handler(CommandHandler("search_msg", cmd_search_msg))
-    app.add_handler(CommandHandler("aging", cmd_aging))
+    app.add_handler(CommandHandler("aging", leads_only(cmd_aging)))
     app.add_handler(CommandHandler("block", cmd_block_user))
     app.add_handler(CommandHandler("unblock", cmd_unblock_user))
     app.add_handler(CommandHandler("del_user", cmd_del_user))
@@ -7014,21 +7035,21 @@ def main():
     app.add_handler(CommandHandler("mychatid", cmd_mychatid))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("clearwazzup", cmd_clear_wazzup))
-    app.add_handler(CommandHandler("wazzup_enrich", cmd_wazzup_enrich))
-    app.add_handler(CommandHandler("wazzup_export", cmd_wazzup_export))
-    app.add_handler(CommandHandler("wazzup_reset", cmd_wazzup_reset))
-    app.add_handler(CommandHandler("wazzup_channels", cmd_wazzup_channels))
-    app.add_handler(CommandHandler("wazzup_setup", cmd_wazzup_setup))
-    app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(CommandHandler("clearwazzup", owner_only(cmd_clear_wazzup)))
+    app.add_handler(CommandHandler("wazzup_enrich", owner_only(cmd_wazzup_enrich)))
+    app.add_handler(CommandHandler("wazzup_export", owner_only(cmd_wazzup_export)))
+    app.add_handler(CommandHandler("wazzup_reset", owner_only(cmd_wazzup_reset)))
+    app.add_handler(CommandHandler("wazzup_channels", owner_only(cmd_wazzup_channels)))
+    app.add_handler(CommandHandler("wazzup_setup", owner_only(cmd_wazzup_setup)))
+    app.add_handler(CommandHandler("test", owner_only(cmd_test)))
     app.add_handler(MessageHandler(filters.StatusUpdate.MESSAGE_AUTO_DELETE_TIMER_CHANGED, handle_message))
-    app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("report", leads_only(cmd_report)))
     app.add_handler(CommandHandler("photo", cmd_photo))
     app.add_handler(CommandHandler("price", cmd_price))
     app.add_handler(CommandHandler("contact", cmd_contact))
-    app.add_handler(CommandHandler("memory", cmd_memory))
-    app.add_handler(CommandHandler("remember", cmd_remember))
-    app.add_handler(CommandHandler("add_webhook", cmd_add_webhook))
+    app.add_handler(CommandHandler("memory", owner_only(cmd_memory)))
+    app.add_handler(CommandHandler("remember", owner_only(cmd_remember)))
+    app.add_handler(CommandHandler("add_webhook", owner_only(cmd_add_webhook)))
     # ── Заглушки для старых ПДЗ-команд (Фаза 1: чистка старой механики) ──
     # Команды отключены, новая механика дебиторки описывается в группе ОП.
     app.add_handler(CommandHandler("pdz", cmd_pdz_disabled))
