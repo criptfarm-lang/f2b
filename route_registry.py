@@ -492,8 +492,10 @@ def _parse_pickup_po(po) -> dict:
         "is_pickup": True,
         "client": (agent.get("name") or "").strip(),   # поставщик
         "address": addr,                               # «Адрес забора»
-        # Комментарий водителю (поле ЗП) — аналог адресного комментария доставки; фолбэк на описание.
-        "comment": drv_comment or (po.get("description") or "").strip(),
+        # Комментарий водителю (поле ЗП) — аналог адресного комментария доставки.
+        # Фолбэка на description НЕТ: там условия закупки для поставщика («2млн, 14
+        # календарных дней»), водителю это мусор (замечание Беляковой 26.08.2026).
+        "comment": drv_comment,
         "manager": (owner.get("name") or "").strip(),  # закупщик = автор ЗП
         "driver": driver,
         "car": car_name,
