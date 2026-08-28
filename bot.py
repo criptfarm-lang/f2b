@@ -49,7 +49,7 @@ from moysklad import (search_products, search_products_filtered, get_price_list,
     format_debtors_by_tag, format_clients_by_tag,
     get_overdue_demands, format_overdue_demands, format_overdue_summary,
     format_reminders_for_manager, format_debt_reminder, fmt_money,
-    list_employees, create_task, invalidate_employees_cache)
+    list_employees, invalidate_employees_cache)
 from claude_ai import parse_task_draft
 
 # ─── Владелец бота — TG-id, гейтит админские команды и адрес утренних сводок ─
@@ -61,7 +61,7 @@ if not _owner_chat_id_raw:
     )
 OWNER_CHAT_ID = int(_owner_chat_id_raw)
 
-# ─── Партнёр — TG-id, whitelist для /задача (второй из двух постановщиков) ───
+# ─── Партнёр — TG-id, второй руководитель (декоратор leads_only) ────────────
 _partner_chat_id_raw = os.getenv("PARTNER_CHAT_ID")
 if not _partner_chat_id_raw:
     raise RuntimeError(
@@ -258,8 +258,8 @@ def _user_menu_keyboard(include_task_button: bool = False) -> None:
     """Кнопок у обычных пользователей больше нет (27.08.2026).
 
     Меню собирало три входа, каждый из которых давно живёт в другом месте:
-    фото товара — команда `/photo`, заявка на закупку — вкладка «Сервисы» в
-    дашборде менеджера, задачи — доска YouGile. А «Отчёт ОП» вообще не спрашивал
+    заявка на закупку — вкладка «Сервисы» в дашборде менеджера, задачи — доска
+    YouGile, поиск фото упразднён совсем. А «Отчёт ОП» вообще не спрашивал
     прав: кнопку видел каждый, кто написал боту, и получал часовую ссылку на
     выручку, планы и АКБ всего отдела. Вскрылось, когда бота запустил Дубинин.
 
@@ -272,10 +272,10 @@ BOT_NOTIFY_ONLY_MSG = "Я только присылаю уведомления. 
 
 MENU_RETIRED_MSG = (
     "Меню отключено — всё переехало.\n\n"
-    "• фото товара — команда /photo\n"
     "• заявка на закупку — дашборд менеджера → «Сервисы»\n"
-    "• задачи — доска руководителей\n\n"
-    "Вопрос ко мне пиши так: *Эф, [вопрос]*"
+    "• задачи — доска руководителей в YouGile\n"
+    "• отчёты и планы — дашборд менеджера\n\n"
+    "Я только присылаю уведомления."
 )
 
 
@@ -480,12 +480,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Панель управления.
-
-    - Виктор (OWNER): полное меню + секция «Постановка задач».
-    - Александр (PARTNER): общее меню + кнопка «Поставить задачу».
-    - Остальные: общее меню.
-    """
+    """Панель управления — с 27.08.2026 просто текст, без кнопок."""
     user = update.effective_user
     if not user:
         return
@@ -496,17 +491,16 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # OWNER — кнопок тоже нет (27.08.2026, решение собственника «убрать все»).
-    # Всё, что они запускали, вызывается командой; постановка задач переехала на
-    # доску руководителей, заявка на закупку — в «Сервисы» дашборда.
+    # Всё, что они запускали, живёт в другом месте: задачи — доска YouGile,
+    # заявка на закупку — «Сервисы» дашборда, отчёты и планы — дашборд.
     keyboard = None
 
     await update.message.reply_text(
         "🎛 *Панель управления Эф*\n\n"
-        "/op_report — отчёт ОП\n"
-        "/aging — стареющие клиенты\n"
-        "/photo — фото товара\n"
-        "/report — недельный отчёт\n\n"
-        "_Задачи — доска руководителей, заявка на закупку — «Сервисы» в дашборде._",
+        "/svetofor <ИНН> — светофор надёжности контрагента\n"
+        "/маршруты, /реестр, /склад, /ход, /статусы — логистика\n\n"
+        "_Отчёты и планы — дашборд, задачи — доска YouGile, "
+        "заявка на закупку — «Сервисы» в дашборде._",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
@@ -617,15 +611,11 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📋 *Все команды:*\n\n"
-        "*Отчёты:*\n"
-        "/report — недельный отчёт\n\n"
-        "*База знаний:*\n"
-        "/фото [товар] — найти фото\n"
-        "/прайс — актуальный прайс\n"
-        "/контакт [имя] — найти контакт\n\n"
-        "*Обращение в свободной форме:*\n"
-        "бот, [любой вопрос]",
+        "📋 *Что доступно:*\n\n"
+        "*Логистика:* /маршруты, /реестр, /склад, /ход, /статусы\n"
+        "*Водителю:* /рейс, /лист\n\n"
+        "Остальное — уведомления. Отчёты и планы в дашборде, "
+        "задачи на доске YouGile.",
         parse_mode="Markdown"
     )
 
@@ -1252,14 +1242,6 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поиск фото по команде /фото [товар]."""
-    query = " ".join(context.args) if context.args else ""
-    if not query:
-        await update.message.reply_text("Укажи товар: /photo тунец")
-        return
-    await search_and_send_photo(update, context, query)
-
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Последний актуальный прайс."""
     price = db.get_latest_price()
@@ -1441,13 +1423,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if awaiting and user and text and not text.startswith("/"):
         _user_awaiting.pop(user.id, None)
 
-        if awaiting == "photo":
-            await message.reply_chat_action("upload_photo")
-            await search_and_send_photo(update, context, text)
-            await message.reply_text(MENU_RETIRED_MSG, parse_mode="Markdown")
-            return
-
-        elif awaiting in ("request_text", "request_text_amend"):
+        if awaiting in ("request_text", "request_text_amend"):
             await message.reply_chat_action("typing")
             try:
                 from request_handler import (
@@ -6279,530 +6255,6 @@ async def cmd_del_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
-# ============================================================================
-# Постановка задач в МойСклад через /задача (whitelist: Виктор + Александр)
-# ============================================================================
-
-from zoneinfo import ZoneInfo
-_MSK = ZoneInfo("Europe/Moscow")
-
-_TASK_CONV_TIMEOUT_SEC = 600  # 10 минут
-
-# Стадии conversation для /задача
-_STAGE_WAITING_DESCRIPTION = "WAITING_DESCRIPTION"       # ждём первое сообщение с задачей
-_STAGE_DRAFT = "DRAFT"                                   # показан драфт, ждём ✅/✏️/❌
-_STAGE_WAITING_CLARIFICATION = "WAITING_CLARIFICATION"   # ждём уточнения исполнителя
-_STAGE_WAITING_REWRITE = "WAITING_REWRITE"               # ждём новое сообщение после ✏️
-
-# In-memory state: {chat_id: {"stage", "draft", "draft_message_id", "started_at"}}
-_task_conversations: dict = {}
-
-
-def _is_task_author(chat_id: int) -> bool:
-    """Whitelist для /задача — только Виктор и Александр."""
-    return chat_id in {OWNER_CHAT_ID, PARTNER_CHAT_ID}
-
-
-def _task_actor_name(chat_id: int) -> str:
-    """Имя инициатора для логов."""
-    if chat_id == OWNER_CHAT_ID:
-        return "Виктор"
-    if chat_id == PARTNER_CHAT_ID:
-        return "Александр"
-    return f"chat_id={chat_id}"
-
-
-def _task_conv_expired(conv: dict) -> bool:
-    """True, если с момента started_at прошло больше таймаута."""
-    started = conv.get("started_at")
-    if not started:
-        return True
-    return (datetime.now(_MSK) - started).total_seconds() > _TASK_CONV_TIMEOUT_SEC
-
-
-async def _task_strip_buttons(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Снять inline-кнопки у драфт-сообщения (если ещё живо)."""
-    try:
-        await context.bot.edit_message_reply_markup(
-            chat_id=chat_id,
-            message_id=message_id,
-            reply_markup=None,
-        )
-    except Exception as e:
-        logger.debug(f"_task_strip_buttons: {e}")
-
-
-async def _task_cancel_existing(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Закрыть активную conversation: снять кнопки, очистить state."""
-    conv = _task_conversations.pop(chat_id, None)
-    if conv:
-        msg_id = conv.get("draft_message_id")
-        if msg_id:
-            await _task_strip_buttons(chat_id, msg_id, context)
-
-
-async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/задача /поставить /task — старт постановки задачи в МойСклад.
-
-    Доступно только Виктору и Александру в личном чате с ботом.
-    В группе от whitelist → подсказка «работает только в личке».
-    Не-whitelist → тихое игнорирование.
-    """
-    user = update.effective_user
-    chat = update.effective_chat
-    if not user or not chat:
-        return
-
-    # Группа + whitelist → подсказка. Группа + не-whitelist → молчим.
-    if chat.type != "private":
-        if _is_task_author(user.id):
-            await update.message.reply_text(
-                "ℹ️ Постановка задач работает только в личном чате со мной."
-            )
-        return
-
-    # Личка + не-whitelist → молчим.
-    if not _is_task_author(user.id):
-        return
-
-    # Если уже есть активная conversation у этого пользователя — отменяем старую.
-    if user.id in _task_conversations:
-        await _task_cancel_existing(user.id, context)
-        await update.message.reply_text("⚠️ Предыдущая задача отменена.")
-
-    _task_conversations[user.id] = {
-        "stage": _STAGE_WAITING_DESCRIPTION,
-        "draft": None,
-        "draft_message_id": None,
-        "started_at": datetime.now(_MSK),
-    }
-    logger.info(
-        f"metric.task_bot.conv_started chat_id={user.id} actor={_task_actor_name(user.id)}"
-    )
-    await update.message.reply_text(
-        "✍️ Опиши задачу одним сообщением — кому, что сделать, к какому сроку."
-    )
-
-
-async def handle_menu_task_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Кнопка «📋 Поставить задачу» из /menu.
-
-    Эквивалент /задача, но стартует через callback. Доступна только whitelist.
-    """
-    query = update.callback_query
-    user = query.from_user
-    if not user:
-        return
-    # Гейт: только Виктор и Александр
-    if not _is_task_author(user.id):
-        await query.answer("⛔ Доступно только Виктору и Александру", show_alert=True)
-        return
-    chat = query.message.chat if query.message else None
-    if not chat or chat.type != "private":
-        await query.answer("ℹ️ Работает только в личном чате со мной", show_alert=True)
-        return
-    await query.answer()
-    # Если активная conv — закрываем старую, начинаем новую
-    if user.id in _task_conversations:
-        await _task_cancel_existing(user.id, context)
-    _task_conversations[user.id] = {
-        "stage": _STAGE_WAITING_DESCRIPTION,
-        "draft": None,
-        "draft_message_id": None,
-        "started_at": datetime.now(_MSK),
-    }
-    logger.info(
-        f"metric.task_bot.conv_started chat_id={user.id} "
-        f"actor={_task_actor_name(user.id)} via=menu"
-    )
-    await context.bot.send_message(
-        chat_id=user.id,
-        text="✍️ Опиши задачу одним сообщением — кому, что сделать, к какому сроку.",
-    )
-
-
-async def cmd_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/отмена — отменить активную постановку задачи."""
-    user = update.effective_user
-    chat = update.effective_chat
-    if not user or not chat or chat.type != "private":
-        return
-    if not _is_task_author(user.id):
-        return
-    if user.id not in _task_conversations:
-        # Нечего отменять — тихо игнорируем, чтобы не реагировать на /отмена вне контекста.
-        return
-    await _task_cancel_existing(user.id, context)
-    logger.info(f"metric.task_bot.task_cancelled chat_id={user.id}")
-    await update.message.reply_text(
-        "❌ Отменил. Чтобы начать заново — /задача."
-    )
-
-
-# ─── Рендеринг драфта и клавиатур ───────────────────────────────────────────
-
-def _render_task_draft_text(draft: dict) -> str:
-    assignee_name = draft.get("assignee_name") or "—"
-    description = draft.get("description") or "—"
-    due_str = draft.get("due_msk")
-    due_pretty = f"{due_str} МСК" if due_str else "не указан"
-    return (
-        "📋 Задача в МойСклад:\n"
-        f"• Исполнитель: {assignee_name}\n"
-        f"• Описание: {description}\n"
-        f"• Дедлайн: {due_pretty}"
-    )
-
-
-def _task_draft_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Создать", callback_data="task_confirm"),
-        InlineKeyboardButton("✏️ Переписать", callback_data="task_rewrite"),
-        InlineKeyboardButton("❌ Отмена", callback_data="task_draft_cancel"),
-    ]])
-
-
-def _task_candidates_keyboard(candidates: list) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(c["name"], callback_data=f"task_cand:{c['id']}")]
-            for c in candidates]
-    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="task_draft_cancel")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def _task_send_draft(chat_id: int, context: ContextTypes.DEFAULT_TYPE, draft: dict) -> None:
-    """Отправляет новое сообщение с драфтом + кнопками, обновляет state."""
-    text = _render_task_draft_text(draft)
-    msg = await context.bot.send_message(
-        chat_id=chat_id, text=text, reply_markup=_task_draft_keyboard()
-    )
-    conv = _task_conversations.get(chat_id)
-    if conv is not None:
-        conv["stage"] = _STAGE_DRAFT
-        conv["draft"] = draft
-        conv["draft_message_id"] = msg.message_id
-        conv["started_at"] = datetime.now(_MSK)
-
-
-# ─── Парсинг и маршрутизация драфта ─────────────────────────────────────────
-
-async def _task_parse_and_route(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    """Парсит текст через Claude, валидирует id, решает: драфт / кандидаты / переспрос."""
-    conv = _task_conversations.get(chat_id)
-    if not conv:
-        return
-    try:
-        employees = await list_employees()
-    except Exception as e:
-        logger.error(f"list_employees failed: {e}")
-        logger.info(f"metric.task_bot.task_error_ms_employees chat_id={chat_id}")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="⚠️ МойСклад временно недоступен. /отмена и попробуй позже.",
-        )
-        return
-    valid_ids = {e["id"] for e in employees}
-    id_to_name = {e["id"]: e["name"] for e in employees}
-    now_msk = datetime.now(_MSK)
-    try:
-        draft = await parse_task_draft(text, employees, now_msk)
-    except Exception as e:
-        logger.error(f"parse_task_draft failed: {e}", exc_info=True)
-        logger.info(f"metric.task_bot.task_error_claude chat_id={chat_id}")
-        await context.bot.send_message(
-            chat_id=chat_id, text="⚠️ Не получилось распарсить, попробуй ещё раз."
-        )
-        return
-    # Валидация assignee_id — отсекаем галлюцинации Claude
-    aid = draft.get("assignee_id")
-    if aid and aid not in valid_ids:
-        logger.warning(f"parse_task_draft: assignee_id={aid} не в списке — отбрасываем")
-        aid = None
-    cands = [c for c in (draft.get("assignee_candidates") or []) if c.get("id") in valid_ids]
-    desc = (draft.get("description") or "").strip()
-    if len(desc) > 200:
-        desc = desc[:199] + "…"
-
-    draft = {
-        "assignee_id": aid,
-        "assignee_name": id_to_name.get(aid) if aid else None,
-        "assignee_candidates": cands if cands else None,
-        "description": desc,
-        "due_msk": draft.get("due_msk"),
-    }
-
-    # Есть однозначный исполнитель → сразу драфт
-    if aid:
-        await _task_send_draft(chat_id, context, draft)
-        return
-    # 2–5 кандидатов → кнопки выбора
-    if cands and 2 <= len(cands) <= 5:
-        conv["stage"] = _STAGE_WAITING_CLARIFICATION
-        conv["draft"] = draft
-        conv["draft_message_id"] = None
-        conv["started_at"] = datetime.now(_MSK)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="🤔 Кого из них ты имел в виду?",
-            reply_markup=_task_candidates_keyboard(cands),
-        )
-        return
-    # 0 или >5 кандидатов → переспрос фамилией
-    conv["stage"] = _STAGE_WAITING_CLARIFICATION
-    conv["draft"] = draft
-    conv["draft_message_id"] = None
-    conv["started_at"] = datetime.now(_MSK)
-    await context.bot.send_message(
-        chat_id=chat_id, text="🤔 Кому ставим? Напиши фамилию."
-    )
-
-
-# ─── MessageHandler для текста в активной conversation ──────────────────────
-
-class _TaskConvActiveFilter(filters.MessageFilter):
-    """Срабатывает только для whitelist-пользователей в личке с активной conv."""
-    def filter(self, message):
-        user = getattr(message, "from_user", None)
-        chat = getattr(message, "chat", None)
-        if not user or not chat or chat.type != "private":
-            return False
-        active = user.id in _task_conversations
-        # Диагностика: логируем попытку для whitelist-юзеров, чтобы увидеть,
-        # почему filter не совпадает, если пользователь в conv ожидает.
-        if _is_task_author(user.id):
-            logger.info(
-                f"metric.task_bot.filter_check user_id={user.id} "
-                f"active={active} conv_keys={list(_task_conversations.keys())} "
-                f"text={(message.text or '')[:60]!r}"
-            )
-        return active
-
-
-_task_conv_active_filter = _TaskConvActiveFilter()
-
-
-async def handle_task_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Текстовое сообщение пользователя в активной /задача-conversation."""
-    user = update.effective_user
-    chat = update.effective_chat
-    if not user or not chat or chat.type != "private":
-        return
-    logger.info(
-        f"metric.task_bot.message_received user_id={user.id} "
-        f"in_conv={user.id in _task_conversations} "
-        f"stage={_task_conversations.get(user.id, {}).get('stage')}"
-    )
-    if user.id not in _task_conversations:
-        return
-    conv = _task_conversations[user.id]
-    if _task_conv_expired(conv):
-        msg_id = conv.get("draft_message_id")
-        if msg_id:
-            await _task_strip_buttons(user.id, msg_id, context)
-        _task_conversations.pop(user.id, None)
-        logger.info(f"metric.task_bot.task_timeout chat_id={user.id}")
-        await update.message.reply_text("⏳ Сессия устарела, нажми /задача заново.")
-        return
-
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-    stage = conv["stage"]
-    if stage == _STAGE_WAITING_DESCRIPTION:
-        await _task_parse_and_route(user.id, context, text)
-    elif stage == _STAGE_WAITING_CLARIFICATION:
-        # Склеиваем старое описание с уточнением-фамилией, чтобы парсер увидел оба факта.
-        old_desc = (conv.get("draft") or {}).get("description") or ""
-        combined = f"{text}, {old_desc}" if old_desc else text
-        await _task_parse_and_route(user.id, context, combined)
-    elif stage == _STAGE_WAITING_REWRITE:
-        await _task_parse_and_route(user.id, context, text)
-    # DRAFT — пользователь пишет текст, не нажимая кнопку. Игнорируем (ждём кнопку или /отмена).
-
-
-# ─── Callback кнопок драфта и кандидатов ────────────────────────────────────
-
-# Идемпотентность ✅ Создать: набор draft_message_id, по которым уже создаём задачу.
-_task_creating: set = set()
-
-
-async def handle_task_draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """✅ Создать / ✏️ Переписать / ❌ Отмена."""
-    query = update.callback_query
-    user = query.from_user
-    if not _is_task_author(user.id):
-        await query.answer("Недоступно", show_alert=False)
-        return
-    conv = _task_conversations.get(user.id)
-    if not conv or _task_conv_expired(conv):
-        await query.answer("⏳ Сессия устарела, нажми /задача заново.", show_alert=True)
-        if conv:
-            await _task_cancel_existing(user.id, context)
-        return
-    data = query.data
-    if data == "task_draft_cancel":
-        await query.answer("Отменил")
-        await _task_cancel_existing(user.id, context)
-        logger.info(f"metric.task_bot.task_cancelled chat_id={user.id}")
-        await context.bot.send_message(
-            chat_id=user.id,
-            text="❌ Отменил. Чтобы начать заново — /задача.",
-        )
-        return
-    if data == "task_rewrite":
-        await query.answer()
-        await _task_strip_buttons(user.id, query.message.message_id, context)
-        conv["stage"] = _STAGE_WAITING_REWRITE
-        conv["draft_message_id"] = None
-        conv["started_at"] = datetime.now(_MSK)
-        await context.bot.send_message(
-            chat_id=user.id, text="✍️ Опиши задачу заново одним сообщением."
-        )
-        return
-    if data == "task_confirm":
-        await _task_handle_confirm(update, context)
-        return
-
-
-async def handle_task_candidate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор кандидата исполнителя из inline-кнопок."""
-    query = update.callback_query
-    user = query.from_user
-    if not _is_task_author(user.id):
-        await query.answer("Недоступно", show_alert=False)
-        return
-    conv = _task_conversations.get(user.id)
-    if not conv or _task_conv_expired(conv):
-        await query.answer("⏳ Сессия устарела, нажми /задача заново.", show_alert=True)
-        if conv:
-            await _task_cancel_existing(user.id, context)
-        return
-    _, _, emp_id = query.data.partition(":")
-    try:
-        employees = await list_employees()
-    except Exception as e:
-        logger.error(f"list_employees failed: {e}")
-        await query.answer("⚠️ МойСклад временно недоступен", show_alert=True)
-        return
-    id_to_name = {e["id"]: e["name"] for e in employees}
-    if emp_id not in id_to_name:
-        await query.answer("Сотрудник не найден, начни заново /задача", show_alert=True)
-        await _task_cancel_existing(user.id, context)
-        return
-    draft = dict(conv.get("draft") or {})
-    draft["assignee_id"] = emp_id
-    draft["assignee_name"] = id_to_name[emp_id]
-    draft["assignee_candidates"] = None
-    await _task_strip_buttons(user.id, query.message.message_id, context)
-    await query.answer()
-    await _task_send_draft(user.id, context, draft)
-
-
-async def _task_handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """✅ Создать: создаём задачу в МС с идемпотентностью и обработкой ошибок."""
-    import aiohttp as _aiohttp
-    query = update.callback_query
-    user_id = query.from_user.id
-    conv = _task_conversations.get(user_id)
-    if not conv:
-        await query.answer("⏳ Сессия устарела, нажми /задача заново.", show_alert=True)
-        return
-    msg_id = query.message.message_id
-
-    # Идемпотентность: второй клик по той же кнопке — отвечаем «уже создаю».
-    if msg_id in _task_creating:
-        await query.answer("Уже создаю…")
-        return
-    _task_creating.add(msg_id)
-
-    try:
-        await query.answer("Создаю…")
-        await _task_strip_buttons(user_id, msg_id, context)
-
-        draft = conv.get("draft") or {}
-        aid = draft.get("assignee_id")
-        desc = draft.get("description") or ""
-        due_str = draft.get("due_msk")
-        due_dt = None
-        if due_str:
-            try:
-                due_dt = datetime.strptime(due_str, "%Y-%m-%d %H:%M")
-            except ValueError:
-                logger.warning(f"task_confirm: не распарсил due_msk='{due_str}', создаю без дедлайна")
-
-        async def _call_create():
-            return await create_task(aid, desc, due_dt)
-
-        try:
-            result = await _call_create()
-        except _aiohttp.ClientResponseError as e:
-            status = e.status
-            logger.warning(f"create_task HTTP {status}: {e}")
-            logger.info(f"metric.task_bot.task_error_{status} chat_id={user_id}")
-            if status == 404:
-                invalidate_employees_cache()
-                try:
-                    result = await _call_create()
-                except Exception as e2:
-                    logger.warning(f"create_task retry after 404 failed: {e2}")
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text="⚠️ Сотрудник не найден, возможно уволен. Выбери через ✏️ Переписать или ❌ Отмена.",
-                    )
-                    await _task_send_draft(user_id, context, draft)
-                    return
-            elif status in (401, 403):
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text="⚠️ У «Эф» недостаточно прав в МойСкладе. Сообщи Виктору.",
-                )
-                await _task_send_draft(user_id, context, draft)
-                return
-            elif status >= 500:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text="⚠️ МойСклад временно недоступен. Жми ✅ ещё раз или ❌ Отмена.",
-                )
-                await _task_send_draft(user_id, context, draft)
-                return
-            else:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"⚠️ Ошибка МС ({status}). Жми ✅ ещё раз или ❌ Отмена.",
-                )
-                await _task_send_draft(user_id, context, draft)
-                return
-        except Exception as e:
-            logger.exception(f"create_task unexpected error: {e}")
-            logger.info(f"metric.task_bot.task_error_exception chat_id={user_id}")
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="⚠️ Не удалось создать задачу. Жми ✅ ещё раз или ❌ Отмена.",
-            )
-            await _task_send_draft(user_id, context, draft)
-            return
-
-        # Успех
-        task_id = result["id"]
-        task_url = result["url"]
-        assignee_name = draft.get("assignee_name") or "—"
-        due_pretty = f"{due_str} МСК" if due_str else "не указан"
-        logger.info(f"metric.task_bot.task_created chat_id={user_id} task_id={task_id}")
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "✅ Задача создана\n"
-                f"Исполнитель: {assignee_name}\n"
-                f"Дедлайн: {due_pretty}\n"
-                f"→ [Открыть в МС]({task_url})"
-            ),
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-        )
-        _task_conversations.pop(user_id, None)
-    finally:
-        _task_creating.discard(msg_id)
-
-
 # ─── Telegram Business: приём BusinessConnection (для TG Stories Publisher) ───
 async def handle_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -7031,6 +6483,8 @@ def main():
         "/sklad", "/склад",
         "/progress", "/ход",
         "/statuses", "/статусы",
+        # владелец: проверка контрагента перед отгрузкой (внутри owner_only-гейт)
+        "/svetofor", "/svetofor_batch",
     }
 
     async def _commands_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7087,8 +6541,6 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_user_menu_callback, pattern="^user_"))
     app.add_handler(CallbackQueryHandler(handle_request_callback, pattern="^req_"))
     app.add_handler(CommandHandler("menu", cmd_menu))
-    # Кнопка «📋 Поставить задачу» в /menu — whitelist-гейт внутри; регистрируется ДО общего handle_menu_callback
-    app.add_handler(CallbackQueryHandler(handle_menu_task_button, pattern=r"^menu_task$"))
     app.add_handler(CallbackQueryHandler(handle_menu_callback, pattern="^menu_"))
     app.add_handler(CommandHandler("mychatid", cmd_mychatid))
     app.add_handler(CommandHandler("start", cmd_start))
@@ -7102,7 +6554,6 @@ def main():
     app.add_handler(CommandHandler("test", owner_only(cmd_test)))
     app.add_handler(MessageHandler(filters.StatusUpdate.MESSAGE_AUTO_DELETE_TIMER_CHANGED, handle_message))
     app.add_handler(CommandHandler("report", leads_only(cmd_report)))
-    app.add_handler(CommandHandler("photo", leads_only(cmd_photo)))
     app.add_handler(CommandHandler("price", leads_only(cmd_price)))
     app.add_handler(CommandHandler("contact", leads_only(cmd_contact)))
     app.add_handler(CommandHandler("memory", owner_only(cmd_memory)))
@@ -7457,16 +6908,6 @@ def main():
         lambda u, c: handle_amo_link_callback(u.callback_query, db),
         pattern="^amo_link\\|"
     ))
-    # ─── Постановка задач в МойСклад (/задача) ───────────────────────────────
-    # PTB не принимает кириллицу в CommandHandler (ValueError: not a valid bot command),
-    # поэтому маршрутизируем /задача /поставить /отмена через MessageHandler + Regex.
-    # /task — ASCII alias, можно зарегистрировать BotFather'ом в меню команд.
-    app.add_handler(CommandHandler("task", cmd_task))
-    app.add_handler(MessageHandler(
-        filters.Regex(r"^/(задача|поставить)(@\w+)?(\s|$)"),
-        cmd_task,
-    ))
-
     # ─── /needs_review: подтверждение needs-review лотов (план 2026-05-28 Под-фаза 2) ──
     from needs_review_handler import cmd_needs_review, cb_needs_review
 
@@ -7485,24 +6926,6 @@ def main():
 
     app.add_handler(CommandHandler("needs_review", _nr_guard_and_cmd))
     app.add_handler(CallbackQueryHandler(_nr_guard_and_cb, pattern=r"^nr_"))
-    app.add_handler(MessageHandler(
-        filters.Regex(r"^/отмена(@\w+)?(\s|$)"),
-        cmd_task_cancel,
-    ))
-    # Текст в активной /задача-conversation (только для whitelist в личке) — ДО общего handle_message
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & _task_conv_active_filter,
-        handle_task_message,
-    ))
-    app.add_handler(CallbackQueryHandler(
-        handle_task_draft_callback,
-        pattern=r"^task_(confirm|rewrite|draft_cancel)$",
-    ))
-    app.add_handler(CallbackQueryHandler(
-        handle_task_candidate_callback,
-        pattern=r"^task_cand:",
-    ))
-
     # ─── Чеклист водителя (/рейс) — план 2026-07-14 ──────────────────────────
     # Регистрируем ДО catch-all handle_message, чтобы текст/фото претензии
     # ловились активным фильтром, а не общим обработчиком.

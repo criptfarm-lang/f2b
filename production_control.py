@@ -18,7 +18,7 @@ import aiohttp
 from datetime import datetime, timedelta, timezone
 
 from telegram import Update
-from telegram.ext import MessageHandler, CommandHandler, filters
+from telegram.ext import MessageHandler, filters
 
 logger = logging.getLogger(__name__)
 
@@ -824,47 +824,21 @@ def _make_reply_handler(db):
     return handler
 
 
-def _make_status_cmd(db):
-    async def cmd(update: Update, context):
-        ensure_tables(db)
-        rows = db._fetchall(
-            """
-            SELECT window_key, point_key, batch_no, descr, stage, ms_product, value_c,
-                   COALESCE(reported_at, measured_at) AT TIME ZONE 'Europe/Moscow' AS t,
-                   author_name
-            FROM quality.temp_readings
-            WHERE measured_at >= NOW() - INTERVAL '2 days' AND NOT superseded
-            ORDER BY measured_at DESC LIMIT 40
-            """
-        )
-        if not rows:
-            await update.effective_message.reply_text("Замеров за двое суток нет.")
-            return
-        lines = [
-            f"{r['t']:%d.%m %H:%M}"
-            f"{' · ' + r['batch_no'] if r['batch_no'] else ''}"
-            f"{' · ' + (r['ms_product'] or r['descr'] or '')[:32] if (r['ms_product'] or r['descr']) else ''}"
-            f"{' · ' + r['stage'] if r['stage'] else ''} — {r['value_c']} °C"
-            for r in rows
-        ]
-        await update.effective_message.reply_text(
-            "Замеры за двое суток:\n" + "\n".join(lines)
-        )
-    return cmd
-
-
 def register(app, db):
-    """Хендлер ответов и команда сводки. Вызывать ДО catch-all MessageHandler."""
+    """Хендлер ответов на замерные окна. Вызывать ДО catch-all MessageHandler.
+
+    Команды сводки нет: 28.08.2026 собственник решил, что замеры смотрим в
+    рабочих сессиях по `quality.temp_readings`, а через бот — не планируем.
+    """
     ensure_tables(db)
     app.add_handler(
         MessageHandler(
-            # ~COMMAND обязателен: хендлер зарегистрирован раньше CommandHandler,
-            # и без фильтра он проглотит /qc и остальные команды в этой группе.
+            # ~COMMAND обязателен: хендлер зарегистрирован раньше остальных и без
+            # фильтра проглотит любые команды, набранные в этой группе.
             filters.Chat(chat_id()) & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
             _make_reply_handler(db),
         )
     )
-    app.add_handler(CommandHandler("qc", _make_status_cmd(db)))
     logger.info("production_control: зарегистрирован, чат %s", chat_id())
 
 
