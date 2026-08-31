@@ -6956,6 +6956,11 @@ def main():
         delivery_statuses.register(app, db)
     except Exception as e:
         logger.exception(f"delivery_statuses.register упал: {e}")
+    try:
+        import logi_morning_check
+        logi_morning_check.register(db)
+    except Exception as e:
+        logger.exception(f"logi_morning_check.register упал: {e}")
 
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
@@ -7159,6 +7164,24 @@ def main():
             logger.error(f"route_web warm job: {e}", exc_info=True)
 
     app.job_queue.run_repeating(_route_web_warm, interval=60, first=20)
+
+    # ────────────────────────────────────────────────────────────────────
+    # Утренняя проверка логистики — заявки на сегодня без машины и машины
+    # с точками, но без подтверждённого маршрута. Логистам в личку, окно
+    # 08:00–13:00 МСК (гейт внутри модуля), повтор только при новом составе.
+    # План: 2026-08-31-алерт-логисту-заявки-без-машины.
+    # ────────────────────────────────────────────────────────────────────
+    from logi_morning_check import poll_job as _logi_check_poll
+
+    async def _logi_morning_check_wrapper(context):
+        try:
+            stats = await _logi_check_poll(app, db)
+            if stats:
+                logger.info(f"logi_morning_check job: {stats}")
+        except Exception as e:
+            logger.error(f"logi_morning_check job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_logi_morning_check_wrapper, interval=1800, first=90)
 
     # ────────────────────────────────────────────────────────────────────
     # Пинг зависших лидов на «Неразобранном» воронки ПРИВЛЕЧЕНИЕ — каждые 30 мин.
