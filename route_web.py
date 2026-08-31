@@ -65,17 +65,31 @@ def _maps_link(address: str) -> str:
 _PHONE_RE = re.compile(r"(?:\+7|8|7)[\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-()]*\d{2}[\s\-()]*\d{2}")
 
 
-def _phone_from_text(text: str) -> str:
-    """Первый телефон из текста → нормализованный +7XXXXXXXXXX для tel:-ссылки. Пусто, если нет."""
-    if not text:
-        return ""
-    m = _PHONE_RE.search(text)
-    if not m:
-        return ""
-    digits = re.sub(r"\D", "", m.group(0))
+def _norm_tel(raw: str) -> str:
+    digits = re.sub(r"\D", "", raw or "")
     if len(digits) == 11 and digits[0] in "78":
         return "+7" + digits[1:]
     return "+" + digits if digits else ""
+
+
+def _phone_from_text(text: str) -> str:
+    """Первый телефон из текста → нормализованный +7XXXXXXXXXX для tel:-ссылки. Пусто, если нет."""
+    m = _PHONE_RE.search(text or "")
+    return _norm_tel(m.group(0)) if m else ""
+
+
+def _phones_from_text(text: str) -> list[str]:
+    """ВСЕ телефоны из текста, по порядку, без дублей.
+
+    Менеджер пишет под адресом несколько контактов приёмки («Катя +7926…, склад
+    +7495…»), а водителю показывался только первый — если он не отвечает, точка
+    встаёт. Поручение совещания по логистике 24.08.2026."""
+    out = []
+    for m in _PHONE_RE.finditer(text or ""):
+        tel = _norm_tel(m.group(0))
+        if tel and tel not in out:
+            out.append(tel)
+    return out
 
 
 def _e(s) -> str:
@@ -379,9 +393,10 @@ async def render_page(uid: int, target: date, db, bot) -> str:
             rows.append(f"<div class='row'>📍 <a href='{_maps_link(address)}' target='_blank'>{_e(address)}</a></div>")
         # Телефон приёмки — из Комментария заказа (менеджеры вписывают контакт туда),
         # карточку контрагента больше не читаем. Номер из комментария делаем кликабельным.
-        tel = _phone_from_text(comment)
-        if tel:
-            rows.append(f"<div class='row'>📞 <a href='tel:{_e(tel)}'>{_e(tel)}</a></div>")
+        tels = _phones_from_text(comment)
+        if tels:
+            links = " · ".join(f"<a href='tel:{_e(t)}'>{_e(t)}</a>" for t in tels)
+            rows.append(f"<div class='row'>📞 {links}</div>")
         wbits = " · ".join(x for x in ((f"{wt} кг" if wt else ""), f"{places} мест") if x)
         meta = " · ".join(x for x in (wbits, (f"Отв: {_e(resp)}" if resp else "")) if x)
         if meta:
