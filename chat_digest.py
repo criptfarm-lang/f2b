@@ -405,6 +405,14 @@ MAX_PER_TYPE = 8
 _HEAD_LIMIT = 30
 _SUMMARY_LIMIT = 80
 
+# Закупщики. Их переписка — это сырьё и поставщики, а не работа менеджера с
+# клиентом: «задержка поставки» у закупа означает подвёл поставщик, а не наш
+# цех. В сводке такие строки помечаем, чтобы на совещании производства их не
+# разбирали как претензию к нам (правило собственника 07.09.2026). Тот же
+# список — в `week_problems.PURCHASING` у publisher'а.
+_PURCHASING = re.compile(r"(?i)белякова|павленко")
+_PURCHASING_MARK = " · закуп сырья"
+
 
 def _short(text: str, limit: int) -> str:
     """Обрезать по границе слова, без хвостовой пунктуации."""
@@ -440,6 +448,8 @@ def render_digest(signals: list[dict], day_label: str = "за сутки") -> st
             head = f"[{who}]({_LEAD_URL.format(lead_id)})" if lead_id else who
             mgr = s.get("manager_name")
             tail = f" · {_short(mgr, 20)}" if mgr else ""
+            if mgr and _PURCHASING.search(mgr):
+                tail += _PURCHASING_MARK
             lines.append(f"• {head} \u2013 {thesis}{tail}")
         if len(group) > MAX_PER_TYPE:
             lines.append(f"  …ещё {len(group) - MAX_PER_TYPE} того же типа")
