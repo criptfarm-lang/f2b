@@ -792,6 +792,25 @@ class Database:
         )
         return bool(row)
 
+    def get_last_payment_planned_entry(self, order_id: str) -> Optional[Dict]:
+        """Последняя запись журнала «Даты планируемой оплаты» по заказу.
+
+        Нужна для дедупа алерта: расхождение даты с расчётной живёт до конца
+        жизни заказа, а webhook UPDATE прилетает на каждое сохранение (статус,
+        позиции, комментарий). Без сверки с последним залогированным значением
+        одна вчерашняя правка менеджера алертит по разу на каждое сохранение —
+        поймано 07.09.2026 на заказах 03951/03952 (Локшин, Оплот Гедонизма):
+        правка была 06.09, а дубли прилетели при переводе в «Отгружен».
+        """
+        return self._fetchone(
+            """SELECT new_date, expected_date, source, changed_by, ts
+               FROM payment_planned_audit
+               WHERE order_id=%s
+               ORDER BY ts DESC
+               LIMIT 1""",
+            (order_id,),
+        )
+
     def get_counterparty_delay_snapshot(self, agent_id: str) -> Optional[int]:
         """Возвращает последний сохранённый snapshot «Дней отсрочки» по контрагенту.
         None — если контрагента ещё не видели (baseline ещё не записан).

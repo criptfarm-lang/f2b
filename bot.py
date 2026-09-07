@@ -8357,6 +8357,57 @@ async def check_counterparty_delay_change(cp_href: str, bot, db):
             logger.warning(f"upsert_counterparty_delay_snapshot after-alert({agent_id}): {ex}")
 
 
+async def _find_ppm_change_author(session, order_id: str, current_date):
+    """Кто поставил текущую «Дату планируемой оплаты» — из аудита МС.
+
+    Возвращает (who, old_date) — ФИО сотрудника и предыдущее значение даты,
+    либо ("unknown", None) если событие не нашлось.
+
+    ВАЖНО: в строках `/entity/customerorder/{id}/audit` НЕТ объекта `employee`
+    (проверено 07.09.2026, даже с `expand=employee` — null). Есть только `uid`
+    вида `karina@vicpure`. Прежний код читал `employee.name` → в алерте всегда
+    было «менеджером unknown». Резолвим uid через справочник сотрудников.
+    """
+    from moysklad import get_headers, MS_BASE, _PPM_INITIAL_ATTR_NAME
+    from notifier import _employee_name_by_uid
+    from datetime import datetime as _dt
+
+    def _parse(v):
+        # В diff аудита кастомная дата приходит как «2026-09-21T15:40».
+        if not v:
+            return None
+        try:
+            return _dt.strptime(str(v)[:16], "%Y-%m-%dT%H:%M").date()
+        except Exception:
+            try:
+                return _dt.strptime(str(v)[:19], "%Y-%m-%d %H:%M:%S").date()
+            except Exception:
+                return None
+
+    headers = get_headers()
+    try:
+        async with session.get(
+            f"{MS_BASE}/entity/customerorder/{order_id}/audit",
+            headers=headers, params={"limit": 100},
+        ) as resp:
+            if resp.status != 200:
+                return "unknown", None
+            rows = (await resp.json()).get("rows", []) or []
+    except Exception:
+        return "unknown", None
+
+    for row in rows:  # rows отсортированы от свежих к старым
+        diff = (row.get("diff") or {}).get(_PPM_INITIAL_ATTR_NAME)
+        if not isinstance(diff, dict):
+            continue
+        new_date = _parse(diff.get("newValue"))
+        if current_date is not None and new_date != current_date:
+            continue  # правка более старая, чем текущее значение поля
+        who = await _employee_name_by_uid(row.get("uid", ""), headers)
+        return who, _parse(diff.get("oldValue"))
+    return "unknown", None
+
+
 async def check_payment_planned_audit(order_href: str, bot, db):
     """Проверяет «Дату планируемой оплаты» после UPDATE-webhook'а.
 
@@ -8418,11 +8469,13 @@ async def check_payment_planned_audit(order_href: str, bot, db):
                 return
             cp = await resp_cp.json()
         delay = 0
+        delay_filled = False
         for a in cp.get("attributes", []) or []:
             if a.get("name") == _DAYS_DELAY_ATTR_NAME:
                 v = a.get("value")
                 if isinstance(v, (int, float)):
                     delay = int(v)
+                    delay_filled = True
                 break
 
         # База расчёта — План.дата отгрузки (deliveryPlannedMoment); фолбэк на moment.
@@ -8443,10 +8496,37 @@ async def check_payment_planned_audit(order_href: str, bot, db):
         try:
             current_dt_cmp = datetime.strptime(str(current_raw)[:19], "%Y-%m-%d %H:%M:%S")
             current_date_cmp = current_dt_cmp.date()
-            if current_date_cmp == expected_dt.date():
-                return  # дата совпадает — нет повода алертить
         except Exception:
             pass
+
+        # Что мы в последний раз видели/логировали по этому заказу. Дедуп строим
+        # на значении даты, а не на факте webhook'а: расхождение с расчётной
+        # живёт до конца жизни заказа, а UPDATE прилетает на каждое сохранение
+        # (статус, позиции, комментарий) — иначе одна правка алертит по разу
+        # на каждое сохранение (07.09.2026, заказы 03951/03952).
+        last_entry = None
+        try:
+            last_entry = db.get_last_payment_planned_entry(order_id_v)
+        except Exception as ex:
+            logger.warning(f"get_last_payment_planned_entry({order_id_v}): {ex}")
+        last_logged_date = (last_entry or {}).get("new_date")
+
+        if current_date_cmp is not None and current_date_cmp == expected_dt.date():
+            # Дата совпадает — алертить не о чем. Но если раньше она была
+            # «неправильной», фиксируем возврат к расчётной: иначе следующая
+            # такая же правка утонет в дедупе.
+            if last_logged_date is not None and last_logged_date != current_date_cmp:
+                try:
+                    db.log_payment_planned_audit(
+                        order_id=order_id_v, order_name=order_name,
+                        agent_id=agent_id, agent_name=(agent.get("name") or ""),
+                        old_date=last_logged_date, new_date=current_date_cmp,
+                        expected_date=expected_dt.date(), changed_by="—",
+                        source="webhook_match",
+                    )
+                except Exception as ex:
+                    logger.warning(f"audit log match({order_id_v}): {ex}")
+            return
 
         # Дата отличается от expected, но если бот сам когда-либо ставил это
         # значение — значит у контрагента позже изменилась отсрочка, реальной
@@ -8461,27 +8541,20 @@ async def check_payment_planned_audit(order_href: str, bot, db):
             except Exception as ex:
                 logger.warning(f"was_payment_planned_set_by_bot({order_id_v}): {ex}")
 
-        # Кто менял
-        changed_by = "unknown"
-        try:
-            async with session.get(f"{MS_BASE}/entity/customerorder/{order_id_v}/audit", headers=get_headers()) as resp_a:
-                if resp_a.status == 200:
-                    adata = await resp_a.json()
-                    rows = adata.get("rows", []) or []
-                    if rows:
-                        last = rows[0]
-                        emp = last.get("employee") or {}
-                        changed_by = emp.get("name") or "unknown"
-        except Exception:
-            pass
+        # Про это значение уже алертили — молчим. Повторный алерт имеет смысл
+        # только когда менеджер поставил НОВУЮ дату.
+        if current_date_cmp is not None and last_logged_date == current_date_cmp:
+            return
 
-        # Парсим current → date
-        from datetime import datetime as _dt2
-        try:
-            current_date = _dt2.strptime(str(current_raw)[:19], "%Y-%m-%d %H:%M:%S").date()
-        except Exception:
-            current_date = None
+        current_date = current_date_cmp
         agent_name = agent.get("name") or ""
+
+        # Кто менял: uid из аудита → ФИО. Поля employee в строках аудита нет.
+        changed_by, old_date = await _find_ppm_change_author(
+            session, order_id_v, current_date,
+        )
+        if old_date is None:
+            old_date = last_logged_date
 
         try:
             db.log_payment_planned_audit(
@@ -8489,7 +8562,7 @@ async def check_payment_planned_audit(order_href: str, bot, db):
                 order_name=order_name,
                 agent_id=agent_id,
                 agent_name=agent_name,
-                old_date=None,
+                old_date=old_date,
                 new_date=current_date,
                 expected_date=expected_dt.date(),
                 changed_by=changed_by,
@@ -8508,12 +8581,21 @@ async def check_payment_planned_audit(order_href: str, bot, db):
             return
 
         href_order = f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id_v}"
+        # Подчёркивания экранируем: parse_mode=Markdown делал из
+        # /payment_planned_history курсив «/payment*planned*history».
+        delay_note = (
+            f"отсрочка {delay} дн."
+            if delay_filled
+            else "«Дней отсрочки» в карточке контрагента не заполнено, считаем 0"
+        )
         text = (
-            f"⚠️ Заказ [{agent_name or order_name or '—'}]({href_order}): "
-            f"«Дата планируемой оплаты» изменена менеджером {changed_by}\n"
-            f"Сейчас: {current_date.strftime('%d.%m.%Y') if current_date else '—'}\n"
-            f"Ожидалось по договору: {expected_dt.date().strftime('%d.%m.%Y')} (отсрочка {delay} дн.)\n"
-            f"История: /payment_planned_history {order_id_v}"
+            f"⚠️ Заказ {order_name or '—'} [{agent_name or '—'}]({href_order}): "
+            f"«Дата планируемой оплаты» изменена\n"
+            f"Кто менял: {changed_by}\n"
+            f"Было: {old_date.strftime('%d.%m.%Y') if old_date else '—'} → "
+            f"стало: {current_date.strftime('%d.%m.%Y') if current_date else '—'}\n"
+            f"Ожидалось по договору: {expected_dt.date().strftime('%d.%m.%Y')} ({delay_note})\n"
+            f"История: /payment\\_planned\\_history {order_id_v}"
         )
         try:
             await bot.send_message(
