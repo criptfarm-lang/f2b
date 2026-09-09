@@ -5583,6 +5583,117 @@ async def cmd_digest_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка анализа: {e}")
 
 
+async def cmd_control_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/control_list — состав листа контроля дебиторки (план 2026-09-09)."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    rows = db.get_control_list()
+    if not rows:
+        await update.message.reply_text("Лист контроля пуст. Добавить: /control_add <ИНН или часть названия>")
+        return
+    seen, lines = set(), []
+    for r in rows:
+        key = r.get("group_key") or r["agent_id"]
+        if key in seen:
+            continue
+        seen.add(key)
+        note = f" — {r['note']}" if r.get("note") else ""
+        lines.append(f"• {r.get('group_name') or r['agent_name']}{note}")
+    await update.message.reply_text(
+        f"📋 Лист контроля ({len(seen)} клиентов):\n" + "\n".join(lines) +
+        "\n\nСводка приходит в 16:00. Разово: /control_now"
+    )
+
+
+async def cmd_control_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/control_add <ИНН или часть названия> [; примечание]"""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    raw = " ".join(context.args or []).strip()
+    if not raw:
+        await update.message.reply_text("Использование: /control_add <ИНН или часть названия> [; примечание]")
+        return
+    query, _, note = raw.partition(";")
+    query, note = query.strip(), note.strip()
+
+    from moysklad import find_counterparties_by_query
+    try:
+        found = await find_counterparties_by_query(query)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка поиска в МойСклад: {e}")
+        return
+    if not found:
+        await update.message.reply_text(f"В МойСклад никого не нашёл по «{query}».")
+        return
+    if len(found) > 8:
+        await update.message.reply_text(
+            f"По «{query}» нашлось {len(found)} контрагентов — уточните запрос."
+        )
+        return
+
+    added = []
+    for cp in found:
+        inn = (cp.get("inn") or "").strip()
+        db.add_to_control_list(
+            agent_id=cp["id"], agent_name=cp["name"], inn=inn,
+            group_key=inn or cp["id"], group_name=cp["name"],
+            manager_tag=cp.get("manager_tag") or "", note=note,
+        )
+        added.append(cp["name"])
+    # Несколько карточек с одним ИНН — это дубли одного ЮЛ, в сводке они
+    # схлопнутся в строку по group_key. Предупреждаем, чтобы не выглядело багом.
+    tail = ""
+    if len({(c.get("inn") or "").strip() for c in found}) == 1 and len(found) > 1:
+        tail = f"\n({len(found)} карточки одного ИНН — в сводке одной строкой)"
+    await update.message.reply_text("Добавил в лист контроля:\n" + "\n".join(f"• {a}" for a in added) + tail)
+
+
+async def cmd_control_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/control_del <часть названия> — убрать клиента из листа."""
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    query = " ".join(context.args or []).strip().lower()
+    if not query:
+        await update.message.reply_text("Использование: /control_del <часть названия>")
+        return
+    hits = [r for r in db.get_control_list() if query in r["agent_name"].lower()]
+    if not hits:
+        await update.message.reply_text(f"В листе нет никого по «{query}».")
+        return
+    for r in hits:
+        db.remove_from_control_list(r["agent_id"])
+    names = sorted({r.get("group_name") or r["agent_name"] for r in hits})
+    await update.message.reply_text("Убрал из листа:\n" + "\n".join(f"• {n}" for n in names))
+
+
+async def cmd_control_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/control_now — сводка по листу контроля прямо сейчас, вне расписания.
+
+    Снимок дня она НЕ перезаписывает: иначе дневная дельта в 16:00 схлопнется
+    в ноль, если сводку дёрнули руками за пять минут до неё.
+    """
+    user = update.effective_user
+    if not user or user.id != OWNER_CHAT_ID:
+        return
+    await update.message.reply_text("Считаю лист контроля…")
+    try:
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        from control_list import collect_snapshot, build_summary
+        rows = await collect_snapshot(db)
+        if not rows:
+            await update.message.reply_text("Лист контроля пуст.")
+            return
+        prev = db.get_last_control_snapshot(_dt.now(_ZI("Europe/Moscow")).date())
+        await update.message.reply_text(build_summary(rows, prev), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"cmd_control_now: {e}", exc_info=True)
+        await update.message.reply_text(f"Ошибка: {e}")
+
+
 async def cmd_svetofor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/svetofor <ИНН> — светофор надёжности контрагента (DaData + ГИР БО).
     План (второй мозг): plans/2026-07-29-svetofor-nadezhnosti-kontragenta.md — Фаза 2."""
@@ -6615,6 +6726,10 @@ def main():
     app.add_handler(CommandHandler("notifier_status", cmd_notifier_status))
     app.add_handler(CommandHandler("direct_report", cmd_direct_report))
     app.add_handler(CommandHandler("svetofor", cmd_svetofor))
+    app.add_handler(CommandHandler("control_list", cmd_control_list))
+    app.add_handler(CommandHandler("control_add", cmd_control_add))
+    app.add_handler(CommandHandler("control_del", cmd_control_del))
+    app.add_handler(CommandHandler("control_now", cmd_control_now))
     app.add_handler(CommandHandler("svetofor_batch", cmd_svetofor_batch))
     app.add_handler(CommandHandler("digest_today", cmd_digest_today))
     app.add_handler(CommandHandler("fishki_remind_dry", cmd_fishki_remind_dry))
@@ -8064,6 +8179,16 @@ def main():
         # на месте прежнего вызова в main()). Только так AsyncIOScheduler цепляет
         # живую петлю и cron-джобы реально исполняются.
         setup_scheduler(app, db)
+
+        # Лист контроля дебиторки — сид стартового состава ТОЛЬКО в пустую
+        # таблицу. Иначе рестарт контейнера возвращал бы клиентов, которых
+        # собственник убрал через /control_del.
+        try:
+            if not db.get_control_list():
+                from control_list import seed_control_list
+                logger.info(f"control_list: засеян стартовый состав, {seed_control_list(db)} карточек")
+        except Exception as e:
+            logger.error(f"control_list seed: {e}", exc_info=True)
 
         # Catch-up пропущенных PDZ-cron'ов: fire-and-forget в фон. Иначе
         # snapshot тянет МС API ~3 мин и блокирует start_polling — бот не

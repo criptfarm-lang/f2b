@@ -154,6 +154,17 @@ def setup_scheduler(app: Application, db):
         misfire_grace_time=3600, coalesce=True,
     )
 
+    # 16:00 МСК — сводка по листу контроля дебиторки собственнику в личку
+    # (план 2026-09-09). После 15:05 owner_pending, чтобы не сталкиваться с
+    # ПДЗ-потоком, и до конца банковского дня 16:00 — приходы за день уже видны.
+    scheduler.add_job(
+        control_list_daily_job,
+        CronTrigger(hour=16, minute=0, timezone=MSK),
+        args=[app, db],
+        id="control_list_daily_1600",
+        misfire_grace_time=3600, coalesce=True,
+    )
+
     # ПТ 08:00 МСК — пересчёт «% работы на новых клиентах» (MTD) и запись
     # снимка в bot_settings.op_new_share_snapshot. Виджет в /op_report читает
     # его независимо от report_cache. План:
@@ -1482,3 +1493,22 @@ async def dashamail_weekly_send_job(app: Application, db) -> None:
         return
     out = stdout.decode("utf-8", errors="replace")
     logger.info(f"dashamail_weekly_send_job rc={proc.returncode}\n{out[-3000:]}")
+
+
+async def control_list_daily_job(app: Application, db):
+    """16:00 МСК — сводка по листу контроля дебиторки собственнику.
+
+    Лист заводится в БД (`control_list`), а не в коде: состав меняется чаще,
+    чем выкатывается бот. Сид стартового состава — `control_list.seed_control_list`,
+    вызывается один раз при старте, дальше состав правится командами.
+    """
+    logger.info(f"control_list_daily_job стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}")
+    owner_raw = os.getenv("OWNER_CHAT_ID")
+    if not owner_raw:
+        logger.warning("control_list_daily_job: OWNER_CHAT_ID не задан, пропуск")
+        return
+    try:
+        from control_list import send_daily_summary
+        await send_daily_summary(app.bot, db, int(owner_raw))
+    except Exception as e:
+        logger.error(f"control_list_daily_job: {e}", exc_info=True)

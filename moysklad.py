@@ -1142,6 +1142,56 @@ async def get_counterparty_requisites(counterparty_id: str) -> dict:
         logger.error(f"get_counterparty_requisites: {e}", exc_info=True)
         return {}
 
+async def find_counterparties_by_query(query: str) -> list:
+    """Поиск карточек МС для листа контроля: [{id, name, inn, manager_tag}].
+
+    Цифровой запрос → точный `inn=` (вернёт ВСЕ карточки одного ЮЛ, включая
+    дубли — их и надо класть в лист целиком). Иначе `name~` с перебором
+    регистров: МС в `~` регистрозависим, «печи» и «ПЕЧИ» дают разные выдачи.
+    """
+    import re as _re
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    async with aiohttp.ClientSession() as session:
+        url = f"{MS_BASE}/entity/counterparty"
+        rows = []
+        if _re.fullmatch(r"\d{10,12}", q):
+            params = {"filter": f"inn={q}", "limit": 50}
+            async with session.get(url, headers=get_headers(), params=params) as resp:
+                if resp.status == 200:
+                    rows = (await resp.json()).get("rows", [])
+        else:
+            stripped = _re.sub(r"^\s*(ооо|ип|зао|ао|пао|оао)\s+", "", q, flags=_re.IGNORECASE).strip()
+            variants = [q, q.upper(), q.lower(), q.capitalize()]
+            if stripped and stripped.lower() != q.lower():
+                variants += [stripped, stripped.upper(), stripped.lower()]
+            seen_v = set()
+            for v in variants:
+                if v in seen_v:
+                    continue
+                seen_v.add(v)
+                params = {"filter": f"name~{v}", "limit": 20}
+                async with session.get(url, headers=get_headers(), params=params) as resp:
+                    if resp.status == 200:
+                        rows = (await resp.json()).get("rows", [])
+                        if rows:
+                            break
+
+    out = []
+    for c in rows:
+        tags = [t.lower() for t in (c.get("tags") or [])]
+        mtag = next((t for t in tags if t in PDZ_MANAGER_TAG_MAP), "")
+        out.append({
+            "id": c["id"],
+            "name": c.get("name", ""),
+            "inn": (c.get("inn") or "").strip(),
+            "manager_tag": mtag,
+        })
+    return out
+
+
 async def find_counterparty_info(query: str) -> list:
     """Находит контрагента и возвращает его теги, менеджера, тип покупателя и баланс."""
     import re as _re

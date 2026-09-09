@@ -1397,6 +1397,7 @@ def _build_approval_text(
     address: dict = None,
     payment_planned_date: str = "",
     reliability: dict = None,
+    control: dict = None,
 ) -> str:
     """
     Шаблон алерта. Порядок строк (по убыванию важности):
@@ -1423,12 +1424,19 @@ def _build_approval_text(
         from counterparty_svetofor import format_reliability_line
         rel_color, rel_line = format_reliability_line(reliability)
     all_green = all(c == "green" for c in colors) and rel_color not in ("yellow", "red")
+    # Клиент из листа контроля виден ВСЕГДА: даже если все проверки зелёные,
+    # схлопывать алерт в одну строку нельзя — метка ради этого и заводилась.
+    if control:
+        all_green = False
 
     header = (
         f"🔔 *{client_name}* · {_fmt_money(order_sum)} ₽\n"
         f"Заказ {order_name}\n"
         f"👔 {manager_name} · 🕐 {sent_at}\n"
     )
+    if control:
+        note = (control.get("note") or "").strip()
+        header += "⛔ *Клиент из листа контроля*" + (f" — {note}" if note else "") + "\n"
 
     if all_green:
         limit_pct = 0
@@ -1639,6 +1647,16 @@ async def check_approval_needed(order_href: str, bot, db):
             except Exception as e:
                 logger.warning(f"check_approval_needed: надёжность {cp_inn} → {e}")
 
+        # 2b. Лист контроля дебиторки (план 2026-09-09) — одно чтение по PK.
+        # Ошибка БД не должна ронять алерт: без метки он всё равно полезен.
+        control = None
+        try:
+            control = db.is_in_control_list(agent_id)
+        except Exception as e:
+            logger.warning(f"check_approval_needed: лист контроля {agent_id} → {e}")
+        if control:
+            logger.info(f"check_approval_needed: {agent_name} — в листе контроля")
+
         # 3. Параллельно: cashflow, overdue, price, upd_debt (+ timeout 20с с fallback)
         try:
             cashflow, overdue, price, upd_debt = await asyncio.wait_for(
@@ -1713,6 +1731,7 @@ async def check_approval_needed(order_href: str, bot, db):
             address=address,
             payment_planned_date=ppm_str,
             reliability=reliability,
+            control=control,
         )
 
         # 6. Дедуп: sum_hash = округлённая сумма в ₽

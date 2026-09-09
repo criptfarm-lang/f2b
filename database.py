@@ -690,6 +690,30 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_assortment_hit_results_period ON procurement.assortment_hit_results (period_from, period_to, computed_at DESC)",
             # ссылка на карточку контакта amoCRM (диалог) — добавлено 2026-07-08
             "ALTER TABLE procurement.assortment_hit_results ADD COLUMN IF NOT EXISTS amocrm_contact_id BIGINT",
+            # Лист контроля дебиторки (план 2026-09-09). Карточки МС, по которым
+            # собственник держит руку на пульсе: метка в светофоре согласований +
+            # ежедневная сводка 16:00. group_key = ИНН — несколько карточек одного
+            # ЮЛ (случай ООО «ПЕЧИ», 3 дубля) в сводке идут одной строкой.
+            """CREATE TABLE IF NOT EXISTS control_list (
+                agent_id    TEXT PRIMARY KEY,
+                agent_name  TEXT NOT NULL,
+                inn         TEXT,
+                group_key   TEXT,
+                group_name  TEXT,
+                manager_tag TEXT,
+                note        TEXT,
+                active      BOOLEAN NOT NULL DEFAULT TRUE,
+                added_at    TIMESTAMP NOT NULL DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS control_list_snapshots (
+                snap_date  DATE NOT NULL,
+                agent_id   TEXT NOT NULL,
+                balance    NUMERIC NOT NULL DEFAULT 0,
+                overdue    NUMERIC NOT NULL DEFAULT 0,
+                max_days   INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (snap_date, agent_id)
+            )""",
         ]
         with self.conn.cursor() as cur:
             for m in migrations:
@@ -2609,3 +2633,87 @@ class Database:
             (since,)
         )
         return {r['manager_name']: r for r in rows}
+
+    # ─── Лист контроля дебиторки (план 2026-09-09) ────────────────────────
+
+    def is_in_control_list(self, agent_id: str) -> Optional[Dict]:
+        """Карточка МС в листе контроля? Возвращает строку листа или None.
+
+        Дёргается в hot-path светофора согласований — держим одним индексным
+        чтением по PK, без join'ов.
+        """
+        if not agent_id:
+            return None
+        return self._fetchone(
+            "SELECT * FROM control_list WHERE agent_id = %s AND active = TRUE",
+            (agent_id,)
+        )
+
+    def get_control_list(self, active_only: bool = True) -> List[Dict]:
+        sql = "SELECT * FROM control_list"
+        if active_only:
+            sql += " WHERE active = TRUE"
+        sql += " ORDER BY group_name NULLS LAST, agent_name"
+        return self._fetchall(sql)
+
+    def add_to_control_list(self, agent_id: str, agent_name: str, inn: str = "",
+                            group_key: str = "", group_name: str = "",
+                            manager_tag: str = "", note: str = "") -> None:
+        """Идемпотентно. Повторный вызов по той же карточке реактивирует её."""
+        self._execute(
+            """INSERT INTO control_list
+                   (agent_id, agent_name, inn, group_key, group_name, manager_tag, note, active)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
+               ON CONFLICT (agent_id) DO UPDATE SET
+                   agent_name  = EXCLUDED.agent_name,
+                   inn         = EXCLUDED.inn,
+                   group_key   = EXCLUDED.group_key,
+                   group_name  = EXCLUDED.group_name,
+                   manager_tag = EXCLUDED.manager_tag,
+                   note        = COALESCE(NULLIF(EXCLUDED.note, ''), control_list.note),
+                   active      = TRUE""",
+            (agent_id, agent_name, inn or None, group_key or inn or agent_id,
+             group_name or agent_name, manager_tag or None, note or None)
+        )
+
+    def remove_from_control_list(self, agent_id: str) -> None:
+        """Мягкое удаление — снимки за прошлые дни остаются валидными."""
+        self._execute(
+            "UPDATE control_list SET active = FALSE WHERE agent_id = %s", (agent_id,)
+        )
+
+    def save_control_snapshot(self, snap_date, rows: List[Dict]) -> None:
+        """rows: [{agent_id, balance, overdue, max_days}]. Перезапись за тот же день."""
+        if not rows:
+            return
+        for r in rows:
+            self._execute(
+                """INSERT INTO control_list_snapshots
+                       (snap_date, agent_id, balance, overdue, max_days)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (snap_date, agent_id) DO UPDATE SET
+                       balance    = EXCLUDED.balance,
+                       overdue    = EXCLUDED.overdue,
+                       max_days   = EXCLUDED.max_days,
+                       created_at = NOW()""",
+                (snap_date, r["agent_id"], r.get("balance", 0),
+                 r.get("overdue", 0), r.get("max_days", 0))
+            )
+
+    def get_last_control_snapshot(self, before_date) -> Dict[str, Dict]:
+        """Последний снимок СТРОГО раньше before_date → {agent_id: строка}.
+
+        Не «вчера», а «последний доступный»: если джоба падала или бот лежал,
+        дельта считается от последней известной картинки, а не от нуля.
+        """
+        row = self._fetchone(
+            "SELECT MAX(snap_date) AS d FROM control_list_snapshots WHERE snap_date < %s",
+            (before_date,)
+        )
+        prev_date = row["d"] if row else None
+        if not prev_date:
+            return {}
+        rows = self._fetchall(
+            "SELECT * FROM control_list_snapshots WHERE snap_date = %s", (prev_date,)
+        )
+        return {r["agent_id"]: r for r in rows}
