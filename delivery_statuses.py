@@ -89,10 +89,11 @@ def _owner_chat_id() -> int:
     return int(os.getenv("OWNER_CHAT_ID", "0") or 0)
 
 
-# Логисты (равный доступ + рассылки): 8267564735 Белякова.
+# Логисты (равный доступ + рассылки): 8267564735 Белякова,
+# 1296942948 Боева А. (с 09.09.2026 — забирает логистику).
 # Петровский В. снят с логистики 07.09.2026 — id убран из дефолта.
 def _logist_chat_ids() -> list:
-    raw = os.getenv("LOGIST_CHAT_IDS") or "8267564735"
+    raw = os.getenv("LOGIST_CHAT_IDS") or "8267564735,1296942948"
     out = []
     for p in raw.split(","):
         p = p.strip()
