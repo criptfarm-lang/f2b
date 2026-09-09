@@ -7083,6 +7083,11 @@ def main():
     except Exception as e:
         logger.exception(f"route_dispatch.register упал: {e}")
     try:
+        import manual_route
+        manual_route.register(app, db)
+    except Exception as e:
+        logger.exception(f"manual_route.register упал: {e}")
+    try:
         import delivery_statuses
         delivery_statuses.register(app, db)
     except Exception as e:
@@ -8002,6 +8007,16 @@ def main():
             return await route_web.handle_submit(request, db, app.bot)
         web_app.router.add_get("/route/{uid}/{date}", handle_route_page)
         web_app.router.add_post("/route/{uid}/{date}/submit", handle_route_submit)
+
+        # Аварийная раскладка логиста, когда Логистика (Wialon) недоступна
+        # (план 2026-09-09): страница со списком заказов дня → машина + порядок.
+        import manual_route as _manual_route
+        async def handle_dispatch_page(request):
+            return await _manual_route.handle(request)
+        async def handle_dispatch_save(request):
+            return await _manual_route.handle_save(request)
+        web_app.router.add_get("/dispatch/{date}", handle_dispatch_page)
+        web_app.router.add_post("/dispatch/{date}", handle_dispatch_save)
 
         web_app.router.add_get("/pdz", handle_pdz_html)
         web_app.router.add_get("/pdz/embed", handle_pdz_embed)

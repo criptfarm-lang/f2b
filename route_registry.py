@@ -103,10 +103,9 @@ def stop_days(s) -> set:
     return days
 
 
-async def fetch_routes(with_meta: bool = False):
-    """Возвращает {unit_id: [stop,...]} по машинам, точки отсортированы по порядку выгрузки.
-    stop = {seq, vt, tf, tt, client, address, phone, order_no, oid, ...}.
-    with_meta=True → кортеж (routes, order_routes) — order_routes нужен для пробега (mileage_km)."""
+async def _fetch_routes_wialon():
+    """Раскладка из Wialon Logistics: (routes, order_routes). Бросает исключение, если
+    Логистика недоступна — обёртка fetch_routes переключается на ручную раскладку."""
     token = os.getenv("WIALON_TOKEN")
     if not token:
         raise RuntimeError("WIALON_TOKEN не задан")
@@ -201,6 +200,62 @@ async def fetch_routes(with_meta: bool = False):
         routes[uid].sort(key=_order_key)
         for i, s in enumerate(routes[uid]):
             s["seq"] = i
+    return routes, order_routes
+
+
+async def _merge_manual(routes: dict, wialon_ok: bool) -> dict:
+    """Подмешать аварийную раскладку логиста (manual_route) к тому, что дала Логистика.
+
+    Правило простое и безопасное от двойной доставки: ручная точка едет, только если
+    (а) Логистика не дала по этой машине на этот день НИ ОДНОЙ точки — то есть она либо
+    лежит, либо раскладки там нет, и (б) этого № заказа на этот день нет ни на одной
+    машине. Пока Wialon жив и раскладка в нём есть, ручной источник не вмешивается.
+    """
+    try:
+        import manual_route
+        manual = await manual_route.build_routes_window()
+    except Exception as e:
+        logger.warning("fetch_routes: ручная раскладка недоступна: %s", e)
+        return routes
+    if not any(manual.values()):
+        return routes
+    seen = {(s.get("order_no"), stop_day(s)) for v in routes.values() for s in v}
+    covered = {(uid, stop_day(s)) for uid, v in routes.items() for s in v}
+    added = 0
+    for uid, stops in manual.items():
+        keep = []
+        for s in stops:
+            d = stop_day(s)
+            if wialon_ok and (uid, d) in covered:
+                continue
+            if (s.get("order_no"), d) in seen:
+                continue
+            seen.add((s.get("order_no"), d))
+            keep.append(s)
+        if keep:
+            routes.setdefault(uid, []).extend(keep)
+            added += len(keep)
+    if added:
+        logger.info("fetch_routes: добавлено %d точек из ручной раскладки (Логистика %s)",
+                    added, "жива" if wialon_ok else "недоступна")
+    return routes
+
+
+async def fetch_routes(with_meta: bool = False):
+    """Возвращает {unit_id: [stop,...]} по машинам, точки отсортированы по порядку выгрузки.
+    stop = {seq, vt, tf, tt, client, address, phone, order_no, oid, ...}.
+    with_meta=True → кортеж (routes, order_routes) — order_routes нужен для пробега (mileage_km).
+
+    Источник — Wialon Logistics; когда она недоступна (с 08.09.2026 провайдер отдаёт
+    ACCESS_DENIED_BY_SITENAME), берём аварийную раскладку логиста из manual_route,
+    иначе водители остаются без реестра, а отгрузки — без статусов."""
+    try:
+        routes, order_routes = await _fetch_routes_wialon()
+        wialon_ok = True
+    except Exception as e:
+        logger.warning("fetch_routes: Логистика недоступна (%s) — беру ручную раскладку", e)
+        routes, order_routes, wialon_ok = {uid: [] for uid in UNITS}, {}, False
+    routes = await _merge_manual(routes, wialon_ok)
     if with_meta:
         return routes, order_routes
     return routes
