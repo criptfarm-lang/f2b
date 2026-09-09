@@ -375,7 +375,8 @@ async def render_page(day: date, saved: int = None) -> str:
     for a in cur.values():
         counts[a["unit_id"]] = counts.get(a["unit_id"], 0) + 1
     sum_txt = " · ".join(f"{units.get(u, u)}: {n}" for u, n in sorted(counts.items())) or "не расставлено"
-    ok = f'<div class="ok">Сохранено: {saved} точек. Дальше в боте: /маршруты → Подтвердить.</div>' if saved is not None else ""
+    ok = (f'<div class="ok">Сохранено точек: {saved}. Дальше в боте: /маршруты → Подтвердить, '
+          f'водителям уйдёт реестр.</div>') if saved is not None else ""
     body = "".join(_card(o, cur, units) for o in orders)
     if not orders:
         body = '<div class="card">На этот день заказов с доставкой нет.</div>'
