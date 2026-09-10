@@ -4837,6 +4837,7 @@ ATTR_CP_TELEGRAM         = "15052610-34d7-11f1-0a80-1489000ec44a"  # string
 ATTR_CP_CONTRACT_SIGNED  = "57ad9627-696b-11f1-0a80-1340000ba884"  # boolean
 ATTR_CP_CONTRACT_NUMBER  = "6ce27c40-633f-11f1-0a80-034000364b19"  # text
 ATTR_CP_DAYS_DELAY       = "6ce27a3b-633f-11f1-0a80-034000364b18"  # long
+ATTR_CP_NOTARY_CLAUSE    = "b46a2b49-ace8-11f1-0a80-144700090f5c"  # boolean
 
 # UUID кастомного атрибута customerorder (Дата плановой оплаты)
 ATTR_CO_PAYMENT_PLANNED = "327940fd-b54e-11f0-0a80-0066000d5578"  # time
@@ -4934,13 +4935,13 @@ async def load_counterparty_attrs(agent_id: str) -> dict:
                     logger.error(f"load_counterparty_attrs: {resp.status} для {agent_id}")
                     return {"site": "", "max": "", "telegram": "", "credit_limit": 0,
                             "contract_signed": False, "contract_number": "", "days_delay": 0,
-                            "_raw_attrs": []}
+                            "notary_clause": False, "_raw_attrs": []}
                 cp = await resp.json()
     except Exception as e:
         logger.error(f"load_counterparty_attrs: {e}")
         return {"site": "", "max": "", "telegram": "", "credit_limit": 0,
                 "contract_signed": False, "contract_number": "", "days_delay": 0,
-                "_raw_attrs": []}
+                "notary_clause": False, "_raw_attrs": []}
 
     attrs = cp.get("attributes", []) or []
     return {
@@ -4952,6 +4953,7 @@ async def load_counterparty_attrs(agent_id: str) -> dict:
         "contract_signed": bool(_extract_attr_value(attrs, ATTR_CP_CONTRACT_SIGNED)),
         "contract_number": (_extract_attr_value(attrs, ATTR_CP_CONTRACT_NUMBER) or "").strip(),
         "days_delay":      _extract_attr_value(attrs, ATTR_CP_DAYS_DELAY) or 0,
+        "notary_clause":   bool(_extract_attr_value(attrs, ATTR_CP_NOTARY_CLAUSE)),
         "_raw_attrs":      attrs,
     }
 
@@ -5005,6 +5007,20 @@ def compute_contract_color(cp_attrs: dict) -> dict:
         "number": number,
         "days":   days,
     }
+
+
+def compute_notary_color(cp_attrs: dict) -> dict:
+    """
+    Блок «Нотар. оговорка» светофора. cp_attrs = результат load_counterparty_attrs().
+    🟢 если в договоре есть условие о взыскании долга по исполнительной надписи
+    нотариуса (галочка «Нотариальная оговорка» в карточке МС); 🔴 иначе.
+
+    Смысл для согласующего: с оговоркой долг взыскивается у нотариуса за ~2 недели
+    (ст. 89–91.1 Основ о нотариате), без неё — только суд. Наша форма договора
+    содержит оговорку с 16.03.2026; договоры по форме покупателя — как правило нет.
+    """
+    has = bool(cp_attrs.get("notary_clause"))
+    return {"color": "green" if has else "red", "has": has}
 
 
 async def compute_overdue_color(agent_id: str) -> dict:

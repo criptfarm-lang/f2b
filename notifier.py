@@ -1398,10 +1398,11 @@ def _build_approval_text(
     payment_planned_date: str = "",
     reliability: dict = None,
     control: dict = None,
+    notary: dict = None,
 ) -> str:
     """
     Шаблон алерта. Порядок строк (по убыванию важности):
-      Лимит → Договор → Просрочка → ДДС → УПД → Сайт → Контакты → Адрес → Цена.
+      Лимит → Договор → Нотар. оговорка → Просрочка → ДДС → УПД → Сайт → Контакты → Адрес → Цена.
     all-green → одна сводная строка; иначе — строки светофора.
     """
     from datetime import datetime, timezone, timedelta
@@ -1412,6 +1413,8 @@ def _build_approval_text(
         upd_debt = {"color": "green", "count": 0, "sum": 0}
     if address is None:
         address = {"color": "green", "addr": "", "reason": ""}
+    if notary is None:
+        notary = {"color": "red", "has": False}
 
     payment_color = "green" if payment_planned_date else "red"
     colors = [credit["color"], contract["color"], overdue["color"], cashflow["color"],
@@ -1447,11 +1450,15 @@ def _build_approval_text(
             rel_suffix = " · надёжность ЕГРЮЛ"
         elif rel_color == "unknown":
             rel_suffix = " · надёжность не пров."
+        # Нотар. оговорка красным не рушит сводку (это свойство договора, не сигнал
+        # по заказу), но её отсутствие видно строкой-суффиксом.
+        notary_suffix = " · нотар. оговорка" if notary["color"] == "green" else " · без нотар. оговорки"
         body = (
             f"\n🟢 Все проверки ОК "
             f"(лимит {limit_pct}% · договор · ДДС {cashflow.get('n_days', 0)}д · "
             f"долг {_fmt_money(credit.get('current_debt', 0))} _на {sent_at}_ · "
-            f"УПД · сайт · контакты · адрес · цена · оплата {payment_planned_date}{rel_suffix})\n"
+            f"УПД · сайт · контакты · адрес · цена · оплата {payment_planned_date}"
+            f"{rel_suffix}{notary_suffix})\n"
         )
         return header + body
 
@@ -1492,6 +1499,15 @@ def _build_approval_text(
         lines.append(f"🟢 *Договор:* " + " · ".join(parts_c))
     else:
         lines.append(f"🔴 *Договор:* не подписан")
+
+    # 2а. Нотариальная оговорка
+    # 🟢 в договоре есть условие о взыскании по исполнительной надписи нотариуса
+    # (галочка в карточке МС) → долг взыскивается за ~2 недели без суда;
+    # 🔴 оговорки нет → только суд. На all_green не влияет (см. выше).
+    if notary["color"] == "green":
+        lines.append("🟢 *Нотар. оговорка:* есть — взыскание без суда")
+    else:
+        lines.append("🔴 *Нотар. оговорка:* нет — долг только через суд")
 
     # 3. Просрочка
     if overdue["color"] == "red":
@@ -1590,7 +1606,7 @@ async def check_approval_needed(order_href: str, bot, db):
         from moysklad import (
             get_headers, MS_BASE,
             load_counterparty_attrs,
-            compute_credit_color, compute_contract_color,
+            compute_credit_color, compute_contract_color, compute_notary_color,
             compute_overdue_color, compute_cashflow_color,
             compute_price_color,
             compute_site_color, compute_contacts_color,
@@ -1692,6 +1708,7 @@ async def check_approval_needed(order_href: str, bot, db):
         current_debt = cashflow.get("current_debt", 0) or 0
         credit = compute_credit_color(cp_attrs, current_debt=current_debt, order_sum=order_sum)
         contract = compute_contract_color(cp_attrs)
+        notary = compute_notary_color(cp_attrs)
         site = compute_site_color(cp_attrs)
         contacts = compute_contacts_color(cp_attrs)
         address = compute_address_color(order.get("shipmentAddress"))
@@ -1700,6 +1717,7 @@ async def check_approval_needed(order_href: str, bot, db):
         colors_json = {
             "credit": credit["color"],
             "contract": contract["color"],
+            "notary": notary["color"],
             "overdue": overdue["color"],
             "cashflow": cashflow["color"],
             "price": price["color"],
@@ -1726,7 +1744,7 @@ async def check_approval_needed(order_href: str, bot, db):
         alert_text = _build_approval_text(
             order_name=order_name, order_sum=order_sum, state_name=state_name,
             client_name=agent_name, manager_name=manager_name,
-            credit=credit, contract=contract, overdue=overdue, cashflow=cashflow,
+            credit=credit, contract=contract, notary=notary, overdue=overdue, cashflow=cashflow,
             price=price, site=site, contacts=contacts, upd_debt=upd_debt,
             address=address,
             payment_planned_date=ppm_str,
