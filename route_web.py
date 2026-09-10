@@ -403,6 +403,11 @@ async def render_page(uid: int, target: date, db, bot) -> str:
             rows.append(f"<div class='meta'>📦 {meta}</div>")
         if comment:
             rows.append(f"<div class='meta'>💬 {_e(comment)}</div>")
+        # Приписка логиста в заявке Логистики (пропуск, номер авианакладной, условия
+        # въезда) — в МойСклад её нет, водителю она нужна на точке. Источник помечаем.
+        mnote = rr.manual_note(s.get("note"), comment, ex.get("descr"))
+        if mnote:
+            rows.append(f"<div class='meta'>📋 От логиста: {_e(mnote)}</div>")
         rows.append(f"<div class='meta'>№ заказа {_e(order_no)}</div>")
 
         if is_done:

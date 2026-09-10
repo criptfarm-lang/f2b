@@ -136,6 +136,7 @@ async def _fetch_routes_wialon():
             "address": p.get("a") or "",
             "phone": p.get("p") or "",
             "order_no": o.get("n"),
+            "note": (p.get("d") or "").strip(),  # комментарий заявки в Логистике (в т.ч. правки логиста)
             "oid": o.get("uid"),  # уникальный id заявки Wialon — для матча с order_routes.ord
             "has_cid": bool(p.get("cid")),  # cid → заявку создал мост; без cid → ручная в Логистике
             "lat": o.get("y"),
@@ -451,6 +452,9 @@ async def _ms_extra_by_order(order_numbers, names=None) -> dict:
             # Поручения водителю на точке (сырой текст доп.поля) — веб-чеклист делает
             # из них отдельные пункты-распоряжения (driver_checklist.driver_tasks).
             "checklist_raw": checklist_raw,
+            # Комментарий заказа (производственный) водителю не показываем — он нужен
+            # только чтобы отличить приписку логиста в заявке от данных МС (manual_note).
+            "descr": (co.get("description") or "").strip(),
         }
 
     # Заказы тянем ПАЧКАМИ: условия по одному полю в фильтре МС объединяются по ИЛИ,
@@ -710,6 +714,54 @@ def _attr_time(val) -> str:
     return f"{int(m.group(1)):02d}:{m.group(2)}" if m else ""
 
 
+def _norm_txt(s) -> str:
+    return _re_rr.sub(r"\s+", " ", str(s or "").strip().lower())
+
+
+def _sig_words(text) -> set:
+    """Значимые слова строки — по ним понимаем, что сегмент пересказывает поле МС.
+    Короткие («шт», «кг», «до») и куски дат отбрасываем: они есть везде и склеили бы
+    любые два текста. Телефоны сначала сводим к цифрам: «8 (989) 632-24-08» рассыпается
+    на короткие числа и иначе не совпал бы с тем же номером, записанным по-другому."""
+    t = _norm_txt(text)
+    for ph in _PHONE_RE.findall(t):
+        t = t.replace(ph, " " + _norm_phone(ph) + " ")
+    return {w for w in _re_rr.findall(r"[a-zа-яё0-9]+", t) if len(w) >= 4}
+
+
+def manual_note(note, ms_comment, descr="") -> str:
+    """Из комментария заявки Логистики — только то, что вписал ЛОГИСТ руками.
+
+    Мост при создании заявки складывает туда данные заказа МС: «мест: N | ещё тел.: … |
+    <комментарий под адресом> · <комментарий заказа>» (f2b-logistics-bridge/wialon.py).
+    Эти куски в реестре уже есть, повторять их незачем.
+
+    Сравнение НЕ по точному совпадению: менеджеры дописывают в комментарий заказа партии
+    и сроки уже после того, как мост создал заявку, поэтому в заявке лежит устаревшая
+    редакция того же текста (кейс №04040 10.09.2026: в заявке «маслян 1 шт лос сс 3 шт…»,
+    в МС к этому добавились номера партий). Считаем сегмент пересказом поля МС, если у них
+    есть хоть одно общее значимое слово, — тогда это состав заказа, а не указание логиста.
+
+    Повод (10.09.2026, №03897 БИГ МАМА): «Авианакладная (для пропуска): 555-18397621» —
+    без неё водителя не пускают на терминал в Шереметьево, а в МойСклад номера нет."""
+    if not note:
+        return ""
+    known = [_sig_words(x) for x in (ms_comment, descr) if _norm_txt(x)]
+    keep = []
+    for seg in _re_rr.split(r"\s*\|\s*|\s+·\s+", str(note)):
+        seg = " ".join(str(seg).split())
+        n = _norm_txt(seg)
+        if not n or n.startswith("мест:") or n.startswith("ещё тел.:"):
+            continue
+        w = _sig_words(seg)
+        if not w:
+            continue   # обрывок вроде «фор 3 шт» — ни слова, ни кода: показывать нечего
+        if any(w & k for k in known):
+            continue
+        keep.append(seg)
+    return " · ".join(keep)
+
+
 def _fmt_window(win_from: str, win_to: str, tf=None, tt=None) -> str:
     """Окно приёмки для листа: приоритет — поля заказа МС «Окно доставки с/до (время)».
     Обе стороны → «09:00–09:30»; только до → «до 09:30»; только с → «с 14:00 »;
@@ -874,6 +926,12 @@ def _build_registry_pdf(routes, ms_extra, date_str, date_iso=None) -> bytes:
                 # Лимит 300, чтобы не срезать длинные инструкции приёмки/номер. Paragraph переносит.
                 # Обрезаем ДО линкификации (иначе можно разрезать <a>-тег), все номера — кликабельные tel:.
                 info += f"<br/><font size=7 color='#888888'>{_linkify_phones(cm[:300])}</font>"
+            # Приписка логиста в самой Логистике (пропуск, авианакладная, условия въезда) —
+            # в МойСклад её нет, поэтому помечаем источник.
+            mn = manual_note(s.get("note"), cm, ex.get("descr"))
+            if mn:
+                info += (f"<br/><font size=7 color='#0b3d5c'><b>Из Логистики:</b> "
+                         f"{_linkify_phones(mn[:300])}</font>")
             link = stop_url(uid, s["order_no"])
             rows.append([
                 Paragraph(str(idx), cell),
