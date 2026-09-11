@@ -7100,6 +7100,11 @@ def main():
         logi_morning_check.register(db)
     except Exception as e:
         logger.exception(f"logi_morning_check.register упал: {e}")
+    try:
+        import delivery_window_check
+        delivery_window_check.ensure_schema(db)
+    except Exception as e:
+        logger.exception(f"delivery_window_check.ensure_schema отложено (БД не готова?): {e}")
 
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.UpdateType.CHANNEL_POSTS, handle_message))
@@ -7321,6 +7326,25 @@ def main():
             logger.error(f"logi_morning_check job wrapper: {e}", exc_info=True)
 
     app.job_queue.run_repeating(_logi_morning_check_wrapper, interval=1800, first=90)
+
+    # ────────────────────────────────────────────────────────────────────
+    # Время приёмки не проставлено в заказе — пинг ответственному менеджеру
+    # в личку. Каждые 30 мин, окно 10:00–18:00 МСК (гейт внутри модуля),
+    # горизонт — отгрузка сегодня/завтра. Добивка к webhook-проверке на
+    # статусе «Согласован»: дедуп у них общий, менеджер получает один пинг.
+    # План: 2026-09-11-алерт-менеджеру-время-приёмки-не-проставлено.
+    # ────────────────────────────────────────────────────────────────────
+    from delivery_window_check import poll_job as _delivery_window_poll
+
+    async def _delivery_window_wrapper(context):
+        try:
+            stats = await _delivery_window_poll(app, db)
+            if stats:
+                logger.info(f"delivery_window_check job: {stats}")
+        except Exception as e:
+            logger.error(f"delivery_window_check job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_delivery_window_wrapper, interval=1800, first=150)
 
     # ────────────────────────────────────────────────────────────────────
     # Пинг зависших лидов на «Неразобранном» воронки ПРИВЛЕЧЕНИЕ — каждые 30 мин.
@@ -8428,6 +8452,20 @@ async def process_ms_webhook(data: dict, bot):
                     except Exception as ex_lg:
                         logger.warning(f"check_order_logistics_validity({order_id}): {ex_lg}")
                 asyncio.create_task(_logi_check())
+
+            # Время приёмки не проставлено → пинг менеджеру в личку. Модуль сам
+            # проверяет статус: реагируем только на «Согласован» (заказ сформирован),
+            # иначе бот пинал бы менеджера прямо во время заполнения заказа.
+            # Дедуп общий с крон-джобой (delivery_window_alerts).
+            # План: 2026-09-11-алерт-менеджеру-время-приёмки-не-проставлено.
+            if action in ("CREATE", "UPDATE"):
+                from delivery_window_check import check_one as _window_check_one
+                async def _window_check(href=order_href):
+                    try:
+                        await _window_check_one(href, bot, db)
+                    except Exception as ex_w:
+                        logger.warning(f"delivery_window_check({order_id}): {ex_w}")
+                asyncio.create_task(_window_check())
 
             # Реактивная автоподстановка «Даты планируемой оплаты» — сразу
             # после сохранения заказа (16.06.2026). Cron в JobQueue остаётся
