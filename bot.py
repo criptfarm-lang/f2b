@@ -7347,6 +7347,22 @@ def main():
     app.job_queue.run_repeating(_delivery_window_wrapper, interval=1800, first=150)
 
     # ────────────────────────────────────────────────────────────────────
+    # Реактивация сайт-лидов предложением «Спец.» через MAX/Telegram — тик раз в минуту,
+    # не больше одного сообщения за тик. Ничего не делает, пока кампания в bot_settings
+    # (ключ reactivation:<кампания>) не включена. Окно, лимит и интервалы — в настройках.
+    # План: 2026-09-17-реактивация-сайт-лидов-спеццена-мессенджеры.
+    # ────────────────────────────────────────────────────────────────────
+    from reactivation_campaign import tick as _reactivation_tick
+
+    async def _reactivation_wrapper(context):
+        try:
+            await _reactivation_tick(app, db)
+        except Exception as e:
+            logger.error(f"reactivation job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_reactivation_wrapper, interval=60, first=180)
+
+    # ────────────────────────────────────────────────────────────────────
     # Пинг зависших лидов на «Неразобранном» воронки ПРИВЛЕЧЕНИЕ — каждые 30 мин.
     # Личка ответственному при возрасте ≥5ч в статусе, окно 09-20 МСК, повтор ≤3ч.
     # PTB JobQueue (не AsyncIOScheduler). План: 2026-07-14-пинг-зависших-лидов-неразобранное.
