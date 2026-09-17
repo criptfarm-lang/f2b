@@ -1423,6 +1423,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user and text:
         db.log_usage(user.id, user.full_name, text[:100], chat_id)
 
+    # Excel-файл от сотрудника в личке (кроме собственника и партнёра) —
+    # сохраняем в media и подтверждаем получение. Ниже по потоку файл с подписью
+    # или пересланный не сохранялся, а без подписи сохранялся молча. Так сотрудники
+    # сдают заполненные списки (проверка контактов клиентов и т.п.).
+    if (user and chat_id == user.id and chat_id not in (OWNER_CHAT_ID, PARTNER_CHAT_ID)
+            and message.document):
+        _fname = message.document.file_name or ""
+        if (_fname.lower().endswith((".xlsx", ".xls"))
+                and not any(w in _fname.lower() for w in ("прайс", "price"))):
+            db.save_media(
+                file_id=message.document.file_id,
+                media_type="document",
+                caption=_fname + (f" | {message.caption}" if message.caption else ""),
+                chat_id=chat_id,
+                uploader=user.full_name,
+                date=datetime.now().isoformat(),
+            )
+            logger.info(f"xlsx от сотрудника сохранён: user={user.id} file={_fname}")
+            await message.reply_text(f"Файл «{_fname}» получен, спасибо.")
+            return
+
     # Обработка ожидаемого ввода из меню (фото / ПДЗ клиента)
     awaiting = _user_awaiting.get(user.id) if user else None
     if awaiting and user and text and not text.startswith("/"):
