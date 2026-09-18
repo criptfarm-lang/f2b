@@ -7,8 +7,10 @@
 Джобы шлют в группу вопрос по окну, мастер отвечает reply, бот парсит строки и
 кладёт в quality.temp_readings — дальше ряд разбирается запросом, а не глазами.
 
-Регламент задан собственником 26.08.2026. Окна: 09:00, 11:00, 12:50 (регламент
-подготовки к обеду, без замера), 14:30, 16:00, 17:30 МСК.
+Регламент с 18.09.2026 (решение собственника): три одинаковых напоминания в день
+— 09:00, 13:00, 17:00 МСК. В каждом весь перечень: сырьё до начала работ и при
+смене, тузлук, цех и камеры хранения. Прежние окна (тушка перед порезкой, филе на
+этапах, подготовка к обеду, толща на дефросте) сняты.
 """
 import logging
 import os
@@ -31,9 +33,6 @@ DEFAULT_CHAT_ID = -5432509607
 # Физически осмысленный диапазон для продукта и тузлука в цеху.
 T_MIN, T_MAX = -40.0, 40.0
 
-# Через сколько минут напомнить, если на окно не ответили. Один раз.
-REMIND_AFTER_MIN = int(os.getenv("QC_REMIND_AFTER_MIN", "30"))
-
 # Дни недели, когда окна работают: 0=Пн … 6=Вс.
 # Пн–Пт и Вс: цех работает по воскресеньям, но без технолога — в этот день
 # на замеры отвечает мастер смены. Суббота выходная.
@@ -49,50 +48,32 @@ def chat_id() -> int:
 # Окна регламента
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Перечень один и тот же во всех трёх напоминаниях: технолог сам решает, что из
+# этого стало актуально к моменту напоминания (решение собственника 18.09.2026).
+CHECKS = [
+    "температура сырья — до начала работ и при каждой смене сырья",
+    "температура тузлука",
+    "температура в цехе и в камерах хранения",
+]
+
+EXAMPLE = ("00614 / лосось Чили / сырьё / -1,5\n"
+           "тузлук / 6,0\n"
+           "цех / 11,0\n"
+           "камера 2 / -18")
+
 WINDOWS = [
     {
-        "key": "09:00",
-        "stage": "перед порезкой",
-        "utc": (6, 0),
+        "key": key,
+        "utc": utc,
         "kind": "measure",
-        "point": "тушка-перед-порезкой",
-        "title": "Температура в тушке перед началом порезки",
-        "fields": "партия / продукт / этап / температура",
-        "example": "00614 / лосось Чили / перед порезкой / -1,5",
-    },
-    {
-        "key": "11:00",
-        "utc": (8, 0),
-        "kind": "measure",
-        "point": "филе-этап",
-        "with_brine": True,
-        "title": "Температура филе на этапах, где идут работы, плюс тузлук",
-        "fields": "партия / продукт / этап / температура — по строке на каждый этап",
-        "example": ("00614 / лосось Чили / финишная зачистка / 6,0\n"
-                    "00615 / форель Осетия / дефрост / -1,0\n"
-                    "тузлук / 6,0"),
-    },
-    {
-        "key": "12:50",
-        "utc": (9, 50),
-        "kind": "checklist",
-        "title": "Подготовка к обеду",
-        "items": [
-            "всё филе убрать в охлаждаемую камеру вместе с паспортами",
-            "ножи и доски замочить",
-            "полы и поверхности протереть",
-        ],
-    },
-    {
-        "key": "18:00",
-        "stage": "дефрост",
-        "utc": (15, 0),
-        "kind": "measure",
-        "point": "дефрост-толща",
-        "title": "Температура в толще рыбы, лежащей на дефросте",
-        "fields": "партия / продукт / этап / температура — по строке на каждую рыбу",
-        "example": "00615 / форель Осетия / дефрост / -1,0\n00614 / лосось Чили / дефрост / -2,0",
-    },
+        # Точка по умолчанию: строка без названия точки — это замер сырья.
+        "point": "сырьё",
+        "title": "Замеры температуры",
+        "checks": CHECKS,
+        "fields": "партия / продукт / точка / температура — по строке на каждый замер",
+        "example": EXAMPLE,
+    }
+    for key, utc in (("09:00", (6, 0)), ("13:00", (10, 0)), ("17:00", (14, 0)))
 ]
 
 WINDOW_BY_KEY = {w["key"]: w for w in WINDOWS}
@@ -226,9 +207,10 @@ _BATCH_RE = re.compile(r"\b(\d{5})\b")
 _TIME_RE = re.compile(r"^\s*([01]?\d|2[0-3])[:.]([0-5]\d)\s*$")
 _SIGN_RE = re.compile(r"^\s*(минус|плюс|[-+−])\s*$", re.IGNORECASE)
 
-# Окна, где продукт может быть ещё мороженым: число без знака двусмысленно
-# (Инна 26.08 написала «12», имея в виду −12). Переспрашиваем.
-SIGN_STRICT_POINTS = {"тушка-перед-порезкой", "дефрост-толща"}
+# Точки, где значение может быть минусовым: число без знака двусмысленно (Инна
+# 26.08 написала «12», имея в виду −12). Переспрашиваем. Сырьё приходит и
+# мороженым, камера хранения бывает морозильной.
+SIGN_STRICT_POINTS = {"сырьё", "камера хранения", "дефрост-толща"}
 
 
 def sign_answer(text: str):
@@ -299,6 +281,39 @@ def _num_and_note(token: str):
     return _to_float(m.group(1)), cut_note(m.group(2))
 
 
+# Точки замера, которые человек называет словом в начале строки. Без партии и без
+# этапа: это среда, а не продукт. Сначала длинные ключи, иначе «камера» перебьёт
+# «камера шоковой заморозки».
+POINT_HEADS = [
+    ("сырьё", ("сырьё", "сырье")),
+    ("тузлук", ("тузлук", "рассол")),
+    ("цех", ("цех", "в цеху", "в цехе", "воздух в цеху", "воздух в цехе", "помещение")),
+    ("камера хранения", ("камера хранения", "камере хранения", "камера", "камере",
+                         "камеры", "холодильная камера", "холодильник", "морозильная камера",
+                         "морозилка", "склад")),
+]
+
+# К этим точкам этап производства не относится: замеряется среда, а не рыба.
+POINT_NO_STAGE = {"тузлук", "цех", "камера хранения"}
+
+# Канонические этапы производства. Если этап назван, продукт уже не сырьё, и
+# писать такой замер в точку «сырьё» нельзя — ряд по сырью поедет.
+STAGE_KNOWN = {canon for canon, _ in STAGE_CANON}
+
+
+def _point_of(head: str):
+    """«камера 2» → ('камера хранения', '2'). Не узнали — (None, head)."""
+    low = re.sub(r"\s+", " ", (head or "").strip().lower())
+    if not low:
+        return None, head
+    for canon, keys in POINT_HEADS:
+        for k in sorted(keys, key=len, reverse=True):
+            if low.startswith(k):
+                rest = (head or "").strip()[len(k):].strip(" .,:;-–—")
+                return canon, (rest or None)
+    return None, head
+
+
 def norm_stage(text: str):
     """Свободное название этапа → канонический. Неизвестное возвращаем как есть."""
     if not text:
@@ -356,20 +371,26 @@ def parse_lines(text: str, window: dict):
 
     def _mk(batch, descr, value, explicit_sign, raw, stage=None, hhmm=None):
         cut = cut_note(raw)
-        head = (descr or "").lower()
-        pt = "тузлук" if head.startswith("тузлук") or head.startswith("рассол") else point
-        if batch is None and (head.startswith("тузлук") or head.startswith("рассол")):
-            descr = None
-        named_stage = norm_stage(stage)
-        if named_stage == "дефрост":
-            pt = "дефрост-толща"
+        named_point, rest = _point_of(descr)
+        # Точку человек называет и в поле этапа: «00614 / лосось / сырьё / -1,5».
+        stage_point, _ = _point_of(stage) if stage else (None, None)
+        pt = named_point or stage_point or point
+        if named_point and batch is None:
+            descr = rest
+        named_stage = None if stage_point else norm_stage(stage)
+        if not named_point and not stage_point:
+            if named_stage == "дефрост":
+                pt = "дефрост-толща"
+            elif named_stage in STAGE_KNOWN:
+                pt = "продукт-этап"
+        no_stage = pt in POINT_NO_STAGE
         return {
             "point_key": pt,
             "batch_no": batch,
             "descr": descr,
-            "stage": named_stage or (None if pt == "тузлук" else default_stage),
+            "stage": named_stage or (None if no_stage else default_stage),
             "stage_source": ("строка" if named_stage
-                             else (None if pt == "тузлук" or not default_stage else "окно")),
+                             else (None if no_stage or not default_stage else "окно")),
             "hhmm": hhmm,
             "cut_note": cut,
             "value_c": value,
@@ -457,15 +478,14 @@ def _question_text(window: dict) -> str:
         "\n\n<b>Температуру пишите со знаком</b>: <code>-12</code> или <code>+4</code>."
         if strict else ""
     )
+    checks = "".join(f"— {c}\n" for c in window.get("checks") or [])
     return (
         f"<b>{window['key']} · {window['title']}</b>\n\n"
-        f"Формат: <code>{window['fields']}</code>\n"
+        + (f"{checks}\n" if checks else "")
+        + f"Формат: <code>{window['fields']}</code>\n"
         f"Например:\n<code>{window['example']}</code>\n\n"
         "Если замер сделан раньше — допишите время последним полем: "
         "<code>… / -1,5 / 09:20</code>.\n"
-        + ("Как пошёл нож — допишите словом: <code>легко</code>, <code>тяжело</code> "
-           "или <code>не идёт</code>.\n" if window.get("point") == "тушка-перед-порезкой" else "")
-        +
         f"Ответьте в ответ на это сообщение.{tail}"
     )
 
@@ -497,35 +517,11 @@ async def send_window(app, db, window_key: str):
     return rec["id"] if rec else None
 
 
-async def remind_open(app, db, window_key: str):
-    """Один повтор по неотвеченному окну. Закрывает окно отдельная джоба close_open."""
-    ensure_tables(db)
-    now = datetime.now(MSK)
-    row = db._fetchone(
-        "SELECT id, message_id, reminded FROM quality.control_windows "
-        "WHERE window_key=%s AND asked_on=%s AND chat_id=%s AND status='open'",
-        (window_key, now.date(), chat_id()),
-    )
-    if not row or row["reminded"]:
-        return
-    try:
-        await app.bot.send_message(
-            chat_id=chat_id(),
-            text=f"Напоминание: замер {window_key} ещё не получен.",
-            reply_to_message_id=row["message_id"],
-        )
-    except Exception as e:
-        logger.warning("production_control: напоминание %s не ушло: %s", window_key, e)
-    db._execute("UPDATE quality.control_windows SET reminded=TRUE WHERE id=%s", (row["id"],))
-    db.conn.commit()
-
-
 async def close_open(app, db, window_key: str):
-    """Закрывает неотвеченное окно пропуском.
+    """Закрывает неотвеченное окно пропуском по истечении срока приёма ответов.
 
-    Отдельная джоба, а не второй заход remind_open: повтор ставится один раз в
-    сутки, поэтому внутри него окно никогда бы не перешло в missed и висело бы
-    open вечно (замечено на первом же окне 26.08.2026).
+    Повтора «замер ещё не получен» с 18.09.2026 нет: собственник просил ровно три
+    сообщения в день, а не три плюс догоняющие.
     """
     ensure_tables(db)
     now = datetime.now(MSK)
@@ -857,27 +853,17 @@ def schedule(app, db):
                 except Exception as e:
                     logger.error("production_control %s: %s", window_key, e, exc_info=True)
 
-            async def _remind(context):
-                try:
-                    await remind_open(app, db, window_key)
-                except Exception as e:
-                    logger.error("production_control remind %s: %s", window_key, e, exc_info=True)
-
             async def _close(context):
                 try:
                     await close_open(app, db, window_key)
                 except Exception as e:
                     logger.error("production_control close %s: %s", window_key, e, exc_info=True)
 
-            return _job, _remind, _close
+            return _job, _close
 
-        job, remind, close = _mk(key)
+        job, close = _mk(key)
         app.job_queue.run_daily(job, time=_time(hour=h, minute=m, tzinfo=timezone.utc))
-        rh, rm = divmod(h * 60 + m + REMIND_AFTER_MIN, 60)
-        app.job_queue.run_daily(
-            remind, time=_time(hour=rh % 24, minute=rm, tzinfo=timezone.utc)
-        )
-        ch, cm = divmod(h * 60 + m + REMIND_AFTER_MIN * 2, 60)
+        ch, cm = divmod(h * 60 + m + WINDOW_TTL_MIN, 60)
         app.job_queue.run_daily(
             close, time=_time(hour=ch % 24, minute=cm, tzinfo=timezone.utc)
         )
