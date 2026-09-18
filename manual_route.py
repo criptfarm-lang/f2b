@@ -105,10 +105,21 @@ def _parse_ms_dt(s):
         return None
 
 
-def _is_selfpickup(addr) -> bool:
-    """Самовывоз менеджеры помечают словом «самовывоз» в адресе доставки — такой заказ
-    машина не везёт (правило моста f2b-logistics-bridge::is_selfpickup)."""
-    return "самовыв" in (addr or "").lower()
+_SELFPICKUP_RE = re.compile(r"(?<!не )(?<!без )самовыв", re.IGNORECASE)
+
+
+def _is_selfpickup(order: dict | None) -> bool:
+    """Самовывоз — такой заказ машина не везёт, в раскладку он не попадает.
+
+    Правило держим синхронно с мостом (`f2b-logistics-bridge::is_selfpickup`, правка
+    18.09.2026): смотрим и «Адрес доставки», и КОММЕНТАРИЙ к адресу. Слово в самом поле
+    адреса ставят редко — чаще в адресе стоит наш цех или город клиента, а пометка
+    «самовывоз» уходит в комментарий.
+    """
+    o = order or {}
+    addr = o.get("shipmentAddress") or ""
+    addr_comment = ((o.get("shipmentAddressFull") or {}).get("comment") or "")
+    return bool(_SELFPICKUP_RE.search(addr) or _SELFPICKUP_RE.search(addr_comment))
 
 
 async def ms_orders_for_day(day: date, force: bool = False) -> list:
@@ -143,7 +154,7 @@ async def ms_orders_for_day(day: date, force: bool = False) -> list:
     out = []
     for o in rows:
         addr = o.get("shipmentAddress")
-        if _is_selfpickup(addr):
+        if _is_selfpickup(o):
             continue
         state = (o.get("state") or {}).get("name") or ""
         if state in STATES_SKIP:
