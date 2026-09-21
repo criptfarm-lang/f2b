@@ -199,7 +199,7 @@ def ensure_schema(db):
             added_at  TIMESTAMPTZ DEFAULT now()
         )
     """)
-    # unit_id — юнит Wialon (26209/26210), чтобы /рейс показывал водителю ТОЛЬКО его машину.
+    # unit_id — юнит Wialon (26209/26210/26695), чтобы /рейс показывал водителю ТОЛЬКО его машину.
     # NULL → водитель видит полный список дня (фолбэк).
     db._execute("ALTER TABLE drivers ADD COLUMN IF NOT EXISTS unit_id BIGINT")
     # custom_items — пункты чек-листа из доп.поля заказа «Чек-лист водителя» (Фаза 7).
