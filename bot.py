@@ -7096,6 +7096,13 @@ def main():
         production_control.register(app, db)
     except Exception as e:
         logger.exception(f"production_control.register упал: {e}")
+    # Недельные протоколы: «Опубликовать» / «Доработка» в личке собственника.
+    # План: 2026-09-21-протоколы-на-утверждение-собственнику (репо «второй мозг»).
+    try:
+        import protocol_approval
+        protocol_approval.register(app, db)
+    except Exception as e:
+        logger.exception(f"protocol_approval.register упал: {e}")
     try:
         import route_registry
         route_registry.register(app)
