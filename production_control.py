@@ -395,7 +395,7 @@ def parse_lines(text: str, window: dict):
             "cut_note": cut,
             "value_c": value,
             "raw_line": raw,
-            "sign_pending": (not explicit_sign) and pt in SIGN_STRICT_POINTS,
+            "sign_pending": (not explicit_sign) and pt in SIGN_STRICT_POINTS and value != 0,  # у нуля знака нет
         }
 
     # Карточка: 2–3 строки, последняя — голое число, ни одна не содержит «/».
@@ -695,13 +695,22 @@ def _make_reply_handler(db):
             return
 
         row = _active_window(db, msg)
-        if not row:
-            return  # вне окна — в сыром логе уже сохранено, разбирать нечего
-        window = WINDOW_BY_KEY.get(row["window_key"])
-        if not window:
-            return
+        if row:
+            window = WINDOW_BY_KEY.get(row["window_key"])
+            if not window:
+                return
+        else:
+            # Вне окна замер тоже принимаем (решение собственника 21.09.2026: запросы
+            # системы не считаем, считаем, сколько раз производство прислало замеры).
+            # Мерят и пишут, когда удобно, — с 10 по 17.09 так пропало ~10 сообщений.
+            # Разбираем только строки в формате «… / … / температура»: без окна в
+            # группу пишут и о другом, и «цех 1 убрать до 15» замером не считаем.
+            if "/" not in text:
+                return
+            row = {"id": None, "window_key": None}
+            window = WINDOWS[0]   # перечень во всех окнах один и тот же
 
-        if window["kind"] == "checklist":
+        if window["kind"] == "checklist" and row["id"]:
             db._execute(
                 "UPDATE quality.control_windows SET answered_at=NOW(), status='done' WHERE id=%s",
                 (row["id"],),
@@ -710,18 +719,22 @@ def _make_reply_handler(db):
             await msg.reply_text("Принято.")
             return
 
-        db._execute(
-            "UPDATE quality.chat_log SET window_id=%s, window_key=%s "
-            "WHERE chat_id=%s AND message_id=%s",
-            (row["id"], row["window_key"], msg.chat_id, msg.message_id),
-        )
-        db.conn.commit()
+        if row["id"]:
+            db._execute(
+                "UPDATE quality.chat_log SET window_id=%s, window_key=%s "
+                "WHERE chat_id=%s AND message_id=%s",
+                (row["id"], row["window_key"], msg.chat_id, msg.message_id),
+            )
+            db.conn.commit()
 
         readings, errors = parse_lines(text, window)
+        if not row["id"]:
+            # Без окна «Не разобрал» не пишем: реплика со слэшем могла быть не замером.
+            errors = []
         if not readings:
             return  # реплика без чисел — молчим, чтобы не шуметь; текст уже в логе
 
-        if (len(readings) == 1 and not readings[0]["batch_no"]
+        if (row["id"] and len(readings) == 1 and not readings[0]["batch_no"]
                 and not readings[0]["descr"]):
             dup = db._fetchone(
                 "SELECT id FROM quality.temp_readings "
@@ -745,7 +758,7 @@ def _make_reply_handler(db):
         for r in readings:
             r["ms_product"], r["ms_state"] = await resolve_batch(db, r["batch_no"])
             # Повторный замер по той же партии в том же окне — исправление.
-            if r["batch_no"]:
+            if r["batch_no"] and row["id"]:
                 db._execute(
                     "UPDATE quality.temp_readings SET superseded=TRUE "
                     "WHERE window_id=%s AND batch_no=%s AND NOT superseded",
@@ -774,10 +787,11 @@ def _make_reply_handler(db):
             )
             if r["sign_pending"]:
                 pending += 1
-        db._execute(
-            "UPDATE quality.control_windows SET answered_at=NOW(), status='done' WHERE id=%s",
-            (row["id"],),
-        )
+        if row["id"]:
+            db._execute(
+                "UPDATE quality.control_windows SET answered_at=NOW(), status='done' WHERE id=%s",
+                (row["id"],),
+            )
         db._execute(
             "UPDATE quality.chat_log SET parsed_count=%s WHERE chat_id=%s AND message_id=%s",
             (len(readings), msg.chat_id, msg.message_id),
@@ -826,7 +840,6 @@ def register(app, db):
     Команды сводки нет: 28.08.2026 собственник решил, что замеры смотрим в
     рабочих сессиях по `quality.temp_readings`, а через бот — не планируем.
     """
-    ensure_tables(db)
     app.add_handler(
         MessageHandler(
             # ~COMMAND обязателен: хендлер зарегистрирован раньше остальных и без
@@ -835,6 +848,15 @@ def register(app, db):
             _make_reply_handler(db),
         )
     )
+    # Таблицы — ПОСЛЕ хендлера и без права уронить регистрацию: с 09.09 по 17.09.2026
+    # замеры из группы в базу не шли, а сообщения забирал общий handle_message —
+    # по всей видимости, DDL на старте падал (таймауты базы видны в логах тех дней),
+    # и хендлер не подключался. Та же ловушка, что у чек-листа водителя 22.07.
+    # Таблицы давно существуют; обработчик сам зовёт ensure_tables на каждом сообщении.
+    try:
+        ensure_tables(db)
+    except Exception as e:
+        logger.exception("production_control: ensure_tables на старте отложено: %s", e)
     logger.info("production_control: зарегистрирован, чат %s", chat_id())
 
 
