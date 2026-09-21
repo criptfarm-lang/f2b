@@ -3486,7 +3486,8 @@ async def cmd_pdz_breaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not aid or aid in agent_url_map:
             continue
         order_id = r.get("order_id") or ""
-        if order_id:
+        # «fifo:<agent_id>» — строка снимка без заказа (должник только по сальдо).
+        if order_id and not order_id.startswith("fifo:"):
             agent_url_map[aid] = f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}"
 
     from datetime import datetime as _dt, timezone as _tz
@@ -5144,11 +5145,18 @@ async def _build_report_data() -> dict:
     from moysklad import get_manager_shipments, get_attracted_goods_by_manager, get_lost_clients_by_manager, get_headers, MS_BASE
     import aiohttp
 
-    today = date.today()
+    # Дата — по Москве: контейнер Amvera живёт в UTC, и с 00:00 до 03:00 МСК отчёт
+    # считался по вчерашнему дню, а 1-го числа — за прошлый месяц.
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+    today = _dt.now(_ZI("Europe/Moscow")).date()
     month_start = today.replace(day=1).isoformat()
     month_end = today.isoformat()
 
-    facts = await get_manager_shipments(month_start, month_end)
+    shipments_details: dict = {}
+    facts = await get_manager_shipments(month_start, month_end, details=shipments_details)
+    # Новые клиенты считаются там же, по ИНН (как в дашбордах мотивации).
+    new_client_names = {mgr: f.pop("new_client_names", []) for mgr, f in facts.items()}
     attracted = await get_attracted_goods_by_manager(month_start, month_end)
     lost = await get_lost_clients_by_manager(month_start, month_end)
 
@@ -5172,89 +5180,46 @@ async def _build_report_data() -> dict:
             db.set_mgr_history_cache(tag, hist)
             mgr_history[mgr_name] = hist
 
-    tag_to_ids = {}
     async with aiohttp.ClientSession() as session:
-        for tag, mgr in TAGS.items():
-            ids = set()
-            off = 0
-            while True:
-                async with session.get(f"{MS_BASE}/entity/counterparty", headers=get_headers(), params={"filter":f"tags={tag}","limit":100,"offset":off}) as r:
-                    d = await r.json()
-                rows = d.get("rows",[])
-                for cp in rows: ids.add(cp.get("id",""))
-                if len(rows)<100: break
-                off+=100
-            tag_to_ids[mgr] = ids
-
-        curr_ids = {}
-        off = 0
-        while True:
-            async with session.get(f"{MS_BASE}/entity/demand", headers=get_headers(), params={"filter":f"moment>={month_start} 00:00:00;moment<={month_end} 23:59:59","expand":"agent","limit":200,"offset":off}) as r:
-                d = await r.json()
-            rows = d.get("rows",[])
-            for row in rows:
-                href = row.get("agent",{}).get("meta",{}).get("href","")
-                aid = href.split("/")[-1] if href else ""
-                if aid: curr_ids[aid] = href
-            if len(rows)<200: break
-            off+=200
-
-        # «Новые» клиенты — есть demand в окне (aid in curr_ids), нет demand до month_start.
-        # КРИТИЧНО: МС API при limit=1 нестабильно возвращает meta.size — иногда 0
-        # даже когда demand реально есть (ловили на Инессе: 12 из 13 «новых» оказались
-        # старыми клиентами с 8–116 demand до месяца). Надёжно — len(rows)+retry.
-        new_client_names = {}
-        for mgr, ids in tag_to_ids.items():
-            for aid in ids:
-                if aid not in curr_ids: continue
-                has_before = False
-                for attempt in range(3):
-                    async with session.get(f"{MS_BASE}/entity/demand", headers=get_headers(), params={"filter":f"agent={MS_BASE}/entity/counterparty/{aid};moment<{month_start} 00:00:00","limit":1}) as r:
-                        prev = await r.json()
-                    if prev.get("rows"):
-                        has_before = True
-                        break
-                    if attempt < 2:
-                        await asyncio.sleep(0.4 * (attempt + 1))
-                if has_before:
-                    continue
-                # Получаем имя контрагента (тоже с retry — ответ counterparty
-                # иногда приходит без name, тогда тултип показывает UUID).
-                name = None
-                for attempt in range(3):
-                    async with session.get(f"{MS_BASE}/entity/counterparty/{aid}", headers=get_headers()) as r2:
-                        cp = await r2.json()
-                    name = cp.get("name")
-                    if name:
-                        break
-                    if attempt < 2:
-                        await asyncio.sleep(0.4 * (attempt + 1))
-                new_client_names.setdefault(mgr,[]).append(name or f"?({aid[:8]}…)")
-
+        # «Выбывшие» — клиенты менеджера (по ИНН), отгружавшиеся в прошлом месяце и
+        # без отгрузки в этом. Ключ клиента и текущий АКБ — из get_manager_shipments,
+        # чтобы вторая карточка того же ЮЛ не считалась ушедшей (кейс ООО «ТЕСЛА»).
         if today.month==1:
             prev_start = f"{today.year-1}-12-01"
         else:
             prev_start = f"{today.year}-{today.month-1:02d}-01"
         prev_ids = set()
-        all_mgr_ids = set().union(*tag_to_ids.values())
+        all_mgr_ids = set().union(*(d["card_key"].keys() for d in shipments_details.values()))
         off = 0
         while True:
-            async with session.get(f"{MS_BASE}/entity/demand", headers=get_headers(), params={"filter":f"moment>={prev_start} 00:00:00;moment<{month_start} 00:00:00","expand":"agent","limit":200,"offset":off}) as r:
+            async with session.get(f"{MS_BASE}/entity/demand", headers=get_headers(), params={"filter":f"moment>={prev_start} 00:00:00;moment<{month_start} 00:00:00;applicable=true","limit":100,"offset":off}) as r:
+                r.raise_for_status()
                 d = await r.json()
             rows = d.get("rows",[])
             for row in rows:
                 href = row.get("agent",{}).get("meta",{}).get("href","")
                 aid = href.split("/")[-1] if href else ""
                 if aid and aid in all_mgr_ids: prev_ids.add(aid)
-            if len(rows)<200: break
-            off+=200
+            if len(rows)<100: break
+            off+=100
 
         EXCLUDED_STATUSES = {"закрылся", "переименован"}
         lost_client_names = {}
-        for mgr, ids in tag_to_ids.items():
-            for aid in (ids & prev_ids - set(curr_ids.keys())):
+        for mgr, det in shipments_details.items():
+            card_key, curr_keys = det["card_key"], det["curr_keys"]
+            seen_keys = set()
+            for aid in sorted(prev_ids & set(card_key)):
+                key = card_key[aid]
+                if key in curr_keys or key in seen_keys:
+                    continue
                 async with session.get(f"{MS_BASE}/entity/counterparty/{aid}", headers=get_headers()) as r:
                     cp = await r.json()
+                if (cp.get("name") or "").strip().lower().startswith("розничный покупатель"):
+                    continue
+                # Архивная карточка — собственник сам убрал её из работы (как и раньше,
+                # когда архивные в выборку по тегу не попадали вовсе).
+                if cp.get("archived"):
+                    continue
                 # Исключаем закрытых и переименованных
                 cp_status = (cp.get("state") or {}).get("name", "").lower().strip()
                 if cp_status in EXCLUDED_STATUSES:
@@ -5267,6 +5232,7 @@ async def _build_report_data() -> dict:
                 if mgr_tag and mgr_tag not in cp_tags:
                     logger.info(f"Skipping lost client {cp.get('name')} for {mgr} — tag changed to {cp_tags}")
                     continue
+                seen_keys.add(key)
                 lost_client_names.setdefault(mgr, []).append(cp.get("name", aid))
 
     MONTHLY_PLANS = {
@@ -5360,6 +5326,30 @@ async def _build_report_data() -> dict:
                     PLANS[mgr_name][metric] = float(row["value"])
             except Exception:
                 pass
+    # Выручка и АКБ — живьём из админки «План ОП» (op_plans): по этим двум метрикам
+    # источник правды она, её же читают дашборды менеджеров. Хардкод выше —
+    # только запасной вариант, если строки в админке нет. До 21.09.2026 план
+    # переписывали руками в MONTHLY_PLANS, и он молча отставал: в сентябре у Антона
+    # стояло 300 тыс против 600 тыс в админке, план отдела в /op_report был
+    # 47,5 млн вместо 47,8. У Инессы план в отчёте полный — её строка плюс «фугу».
+    try:
+        op_rows = {r["manager_tag"]: r for r in db._fetchall(
+            "SELECT manager_tag, revenue_plan_rub, akb_plan_count FROM op_plans WHERE period=%s",
+            (current_month_key,))}
+    except Exception as e:
+        logger.warning(f"_build_report_data: op_plans не прочитан, план из хардкода: {e}")
+        op_rows = {}
+    for tag, mgr_name in TAGS.items():
+        r = op_rows.get(tag)
+        if not r:
+            continue
+        subs = [op_rows.get("фугу")] if tag == "скляр" else []
+        plan_mgr = PLANS.setdefault(mgr_name, {"shipments": 0, "revenue": 0, "clients": 0,
+                                               "new_clients": 0, "attracted": 0})
+        for col, metric in (("revenue_plan_rub", "revenue"), ("akb_plan_count", "clients")):
+            if r[col] is None:
+                continue
+            plan_mgr[metric] = float(r[col]) + sum(float(s[col] or 0) for s in subs if s)
     WEEKLY_PLANS = {
         "Инесса Скляр":     {"shipments": 25,  "revenue": 2_000_000,  "clients": 10, "new_clients": 1, "attracted": 250_000},
         "Карина Баласанян": {"shipments": 40,  "revenue": 1_200_000,  "clients": 16, "new_clients": 1, "attracted": 275_000},
@@ -6257,6 +6247,13 @@ async def cmd_set_monthly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not metric_key:
         await update.message.reply_text(f"❌ Показатель '{context.args[1]}' не найден.\nДоступные: выручка, отгрузки, акб, новые, привл")
         return
+    if metric_key in ("revenue", "clients"):
+        # Выручку и АКБ /op_report берёт из админки «План ОП» (op_plans) — запись
+        # сюда молча перекрылась бы ею. Не делаем вид, что план поменялся.
+        await update.message.reply_text(
+            "Выручку и АКБ бот берёт из админки «План ОП» – поменяй там, "
+            "тогда цифра сойдётся и в /op_report, и на дашбордах менеджеров.")
+        return
     key = f"monthly_target_{period}_{mgr_name}_{metric_key}"
     db._execute(
         "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
@@ -6308,6 +6305,11 @@ async def cmd_set_monthly_bulk(update: Update, context: ContextTypes.DEFAULT_TYP
 
     applied: list = []
     for mgr_name, metric_key, value in successes:
+        if metric_key in ("revenue", "clients"):
+            # Выручку и АКБ /op_report берёт из админки «План ОП» (см. cmd_set_monthly).
+            errors.append((f"{mgr_name} {metric_key}={value:,.0f}".replace(',', ' '),
+                           "выручка и АКБ – только в админке «План ОП»"))
+            continue
         try:
             db._execute(
                 "INSERT INTO bot_settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s",
@@ -8021,6 +8023,9 @@ def main():
             # Живой набор клиентов с тегом «суд» — они автоматически вне штрафа.
             court_ids = await agent_ids_with_tag_live(PDZ_PENALTY_EXCLUDE_TAG)
             pdz_list = [{
+                # agent_id — чтобы дашборд исключал Фугу/суд по карточке, а не по
+                # имени (переименование карточки иначе молча сломало бы фильтр).
+                "agent_id":         x.get("agent_id"),
                 "name":             x.get("agent_name") or "—",
                 "days_overdue":     int(x.get("max_days_overdue") or 0),
                 "amount_rub":       round(float(x.get("total_unpaid") or 0), 2),

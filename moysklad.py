@@ -1931,6 +1931,64 @@ async def pdz_take_snapshot() -> list:
                 f"контрагентов; balance>=0 (не должны): {non_debtors}; запросы упали: {failed}"
             )
 
+            # ── Должники без заказов с датой оплаты ──────────────────────────
+            # Снимок строится по заказам с «Датой планируемой оплаты», и клиент,
+            # у которого таких заказов нет, в него не попадал вовсе: 21.09.2026 в
+            # МС было 173 должника, в снимке — 115 (КОРОЛЕВСКИЙ РАЦИОН у Карины,
+            # 333 дн / 45 242 ₽, в ПДЗ не было). Добираем всех с отрицательным
+            # сальдо одной строкой на клиента: order_id = «fifo:<agent_id>»,
+            # сумм и дат оплаты нет — такие строки видит только demand-FIFO, все
+            # потребители по заказам их пропускают (payed_sum >= total_sum).
+            try:
+                extra: dict = {}
+                offset_r = 0
+                while True:
+                    async with session.get(f"{MS_BASE}/report/counterparty", headers=get_headers(),
+                                           params={"limit": 1000, "offset": offset_r}) as resp_r:
+                        if resp_r.status != 200:
+                            raise RuntimeError(f"report/counterparty {resp_r.status}")
+                        rep = await resp_r.json()
+                    rep_rows = rep.get("rows", []) or []
+                    for rr in rep_rows:
+                        cp = rr.get("counterparty") or {}
+                        aid = cp.get("id") or ((cp.get("meta") or {}).get("href", "").rsplit("/", 1)[-1])
+                        bal = round((rr.get("balance", 0) or 0) / 100, 2)
+                        if aid and bal < 0 and aid not in balance_map:
+                            extra[aid] = bal
+                    if len(rep_rows) < 1000:
+                        break
+                    offset_r += 1000
+                added = 0
+                for aid, bal in extra.items():
+                    async with session.get(f"{MS_BASE}/entity/counterparty/{aid}", headers=get_headers()) as resp_c:
+                        if resp_c.status != 200:
+                            continue
+                        cp = await resp_c.json()
+                    name = cp.get("name") or "неизвестно"
+                    if "розничный покупатель" in name.lower():
+                        continue
+                    manager_tag = next((t.lower() for t in (cp.get("tags") or [])
+                                        if isinstance(t, str) and t.lower() in PDZ_MANAGER_TAG_MAP), None)
+                    balance_map[aid] = bal
+                    rows.append({
+                        "snap_date": snap_date,
+                        "order_id": f"fifo:{aid}",
+                        "order_name": "",
+                        "agent_id": aid,
+                        "agent_name": name,
+                        "manager_tag": manager_tag,
+                        "ppm_initial": None,
+                        "ppm_new": None,
+                        "payed_sum": 0.0,
+                        "total_sum": 0.0,
+                        "agent_balance": bal,
+                    })
+                    added += 1
+                    await asyncio.sleep(0.1)
+                logger.info(f"pdz_take_snapshot: должников без заказов с датой оплаты добавлено: {added}")
+            except Exception as ex_r:
+                logger.warning(f"pdz_take_snapshot: добор должников по сальдо не удался: {ex_r}")
+
             # ── Обогащение demand-FIFO (единый источник правды по просрочке) ──
             # Для каждого должника считаем день-каунт и сумму просрочки по
             # ОТГРУЗКАМ + FIFO приходов (_overdue_by_demand_fifo): срок каждой
@@ -2349,7 +2407,9 @@ async def _overdue_by_demand_fifo(agent_id: str, today, delay: Optional[int] = N
             demands = []; offset = 0
             while True:
                 async with session.get(f"{MS_BASE}/entity/demand", headers=get_headers(),
-                        params={"filter": f"agent={agent_href}", "limit": 100, "offset": offset,
+                        # Только проведённые: непроведённая отгрузка в сальдо не
+                        # входит, а в Σотгрузок сдвигала бы FIFO.
+                        params={"filter": f"agent={agent_href};applicable=true", "limit": 100, "offset": offset,
                                 "order": "moment,asc"}) as r:
                     if r.status != 200:
                         return None
@@ -2484,6 +2544,25 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
             row_tag = (r.get("manager_tag") or "").lower()
             if row_tag != tag_lower:
                 continue
+        bal_raw = r.get("agent_balance")
+        agent_balance = float(bal_raw) if bal_raw is not None else None
+        aid = r.get("agent_id") or ""
+        # Клиента заводим ДО проверок по заказам: решение по нему принимает
+        # demand-FIFO из снимка, а он от ppm и payedSum заказов не зависит. Раньше
+        # корзина создавалась только для неоплаченного заказа с датой оплаты, и
+        # клиент с реальной просрочкой по отгрузкам выпадал (см. ниже про АИТКУЛОВ).
+        bucket = by_agent_unpaid.setdefault(aid, {
+            "agent_id": aid,
+            "agent_name": r.get("agent_name"),
+            "balance": agent_balance,
+            "overdue_fifo": None,
+            "overdue": [],
+            "in_сroк_unpaid_total": 0.0,
+        })
+        if bucket["overdue_fifo"] is None:
+            bucket["overdue_fifo"] = _row_fifo(r)
+        if bucket["balance"] is None and agent_balance is not None:
+            bucket["balance"] = agent_balance
         ppm_new = _to_date(r.get("ppm_new"))
         ppm_initial = _to_date(r.get("ppm_initial"))
         status, effective, days_overdue = _pdz_classify(ppm_initial, ppm_new, today)
@@ -2493,18 +2572,6 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
         total = float(r.get("total_sum") or 0)
         if payed >= total:
             continue
-        bal_raw = r.get("agent_balance")
-        agent_balance = float(bal_raw) if bal_raw is not None else None
-        aid = r.get("agent_id") or ""
-
-        bucket = by_agent_unpaid.setdefault(aid, {
-            "agent_id": aid,
-            "agent_name": r.get("agent_name"),
-            "balance": agent_balance,
-            "overdue_fifo": _row_fifo(r),
-            "overdue": [],
-            "in_сroк_unpaid_total": 0.0,
-        })
         unpaid = round(total - payed, 2)
         if status in ("in_срок", "in_grace"):
             # in_grace = заказ формально просрочен, но лаг ещё активен —
@@ -2539,10 +2606,33 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
     # по `payedSum`, по которым приходы есть, но бухгалтерия не разнесла.
     agent_real_overdue: dict = {}
     agent_fifo: dict = {}  # aid → (days, amount, url, count) | None (стор. в снимке)
+    included: list = []  # agent_id в порядке включения
     for aid, data in by_agent_unpaid.items():
+        bal = data["balance"]
+        # ПЕРВИЧНЫЙ источник — demand-FIFO из снимка, как в compute_overdue_color
+        # (светофор). До 21.09.2026 здесь сначала шли ppm-предфильтры — «есть ли
+        # просроченный по дате оплаты заказ» и «|сальдо| − в-сроке > 0», — и они
+        # скрывали реальную просрочку: у АИТКУЛОВ (Скляр) неотгруженный заказ со
+        # сроком 05.10 поднял «в сроке» выше сальдо, и 13 дн / 13 099 ₽ по
+        # отгрузкам в список не попали. Дашборд и дайджест обязаны совпадать со
+        # светофором, поэтому порядок проверок теперь тот же.
+        fifo = data.get("overdue_fifo")
+        if fifo is not None and bal is not None:
+            if bal >= 0:
+                skipped_balance_ok += 1
+                continue
+            f_days, f_amt, f_url, _ = fifo
+            if f_days == 0 and not f_url:
+                skipped_fifo_covered += 1
+                continue
+            agent_real_overdue[aid] = f_amt
+            agent_fifo[aid] = fifo
+            included.append(aid)
+            orders.extend(data["overdue"])
+            continue
+        # Нет FIFO в снимке (МС был недоступен) — старая логика по заказам.
         if not data["overdue"]:
             continue
-        bal = data["balance"]
         if bal is None:
             # balance не подтянулся при snapshot (rate-limit/timeout МС API).
             # Без balance FIFO не применим. Пропускаем, чтобы не показать
@@ -2575,6 +2665,7 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
             continue
         agent_real_overdue[aid] = real_overdue
         agent_fifo[aid] = data.get("overdue_fifo")
+        included.append(aid)
         orders.extend(data["overdue"])
 
     if skipped_balance_ok or skipped_fifo_covered or skipped_balance_unknown:
@@ -2590,17 +2681,17 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
         return orders
 
     # ── Группировка по контрагенту ────────────────────────────────────────
+    # По включённым КЛИЕНТАМ, а не по списку заказов: у клиента с просрочкой по
+    # отгрузкам может не быть ни одного заказа, просроченного по дате оплаты.
     by_agent: dict = {}
-    for o in orders:
-        aid = o.get("agent_id") or ""
-        if aid not in by_agent:
-            by_agent[aid] = {
-                "agent_id": aid,
-                "agent_name": o.get("agent_name"),
-                "agent_balance": o.get("agent_balance"),
-                "orders": [],
-            }
-        by_agent[aid]["orders"].append(o)
+    for aid in included:
+        data = by_agent_unpaid[aid]
+        by_agent[aid] = {
+            "agent_id": aid,
+            "agent_name": data["agent_name"],
+            "agent_balance": data["balance"],
+            "orders": list(data["overdue"]),
+        }
 
     grouped: list = []
     for aid, data in by_agent.items():
@@ -2837,6 +2928,14 @@ def pdz_unprocessed_for_owner(db, live_map=None) -> dict:
             if bal is None:
                 continue  # balance не подтянулся — не показываем (см. 1593622)
             if bal >= 0:
+                continue
+            # Есть demand-FIFO в снимке — решает он (как светофор и дашборд
+            # менеджера, 21.09.2026); ppm-перекрытие ниже — только без него.
+            fifo = data.get("overdue_fifo")
+            if fifo is not None:
+                if fifo[0] == 0 and not fifo[2]:
+                    continue
+                by_tag.setdefault(tag, {})[aid] = data
                 continue
             bal_abs = abs(bal)
             in_сroк = data["in_сroк_unpaid_total"]
@@ -4137,12 +4236,33 @@ async def get_aging_clients(days: int = 50) -> list:
         logger.error(f"get_aging_clients: {e}", exc_info=True)
         return []
 
-async def get_manager_shipments(date_from: str, date_to: str) -> dict:
+# Служебная карточка кассовых продаж «Розничный покупатель*** (Имя)» — не клиент
+# менеджера: в АКБ и «новых» её не считаем (как в дашбордах мотивации).
+RETAIL_CARD_PREFIX = "розничный покупатель"
+
+
+async def get_manager_shipments(date_from: str, date_to: str, details: dict | None = None) -> dict:
     """
-    Берёт отгрузки за период для всех менеджеров ОП.
-    Для каждого менеджера: кол-во отгрузок, выручка, кол-во клиентов.
+    Факт отдела продаж для /op_report: отгрузки, выручка, АКБ, новые клиенты.
+
+    Правила — те же, что у дашбордов мотивации менеджеров (f2b-publisher,
+    manager_dashboard_data.fetch_demands_month + АКБ по ИНН). До 21.09.2026 отчёт
+    считал по-своему, и в сентябре АКБ отдела расходился с дашбордами на 11
+    клиентов, а выручка — на сотни тысяч:
+      * только проведённые отгрузки (applicable=true);
+      * выручка товарная — без перевыставленных услуг (авиадоставка, терминал);
+      * возвраты за период вычитаются;
+      * клиент = ИНН, а не карточка МС (дубли карточек одного ЮЛ — один клиент);
+        клиент в АКБ, если его чистая отгрузка за период > 0;
+      * служебные карточки «Розничный покупатель» в АКБ и «новых» не идут;
+      * архивные карточки с тегом тоже учитываются: их отгрузки были.
+    Ошибка МС пробрасывается наверх — неполный факт не должен лечь в кэш отчёта.
+
+    details (необязательный) заполняется служебными данными для «выбывших»:
+    {mgr_name: {"card_key": {agent_id: ключ клиента}, "curr_keys": set()}}.
     """
     import aiohttp
+    import asyncio as _asyncio
 
     MANAGERS = {
         "скляр":      "Инесса Скляр",
@@ -4153,96 +4273,132 @@ async def get_manager_shipments(date_from: str, date_to: str) -> dict:
         "кормилицын": "Антон Кормилицын",
     }
 
-    result = {name: {"shipments": 0, "revenue": 0.0, "clients": set(), "new_clients": 0}
+    result = {name: {"shipments": 0, "revenue": 0.0, "clients": 0, "new_clients": 0,
+                     "new_client_names": []}
               for name in MANAGERS.values()}
+    card_mgr: dict = {}      # agent_id -> mgr_name (первый тег по порядку MANAGERS)
+    card_key: dict = {}      # agent_id -> ключ клиента (inn:… или card:…)
+    card_name: dict = {}
+    card_retail: set = set()
+    net_by_key = {name: {} for name in MANAGERS.values()}  # копейки
 
-    try:
-        async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession() as session:
 
-            # 1. Загружаем всех контрагентов каждого менеджера
-            tag_to_ids = {}
-            for tag in MANAGERS:
-                ids = set()
-                offset = 0
-                while True:
-                    async with session.get(
-                        f"{MS_BASE}/entity/counterparty",
-                        headers=get_headers(),
-                        params={"filter": f"tags={tag}", "limit": 100, "offset": offset}
-                    ) as r:
-                        data = await r.json()
-                    rows = data.get("rows", [])
-                    for cp in rows:
-                        ids.add(cp.get("id", ""))
-                    if len(rows) < 100:
-                        break
-                    offset += 100
-                tag_to_ids[tag] = ids
-                logger.info(f"get_manager_shipments: {tag} — {len(ids)} контрагентов")
+        async def _get(path: str, params: dict) -> dict:
+            for attempt in range(4):
+                async with session.get(f"{MS_BASE}{path}", headers=get_headers(), params=params) as r:
+                    if r.status == 429 and attempt < 3:
+                        await _asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    r.raise_for_status()
+                    return await r.json()
 
-            # 2. Все отгрузки за период
+        # 1. Карточки каждого менеджера, включая архивные.
+        for tag, mgr_name in MANAGERS.items():
             offset = 0
             while True:
-                params = {
-                    "filter": f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59",
-                    "expand": "agent",
-                    "limit": 200,
-                    "offset": offset,
-                }
-                async with session.get(
-                    f"{MS_BASE}/entity/demand",
-                    headers=get_headers(), params=params
-                ) as r:
-                    data = await r.json()
+                data = await _get("/entity/counterparty", {
+                    "filter": f"tags={tag};archived=true;archived=false",
+                    "limit": 1000, "offset": offset})
                 rows = data.get("rows", [])
-                for row in rows:
-                    agent_href = row.get("agent", {}).get("meta", {}).get("href", "")
-                    agent_id = agent_href.split("/")[-1] if agent_href else ""
-                    revenue = (row.get("sum", 0) or 0) / 100
-                    for tag, mgr_name in MANAGERS.items():
-                        if agent_id in tag_to_ids.get(tag, set()):
-                            result[mgr_name]["shipments"] += 1
-                            result[mgr_name]["revenue"] += revenue
-                            result[mgr_name]["clients"].add(agent_id)
-                            break
-                if len(rows) < 200:
+                for cp in rows:
+                    aid = cp.get("id", "")
+                    if not aid or aid in card_mgr:
+                        continue
+                    card_mgr[aid] = mgr_name
+                    inn = (cp.get("inn") or "").strip()
+                    card_key[aid] = f"inn:{inn}" if inn else f"card:{aid}"
+                    card_name[aid] = cp.get("name", "")
+                    if (cp.get("name") or "").strip().lower().startswith(RETAIL_CARD_PREFIX):
+                        card_retail.add(aid)
+                if len(rows) < 1000:
                     break
-                offset += 200
+                offset += 1000
+            logger.info(f"get_manager_shipments: {tag} — "
+                        f"{sum(1 for m in card_mgr.values() if m == mgr_name)} карточек")
 
-            # 3. Новые клиенты — у кого не было отгрузок до date_from.
-            # ВАЖНО: meta.size при limit=1 у МС API нестабилен (даёт 0 даже когда
-            # demand есть). Надёжная проверка — len(rows) и retry на пустой ответ.
-            import asyncio as _asyncio
-            for mgr_name, data_mgr in result.items():
-                new_clients = set()
-                for agent_id in data_mgr["clients"]:
-                    has_before = False
+        def _book(aid: str, amount_kop: int) -> None:
+            mgr_name = card_mgr[aid]
+            result[mgr_name]["revenue"] += amount_kop / 100
+            if aid in card_retail:
+                return
+            k = card_key[aid]
+            net_by_key[mgr_name][k] = net_by_key[mgr_name].get(k, 0) + amount_kop
+
+        period_flt = f"moment>={date_from} 00:00:00;moment<={date_to} 23:59:59;applicable=true"
+
+        # 2. Отгрузки за период — товарная сумма (минус позиции-услуги).
+        offset = 0
+        while True:
+            data = await _get("/entity/demand", {
+                "filter": period_flt, "expand": "positions.assortment",
+                "limit": 100, "offset": offset})
+            rows = data.get("rows", [])
+            for row in rows:
+                aid = (row.get("agent", {}).get("meta", {}).get("href", "") or "").split("/")[-1]
+                if aid not in card_mgr:
+                    continue
+                amt = int(row.get("sum", 0) or 0)
+                for pos in (row.get("positions") or {}).get("rows", []):
+                    if ((pos.get("assortment") or {}).get("meta") or {}).get("type") == "service":
+                        amt -= int(int(pos.get("price") or 0) * float(pos.get("quantity") or 0))
+                result[card_mgr[aid]]["shipments"] += 1
+                _book(aid, amt)
+            if len(rows) < 100:
+                break
+            offset += 100
+
+        # 3. Возвраты за период вычитаем.
+        offset = 0
+        while True:
+            data = await _get("/entity/salesreturn", {
+                "filter": period_flt, "limit": 100, "offset": offset})
+            rows = data.get("rows", [])
+            for row in rows:
+                aid = (row.get("agent", {}).get("meta", {}).get("href", "") or "").split("/")[-1]
+                if aid in card_mgr:
+                    _book(aid, -int(row.get("sum", 0) or 0))
+            if len(rows) < 100:
+                break
+            offset += 100
+
+        # 4. АКБ и новые клиенты — по ИНН. Новый = ни одна карточка этого ЮЛ у
+        # менеджера не отгружалась до начала периода.
+        # ВАЖНО: meta.size при limit=1 у МС API нестабилен (даёт 0 даже когда
+        # demand есть). Надёжная проверка — len(rows) и retry на пустой ответ.
+        cards_by_key: dict = {}
+        for aid, k in card_key.items():
+            cards_by_key.setdefault((card_mgr[aid], k), []).append(aid)
+        for mgr_name, by_key in net_by_key.items():
+            curr_keys = {k for k, v in by_key.items() if v > 0}
+            result[mgr_name]["clients"] = len(curr_keys)
+            if details is not None:
+                details[mgr_name] = {"card_key": {a: card_key[a] for a, m in card_mgr.items() if m == mgr_name},
+                                     "curr_keys": curr_keys}
+            for k in sorted(curr_keys, key=lambda x: -by_key[x]):
+                has_before = False
+                for aid in cards_by_key.get((mgr_name, k), []):
                     for attempt in range(3):
-                        async with session.get(
-                            f"{MS_BASE}/entity/demand",
-                            headers=get_headers(),
-                            params={
-                                "filter": f"agent={MS_BASE}/entity/counterparty/{agent_id};moment<{date_from} 00:00:00",
-                                "limit": 1,
-                            }
-                        ) as r:
-                            prev = await r.json()
+                        prev = await _get("/entity/demand", {
+                            "filter": f"agent={MS_BASE}/entity/counterparty/{aid};moment<{date_from} 00:00:00",
+                            "limit": 1})
                         if prev.get("rows"):
                             has_before = True
                             break
                         if attempt < 2:
                             await _asyncio.sleep(0.4 * (attempt + 1))
-                    if not has_before:
-                        new_clients.add(agent_id)
-                result[mgr_name]["new_clients"] = len(new_clients)
-                logger.info(f"get_manager_shipments {mgr_name}: new_clients={len(new_clients)}")
-
-    except Exception as e:
-        logger.error(f"get_manager_shipments: {e}", exc_info=True)
+                    if has_before:
+                        break
+                if not has_before:
+                    cards = cards_by_key.get((mgr_name, k), [])
+                    result[mgr_name]["new_client_names"].append(
+                        next((card_name[a] for a in cards if card_name.get(a)), k))
+            result[mgr_name]["new_clients"] = len(result[mgr_name]["new_client_names"])
 
     for name in result:
-        result[name]["clients"] = len(result[name]["clients"])
-        logger.info(f"get_manager_shipments {name}: ship={result[name]['shipments']} rev={result[name]['revenue']:.0f} cl={result[name]['clients']}")
+        logger.info(f"get_manager_shipments {name}: ship={result[name]['shipments']} "
+                    f"rev={result[name]['revenue']:.0f} cl={result[name]['clients']} "
+                    f"new={result[name]['new_clients']}")
 
     return result
 

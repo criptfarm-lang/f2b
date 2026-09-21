@@ -126,6 +126,26 @@ def build_pdz_payload(db) -> dict:
             payed = float(r.get("payed_sum") or 0)
         except Exception:
             total, payed = 0.0, 0.0
+        aid = r.get("agent_id") or ""
+        if not aid:
+            continue
+        # Клиента заводим до проверок по заказам — решает demand-FIFO снимка
+        # (21.09.2026, синхронно с pdz_overdue_for_manager и светофором).
+        bucket = by_agent_raw.setdefault(aid, {
+            "agent_id": aid,
+            "agent_name": r.get("agent_name") or "—",
+            "manager_tag": r.get("manager_tag") or "",
+            "agent_balance": balance,
+            "overdue_fifo": None,
+            "overdue": [],
+            "in_сroк_unpaid_total": 0.0,
+            "work_total": 0,
+            "work_touched": 0,
+        })
+        if bucket["overdue_fifo"] is None:
+            bucket["overdue_fifo"] = _row_fifo(r)
+        if bucket["agent_balance"] is None and balance is not None:
+            bucket["agent_balance"] = balance
         if payed >= total:
             continue
         ppm_new = _to_date(r.get("ppm_new"))
@@ -133,21 +153,7 @@ def build_pdz_payload(db) -> dict:
         status, effective, days_overdue = _pdz_classify(ppm_initial, ppm_new, today)
         if status == "skip":
             continue
-        aid = r.get("agent_id") or ""
-        if not aid:
-            continue
         unpaid = round(total - payed, 2)
-        bucket = by_agent_raw.setdefault(aid, {
-            "agent_id": aid,
-            "agent_name": r.get("agent_name") or "—",
-            "manager_tag": r.get("manager_tag") or "",
-            "agent_balance": balance,
-            "overdue_fifo": _row_fifo(r),
-            "overdue": [],
-            "in_сroк_unpaid_total": 0.0,
-            "work_total": 0,
-            "work_touched": 0,
-        })
         # Работа менеджера — по ppm_initial + GRACE (синхронно с дайджестом).
         if ppm_initial is not None and today > ppm_initial + timedelta(days=PDZ_GRACE_DAYS):
             bucket["work_total"] += 1
@@ -165,21 +171,23 @@ def build_pdz_payload(db) -> dict:
     # Шаг 2: применить FIFO + balance=None skip. total_unpaid = real_overdue.
     debtors: list[dict] = []
     for aid, data in by_agent_raw.items():
-        if not data["overdue"]:
-            continue
         bal = data["agent_balance"]
         if bal is None:
             continue  # balance не подтянулся в snapshot — пропускаем
         if bal >= 0:
             continue
-        bal_abs = abs(bal)
-        in_сroк = data["in_сroк_unpaid_total"]
-        real_overdue = max(0.0, round(bal_abs - in_сroк, 2))
-        if real_overdue < 0.01:
-            continue  # FIFO-перекрытие
         # День-каунт/сумма/url — из demand-FIFO снимка (единый источник правды,
-        # 2026-07-14). Заменил LIFO по payedSum. cashflow-45 gate здесь не было.
+        # 2026-07-14). С 21.09.2026 он же решает, есть ли просрочка вообще:
+        # ppm-проверки ниже — только когда FIFO в снимке нет.
         fifo = data.get("overdue_fifo")
+        if fifo is None:
+            if not data["overdue"]:
+                continue
+            real_overdue = max(0.0, round(abs(bal) - data["in_сroк_unpaid_total"], 2))
+            if real_overdue < 0.01:
+                continue  # FIFO-перекрытие
+        else:
+            real_overdue = 0.0
         if fifo is not None:
             f_days, f_amt, f_url, f_cnt = fifo
             if f_days == 0 and not f_url:
