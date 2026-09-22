@@ -1392,6 +1392,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Видео-файл сохранён в базу.")
             return
 
+    # Ценовое согласование: собственник нажал «✏️ Другая цена» и пишет число
+    if _u and _u.id == OWNER_CHAT_ID and message.chat_id == OWNER_CHAT_ID and message.text:
+        try:
+            from price_requests import owner_price_input
+            if await owner_price_input(message, context):
+                return
+        except Exception as e:
+            logger.warning(f"price request owner input: {e}")
+
     async def safe_reply(text, **kwargs):
         """Отправляет ответ, при ошибке цитаты — без неё."""
         try:
@@ -6965,6 +6974,9 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_doc_approval_callback, pattern="^doc_(approve|reject):"))
     app.add_handler(CallbackQueryHandler(handle_claim_callback,
                                          pattern="^mclaim_(resolved|fix|finance|ack):"))
+    # Ценовое согласование из дашборда менеджера (quiz-game) – светофор «ЗАПРОС ЦЕНЫ»
+    from price_requests import handle_price_request_callback
+    app.add_handler(CallbackQueryHandler(handle_price_request_callback, pattern="^preq_(ok|other):"))
     app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing|wazzup_later)"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
