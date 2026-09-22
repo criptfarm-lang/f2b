@@ -5755,6 +5755,7 @@ async def compute_price_color(order_href: str) -> dict:
                     item = {
                         "name": product_name,
                         "code": assortment.get("code") or product_data.get("code"),
+                        "qty": float(pos.get("quantity") or 0),
                         "order_price": order_price,
                         "min_price": min_price,
                         "diff_rub": diff_rub,

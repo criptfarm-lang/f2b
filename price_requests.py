@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
 VALID_DAYS = 14
 AWAIT_MINUTES = 60          # «Другая цена» ждёт ввода не дольше часа
+VOLUME_TOLERANCE = 1.2      # согласованная цена держит объём до +20 % от запрошенного
 _PRICE_RE = re.compile(r"^\s*(\d[\d\s]{0,8}(?:[.,]\d{1,2})?)\s*(?:₽|р\.?|руб\.?)?\s*$", re.IGNORECASE)
 
 _conn = None
@@ -88,7 +89,7 @@ def apply_dashboard_approvals(price: dict, order_name: str) -> dict:
         return price
     today = datetime.now(MSK).date()
     rows = _all(
-        """SELECT id, sku_code, approved_price FROM price_requests
+        """SELECT id, sku_code, approved_price, qty_kg FROM price_requests
            WHERE status='approved' AND valid_until >= %s
              AND (used_order IS NULL OR used_order = %s)
              AND sku_code = ANY(%s)
@@ -110,11 +111,17 @@ def apply_dashboard_approvals(price: dict, order_name: str) -> dict:
                 keep.append(it)
                 continue
             approved = float(r["approved_price"])
-            if it["order_price"] >= approved - 0.5:
-                ok.append({**it, "dashboard_id": r["id"], "dashboard_price": approved})
+            agreed_qty = float(r["qty_kg"]) if r.get("qty_kg") else None
+            info = {"dashboard_id": r["id"], "dashboard_price": approved, "dashboard_qty": agreed_qty}
+            price_ok = it["order_price"] >= approved - 0.5
+            # скидку согласовывали на объём – в заказе больше +20 % уже не тот запрос
+            qty_ok = not agreed_qty or not it.get("qty") or it["qty"] <= agreed_qty * VOLUME_TOLERANCE + 0.5
+            if price_ok and qty_ok:
+                ok.append({**it, **info})
                 _one("UPDATE price_requests SET used_order=%s WHERE id=%s", (order_name, r["id"]))
             else:
-                keep.append({**it, "dashboard_id": r["id"], "dashboard_price": approved})
+                reason = "объём больше согласованного" if price_ok else "цена ниже согласованной"
+                keep.append({**it, **info, "dashboard_reason": reason})
         return keep
 
     red = split(items)

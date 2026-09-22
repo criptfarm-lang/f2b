@@ -1673,8 +1673,12 @@ def _build_approval_text(
         lines.append(f"🔴 *Цена ниже минимальной* — {n} {'позиция' if n == 1 else 'позиций'}:")
         for it in items[:5]:
             name = (it.get("name") or "")[:48]
-            dash = (f" · в дашборде согласовано {_fmt_money(it['dashboard_price'])} ₽ (№{it['dashboard_id']})"
-                    if it.get("dashboard_id") else "")
+            dash = ""
+            if it.get("dashboard_id"):
+                qty = f" на {_fmt_money(it['dashboard_qty'])} кг" if it.get("dashboard_qty") else ""
+                why = f", {it['dashboard_reason']}" if it.get("dashboard_reason") else ""
+                dash = (f" · в дашборде согласовано {_fmt_money(it['dashboard_price'])} ₽{qty} "
+                        f"(№{it['dashboard_id']}{why})")
             lines.append(
                 f"   • {name}: {_fmt_money(it['order_price'])} ₽ "
                 f"при минимуме {_fmt_money(it['min_price'])} ₽ "
