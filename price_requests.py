@@ -57,6 +57,62 @@ def _one(sql: str, params=()) -> dict | None:
             return cur.fetchone() if cur.description else None
 
 
+def _all(sql: str, params=()) -> list[dict]:
+    try:
+        with _db().cursor() as cur:
+            cur.execute(sql, params)
+            return list(cur.fetchall())
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        global _conn
+        _conn = None
+        with _db().cursor() as cur:
+            cur.execute(sql, params)
+            return list(cur.fetchall())
+
+
+def apply_dashboard_approvals(price: dict, order_name: str) -> dict:
+    """Позиции заказа ниже прайса, по которым собственник уже согласовал цену в дашборде.
+
+    Совпадение: тот же клиент (id МойСклада, а для «нового» – ИНН), та же позиция,
+    согласование ещё действует (14 дней) и не использовано в другом заказе.
+    Цена в заказе не ниже согласованной – позиция уходит из красной строки в пометку
+    «согласовано в дашборде», запрос помечается использованным этим заказом.
+    Ниже согласованной – остаётся красной с подсказкой, что было согласовано.
+    """
+    items = list(price.get("items") or [])
+    agent_id, agent_inn = price.get("agent_id"), price.get("agent_inn")
+    codes = [it.get("code") for it in items if it.get("code")]
+    if not items or not codes or not (agent_id or agent_inn):
+        return price
+    today = datetime.now(MSK).date()
+    rows = _all(
+        """SELECT id, sku_code, approved_price FROM price_requests
+           WHERE status='approved' AND valid_until >= %s
+             AND (used_order IS NULL OR used_order = %s)
+             AND sku_code = ANY(%s)
+             AND (client_ms_id = %s OR (client_inn IS NOT NULL AND client_inn <> '' AND client_inn = %s))
+           ORDER BY decided_at DESC""",
+        (today, order_name, codes, agent_id or "", agent_inn or ""))
+    by_code: dict[str, dict] = {}
+    for r in rows:
+        by_code.setdefault(r["sku_code"], r)
+    red, ok = [], []
+    for it in items:
+        r = by_code.get(it.get("code"))
+        if not r:
+            red.append(it)
+            continue
+        approved = float(r["approved_price"])
+        if it["order_price"] >= approved - 0.5:
+            ok.append({**it, "dashboard_id": r["id"], "dashboard_price": approved})
+            _one("UPDATE price_requests SET used_order=%s WHERE id=%s", (order_name, r["id"]))
+        else:
+            red.append({**it, "dashboard_id": r["id"], "dashboard_price": approved})
+    if not ok and len(red) == len(items) and not any("dashboard_id" in it for it in red):
+        return price
+    return {**price, "items": red, "dashboard_items": ok, "color": "red" if red else "green"}
+
+
 def _owner_id() -> int:
     v = (os.getenv("OWNER_CHAT_ID") or "").strip()
     return int(v) if v.lstrip("-").isdigit() else 0

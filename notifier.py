@@ -1471,6 +1471,12 @@ def build_attracted_buyer_text(order_name: str, client_name: str, manager_name: 
     return "\n".join(lines)
 
 
+def _dashboard_suffix(price: dict) -> str:
+    """Хвост «цена» в сводке all-green: позиции, согласованные в дашборде менеджера."""
+    ids = [str(it["dashboard_id"]) for it in (price.get("dashboard_items") or [])]
+    return f" (согласовано в дашборде №{', №'.join(ids)})" if ids else ""
+
+
 def _build_approval_text(
     order_name: str, order_sum: float, state_name: str,
     client_name: str, manager_name: str,
@@ -1544,7 +1550,7 @@ def _build_approval_text(
             f"\n🟢 Все проверки ОК "
             f"(лимит {limit_pct}% · договор · ДДС {cashflow.get('n_days', 0)}д · "
             f"долг {_fmt_money(credit.get('current_debt', 0))} _на {sent_at}_ · "
-            f"УПД · сайт · контакты · адрес · цена · оплата {payment_planned_date}"
+            f"УПД · сайт · контакты · адрес · цена{_dashboard_suffix(price)} · оплата {payment_planned_date}"
             f"{rel_suffix}{notary_suffix})\n"
         )
         return header + body
@@ -1667,15 +1673,21 @@ def _build_approval_text(
         lines.append(f"🔴 *Цена ниже минимальной* — {n} {'позиция' if n == 1 else 'позиций'}:")
         for it in items[:5]:
             name = (it.get("name") or "")[:48]
+            dash = (f" · в дашборде согласовано {_fmt_money(it['dashboard_price'])} ₽ (№{it['dashboard_id']})"
+                    if it.get("dashboard_id") else "")
             lines.append(
                 f"   • {name}: {_fmt_money(it['order_price'])} ₽ "
                 f"при минимуме {_fmt_money(it['min_price'])} ₽ "
-                f"(−{it['diff_pct']:.1f}%, −{_fmt_money(it['diff_rub'])} ₽)"
+                f"(−{it['diff_pct']:.1f}%, −{_fmt_money(it['diff_rub'])} ₽){dash}"
             )
         if n > 5:
             lines.append(f"   • … и ещё {n - 5} {'позиция' if n - 5 == 1 else 'позиций'}")
     else:
         lines.append("🟢 *Цена:* в норме")
+    for it in (price.get("dashboard_items") or [])[:5]:
+        name = (it.get("name") or "")[:48]
+        lines.append(f"✅ *Согласовано в дашборде* (№{it['dashboard_id']}): {name} – "
+                     f"{_fmt_money(it['order_price'])} ₽ при прайсе {_fmt_money(it['min_price'])} ₽")
 
     if attracted_line:
         lines.append(attracted_line)
@@ -1791,6 +1803,14 @@ async def check_approval_needed(order_href: str, bot, db):
         overdue = _norm(overdue, {"color": "yellow", "days": 0, "debt": 0})
         price = _norm(price, {"color": "yellow", "items": []})
         upd_debt = _norm(upd_debt, {"color": "yellow", "count": 0, "sum": 0})
+
+        # Цены, которые собственник уже согласовал в дашборде менеджера («ЗАПРОС ЦЕНЫ»):
+        # такие позиции не красят блок цены, а идут пометкой «согласовано в дашборде».
+        try:
+            from price_requests import apply_dashboard_approvals
+            price = apply_dashboard_approvals(price, order_name)
+        except Exception as e:
+            logger.warning(f"check_approval_needed: согласования из дашборда → {e!r}")
 
         # Привлечённые ниже прайса → на согласование закупщику. Если закупщик
         # выключен (env) – они идут собственнику общим списком, как раньше.

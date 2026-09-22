@@ -5702,6 +5702,7 @@ async def compute_price_color(order_href: str) -> dict:
     }
     items: list[dict] = []
     attracted: list[dict] = []
+    agent: dict = {}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -5753,6 +5754,7 @@ async def compute_price_color(order_href: str) -> dict:
                     diff_pct = diff_rub / min_price * 100
                     item = {
                         "name": product_name,
+                        "code": assortment.get("code") or product_data.get("code"),
                         "order_price": order_price,
                         "min_price": min_price,
                         "diff_rub": diff_rub,
@@ -5781,8 +5783,10 @@ async def compute_price_color(order_href: str) -> dict:
                         it["margin_pct"] = (it["order_price"] - cost) / it["order_price"] * 100
     except Exception as e:
         logger.error(f"compute_price_color: {e}")
+    # agent_* – для сверки с ценами, согласованными в дашборде менеджера (price_requests)
     return {"color": "red" if items else "green", "items": items,
-            "attracted_items": attracted}
+            "attracted_items": attracted,
+            "agent_id": agent.get("id"), "agent_inn": agent.get("inn")}
 
 
 def compute_payment_date_color(order: dict) -> dict:
