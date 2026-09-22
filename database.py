@@ -521,6 +521,17 @@ class Database:
             )""",
             "CREATE INDEX IF NOT EXISTS idx_approval_alerts_order ON pending_approval_alerts (order_id)",
             "CREATE INDEX IF NOT EXISTS idx_approval_alerts_open ON pending_approval_alerts (closed_at) WHERE closed_at IS NULL",
+            # Двухступенчатое согласование: цены привлечённых товаров согласует
+            # закупщик (buyer_*), статус в МС – только когда «да» и от него, и от
+            # собственника (owner_*). buyer_chat_id IS NULL → закупщик не участвует.
+            # План: 2026-09-22-согласование-цен-привлечённых-кристиной.md
+            "ALTER TABLE pending_approval_alerts ADD COLUMN IF NOT EXISTS buyer_chat_id BIGINT",
+            "ALTER TABLE pending_approval_alerts ADD COLUMN IF NOT EXISTS buyer_message_id BIGINT",
+            "ALTER TABLE pending_approval_alerts ADD COLUMN IF NOT EXISTS buyer_text TEXT",
+            "ALTER TABLE pending_approval_alerts ADD COLUMN IF NOT EXISTS buyer_approved_at TIMESTAMPTZ",
+            "ALTER TABLE pending_approval_alerts ADD COLUMN IF NOT EXISTS owner_approved_at TIMESTAMPTZ",
+            "ALTER TABLE pending_approval_alerts ADD COLUMN IF NOT EXISTS owner_approved_by BIGINT",
+            "ALTER TABLE pending_approval_alerts ADD COLUMN IF NOT EXISTS owner_messages JSONB",
             """CREATE TABLE IF NOT EXISTS pdz_results (
                 id SERIAL PRIMARY KEY,
                 manager_name TEXT,
@@ -1903,6 +1914,58 @@ class Database:
                WHERE order_id=%s AND closed_at IS NULL
                ORDER BY id DESC LIMIT 1""",
             (order_id,)
+        )
+
+    def set_approval_buyer(self, alert_id: int, chat_id: int, message_id: int, text: str):
+        """Сообщение закупщику ушло – с этого момента заказу нужно его «да»."""
+        self._execute(
+            """UPDATE pending_approval_alerts
+               SET buyer_chat_id = %s, buyer_message_id = %s, buyer_text = %s
+               WHERE id = %s""",
+            (chat_id, message_id, text, alert_id)
+        )
+
+    def set_approval_owner_messages(self, alert_id: int, messages: list):
+        """[[chat_id, message_id], …] – сообщения согласующих, чтобы править их потом."""
+        import json
+        self._execute(
+            "UPDATE pending_approval_alerts SET owner_messages = %s WHERE id = %s",
+            (json.dumps(messages), alert_id)
+        )
+
+    def set_approval_alert_text(self, alert_id: int, text: str):
+        self._execute(
+            "UPDATE pending_approval_alerts SET alert_text = %s WHERE id = %s",
+            (text, alert_id)
+        )
+
+    def mark_approval_owner(self, alert_id: int, user_id: int) -> Optional[dict]:
+        """«Да» собственника. Повторный клик время не сдвигает. Возвращает строку
+        после записи: по ней видно, успел ли закупщик согласовать раньше (UPDATE
+        берёт блокировку строки, поэтому одновременные клики не теряют друг друга)."""
+        return self._fetchone(
+            """UPDATE pending_approval_alerts
+               SET owner_approved_at = COALESCE(owner_approved_at, NOW()),
+                   owner_approved_by = COALESCE(owner_approved_by, %s)
+               WHERE id = %s RETURNING *""",
+            (user_id, alert_id)
+        )
+
+    def mark_approval_buyer(self, alert_id: int) -> Optional[dict]:
+        """«Да» закупщика. Возвращает строку после записи (см. mark_approval_owner)."""
+        return self._fetchone(
+            """UPDATE pending_approval_alerts
+               SET buyer_approved_at = COALESCE(buyer_approved_at, NOW())
+               WHERE id = %s RETURNING *""",
+            (alert_id,)
+        )
+
+    def set_approval_comment(self, alert_id: int, comment: str):
+        """Ответ менеджера на «Комментарий» – сохраняем, алерт НЕ закрываем:
+        закрытый алерт блокирует кнопку «Согласовано» (раньше так и было)."""
+        self._execute(
+            "UPDATE pending_approval_alerts SET comment = %s WHERE id = %s",
+            (comment, alert_id)
         )
 
     def close_approval_alert(self, alert_id: int, closed_by: int, comment: str = None):

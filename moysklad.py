@@ -5641,11 +5641,53 @@ async def compute_cashflow_color(agent_id: str, today=None, window_days: int = 3
     }
 
 
+# Зона закупщика привлечённых товаров (Кристина Павленко): эти папки МС она
+# согласует по цене сама, собственник видит по ним только её статус.
+# Акционный прайс-лист лежит в ГП, но по сути перепродажа – решение собственника
+# 22.09.2026. План: 2026-09-22-согласование-цен-привлечённых-кристиной.md
+ATTRACTED_FOLDER_PATHS = ("ПРИВЛЕЧЕННЫЕ ТОВАРЫ", "ГОТОВАЯ ПРОДУКЦИЯ/Акционный прайс-лист")
+
+
+def is_attracted_path(path_name: str) -> bool:
+    """pathName товара МС (папка и подпапки) → зона привлечённых товаров?"""
+    p = (path_name or "").strip()
+    return any(p == f or p.startswith(f + "/") for f in ATTRACTED_FOLDER_PATHS)
+
+
+async def _stock_cost_by_product(session, product_ids: list[str]) -> dict[str, float]:
+    """Средняя себестоимость остатка (₽ за единицу) по товарам – /report/stock/all.
+    Та же база, что в отчёте «Прибыльность». Нет остатка или 0 → товара нет в ответе."""
+    ids = list(dict.fromkeys(i for i in product_ids if i))
+    if not ids:
+        return {}
+    flt = ";".join(f"product={MS_BASE}/entity/product/{i}" for i in ids) + ";stockMode=all"
+    out: dict[str, float] = {}
+    async with session.get(
+        f"{MS_BASE}/report/stock/all", headers=get_headers(),
+        params={"filter": flt, "limit": 1000},
+    ) as r:
+        if r.status != 200:
+            logger.warning(f"_stock_cost_by_product: HTTP {r.status}")
+            return {}
+        data = await r.json()
+    for row in data.get("rows", []) or []:
+        pid = (row.get("meta") or {}).get("href", "").split("/")[-1].split("?")[0]
+        cost = (row.get("price") or 0) / 100
+        if pid and cost > 0:
+            out[pid] = cost
+    return out
+
+
 async def compute_price_color(order_href: str) -> dict:
     """
     Блок цены в светофоре. Возвращает структурированный список заниженных позиций,
     а не строки (для красивого форматирования в шаблоне алерта).
-    Возвращает {color, items: [{name, order_price, min_price, diff_rub, diff_pct, client_type}]}.
+    Позиции делятся на две зоны: items – ГП и прочее (согласует собственник),
+    attracted_items – привлечённые товары (согласует закупщик), у них ещё
+    cost (себестоимость остатка или None) и margin_pct (доля прибыли в цене заказа).
+    Цвет считается только по items: привлечёнкой управляет отдельный согласующий.
+    Возвращает {color, items: [{name, order_price, min_price, diff_rub, diff_pct, client_type}],
+                attracted_items: [{…, product_id, cost, margin_pct}]}.
     """
     SKIP_STATES = {
         "005f3651-9a9a-11f0-0a80-03a900027474",  # Согласован
@@ -5659,6 +5701,7 @@ async def compute_price_color(order_href: str) -> dict:
         "005f398e-9a9a-11f0-0a80-03a900027479",  # Отменен
     }
     items: list[dict] = []
+    attracted: list[dict] = []
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -5666,12 +5709,12 @@ async def compute_price_color(order_href: str) -> dict:
                 params={"expand": "agent,positions.assortment,state"},
             ) as resp:
                 if resp.status != 200:
-                    return {"color": "green", "items": []}
+                    return {"color": "green", "items": [], "attracted_items": []}
                 order = await resp.json()
 
             state_id = (order.get("state") or {}).get("id")
             if state_id in SKIP_STATES:
-                return {"color": "green", "items": []}
+                return {"color": "green", "items": [], "attracted_items": []}
 
             agent = order.get("agent") or {}
             tags_lower = [t.lower() for t in (agent.get("tags") or [])]
@@ -5682,7 +5725,7 @@ async def compute_price_color(order_href: str) -> dict:
                 price_type_name = "Цена опт"
                 client_type = "опт"
             else:
-                return {"color": "green", "items": []}
+                return {"color": "green", "items": [], "attracted_items": []}
 
             positions = order.get("positions", {}) or {}
             for pos in (positions.get("rows", []) if isinstance(positions, dict) else []):
@@ -5708,17 +5751,38 @@ async def compute_price_color(order_href: str) -> dict:
                 if order_price < min_price:
                     diff_rub = min_price - order_price
                     diff_pct = diff_rub / min_price * 100
-                    items.append({
+                    item = {
                         "name": product_name,
                         "order_price": order_price,
                         "min_price": min_price,
                         "diff_rub": diff_rub,
                         "diff_pct": diff_pct,
                         "client_type": client_type,
-                    })
+                    }
+                    if is_attracted_path(product_data.get("pathName")):
+                        item.update(product_id=product_id, cost=None, margin_pct=None)
+                        attracted.append(item)
+                    else:
+                        items.append(item)
+
+            # Себестоимость – одним запросом по всем привлечённым позициям. Ошибка
+            # здесь не должна терять сами позиции: рентабельность просто «нет».
+            if attracted:
+                try:
+                    costs = await _stock_cost_by_product(
+                        session, [it["product_id"] for it in attracted])
+                except Exception as e:
+                    logger.warning(f"compute_price_color: себестоимость → {e}")
+                    costs = {}
+                for it in attracted:
+                    cost = costs.get(it["product_id"])
+                    if cost:
+                        it["cost"] = cost
+                        it["margin_pct"] = (it["order_price"] - cost) / it["order_price"] * 100
     except Exception as e:
         logger.error(f"compute_price_color: {e}")
-    return {"color": "red" if items else "green", "items": items}
+    return {"color": "red" if items else "green", "items": items,
+            "attracted_items": attracted}
 
 
 def compute_payment_date_color(order: dict) -> dict:

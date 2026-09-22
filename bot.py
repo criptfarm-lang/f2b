@@ -1628,7 +1628,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Reply менеджера на approval-комментарий → шлём approver'у с шапкой заказа
                 approver_chat_id = pending.get("approver_chat_id", OWNER_CHAT_ID)
                 if alert_id:
-                    db.close_approval_alert(alert_id, closed_by=user.id, comment=text)
+                    # Не закрываем: закрытый алерт блокировал кнопку «Согласовано».
+                    db.set_approval_comment(alert_id, text)
                 await context.bot.send_message(
                     chat_id=approver_chat_id,
                     text=(
@@ -5001,6 +5002,170 @@ async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TY
                        claim_id, row.get("manager_tag"))
 
 
+# ─── Двухступенчатое согласование: привлечённые товары (закупщик) + собственник ──
+# План: 2026-09-22-согласование-цен-привлечённых-кристиной.md
+MS_STATE_AGREED_ID = "005f3651-9a9a-11f0-0a80-03a900027474"
+_OWNER_WAIT_MARK = "\n\n☑️"   # хвост «собственник согласовал, ждём закупщика»
+
+
+def _msk_hhmm() -> str:
+    from datetime import datetime, timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M")
+
+
+def _approval_kb(alert_id: int, with_ok: bool = True):
+    row = []
+    if with_ok:
+        row.append(InlineKeyboardButton("✅ Согласовано", callback_data=f"appr_ok|{alert_id}"))
+    row.append(InlineKeyboardButton("💬 Комментарий", callback_data=f"appr_comment|{alert_id}"))
+    return InlineKeyboardMarkup([row])
+
+
+def _owner_msgs(alert_row: dict) -> list:
+    v = alert_row.get("owner_messages") or []
+    if isinstance(v, str):
+        import json as _json
+        try:
+            v = _json.loads(v)
+        except Exception:
+            v = []
+    return [m for m in v if isinstance(m, (list, tuple)) and len(m) == 2]
+
+
+async def _edit_owner_messages(bot, alert_row: dict, text: str, reply_markup=None) -> int:
+    """Правит светофор у всех согласующих. Возвращает, скольким получилось."""
+    done = 0
+    for chat_id, message_id in _owner_msgs(alert_row):
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text,
+                parse_mode="Markdown", reply_markup=reply_markup,
+            )
+            done += 1
+        except Exception as e:
+            logger.warning(f"approval: правка сообщения {chat_id}/{message_id} → {e}")
+    return done
+
+
+async def _notify_owners(bot, alert_row: dict, text: str):
+    """Короткий ответ на светофор (чтобы пришло уведомление – правка его не даёт)."""
+    msgs = _owner_msgs(alert_row)
+    if not msgs:
+        from notifier import _parse_approvers_chat_ids
+        msgs = [[c, None] for c in _parse_approvers_chat_ids()]
+    for chat_id, message_id in msgs:
+        try:
+            await bot.send_message(chat_id=chat_id, text=text,
+                                   reply_to_message_id=message_id)
+        except Exception as e:
+            logger.warning(f"approval: уведомление {chat_id} → {e}")
+
+
+async def _agree_order_in_ms(order_id: str) -> str:
+    """Ставит заказу «Согласован». 'already' – уже стоял, 'ok' – поставили, 'fail'."""
+    from moysklad import set_order_state, get_headers, MS_BASE
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder/{order_id}",
+                headers=get_headers(), params={"expand": "state"},
+            ) as r:
+                if r.status == 200:
+                    ord_data = await r.json()
+                    cur = ord_data.get("state", {}).get("meta", {}).get("href", "").split("/")[-1]
+                    if cur == MS_STATE_AGREED_ID:
+                        return "already"
+    except Exception as e:
+        logger.warning(f"_agree_order_in_ms idempotency check: {e}")
+    return "ok" if await set_order_state(order_id, MS_STATE_AGREED_ID) else "fail"
+
+
+async def _handle_buyer_approval(query, context, alert_id: int):
+    """Кнопка закупщика «✅ Согласовать» по привлечённым товарам. Сама статус в МС
+    не меняет; меняет, только если собственник уже согласовал раньше."""
+    from notifier import (mark_attracted_approved_in_text, ATTRACTED_APPROVER_DONE)
+    user = query.from_user
+    alert = db.get_approval_alert(alert_id)
+    if not alert or user.id != alert.get("buyer_chat_id"):
+        await query.answer("⛔ Это согласование не ваше.", show_alert=True)
+        return
+    buyer_text = alert.get("buyer_text") or query.message.text_markdown or ""
+    if alert.get("buyer_approved_at"):
+        await query.answer("Уже согласовано ✓")
+        return
+    if alert.get("closed_at"):
+        # Заказ уже согласован (статус поставили руками в МС) – ждать нечего.
+        try:
+            await query.edit_message_text(buyer_text + "\n\n✅ Заказ уже согласован",
+                                          parse_mode="Markdown")
+        except Exception:
+            pass
+        return
+
+    row = db.mark_approval_buyer(alert_id) or alert
+    t = _msk_hhmm()
+    try:
+        await query.edit_message_text(buyer_text + f"\n\n✅ Согласовано вами в {t}",
+                                      parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"appr_buyer: правка сообщения закупщика → {e}")
+
+    order_name = row.get("order_name") or ""
+    client_name = row.get("client_name") or ""
+    full = row.get("alert_text") or ""
+    base = full.split(_OWNER_WAIT_MARK)[0]
+    tail = full[len(base):]
+    new_base = mark_attracted_approved_in_text(base, t)
+
+    if not row.get("owner_approved_at"):
+        text = new_base + tail
+        db.set_approval_alert_text(alert_id, text)
+        await _edit_owner_messages(context.bot, row, text, _approval_kb(alert_id))
+        await _notify_owners(context.bot, row,
+            f"🟢 {ATTRACTED_APPROVER_DONE} привлечённые по заказу {order_name} "
+            f"({client_name}) – ждём вашего согласования")
+        return
+
+    # Собственник согласовал раньше – теперь оба «да», меняем статус.
+    res = await _agree_order_in_ms(row["order_id"])
+    if res == "fail":
+        text = new_base + tail
+        db.set_approval_alert_text(alert_id, text)
+        await _edit_owner_messages(context.bot, row, text, _approval_kb(alert_id))
+        await _notify_owners(context.bot, row,
+            f"❌ {ATTRACTED_APPROVER_DONE} привлечённые по заказу {order_name}, но статус "
+            f"в МС сменить не удалось – нажмите «Согласовано» ещё раз")
+        return
+    db.close_approval_alert(alert_id, closed_by=row.get("owner_approved_by") or user.id)
+    text = new_base + f"\n\n✅ Согласовано в МС в {t}"
+    db.set_approval_alert_text(alert_id, text)
+    await _edit_owner_messages(context.bot, row, text)
+    await _notify_owners(context.bot, row,
+        f"✅ {ATTRACTED_APPROVER_DONE} привлечённые – заказ {order_name} "
+        f"({client_name}) согласован в МС")
+
+
+async def _finalize_two_step(query, context, alert_id: int, row: dict):
+    """Собственник жмёт «Согласовано», закупщик уже согласовал – ставим статус
+    и правим светофор у всех согласующих."""
+    from notifier import _md
+    user = query.from_user
+    res = await _agree_order_in_ms(row["order_id"])
+    if res == "fail":
+        await query.answer("❌ Ошибка смены статуса в МС", show_alert=True)
+        return
+    db.close_approval_alert(alert_id, closed_by=user.id)
+    base = (row.get("alert_text") or "").split(_OWNER_WAIT_MARK)[0]
+    text = base + f"\n\n✅ Согласовал: {_md(user.full_name)} в {_msk_hhmm()}"
+    db.set_approval_alert_text(alert_id, text)
+    if not await _edit_owner_messages(context.bot, row, text):
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown")
+        except Exception:
+            await query.message.reply_text("✅ Согласовано")
+
+
 async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обрабатывает нажатия на кнопки объединённого алерта «На согласовании / ЗА ЛИМИТОМ».
@@ -5018,6 +5183,12 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
     except (ValueError, IndexError):
         alert_id = 0
     if not alert_id:
+        return
+
+    # Закупщик согласует свои привлечённые – он не в APPROVERS_CHAT_IDS,
+    # права проверяются по buyer_chat_id самого алерта.
+    if action == "appr_buyer":
+        await _handle_buyer_approval(query, context, alert_id)
         return
 
     # Авторизация: пользователь должен быть в APPROVERS_CHAT_IDS (или дефолтный OWNER)
@@ -5059,6 +5230,27 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         action = "appr_confirm"
 
     # --- appr_confirm ---
+    # Привлечённые ещё не согласованы закупщиком → фиксируем «да» собственника,
+    # статус в МС не трогаем: его поставит кнопка закупщика (решение 22.09.2026).
+    if action == "appr_confirm" and alert_data.get("buyer_chat_id"):
+        from notifier import ATTRACTED_APPROVER_GEN, _md
+        row = db.mark_approval_owner(alert_id, user.id) or alert_data
+        if not row.get("buyer_approved_at"):
+            base = (row.get("alert_text") or "").split(_OWNER_WAIT_MARK)[0]
+            text = (base + f"{_OWNER_WAIT_MARK} Согласовал {_md(user.full_name)} "
+                    f"в {_msk_hhmm()} – статус в МС сменится после {ATTRACTED_APPROVER_GEN}")
+            db.set_approval_alert_text(alert_id, text)
+            kb = _approval_kb(alert_id, with_ok=False)
+            if not await _edit_owner_messages(context.bot, row, text, kb):
+                try:
+                    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+                except Exception as e:
+                    logger.warning(f"appr_confirm: правка ожидания → {e}")
+            return
+        # Закупщик уже согласовал – оба «да», меняем статус.
+        await _finalize_two_step(query, context, alert_id, row)
+        return
+
     if action == "appr_confirm":
         from moysklad import set_order_state, get_headers, MS_BASE
         import aiohttp

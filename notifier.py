@@ -1389,6 +1389,88 @@ def _fmt_money(amount: float) -> str:
     return f"{amount:,.0f}".replace(",", " ")
 
 
+# ─── Согласование цен привлечённых товаров закупщиком ─────────────────────────
+# Позиции из зоны привлечённых (moysklad.ATTRACTED_FOLDER_PATHS) ниже прайса
+# согласует Кристина Павленко отдельным сообщением; у собственника по ним одна
+# строка со статусом. Статус заказа в МС меняется, только когда согласовали оба.
+# План: 2026-09-22-согласование-цен-привлечённых-кристиной.md
+ATTRACTED_APPROVER_CHAT_ID_DEFAULT = 8185545246   # Кристина Павленко, manager_chats
+# Падежи имени – готовыми строками, склонять по шаблону нельзя.
+ATTRACTED_APPROVER_BY = "Кристиной"     # согласовано кем
+ATTRACTED_APPROVER_WHOM = "Кристину"    # ждём кого
+ATTRACTED_APPROVER_GEN = "Кристины"     # после кого
+ATTRACTED_APPROVER_DONE = "Кристина согласовала"
+
+
+def _attracted_approver_chat_id() -> int | None:
+    """ATTRACTED_APPROVER_CHAT_ID (env) → иначе Кристина. «0»/«off» выключает
+    отдельное согласование: привлечённые снова идут собственнику общим списком."""
+    raw = os.getenv("ATTRACTED_APPROVER_CHAT_ID", "").strip().lower()
+    if raw in ("0", "off", "no", "нет"):
+        return None
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    return ATTRACTED_APPROVER_CHAT_ID_DEFAULT
+
+
+def _md(text: str) -> str:
+    """Экранирование для parse_mode=Markdown (v1): названия товаров и клиентов
+    со «_» или «*» иначе ломают разметку всего сообщения."""
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def _pcs(n: int) -> str:
+    return "позиция" if n % 10 == 1 and n % 100 != 11 else \
+        "позиции" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "позиций"
+
+
+def attracted_owner_line(n: int, approved_at: str = "") -> str:
+    """Строка по привлечённым в светофоре собственника. Текст «ждём» заменяется
+    на «согласовано» в уже отправленном сообщении, поэтому оба варианта – здесь."""
+    head = f"*Привлечённые:* {n} {_pcs(n)} ниже прайса"
+    if approved_at:
+        return f"🟢 {head} – согласовано {ATTRACTED_APPROVER_BY} в {approved_at}"
+    return f"🟡 {head} – ждём {ATTRACTED_APPROVER_WHOM}"
+
+
+def mark_attracted_approved_in_text(text: str, approved_at: str) -> str:
+    """В уже отправленном светофоре собственника «ждём» → «согласовано в ЧЧ:ММ»."""
+    pending_tail = f" – ждём {ATTRACTED_APPROVER_WHOM}"
+    out = []
+    for line in text.split("\n"):
+        if line.startswith("🟡 *Привлечённые:*") and line.endswith(pending_tail):
+            line = "🟢" + line[len("🟡"):-len(pending_tail)] + \
+                f" – согласовано {ATTRACTED_APPROVER_BY} в {approved_at}"
+        out.append(line)
+    return "\n".join(out)
+
+
+def build_attracted_buyer_text(order_name: str, client_name: str, manager_name: str,
+                               items: list[dict]) -> str:
+    """Сообщение закупщику: только его позиции – прайс, цена в заказе, рентабельность."""
+    from datetime import datetime, timezone, timedelta
+    sent_at = datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M")
+    client_type = (items[0].get("client_type") or "") if items else ""
+    lines = [
+        "🔔 *Согласование цены · привлечённые товары*",
+        f"*{_md(client_name)}* · заказ {_md(order_name)}" + (f" · {client_type}" if client_type else ""),
+        f"👔 {_md(manager_name)} · 🕐 {sent_at}",
+        "",
+    ]
+    for it in items:
+        margin = it.get("margin_pct")
+        margin_s = ("рентаб. " + f"{margin:.1f}".replace(".", ",") + "%") \
+            if margin is not None else "себест. нет"
+        lines.append(f"• {_md((it.get('name') or '')[:60])}")
+        lines.append(
+            f"   прайс {_fmt_money(it['min_price'])} ₽ · в заказе "
+            f"{_fmt_money(it['order_price'])} ₽ · {margin_s}"
+        )
+    return "\n".join(lines)
+
+
 def _build_approval_text(
     order_name: str, order_sum: float, state_name: str,
     client_name: str, manager_name: str,
@@ -1399,10 +1481,12 @@ def _build_approval_text(
     reliability: dict = None,
     control: dict = None,
     notary: dict = None,
+    attracted_line: str = None,
 ) -> str:
     """
     Шаблон алерта. Порядок строк (по убыванию важности):
-      Лимит → Договор → Нотар. оговорка → Просрочка → ДДС → УПД → Сайт → Контакты → Адрес → Цена.
+      Лимит → Договор → Нотар. оговорка → Просрочка → ДДС → УПД → Сайт → Контакты → Адрес → Цена
+      → Привлечённые (статус согласования закупщиком, если он участвует).
     all-green → одна сводная строка; иначе — строки светофора.
     """
     from datetime import datetime, timezone, timedelta
@@ -1430,6 +1514,9 @@ def _build_approval_text(
     # Клиент из листа контроля виден ВСЕГДА: даже если все проверки зелёные,
     # схлопывать алерт в одну строку нельзя — метка ради этого и заводилась.
     if control:
+        all_green = False
+    # Привлечённые ждут закупщика – это решение по заказу, сводка его бы спрятала.
+    if attracted_line:
         all_green = False
 
     header = (
@@ -1590,6 +1677,9 @@ def _build_approval_text(
     else:
         lines.append("🟢 *Цена:* в норме")
 
+    if attracted_line:
+        lines.append(attracted_line)
+
     return header + "\n".join(lines)
 
 
@@ -1702,6 +1792,19 @@ async def check_approval_needed(order_href: str, bot, db):
         price = _norm(price, {"color": "yellow", "items": []})
         upd_debt = _norm(upd_debt, {"color": "yellow", "count": 0, "sum": 0})
 
+        # Привлечённые ниже прайса → на согласование закупщику. Если закупщик
+        # выключен (env) – они идут собственнику общим списком, как раньше.
+        attracted_items = price.get("attracted_items") or []
+        buyer_chat_id = _attracted_approver_chat_id() if attracted_items else None
+
+        def _merge_attracted(p: dict) -> dict:
+            merged = list(p.get("items") or []) + list(p.get("attracted_items") or [])
+            return {**p, "items": merged, "attracted_items": [],
+                    "color": "red" if merged else p.get("color", "green")}
+
+        if attracted_items and not buyer_chat_id:
+            price = _merge_attracted(price)
+
         # 4. Sync helper'ы.
         # current_debt берём из /report (cashflow), а НЕ из overdue.debt — overdue
         # отдаёт только просроченную часть, а для лимита нужна вся текущая дебиторка.
@@ -1726,6 +1829,7 @@ async def check_approval_needed(order_href: str, bot, db):
             "upd_debt": upd_debt["color"],
             "address": address["color"],
             "reliability": (reliability or {}).get("color", "unknown"),
+            "attracted": "pending" if buyer_chat_id else "none",
         }
         # Дата планируемой оплаты — то что выставил webhook-autofill за 60с до
         # этого алерта. Берём из attributes заказа, форматируем DD.MM.YYYY.
@@ -1741,16 +1845,21 @@ async def check_approval_needed(order_href: str, bot, db):
                         ppm_str = str(v)[:10]
                 break
 
-        alert_text = _build_approval_text(
-            order_name=order_name, order_sum=order_sum, state_name=state_name,
-            client_name=agent_name, manager_name=manager_name,
-            credit=credit, contract=contract, notary=notary, overdue=overdue, cashflow=cashflow,
-            price=price, site=site, contacts=contacts, upd_debt=upd_debt,
-            address=address,
-            payment_planned_date=ppm_str,
-            reliability=reliability,
-            control=control,
-        )
+        def _render(price_block: dict, attracted_line: str = None) -> str:
+            return _build_approval_text(
+                order_name=order_name, order_sum=order_sum, state_name=state_name,
+                client_name=agent_name, manager_name=manager_name,
+                credit=credit, contract=contract, notary=notary, overdue=overdue, cashflow=cashflow,
+                price=price_block, site=site, contacts=contacts, upd_debt=upd_debt,
+                address=address,
+                payment_planned_date=ppm_str,
+                reliability=reliability,
+                control=control,
+                attracted_line=attracted_line,
+            )
+
+        alert_text = _render(
+            price, attracted_owner_line(len(attracted_items)) if buyer_chat_id else None)
 
         # 6. Дедуп: sum_hash = округлённая сумма в ₽
         sum_hash = round(order_sum)
@@ -1796,6 +1905,29 @@ async def check_approval_needed(order_href: str, bot, db):
 
         logger.info(f"check_approval_needed: alert_id={alert_id} для {order_name}")
 
+        # 7a. Привлечённые – закупщику, до собственника: если сообщение ему не
+        # ушло, собственник должен получить их общим списком, а не «ждём», которое
+        # никто не закроет (заказ повис бы навсегда).
+        if buyer_chat_id:
+            buyer_text = build_attracted_buyer_text(
+                order_name, agent_name, manager_name, attracted_items)
+            buyer_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Согласовать", callback_data=f"appr_buyer|{alert_id}"),
+            ]])
+            try:
+                bmsg = await bot.send_message(
+                    chat_id=buyer_chat_id, text=buyer_text,
+                    parse_mode="Markdown", reply_markup=buyer_kb,
+                )
+                db.set_approval_buyer(alert_id, buyer_chat_id, bmsg.message_id, buyer_text)
+                logger.info(f"check_approval_needed: {order_name} – "
+                            f"{len(attracted_items)} привлечённых закупщику {buyer_chat_id}")
+            except Exception as e:
+                logger.error(f"check_approval_needed: закупщику {buyer_chat_id} не ушло ({e}) – "
+                             f"привлечённые {order_name} собственнику общим списком")
+                alert_text = _render(_merge_attracted(price))
+                db.set_approval_alert_text(alert_id, alert_text)
+
         # 8. Клавиатура + fan-out
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Согласовано", callback_data=f"appr_ok|{alert_id}"),
@@ -1807,14 +1939,22 @@ async def check_approval_needed(order_href: str, bot, db):
             logger.error("check_approval_needed: APPROVERS_CHAT_IDS / OWNER_CHAT_ID не задан")
             return
 
+        # message_id нужны, чтобы потом обновить строку «Привлечённые» у каждого.
+        owner_msgs = []
         for chat_id in approvers:
             try:
-                await bot.send_message(
+                m = await bot.send_message(
                     chat_id=chat_id, text=alert_text,
                     parse_mode="Markdown", reply_markup=keyboard
                 )
+                owner_msgs.append([chat_id, m.message_id])
             except Exception as e:
                 logger.error(f"check_approval_needed: send to {chat_id} failed: {e}")
+        if owner_msgs:
+            try:
+                db.set_approval_owner_messages(alert_id, owner_msgs)
+            except Exception as e:
+                logger.warning(f"check_approval_needed: owner_messages {alert_id} → {e}")
 
     except Exception as e:
         logger.error(f"notifier.check_approval_needed: {e}", exc_info=True)
