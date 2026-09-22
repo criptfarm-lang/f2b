@@ -7309,6 +7309,14 @@ def main():
         protocol_approval.register(app, db)
     except Exception as e:
         logger.exception(f"protocol_approval.register упал: {e}")
+    # Сторис-студия: фото/видео собственника в личке → очередь сторис (ДО catch-all
+    # handle_message). Включается ключом bot_settings.stories_studio_enabled = '1'.
+    # План: 2026-09-22-сторис-студия-в-боте (репо «второй мозг»).
+    try:
+        import stories_studio
+        stories_studio.register(app, db)
+    except Exception as e:
+        logger.exception(f"stories_studio.register упал: {e}")
     try:
         import route_registry
         route_registry.register(app)
