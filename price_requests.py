@@ -71,18 +71,20 @@ def _all(sql: str, params=()) -> list[dict]:
 
 
 def apply_dashboard_approvals(price: dict, order_name: str) -> dict:
-    """Позиции заказа ниже прайса, по которым собственник уже согласовал цену в дашборде.
+    """Позиции заказа ниже прайса, цену которых уже согласовали в дашборде («ЗАПРОС ЦЕНЫ»).
 
     Совпадение: тот же клиент (id МойСклада, а для «нового» – ИНН), та же позиция,
     согласование ещё действует (14 дней) и не использовано в другом заказе.
-    Цена в заказе не ниже согласованной – позиция уходит из красной строки в пометку
-    «согласовано в дашборде», запрос помечается использованным этим заказом.
-    Ниже согласованной – остаётся красной с подсказкой, что было согласовано.
+    Цена в заказе не ниже согласованной – позиция уходит из красной строки (и из
+    блока закупщика для привлечённых) в пометку «согласовано в дашборде», запрос
+    помечается использованным этим заказом. Ниже согласованной – остаётся на месте
+    с подсказкой, что было согласовано.
     """
     items = list(price.get("items") or [])
+    attracted = list(price.get("attracted_items") or [])
     agent_id, agent_inn = price.get("agent_id"), price.get("agent_inn")
-    codes = [it.get("code") for it in items if it.get("code")]
-    if not items or not codes or not (agent_id or agent_inn):
+    codes = [it.get("code") for it in items + attracted if it.get("code")]
+    if not codes or not (agent_id or agent_inn):
         return price
     today = datetime.now(MSK).date()
     rows = _all(
@@ -93,29 +95,60 @@ def apply_dashboard_approvals(price: dict, order_name: str) -> dict:
              AND (client_ms_id = %s OR (client_inn IS NOT NULL AND client_inn <> '' AND client_inn = %s))
            ORDER BY decided_at DESC""",
         (today, order_name, codes, agent_id or "", agent_inn or ""))
+    if not rows:
+        return price
     by_code: dict[str, dict] = {}
     for r in rows:
         by_code.setdefault(r["sku_code"], r)
-    red, ok = [], []
-    for it in items:
-        r = by_code.get(it.get("code"))
-        if not r:
-            red.append(it)
-            continue
-        approved = float(r["approved_price"])
-        if it["order_price"] >= approved - 0.5:
-            ok.append({**it, "dashboard_id": r["id"], "dashboard_price": approved})
-            _one("UPDATE price_requests SET used_order=%s WHERE id=%s", (order_name, r["id"]))
-        else:
-            red.append({**it, "dashboard_id": r["id"], "dashboard_price": approved})
-    if not ok and len(red) == len(items) and not any("dashboard_id" in it for it in red):
-        return price
-    return {**price, "items": red, "dashboard_items": ok, "color": "red" if red else "green"}
+    ok: list[dict] = []
+
+    def split(lst: list[dict]) -> list[dict]:
+        keep = []
+        for it in lst:
+            r = by_code.get(it.get("code"))
+            if not r:
+                keep.append(it)
+                continue
+            approved = float(r["approved_price"])
+            if it["order_price"] >= approved - 0.5:
+                ok.append({**it, "dashboard_id": r["id"], "dashboard_price": approved})
+                _one("UPDATE price_requests SET used_order=%s WHERE id=%s", (order_name, r["id"]))
+            else:
+                keep.append({**it, "dashboard_id": r["id"], "dashboard_price": approved})
+        return keep
+
+    red = split(items)
+    attracted_left = split(attracted)
+    return {**price, "items": red, "attracted_items": attracted_left, "dashboard_items": ok,
+            "color": "red" if red else "green"}
 
 
 def _owner_id() -> int:
     v = (os.getenv("OWNER_CHAT_ID") or "").strip()
     return int(v) if v.lstrip("-").isdigit() else 0
+
+
+def approver_ids() -> set[int]:
+    """Кто решает по «ЗАПРОС ЦЕНЫ»: собственник и закупщик (привлечённые товары – Кристина)."""
+    ids = {_owner_id()}
+    try:
+        from notifier import _attracted_approver_chat_id
+        buyer = _attracted_approver_chat_id()
+        if buyer:
+            ids.add(int(buyer))
+    except Exception:
+        pass
+    ids.discard(0)
+    return ids
+
+
+def _decider_name(uid: int) -> str:
+    return "Виктор" if uid == _owner_id() else "Кристина"
+
+
+def _can_decide(uid: int, row: dict) -> bool:
+    """Собственник – по любому запросу; закупщик – по тем, что ушли ему."""
+    return uid == _owner_id() or (row.get("approver_chat") and uid == int(row["approver_chat"]))
 
 
 def _rub(x) -> str:
@@ -153,14 +186,15 @@ async def _drop_buttons(bot, row) -> None:
             pass
 
 
-async def _approve(bot, req_id: int, price: float, from_status: tuple[str, ...]) -> dict | None:
+async def _approve(bot, req_id: int, price: float, from_status: tuple[str, ...],
+                   decided_by: str = "Виктор") -> dict | None:
     """Согласовать цену: статус, срок, снять кнопки, пуш менеджеру. None – уже обработано."""
     valid_until = datetime.now(MSK).date() + timedelta(days=VALID_DAYS)
     row = _one(
-        """UPDATE price_requests SET status='approved', approved_price=%s, decided_by='Виктор',
-                  decided_at=NOW(), valid_until=%s, awaiting_since=NULL
+        """UPDATE price_requests SET status='approved', approved_price=%s, decided_by=%s,
+                  decided_at=NOW(), valid_until=%s, awaiting_since=NULL, awaiting_by=NULL
            WHERE id=%s AND status = ANY(%s) RETURNING *""",
-        (price, valid_until, req_id, list(from_status)))
+        (price, decided_by, valid_until, req_id, list(from_status)))
     if not row:
         return None
     await _drop_buttons(bot, row)
@@ -169,7 +203,8 @@ async def _approve(bot, req_id: int, price: float, from_status: tuple[str, ...])
         asked = float(row["price_requested"])
         other = f" (вы просили {_rub(asked)})" if abs(float(price) - asked) >= 0.5 else ""
         qty = f", {_rub(row['qty_kg'])} кг" if row.get("qty_kg") else ""
-        text = (f"✅ Цена согласована – запрос №{row['id']}\n\n"
+        who = "" if decided_by == "Виктор" else f" ({decided_by})"
+        text = (f"✅ Цена согласована{who} – запрос №{row['id']}\n\n"
                 f"Клиент: {row['client_name']}\n"
                 f"Позиция: {_sku(row)}{qty}\n"
                 f"Цена: {_rub(price)} ₽/кг{other}\n\n"
@@ -189,9 +224,6 @@ async def handle_price_request_callback(update, context):
     """Кнопки светофора «ЗАПРОС ЦЕНЫ»: preq_ok:<id> / preq_other:<id>."""
     query = update.callback_query
     uid = update.effective_user.id if update.effective_user else 0
-    if uid != _owner_id():
-        await query.answer("Только для собственника.", show_alert=True)
-        return
     try:
         action, sid = (query.data or "").split(":", 1)
         req_id = int(sid)
@@ -203,9 +235,13 @@ async def handle_price_request_callback(update, context):
     if not row:
         await query.answer("Запрос не найден.", show_alert=True)
         return
+    if not _can_decide(uid, row):
+        await query.answer("Решает тот, кому пришёл запрос.", show_alert=True)
+        return
 
     if action == "preq_ok":
-        done = await _approve(context.bot, req_id, float(row["price_requested"]), ("pending", "awaiting_price"))
+        done = await _approve(context.bot, req_id, float(row["price_requested"]), ("pending", "awaiting_price"),
+                              _decider_name(uid))
         if not done:
             await query.answer(f"Уже обработано: {row['status']}", show_alert=True)
             return
@@ -217,10 +253,10 @@ async def handle_price_request_callback(update, context):
 
     if action == "preq_other":
         # один ввод за раз: предыдущий незаконченный – обратно на кнопки
-        _one("""UPDATE price_requests SET status='pending', awaiting_since=NULL
-                WHERE status='awaiting_price' AND id<>%s""", (req_id,))
-        upd = _one("""UPDATE price_requests SET status='awaiting_price', awaiting_since=NOW()
-                      WHERE id=%s AND status IN ('pending','awaiting_price') RETURNING *""", (req_id,))
+        _one("""UPDATE price_requests SET status='pending', awaiting_since=NULL, awaiting_by=NULL
+                WHERE status='awaiting_price' AND awaiting_by=%s AND id<>%s""", (uid, req_id))
+        upd = _one("""UPDATE price_requests SET status='awaiting_price', awaiting_since=NOW(), awaiting_by=%s
+                      WHERE id=%s AND status IN ('pending','awaiting_price') RETURNING *""", (uid, req_id))
         if not upd:
             await query.answer(f"Уже обработано: {row['status']}", show_alert=True)
             return
@@ -232,15 +268,18 @@ async def handle_price_request_callback(update, context):
 
 
 async def owner_price_input(message, context) -> bool:
-    """Собственник пишет цену после «Другая цена». True – сообщение обработано."""
+    """Согласующий (собственник или закупщик) пишет цену после «Другая цена».
+    True – сообщение обработано, дальше его не разбирать."""
     text = (message.text or "").strip()
-    row = _one("""SELECT * FROM price_requests WHERE status='awaiting_price'
+    uid = message.from_user.id if message.from_user else 0
+    row = _one("""SELECT * FROM price_requests WHERE status='awaiting_price' AND awaiting_by=%s
                   AND awaiting_since > NOW() - (%s || ' minutes')::interval
-                  ORDER BY awaiting_since DESC LIMIT 1""", (str(AWAIT_MINUTES),))
+                  ORDER BY awaiting_since DESC LIMIT 1""", (uid, str(AWAIT_MINUTES)))
     if not row:
         return False
     if text.lower() in ("отмена", "отменить", "cancel"):
-        _one("UPDATE price_requests SET status='pending', awaiting_since=NULL WHERE id=%s", (row["id"],))
+        _one("UPDATE price_requests SET status='pending', awaiting_since=NULL, awaiting_by=NULL WHERE id=%s",
+             (row["id"],))
         await message.reply_text(f"Запрос №{row['id']}: ввод цены отменён, кнопки остались в сообщении.")
         return True
     m = _PRICE_RE.match(text)
@@ -249,7 +288,7 @@ async def owner_price_input(message, context) -> bool:
     price = float(m.group(1).replace(" ", "").replace(",", "."))
     if price <= 0:
         return False
-    done = await _approve(context.bot, row["id"], price, ("awaiting_price",))
+    done = await _approve(context.bot, row["id"], price, ("awaiting_price",), _decider_name(uid))
     if not done:
         await message.reply_text(f"Запрос №{row['id']} уже обработан.")
         return True

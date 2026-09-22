@@ -1392,14 +1392,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Видео-файл сохранён в базу.")
             return
 
-    # Ценовое согласование: собственник нажал «✏️ Другая цена» и пишет число
-    if _u and _u.id == OWNER_CHAT_ID and message.chat_id == OWNER_CHAT_ID and message.text:
+    # Ценовое согласование: согласующий (собственник или закупщик) нажал «✏️ Другая цена» и пишет число
+    if _u and message.text and message.chat_id == _u.id:
         try:
-            from price_requests import owner_price_input
-            if await owner_price_input(message, context):
+            from price_requests import owner_price_input, approver_ids
+            if _u.id in approver_ids() and await owner_price_input(message, context):
                 return
         except Exception as e:
-            logger.warning(f"price request owner input: {e}")
+            logger.warning(f"price request approver input: {e}")
 
     async def safe_reply(text, **kwargs):
         """Отправляет ответ, при ошибке цитаты — без неё."""
