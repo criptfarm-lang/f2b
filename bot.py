@@ -7630,6 +7630,21 @@ def main():
     app.job_queue.run_repeating(_fishki_sweep_wrapper, interval=7200, first=180)
 
     # ────────────────────────────────────────────────────────────────────
+    # Сторож «заказ ниже прайса без согласования» – добор каждые 30 мин
+    # (вебхуки МС теряются). Первый прогон – тихая разметка текущих заказов.
+    # План: 2026-09-22-сторож-заказ-ниже-прайса-без-согласования.
+    # ────────────────────────────────────────────────────────────────────
+    from price_watch import sweep as _price_watch_sweep
+
+    async def _price_watch_wrapper(context):
+        try:
+            await _price_watch_sweep(app.bot)
+        except Exception as e:
+            logger.error(f"price_watch job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_price_watch_wrapper, interval=1800, first=120)
+
+    # ────────────────────────────────────────────────────────────────────
     # Safety-net к алерту «позиция удалена при сборке» — каждые 15 мин.
     # Ловит удаления, по которым webhook МС потерялся. Дедуп общий с
     # webhook-путём (position_removed_notifications) → без задвоений.
@@ -8679,6 +8694,19 @@ async def process_ms_webhook(data: dict, bot):
                     except Exception as ex_app:
                         logger.warning(f"delayed check_approval_needed({order_id}): {ex_app}")
                 asyncio.create_task(_delayed_approval())
+
+            # Сторож: заказ ниже прайса ушёл в работу без согласования собственника.
+            # Через 90 сек – чтобы кнопка «Согласовано» светофора успела отметиться.
+            # План: 2026-09-22-сторож-заказ-ниже-прайса-без-согласования.md
+            if action == "UPDATE":
+                from price_watch import check_order_href as _price_watch_check
+                async def _delayed_price_watch(href=order_href, oid=order_id):
+                    try:
+                        await asyncio.sleep(90)
+                        await _price_watch_check(href, bot)
+                    except Exception as ex_pw:
+                        logger.warning(f"delayed price_watch({oid}): {ex_pw}")
+                asyncio.create_task(_delayed_price_watch())
 
             # Позиция удалена из заказа, который уже собирается → в группу PRO.
             # Задержка 45 сек: аудит МС пишется чуть позже webhook'а. Дедуп —
