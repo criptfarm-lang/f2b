@@ -35,7 +35,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "stale-guard-mrm100"
+CODE_VERSION = "edit-by-reply"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -100,6 +100,11 @@ def ensure_tables(db) -> None:
     # пишет в тот мессенджер, в котором ему удобно. Канал храним рядом с чатом.
     db._execute("""ALTER TABLE sales_dialog_messages
                    ADD COLUMN IF NOT EXISTS chat_type TEXT""")
+    # id карточки в Telegram: по нему находим черновик, когда собственник
+    # отвечает на неё своим текстом. Без этого правка жила в одной ячейке на
+    # пользователя и терялась, стоило прийти следующей карточке.
+    db._execute("""ALTER TABLE sales_dialog_messages
+                   ADD COLUMN IF NOT EXISTS tg_message_id BIGINT""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_leads_status_idx
                    ON sales_dialog_leads (campaign, status)""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_messages_lead_idx
@@ -725,6 +730,16 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     if not in_window(now, cfg):
         return
 
+    # Не бежим впереди собственника: пока карточки ждут его решения, новые не
+    # собираем. Иначе за час набегает два десятка сообщений, и разобрать их
+    # быстрее, чем они приходят, физически нельзя (23.09.2026).
+    pending = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages
+                              WHERE campaign=%s AND verdict IN ('draft','edited')""", (campaign,))
+    n_pending = (pending or {}).get("n", 0)
+    if n_pending >= cfg.get("max_pending", 3):
+        _heartbeat(db, f"ждут решения {n_pending} карточек, новые не собираю")
+        return
+
     # Суточный потолок: защита от лавины, если очередь вдруг окажется большой.
     sent_today = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages
                                  WHERE campaign=%s AND verdict='sent'
@@ -811,7 +826,7 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
 _CB = re.compile(r"^sd:(send|edit|skip|hand):(\d+)$")
 # Сколько черновик живёт до протухания: ответ на утреннее сообщение, ушедший
 # вечером, хуже молчания.
-APPROVAL_TTL_MIN = 90
+APPROVAL_TTL_MIN = 180
 
 
 def _owner_id() -> int:
@@ -852,8 +867,10 @@ async def send_for_approval(app, db, row_id: int) -> None:
     if not msg:
         return
     try:
-        await app.bot.send_message(_owner_id(), _card_text(db, msg),
-                                   reply_markup=_keyboard(row_id, msg.get("action")))
+        sent = await app.bot.send_message(_owner_id(), _card_text(db, msg),
+                                          reply_markup=_keyboard(row_id, msg.get("action")))
+        db._execute("UPDATE sales_dialog_messages SET tg_message_id=%s WHERE id=%s",
+                    (sent.message_id, row_id))
     except Exception as e:
         logger.warning("sales_dialog: карточка не ушла lead=%s: %s", msg["lead_id"], e)
 
@@ -978,10 +995,25 @@ def register(app, db) -> None:
         await q.answer()
 
     async def on_edit_reply(update, context):
-        row_id = context.user_data.pop("sd_edit_row", None)
-        if not row_id or not update.effective_message:
+        """Ответ собственника на карточку — это правка именно её черновика.
+
+        Раньше id черновика жил в одной ячейке `user_data`: следующая карточка
+        затирала предыдущую, а любой посторонний ответ боту её съедал. Теперь
+        черновик ищется по сообщению, на которое отвечают, поэтому карточки
+        можно править в любом порядке и даже не нажимая «Правка».
+        """
+        if not update.effective_message:
             return
-        text = update.effective_message.text or ""
+        reply_to = update.effective_message.reply_to_message
+        row = None
+        if reply_to:
+            row = db._fetchone("SELECT id FROM sales_dialog_messages WHERE tg_message_id=%s",
+                               (reply_to.message_id,))
+        row_id = (row or {}).get("id") or context.user_data.pop("sd_edit_row", None)
+        if not row_id:
+            return
+        context.user_data.pop("sd_edit_row", None)
+        text = update.effective_message.text or "" 
         db._execute("UPDATE sales_dialog_messages SET verdict='edited', final_text=%s WHERE id=%s",
                     (text, row_id))
         ok, info = await _do_send(db, row_id, text)
