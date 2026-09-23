@@ -374,7 +374,23 @@ def parse_draft(raw: str) -> dict | None:
         return None
 
 
-async def generate_draft(ctx: dict) -> dict | None:
+def _answer_text(resp) -> str:
+    """Текст ответа из блоков content.
+
+    Брать `content[0]` нельзя: у моделей с размышлением первым идёт блок
+    `thinking`, и старый SDK о нём не знает — обращение к `.text` роняет вызов.
+    """
+    for b in getattr(resp, "content", []) or []:
+        if getattr(b, "type", None) == "text" and getattr(b, "text", None):
+            return b.text
+    for b in getattr(resp, "content", []) or []:
+        t = getattr(b, "text", None)
+        if t:
+            return t
+    return ""
+
+
+async def generate_draft(ctx: dict, db=None) -> dict | None:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         logger.error("sales_dialog: ANTHROPIC_API_KEY не задан")
@@ -386,9 +402,12 @@ async def generate_draft(ctx: dict) -> dict | None:
             system=ctx["system"] + JSON_RULE,
             messages=[{"role": "user", "content": ctx["user"]}],
         )
-        draft = parse_draft(resp.content[0].text)
+        raw = _answer_text(resp)
+        draft = parse_draft(raw)
         if not draft or "text" not in draft:
-            logger.warning("sales_dialog: ответ модели не разобран: %r", (resp.content[0].text or "")[:200])
+            logger.warning("sales_dialog: ответ модели не разобран: %r", raw[:200])
+            if db is not None:
+                _heartbeat(db, f"ответ не разобран: {raw[:200]!r}", problem=True)
             return None
         draft.setdefault("action", "reply")
         draft.setdefault("price_claims", [])
@@ -397,6 +416,8 @@ async def generate_draft(ctx: dict) -> dict | None:
         return draft
     except Exception as e:
         logger.warning("sales_dialog: генерация не удалась: %s: %s", type(e).__name__, e)
+        if db is not None:
+            _heartbeat(db, f"вызов Anthropic упал: {type(e).__name__}: {e}"[:400], problem=True)
         return None
 
 
@@ -583,7 +604,7 @@ async def _tick_campaign(app, db, campaign: str) -> None:
 
 async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> None:
     ctx = await build_context(db, session, row)
-    draft = await generate_draft(ctx)
+    draft = await generate_draft(ctx, db)
     if not draft:
         _heartbeat(db, f"генерация не дала результата, lead={row['lead_id']}", problem=True)
         return

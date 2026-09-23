@@ -273,3 +273,28 @@ def test_parse_garbage_returns_none():
     from sales_dialog import parse_draft
     assert parse_draft("совсем не json") is None
     assert parse_draft("") is None
+
+
+def test_answer_text_skips_thinking_block():
+    """У моделей с размышлением content[0] — не текст; берём первый текстовый."""
+    from sales_dialog import _answer_text
+
+    class B:
+        def __init__(self, type_, text=None):
+            self.type = type_
+            if text is not None:
+                self.text = text
+
+    class R:
+        content = [B("thinking"), B("text", '{"action":"reply","text":"ок"}')]
+
+    assert _answer_text(R()) == '{"action":"reply","text":"ок"}'
+
+
+def test_answer_text_empty_content():
+    from sales_dialog import _answer_text
+
+    class R:
+        content = []
+
+    assert _answer_text(R()) == ""
