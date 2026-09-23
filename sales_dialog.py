@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 MSK = timezone(timedelta(hours=3))
 MODEL = "claude-opus-5"
-PROMPT_VERSION = "sales-dialog-v5"
+PROMPT_VERSION = "sales-dialog-v6"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -158,9 +158,14 @@ async def _ms_price_rows(session: aiohttp.ClientSession) -> list:
                   for p in r.get("salePrices") or []}
         if not prices.get("Цена опт"):
             continue
+        path = r.get("pathName") or ""
         out.append({"code": r.get("code"), "name": r.get("name"),
                     "opt": prices.get("Цена опт"), "horeca": prices.get("Цена продажи"),
-                    "spec": prices.get("Спец."), "stock": round(r.get("stock") or 0, 1)})
+                    "spec": prices.get("Спец."), "stock": round(r.get("stock") or 0, 1),
+                    # Собственное производство делаем под заказ, поэтому нулевой остаток
+                    # по нему — не «нет», а «сделаем». Привлечённые товары так нельзя:
+                    # там ноль означает, что позицию надо закупить.
+                    "own": path.startswith("ГОТОВАЯ ПРОДУКЦИЯ")})
     _price_cache.update({"at": now, "rows": out})
     logger.info("sales_dialog: прайс обновлён, позиций %s", len(out))
     return out
@@ -262,11 +267,12 @@ def delivery_note(city: str | None) -> str:
 
 
 def _format_prices(rows: list) -> str:
-    """В промпт идут позиции с остатком плюс все спеццены — прочее только шум."""
+    """В промпт идут позиции с остатком, все спеццены и вся своя готовая продукция."""
     return "\n".join(
         f"{p['code']} | {p['name']} | опт {p['opt']} | horeca {p['horeca'] or '-'} | "
-        f"спец {p['spec'] or '-'} | остаток {p['stock']}"
-        for p in rows if p["stock"] > 0 or p["spec"])
+        f"спец {p['spec'] or '-'} | остаток {p['stock']} | "
+        f"{'наше производство' if p.get('own') else 'привлечённый товар'}"
+        for p in rows if p["stock"] > 0 or p["spec"] or p.get("own"))
 
 
 async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
