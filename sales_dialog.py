@@ -519,18 +519,21 @@ def _pending_silent(db, campaign: str, silent_days: int) -> list:
     """, (campaign, str(silent_days)))
 
 
-def _heartbeat(db, status: str) -> None:
+def _heartbeat(db, status: str, problem: bool = False) -> None:
     """Отметка живости тика прямо в БД.
 
     Логи Amvera снимаются только из TTY, поэтому диагностику держим там, где её
-    видно снаружи: ключ `sales_dialog:_heartbeat` в `bot_settings`.
+    видно снаружи: ключи `sales_dialog:_heartbeat` и `_lasterror` в `bot_settings`.
+    Проблемы пишем отдельным ключом: иначе следующий успешный тик затирает их
+    своим «ok» и причина молчания теряется.
     """
     try:
-        v = json.dumps({"at": datetime.now(MSK).isoformat(timespec="seconds"), "status": status[:400]},
-                       ensure_ascii=False)
+        payload = {"at": datetime.now(MSK).isoformat(timespec="seconds"),
+                   "status": status[:400], "code": PROMPT_VERSION}
+        v = json.dumps(payload, ensure_ascii=False)
+        key = SETTINGS_PREFIX + ("_lasterror" if problem else "_heartbeat")
         db._execute("""INSERT INTO bot_settings (key, value) VALUES (%s, %s)
-                       ON CONFLICT (key) DO UPDATE SET value=%s""",
-                    (SETTINGS_PREFIX + "_heartbeat", v, v))
+                       ON CONFLICT (key) DO UPDATE SET value=%s""", (key, v, v))
     except Exception:
         pass
 
@@ -543,15 +546,14 @@ async def tick(app, db) -> None:
             _tables_ready = True
         campaigns = [c for c in _campaigns(db) if not c.startswith("_")]
     except Exception as e:
-        _heartbeat(db, f"старт тика упал: {type(e).__name__}: {e}")
+        _heartbeat(db, f"старт тика упал: {type(e).__name__}: {e}", problem=True)
         logger.error("sales_dialog: старт тика: %s", e, exc_info=True)
         return
     for campaign in campaigns:
         try:
             await _tick_campaign(app, db, campaign)
-            _heartbeat(db, f"ok {campaign}")
         except Exception as e:
-            _heartbeat(db, f"{campaign}: {type(e).__name__}: {e}")
+            _heartbeat(db, f"{campaign}: {type(e).__name__}: {e}", problem=True)
             logger.error("sales_dialog[%s]: %s", campaign, e, exc_info=True)
 
 
@@ -565,10 +567,12 @@ async def _tick_campaign(app, db, campaign: str) -> None:
 
     # Ответ живому клиенту важнее, чем оживление молчащего диалога.
     rows = _pending_inbound(db, campaign)
+    n_inbound = len(rows)
     if cfg.get("revive", True):
         seen = {r["lead_id"] for r in rows}
         rows += [r for r in _pending_silent(db, campaign, cfg.get("silent_days", 3))
                  if r["lead_id"] not in seen]
+    _heartbeat(db, f"очередь: входящих {n_inbound}, оживление {len(rows) - n_inbound}")
     if not rows:
         return
     cap = cfg.get("drafts_per_tick", 1)
@@ -581,7 +585,7 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
     ctx = await build_context(db, session, row)
     draft = await generate_draft(ctx)
     if not draft:
-        _heartbeat(db, f"генерация не дала результата, lead={row['lead_id']}")
+        _heartbeat(db, f"генерация не дала результата, lead={row['lead_id']}", problem=True)
         return
     problems = (check_prices(draft, ctx["prices"], allowed_numbers(ctx.get("city")))
                 + check_style(draft.get("text") or ""))
