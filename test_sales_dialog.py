@@ -276,25 +276,14 @@ def test_parse_garbage_returns_none():
 
 
 def test_answer_text_skips_thinking_block():
-    """У моделей с размышлением content[0] — не текст; берём первый текстовый."""
-    from sales_dialog import _answer_text
-
-    class B:
-        def __init__(self, type_, text=None):
-            self.type = type_
-            if text is not None:
-                self.text = text
-
-    class R:
-        content = [B("thinking"), B("text", '{"action":"reply","text":"ок"}')]
-
-    assert _answer_text(R()) == '{"action":"reply","text":"ок"}'
+    """У моделей с размышлением content[0] — блок thinking, текст идёт вторым."""
+    from sales_dialog import answer_text
+    data = {"content": [{"type": "thinking", "thinking": "..."},
+                        {"type": "text", "text": '{"action":"reply","text":"ок"}'}]}
+    assert answer_text(data) == '{"action":"reply","text":"ок"}'
 
 
 def test_answer_text_empty_content():
-    from sales_dialog import _answer_text
-
-    class R:
-        content = []
-
-    assert _answer_text(R()) == ""
+    from sales_dialog import answer_text
+    assert answer_text({"content": []}) == ""
+    assert answer_text({}) == ""

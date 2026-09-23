@@ -23,7 +23,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
-from anthropic import AsyncAnthropic
 
 from chat_anonymizer import anonymize, find_leaks
 # Каналы и эндпоинт Wazzup общие с рассылкой реактивации — держим в одном месте.
@@ -37,6 +36,8 @@ PROMPT_VERSION = "sales-dialog-v5"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 AMO_BASE = f"https://{os.getenv('AMO_SUBDOMAIN', 'victorfishtobiz')}.amocrm.ru/api/v4"
 
@@ -374,35 +375,48 @@ def parse_draft(raw: str) -> dict | None:
         return None
 
 
-def _answer_text(resp) -> str:
-    """Текст ответа из блоков content.
+def answer_text(data: dict) -> str:
+    """Текст ответа из блоков `content`.
 
     Брать `content[0]` нельзя: у моделей с размышлением первым идёт блок
-    `thinking`, и старый SDK о нём не знает — обращение к `.text` роняет вызов.
+    `thinking`, текст — вторым.
     """
-    for b in getattr(resp, "content", []) or []:
-        if getattr(b, "type", None) == "text" and getattr(b, "text", None):
-            return b.text
-    for b in getattr(resp, "content", []) or []:
-        t = getattr(b, "text", None)
-        if t:
-            return t
+    for b in (data or {}).get("content") or []:
+        if b.get("type") == "text" and b.get("text"):
+            return b["text"]
     return ""
 
 
 async def generate_draft(ctx: dict, db=None) -> dict | None:
+    """Запрос к Claude напрямую по HTTP, в обход SDK.
+
+    На Amvera стоит anthropic==0.40.0 (новее в этом контейнере не соединяется с
+    api.anthropic.com), и этот SDK не умеет разбирать ответ Opus 5: падает с
+    `AttributeError: 'typing.Union' object has no attribute '__discriminator__'`
+    ещё до того, как мы увидим текст. Сам запрос при этом проходит. Поэтому
+    ходим aiohttp'ом и разбираем JSON сами — версия SDK перестаёт что-либо решать.
+    """
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         logger.error("sales_dialog: ANTHROPIC_API_KEY не задан")
         return None
-    client = AsyncAnthropic(api_key=api_key)
+    payload = {"model": MODEL, "max_tokens": 8000,
+               "system": ctx["system"] + JSON_RULE,
+               "messages": [{"role": "user", "content": ctx["user"]}]}
+    headers = {"x-api-key": api_key, "anthropic-version": ANTHROPIC_VERSION,
+               "content-type": "application/json"}
     try:
-        resp = await client.messages.create(
-            model=MODEL, max_tokens=8000,
-            system=ctx["system"] + JSON_RULE,
-            messages=[{"role": "user", "content": ctx["user"]}],
-        )
-        raw = _answer_text(resp)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(ANTHROPIC_URL, json=payload, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=180)) as r:
+                if r.status != 200:
+                    body = (await r.text())[:300]
+                    logger.warning("sales_dialog: Anthropic %s: %s", r.status, body)
+                    if db is not None:
+                        _heartbeat(db, f"Anthropic http {r.status}: {body}", problem=True)
+                    return None
+                data = await r.json()
+        raw = answer_text(data)
         draft = parse_draft(raw)
         if not draft or "text" not in draft:
             logger.warning("sales_dialog: ответ модели не разобран: %r", raw[:200])
