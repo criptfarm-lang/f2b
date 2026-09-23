@@ -7605,6 +7605,25 @@ def main():
     app.job_queue.run_repeating(_reactivation_wrapper, interval=60, first=180)
 
     # ────────────────────────────────────────────────────────────────────
+    # Агент ведёт переписку с лидом (воронка «Эф»): тик раз в минуту, черновик
+    # ответа от имени Инессы уходит собственнику на кнопку. Без нажатия клиенту
+    # НИЧЕГО не отправляется. Спит, пока кампания в bot_settings
+    # (ключ sales_dialog:<кампания>) выключена.
+    # План: 2026-09-23-агент-ведёт-переписку-с-лидом.
+    # ────────────────────────────────────────────────────────────────────
+    import sales_dialog as _sales_dialog
+
+    _sales_dialog.register(app, db)
+
+    async def _sales_dialog_wrapper(context):
+        try:
+            await _sales_dialog.tick(app, db)
+        except Exception as e:
+            logger.error(f"sales_dialog job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_sales_dialog_wrapper, interval=60, first=240)
+
+    # ────────────────────────────────────────────────────────────────────
     # Пинг зависших лидов на «Неразобранном» воронки ПРИВЛЕЧЕНИЕ — каждые 30 мин.
     # Личка ответственному при возрасте ≥5ч в статусе, окно 09-20 МСК, повтор ≤3ч.
     # PTB JobQueue (не AsyncIOScheduler). План: 2026-07-14-пинг-зависших-лидов-неразобранное.
