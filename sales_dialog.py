@@ -477,15 +477,39 @@ def _pending_silent(db, campaign: str, silent_days: int) -> list:
     """, (campaign, str(silent_days)))
 
 
+def _heartbeat(db, status: str) -> None:
+    """Отметка живости тика прямо в БД.
+
+    Логи Amvera снимаются только из TTY, поэтому диагностику держим там, где её
+    видно снаружи: ключ `sales_dialog:_heartbeat` в `bot_settings`.
+    """
+    try:
+        v = json.dumps({"at": datetime.now(MSK).isoformat(timespec="seconds"), "status": status[:400]},
+                       ensure_ascii=False)
+        db._execute("""INSERT INTO bot_settings (key, value) VALUES (%s, %s)
+                       ON CONFLICT (key) DO UPDATE SET value=%s""",
+                    (SETTINGS_PREFIX + "_heartbeat", v, v))
+    except Exception:
+        pass
+
+
 async def tick(app, db) -> None:
     global _tables_ready
-    if not _tables_ready:
-        ensure_tables(db)
-        _tables_ready = True
-    for campaign in _campaigns(db):
+    try:
+        if not _tables_ready:
+            ensure_tables(db)
+            _tables_ready = True
+        campaigns = [c for c in _campaigns(db) if not c.startswith("_")]
+    except Exception as e:
+        _heartbeat(db, f"старт тика упал: {type(e).__name__}: {e}")
+        logger.error("sales_dialog: старт тика: %s", e, exc_info=True)
+        return
+    for campaign in campaigns:
         try:
             await _tick_campaign(app, db, campaign)
+            _heartbeat(db, f"ok {campaign}")
         except Exception as e:
+            _heartbeat(db, f"{campaign}: {type(e).__name__}: {e}")
             logger.error("sales_dialog[%s]: %s", campaign, e, exc_info=True)
 
 
