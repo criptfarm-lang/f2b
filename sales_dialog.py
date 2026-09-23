@@ -510,7 +510,7 @@ def check_style(text: str) -> list:
 
 
 # ─── тик ──────────────────────────────────────────────────────────────────────
-def _pending_inbound(db, campaign: str) -> list:
+def _pending_inbound(db, campaign: str, max_replies: int) -> list:
     """Клиент написал, и после его сообщения мы ещё не отвечали.
 
     Последнее условие важно: если менеджер успел ответить руками, агент в разговор
@@ -527,16 +527,17 @@ def _pending_inbound(db, campaign: str) -> list:
             ORDER BY w.sent_at DESC LIMIT 1
         ) m ON true
         WHERE l.campaign = %s AND l.status = 'active'
+          AND l.replies_sent < %s
           AND NOT EXISTS (
               SELECT 1 FROM sales_dialog_messages d
               WHERE d.inbound_message_id = m.message_id AND d.prompt_version = %s)
           AND NOT EXISTS (
               SELECT 1 FROM wazzup_messages o
               WHERE o.chat_id = l.chat_id AND o.is_outbound = true AND o.sent_at > m.sent_at)
-    """, (campaign, PROMPT_VERSION))
+    """, (campaign, max_replies, PROMPT_VERSION))
 
 
-def _pending_silent(db, campaign: str, silent_days: int) -> list:
+def _pending_silent(db, campaign: str, silent_days: int, max_replies: int) -> list:
     """Диалог затих — агент пишет в него один раз, чтобы оживить.
 
     Без этой ветки агент только реагировал бы на новые сообщения и никогда не
@@ -560,13 +561,14 @@ def _pending_silent(db, campaign: str, silent_days: int) -> list:
                'silent' AS source
         FROM sales_dialog_leads l
         WHERE l.campaign = %s AND l.status = 'active'
+          AND l.replies_sent < %s
           AND (SELECT max(sent_at) FROM wazzup_messages w WHERE w.chat_id = l.chat_id)
               < now() - (%s || ' days')::interval
           AND NOT EXISTS (
               SELECT 1 FROM sales_dialog_messages d
               WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
                 AND d.verdict <> 'expired')
-    """, (campaign, str(silent_days)))
+    """, (campaign, max_replies, str(silent_days)))
 
 
 def _heartbeat(db, status: str, problem: bool = False) -> None:
@@ -615,12 +617,23 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     if not in_window(now, cfg):
         return
 
+    # Суточный потолок: защита от лавины, если очередь вдруг окажется большой.
+    sent_today = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages
+                                 WHERE campaign=%s AND verdict='sent'
+                                   AND sent_at >= date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')
+                                                  AT TIME ZONE 'Europe/Moscow'""",
+                              (campaign,))
+    if (sent_today or {}).get("n", 0) >= cfg.get("daily_cap", 20):
+        _heartbeat(db, f"дневной потолок отправок исчерпан: {(sent_today or {}).get('n')}")
+        return
+
+    max_replies = cfg.get("max_replies_per_lead", 8)
     # Ответ живому клиенту важнее, чем оживление молчащего диалога.
-    rows = _pending_inbound(db, campaign)
+    rows = _pending_inbound(db, campaign, max_replies)
     n_inbound = len(rows)
     if cfg.get("revive", True):
         seen = {r["lead_id"] for r in rows}
-        rows += [r for r in _pending_silent(db, campaign, cfg.get("silent_days", 3))
+        rows += [r for r in _pending_silent(db, campaign, cfg.get("silent_days", 3), max_replies)
                  if r["lead_id"] not in seen]
     _heartbeat(db, f"очередь: входящих {n_inbound}, оживление {len(rows) - n_inbound}")
     if not rows:
