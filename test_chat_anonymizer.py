@@ -26,6 +26,57 @@ def test_phone_formats():
         assert not find_leaks(r), (raw, r)
 
 
+def test_phone_unicode_hyphens():
+    """Телефон с юникодными дефисами/тире — регресс от 23.09.2026.
+
+    В подписи менеджера телефон записан через неразрывный дефис (U+2011);
+    до фикса он проходил мимо маски, а find_leaks возвращал «чисто».
+    """
+    for name, sep in [
+        ("U+2011 неразрывный", "\u2011"),
+        ("U+2010 дефис", "\u2010"),
+        ("U+2013 короткое тире", "\u2013"),
+        ("U+2014 длинное тире", "\u2014"),
+        ("U+2212 минус", "\u2212"),
+        ("U+FF0D широкий", "\uff0d"),
+    ]:
+        raw = f"Тел.: 8{sep}968{sep}547{sep}93{sep}49"
+        r = anonymize(raw)
+        assert "[PHONE]" in r, (name, raw, r)
+        assert not find_leaks(r), (name, r)
+
+
+def test_phone_nonbreaking_space():
+    r"""Неразрывные пробелы внутри номера — \s их ловит, тест закрепляет."""
+    for sep in ["\u00a0", "\u202f", "\u2007"]:
+        r = anonymize(f"8{sep}968{sep}547{sep}93{sep}49")
+        assert "[PHONE]" in r, repr(sep)
+        assert not find_leaks(r)
+
+
+def test_volume_unicode_dash_range():
+    """Диапазон объёма через любое тире: «1,3‑1,5 кг»."""
+    for sep in ["-", "\u2010", "\u2011", "\u2013", "\u2014"]:
+        r = anonymize(f"нужно 1,3{sep}1,5 кг форели")
+        assert "[VOLUME]" in r, repr(sep)
+        assert "форел" in r
+
+
+def test_manager_signature_from_real_chat():
+    """Реальная подпись из переписки сделки 44721919 — ни одной утечки."""
+    raw = (
+        "С уважением,\n"
+        "\u041a\u0430\u0440\u0438\u043d\u0430 \u0411\u0430\u043b\u0430\u0441\u0430\u043d\u044f\u043d FISH TO BUSINESS\n"
+        "\u0422\u0435\u043b.: 8\u2011968\u2011547\u201193\u201149\n"
+        "karina@f2b.group"
+    )
+    r = anonymize(raw)
+    assert "[PHONE]" in r
+    assert "[EMAIL]" in r
+    assert "[MANAGER]" in r
+    assert not find_leaks(r), r
+
+
 def test_inn_masked():
     r = anonymize("ИНН 7701234567 и ещё 770112345678")
     assert r.count("[INN]") == 2
