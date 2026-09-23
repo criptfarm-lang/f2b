@@ -35,7 +35,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "followups-2x2"
+CODE_VERSION = "multichat-1"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -96,6 +96,10 @@ def ensure_tables(db) -> None:
         created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
         UNIQUE (inbound_message_id, prompt_version)
     )""")
+    # Чат, в который отвечаем, может отличаться от основного чата лида: клиент
+    # пишет в тот мессенджер, в котором ему удобно. Канал храним рядом с чатом.
+    db._execute("""ALTER TABLE sales_dialog_messages
+                   ADD COLUMN IF NOT EXISTS chat_type TEXT""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_leads_status_idx
                    ON sales_dialog_leads (campaign, status)""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_messages_lead_idx
@@ -536,17 +540,25 @@ def _pending_inbound(db, campaign: str) -> list:
     было. Ограничение касается только инициативы в молчащий диалог, см.
     `_pending_silent`.
 
+    Смотрим во ВСЕ чаты лида (`all_chat_ids`), а не только в основной: у части
+    лидов контакт заведён в двух мессенджерах, и написать клиент может в любой.
+    Отвечаем в тот чат, откуда пришло сообщение, — его `chat_id` и канал и
+    возвращаем, они же уедут в черновик.
+
     Условие про исходящие важно: если менеджер успел ответить руками, агент в
     разговор не лезет. Идемпотентность — по `message_id` входящего.
     """
     return db._fetchall("""
-        SELECT l.campaign, l.lead_id, l.contact_id, l.chat_id, l.chat_type,
+        SELECT l.campaign, l.lead_id, l.contact_id,
+               m.chat_id, coalesce(m.chat_type, l.chat_type) AS chat_type,
                l.lead_name, l.contact_name, l.replies_sent,
                m.message_id, m.text AS inbound_text, m.sent_at, 'inbound' AS source
         FROM sales_dialog_leads l
+        CROSS JOIN LATERAL (SELECT coalesce(l.all_chat_ids, ARRAY[l.chat_id]) AS ids) c
         JOIN LATERAL (
-            SELECT message_id, text, sent_at FROM wazzup_messages w
-            WHERE w.chat_id = l.chat_id AND w.is_outbound = false
+            SELECT w.message_id, w.text, w.sent_at, w.chat_id, w.chat_type
+            FROM wazzup_messages w
+            WHERE w.chat_id = ANY(c.ids) AND w.is_outbound = false
             ORDER BY w.sent_at DESC LIMIT 1
         ) m ON true
         WHERE l.campaign = %s AND l.status = 'active'
@@ -555,7 +567,7 @@ def _pending_inbound(db, campaign: str) -> list:
               WHERE d.inbound_message_id = m.message_id AND d.prompt_version = %s)
           AND NOT EXISTS (
               SELECT 1 FROM wazzup_messages o
-              WHERE o.chat_id = l.chat_id AND o.is_outbound = true AND o.sent_at > m.sent_at)
+              WHERE o.chat_id = ANY(c.ids) AND o.is_outbound = true AND o.sent_at > m.sent_at)
     """, (campaign, PROMPT_VERSION))
 
 
@@ -569,8 +581,12 @@ def _pending_silent(db, campaign: str, silent_days: int,
     клиент напишет, разговор подхватит `_pending_inbound`, а счётчик
     обнулится сам, потому что считается от последнего входящего.
 
-    Пауза отмеряется от последнего исходящего в чате, включая ручное сообщение
+    Пауза отмеряется от последнего исходящего, включая ручное сообщение
     менеджера: если человек только что написал сам, агент сверху не пишет.
+
+    Тишину и касания считаем по всем чатам лида, а пишем в тот чат, где клиент
+    писал последний раз (если не писал нигде — в основной чат карточки): именно
+    там он и читает.
 
     Ключ идемпотентности — лид плюс сегодняшняя дата, и ровно то же условие
     стоит в отборе («сегодня по лиду черновиков ещё не было»). Если отбор и
@@ -578,27 +594,33 @@ def _pending_silent(db, campaign: str, silent_days: int,
     крутится вхолостую без единой ошибки — уже обжигались.
     """
     return db._fetchall("""
-        SELECT l.campaign, l.lead_id, l.contact_id, l.chat_id, l.chat_type,
+        SELECT l.campaign, l.lead_id, l.contact_id,
+               coalesce(lastin.chat_id, l.chat_id) AS chat_id,
+               coalesce(lastin.chat_type, l.chat_type) AS chat_type,
                l.lead_name, l.contact_name, l.replies_sent,
                'silent:' || l.lead_id || ':' ||
                  to_char(now() AT TIME ZONE 'Europe/Moscow', 'YYYYMMDD') AS message_id,
                NULL AS inbound_text,
                (SELECT max(w.sent_at) AT TIME ZONE 'UTC' FROM wazzup_messages w
-                 WHERE w.chat_id = l.chat_id) AS sent_at,
+                 WHERE w.chat_id = ANY(c.ids)) AS sent_at,
                'silent' AS source
         FROM sales_dialog_leads l
+        CROSS JOIN LATERAL (SELECT coalesce(l.all_chat_ids, ARRAY[l.chat_id]) AS ids) c
+        LEFT JOIN LATERAL (
+            SELECT w.chat_id, w.chat_type, w.sent_at FROM wazzup_messages w
+            WHERE w.chat_id = ANY(c.ids) AND w.is_outbound = false
+            ORDER BY w.sent_at DESC LIMIT 1
+        ) lastin ON true
         WHERE l.campaign = %s AND l.status = 'active'
           AND (SELECT max(w.sent_at) AT TIME ZONE 'UTC' FROM wazzup_messages w
-                WHERE w.chat_id = l.chat_id) < now() - (%s || ' days')::interval
+                WHERE w.chat_id = ANY(c.ids)) < now() - (%s || ' days')::interval
           AND (SELECT count(*) FROM sales_dialog_messages d
                 WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
                   AND d.verdict = 'sent'
-                  AND d.sent_at > coalesce(
-                      (SELECT max(w.sent_at) AT TIME ZONE 'UTC' FROM wazzup_messages w
-                        WHERE w.chat_id = l.chat_id AND w.is_outbound = false),
-                      '-infinity'::timestamptz)) < %s
+                  AND d.sent_at > coalesce(lastin.sent_at AT TIME ZONE 'UTC',
+                                           '-infinity'::timestamptz)) < %s
           AND coalesce((SELECT max(w.sent_at) AT TIME ZONE 'UTC' FROM wazzup_messages w
-                         WHERE w.chat_id = l.chat_id AND w.is_outbound = true),
+                         WHERE w.chat_id = ANY(c.ids) AND w.is_outbound = true),
                        '-infinity'::timestamptz) <= %s
           AND NOT EXISTS (
               SELECT 1 FROM sales_dialog_messages d
@@ -703,12 +725,13 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
         logger.warning("sales_dialog: проверка не пройдена lead=%s %s", row["lead_id"], problems)
 
     saved = db._fetchone("""INSERT INTO sales_dialog_messages
-        (campaign, lead_id, chat_id, inbound_message_id, inbound_text, draft_text,
+        (campaign, lead_id, chat_id, chat_type, inbound_message_id, inbound_text, draft_text,
          action, reason, need_check, price_claims, model, prompt_version, verdict)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'draft')
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'draft')
         ON CONFLICT (inbound_message_id, prompt_version) DO NOTHING
         RETURNING id""",
-        (campaign, row["lead_id"], row["chat_id"], row["message_id"], row["inbound_text"],
+        (campaign, row["lead_id"], row["chat_id"], row.get("chat_type"),
+         row["message_id"], row["inbound_text"],
          draft.get("text"), action, draft.get("reason"), draft.get("need_check"),
          json.dumps(draft.get("price_claims"), ensure_ascii=False), MODEL, PROMPT_VERSION))
     db._execute("""UPDATE sales_dialog_leads SET last_inbound_at=%s
@@ -736,7 +759,7 @@ def _card_text(db, msg: dict) -> str:
     lead = db._fetchone("""SELECT lead_name, contact_name, chat_type FROM sales_dialog_leads
                            WHERE campaign=%s AND lead_id=%s""", (msg["campaign"], msg["lead_id"]))
     who = (lead or {}).get("lead_name") or f"сделка {msg['lead_id']}"
-    head = f"{who} · {(lead or {}).get('chat_type', '')} · сделка {msg['lead_id']}"
+    head = f"{who} · {delivery_target(msg, lead)[1] or ''} · сделка {msg['lead_id']}"
     if msg.get("inbound_text"):
         head += f"\n\nКлиент: {msg['inbound_text'][:300]}"
     else:
@@ -772,14 +795,27 @@ async def send_for_approval(app, db, row_id: int) -> None:
         logger.warning("sales_dialog: карточка не ушла lead=%s: %s", msg["lead_id"], e)
 
 
+def delivery_target(msg: dict, lead: dict | None) -> tuple:
+    """Куда отвечать: чат черновика первичен, карточка лида — запасной вариант.
+
+    У части лидов контакт заведён в двух мессенджерах, и отвечать надо в тот,
+    откуда пришло сообщение, а не в основной чат карточки. Фоллбэк нужен для
+    старых черновиков, созданных до того, как канал стали записывать.
+    """
+    lead = lead or {}
+    return (msg.get("chat_id") or lead.get("chat_id"),
+            msg.get("chat_type") or lead.get("chat_type"))
+
+
 async def _deliver(db, session, msg: dict, text: str) -> tuple[bool, str]:
     """Отправка клиенту. Канал и чат берём из карточки лида, не из вольного ввода."""
     lead = db._fetchone("""SELECT chat_type, chat_id FROM sales_dialog_leads
                            WHERE campaign=%s AND lead_id=%s""", (msg["campaign"], msg["lead_id"]))
-    if not lead or lead["chat_type"] not in CHANNEL_IDS:
-        return False, f"неизвестный канал {(lead or {}).get('chat_type')}"
-    payload = {"channelId": CHANNEL_IDS[lead["chat_type"]], "chatType": lead["chat_type"],
-               "chatId": str(lead["chat_id"]), "text": text}
+    chat_id, chat_type = delivery_target(msg, lead)
+    if chat_type not in CHANNEL_IDS or not chat_id:
+        return False, f"неизвестный канал {chat_type}"
+    payload = {"channelId": CHANNEL_IDS[chat_type], "chatType": chat_type,
+               "chatId": str(chat_id), "text": text}
     async with session.post(WAZZUP_API_URL, json=payload, headers={
             "Authorization": f"Bearer {os.getenv('WAZZUP_API_KEY', '')}",
             "Content-Type": "application/json"}) as r:

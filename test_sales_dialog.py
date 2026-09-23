@@ -4,7 +4,7 @@
 """
 from datetime import date, datetime, timedelta, timezone
 
-from sales_dialog import check_prices, in_window, workdays_ago
+from sales_dialog import check_prices, delivery_target, in_window, workdays_ago
 
 MSK = timezone(timedelta(hours=3))
 PRICES = {
@@ -239,6 +239,19 @@ def test_normal_card_has_send_button():
     from sales_dialog import _keyboard
     labels = [b.text for row in _keyboard(7, "reply").inline_keyboard for b in row]
     assert labels[0] == "Отправить"
+
+
+def test_delivery_goes_to_chat_of_the_draft():
+    # Клиент написал во второй мессенджер — отвечаем туда, а не в основной чат.
+    msg = {"chat_id": "672974160", "chat_type": "telegram"}
+    lead = {"chat_id": "18973580", "chat_type": "max"}
+    assert delivery_target(msg, lead) == ("672974160", "telegram")
+
+
+def test_delivery_falls_back_to_lead_card():
+    # Старый черновик без канала — берём чат карточки лида.
+    assert delivery_target({"chat_id": None, "chat_type": None},
+                           {"chat_id": "18973580", "chat_type": "max"}) == ("18973580", "max")
 
 
 def test_callback_data_fits_telegram_limit():
