@@ -2,9 +2,11 @@
 
 Гоняется: `python3 -m pytest test_sales_dialog.py -q` из ~/code/f2b.
 """
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 
-from sales_dialog import check_prices, delivery_target, in_window, polish, workdays_ago
+import sales_dialog
+from sales_dialog import check_prices, delivery_target, in_window, mrm_price, polish, workdays_ago
 
 MSK = timezone(timedelta(hours=3))
 PRICES = {
@@ -191,6 +193,8 @@ class FakeDB:
     def _fetchone(self, sql, params=None):
         if "sales_dialog_leads" in sql:
             return self.rows.get("lead")
+        if "wazzup_messages" in sql:
+            return self.rows.get("fresh")
         return self.rows.get("msg")
 
     def _fetchall(self, sql, params=None):
@@ -241,6 +245,22 @@ def test_normal_card_has_send_button():
     assert labels[0] == "Отправить"
 
 
+def test_mrm_price_minus_100():
+    assert mrm_price("Лосось (сёмга) филе, ОХЛ., Трим Д 1.6-2.0 кг. Мурманск", 2750.0) == 2650.0
+    assert mrm_price("Лосось атл. (сёмга), ПСГ, ОХЛ., 4-5 кг. Мурманск", 1690.0) == 1590.0
+
+
+def test_mrm_discount_only_for_chilled_murmansk():
+    # заморозка из Мурманска и охлаждёнка не из Мурманска идут по цене МойСклада
+    assert mrm_price("Лосось (сёмга) филе, ЗАМОРОЖ., Трим Д 1.6-2.0 кг. Мурманск", 2750.0) == 2750.0
+    assert mrm_price("Лосось (сёмга) филе, ОХЛ., Трим Д 1.6-2.0 кг.", 2290.0) == 2290.0
+    assert mrm_price("Форель филе, ОХЛ., Трим С 1.4-2.0 кг.", 2020.0) == 2020.0
+
+
+def test_mrm_price_handles_missing():
+    assert mrm_price("Лосось филе, ОХЛ. Мурманск", None) is None
+
+
 def test_polish_drops_introduction():
     t = ("Добрый день. Меня зовут Инесса, компания F2B – теперь я веду ваш вопрос.\n\n"
          "По форели Трим ПР: 1420 ₽/кг.")
@@ -281,6 +301,34 @@ def test_callback_data_fits_telegram_limit():
         for b in row:
             assert len(b.callback_data.encode()) <= 64
             assert _CB.match(b.callback_data)
+
+
+def test_draft_not_sent_if_client_replied_meanwhile():
+    """Клиент ответил после черновика – отправка блокируется, черновик stale."""
+    db = FakeDB({"msg": _msg(), "lead": {"all_chat_ids": ["1"], "chat_id": "1"},
+                 "fresh": {"text": "Только Мурманск", "sent_at": None}})
+    ok, info = asyncio.run(sales_dialog._do_send(db, 7, "текст"))
+    assert ok is False
+    assert "клиент ответил" in info.lower() and "Мурманск" in info
+    assert any("verdict='stale'" in sql for sql, _ in db.executed)
+
+
+def test_draft_sent_when_no_new_inbound():
+    """Нового входящего нет – отправка идёт как обычно."""
+    db = FakeDB({"msg": _msg(), "lead": {"all_chat_ids": ["1"], "chat_id": "1"}, "fresh": None})
+    sent = {}
+
+    async def fake_deliver(db_, session, msg, text):
+        sent["text"] = text
+        return True, "ok"
+
+    orig = sales_dialog._deliver
+    sales_dialog._deliver = fake_deliver
+    try:
+        ok, _ = asyncio.run(sales_dialog._do_send(db, 7, "текст"))
+    finally:
+        sales_dialog._deliver = orig
+    assert ok is True and sent["text"] == "текст"
 
 
 def test_expired_draft_is_not_sent():

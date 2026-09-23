@@ -35,7 +35,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "no-intro-size"
+CODE_VERSION = "stale-guard-mrm100"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -147,6 +147,24 @@ def workdays_ago(now: datetime, days: int) -> datetime:
 
 
 # ─── внешние системы ──────────────────────────────────────────────────────────
+MRM_DISCOUNT = 100.0
+
+
+def mrm_price(name: str, price: float | None) -> float | None:
+    """Охлаждённая мурманская рыба идёт клиенту на 100 ₽ дешевле, чем в МойСкладе.
+
+    Правило собственника от 23.09.2026. Скидку применяем прямо в справочнике,
+    который уходит и в промпт, и в сверку цен, — иначе агент назовёт одну цифру,
+    а проверка потребует другую и завернёт черновик.
+    """
+    if price is None:
+        return None
+    u = (name or "").upper()
+    if "ОХЛ" in u and "МУРМАНСК" in u and price > MRM_DISCOUNT:
+        return round(price - MRM_DISCOUNT, 2)
+    return price
+
+
 async def _ms_price_rows(session: aiohttp.ClientSession) -> list:
     """Ассортимент МойСклад: код, имя, три типа цены, остаток. С часовым кэшем.
 
@@ -182,9 +200,12 @@ async def _ms_price_rows(session: aiohttp.ClientSession) -> list:
         if not prices.get("Цена опт"):
             continue
         path = r.get("pathName") or ""
-        out.append({"code": r.get("code"), "name": r.get("name"),
-                    "opt": prices.get("Цена опт"), "horeca": prices.get("Цена продажи"),
-                    "spec": prices.get("Спец."), "stock": round(r.get("stock") or 0, 1),
+        name = r.get("name")
+        out.append({"code": r.get("code"), "name": name,
+                    "opt": mrm_price(name, prices.get("Цена опт")),
+                    "horeca": mrm_price(name, prices.get("Цена продажи")),
+                    "spec": mrm_price(name, prices.get("Спец.")),
+                    "stock": round(r.get("stock") or 0, 1),
                     # Собственное производство делаем под заказ, поэтому нулевой остаток
                     # по нему — не «нет», а «сделаем». Привлечённые товары так нельзя:
                     # там ноль означает, что позицию надо закупить.
@@ -737,6 +758,20 @@ async def _tick_campaign(app, db, campaign: str) -> None:
 
 
 async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> None:
+    # Клиент написал, пока прежний черновик ждал кнопки, – снимаем его и говорим
+    # об этом собственнику, чтобы он не отправил ответ на уже неактуальную реплику.
+    if row.get("source") == "inbound":
+        stale = db._fetchall("""SELECT id FROM sales_dialog_messages
+                                WHERE campaign=%s AND lead_id=%s AND verdict IN ('draft','edited')
+                                  AND created_at < %s::timestamp AT TIME ZONE 'UTC'""",
+                             (campaign, row["lead_id"], row["sent_at"]))
+        if stale:
+            db._execute("UPDATE sales_dialog_messages SET verdict='stale' WHERE id = ANY(%s)",
+                        ([x["id"] for x in stale],))
+            if app:
+                await notify_owner(app, f"{row.get('lead_name') or row['lead_id']} · сделка {row['lead_id']}\n"
+                                        f"Клиент ответил, пока черновик ждал: «{(row.get('inbound_text') or '')[:150]}»\n"
+                                        f"Прежний черновик снят, готовлю новый.")
     ctx = await build_context(db, session, row)
     draft = await generate_draft(ctx, db)
     if not draft:
@@ -853,6 +888,30 @@ async def _deliver(db, session, msg: dict, text: str) -> tuple[bool, str]:
         return False, f"http {r.status}: {body}"
 
 
+def newer_inbound(db, msg: dict) -> dict | None:
+    """Входящее, пришедшее уже после того, как черновик был написан.
+
+    Собственник держит карточку в руках не мгновенно, и за это время клиент
+    успевает ответить – так было с Кибер домом 23.09.2026: на вопрос «какую из
+    двух берём» он написал «только Мурманск», а карточка с тем же вопросом всё
+    ещё ждала кнопки. Отправлять такой черновик нельзя: разговор разъедется.
+    """
+    lead = db._fetchone("""SELECT all_chat_ids, chat_id FROM sales_dialog_leads
+                           WHERE campaign=%s AND lead_id=%s""", (msg["campaign"], msg["lead_id"]))
+    chats = (lead or {}).get("all_chat_ids") or [msg.get("chat_id")]
+    return db._fetchone("""SELECT text, sent_at FROM wazzup_messages
+                           WHERE chat_id = ANY(%s) AND is_outbound = false
+                             AND sent_at AT TIME ZONE 'UTC' > %s
+                           ORDER BY sent_at DESC LIMIT 1""", (list(chats), msg["created_at"]))
+
+
+async def notify_owner(app, text: str) -> None:
+    try:
+        await app.bot.send_message(_owner_id(), text)
+    except Exception as e:
+        logger.warning("sales_dialog: уведомление не ушло: %s", e)
+
+
 async def _do_send(db, row_id: int, text: str) -> tuple[bool, str]:
     msg = db._fetchone("SELECT * FROM sales_dialog_messages WHERE id=%s", (row_id,))
     if not msg:
@@ -864,6 +923,11 @@ async def _do_send(db, row_id: int, text: str) -> tuple[bool, str]:
         # Ответ на утреннее сообщение, ушедший вечером, хуже молчания.
         db._execute("UPDATE sales_dialog_messages SET verdict='expired' WHERE id=%s", (row_id,))
         return False, f"черновик устарел ({int(age_min)} мин), не отправлен"
+    fresh = newer_inbound(db, msg)
+    if fresh:
+        db._execute("UPDATE sales_dialog_messages SET verdict='stale' WHERE id=%s", (row_id,))
+        return False, ("клиент ответил после черновика: «"
+                       + (fresh.get("text") or "")[:120] + "» – ответ пересобираю")
     async with aiohttp.ClientSession() as session:
         ok, info = await _deliver(db, session, msg, text)
     if ok:
