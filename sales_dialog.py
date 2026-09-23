@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
 MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
+# Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
+# наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
+CODE_VERSION = "followups-2x2"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -122,6 +125,21 @@ def in_window(now_msk: datetime, cfg: dict) -> bool:
     if now_msk.weekday() >= 5 and not cfg.get("weekends"):
         return False
     return cfg.get("start_hour", 9) <= now_msk.hour < cfg.get("end_hour", 19)
+
+
+def workdays_ago(now: datetime, days: int) -> datetime:
+    """Момент, отстоящий на `days` рабочих дней назад (выходные не считаются).
+
+    Нужен для паузы между двумя сообщениями в молчащий диалог: «пара рабочих
+    дней» в пятницу означает среду, а не воскресенье.
+    """
+    d = now
+    left = max(0, days)
+    while left > 0:
+        d -= timedelta(days=1)
+        if d.weekday() < 5:
+            left -= 1
+    return d
 
 
 # ─── внешние системы ──────────────────────────────────────────────────────────
@@ -510,11 +528,16 @@ def check_style(text: str) -> list:
 
 
 # ─── тик ──────────────────────────────────────────────────────────────────────
-def _pending_inbound(db, campaign: str, max_replies: int) -> list:
+def _pending_inbound(db, campaign: str) -> list:
     """Клиент написал, и после его сообщения мы ещё не отвечали.
 
-    Последнее условие важно: если менеджер успел ответить руками, агент в разговор
-    не лезет. Идемпотентность — по `message_id` входящего.
+    Потолка на число ответов здесь нет сознательно (правило собственника от
+    23.09.2026): пока клиент задаёт вопросы, на них отвечают, сколько бы их ни
+    было. Ограничение касается только инициативы в молчащий диалог, см.
+    `_pending_silent`.
+
+    Условие про исходящие важно: если менеджер успел ответить руками, агент в
+    разговор не лезет. Идемпотентность — по `message_id` входящего.
     """
     return db._fetchall("""
         SELECT l.campaign, l.lead_id, l.contact_id, l.chat_id, l.chat_type,
@@ -527,48 +550,62 @@ def _pending_inbound(db, campaign: str, max_replies: int) -> list:
             ORDER BY w.sent_at DESC LIMIT 1
         ) m ON true
         WHERE l.campaign = %s AND l.status = 'active'
-          AND l.replies_sent < %s
           AND NOT EXISTS (
               SELECT 1 FROM sales_dialog_messages d
               WHERE d.inbound_message_id = m.message_id AND d.prompt_version = %s)
           AND NOT EXISTS (
               SELECT 1 FROM wazzup_messages o
               WHERE o.chat_id = l.chat_id AND o.is_outbound = true AND o.sent_at > m.sent_at)
-    """, (campaign, max_replies, PROMPT_VERSION))
+    """, (campaign, PROMPT_VERSION))
 
 
-def _pending_silent(db, campaign: str, silent_days: int, max_replies: int) -> list:
-    """Диалог затих — агент пишет в него один раз, чтобы оживить.
+def _pending_silent(db, campaign: str, silent_days: int,
+                    max_followups: int, not_before: datetime) -> list:
+    """Диалог затих — агент пишет в него сам, но не больше пары раз.
 
-    Без этой ветки агент только реагировал бы на новые сообщения и никогда не
-    возвращался к молчащим лидам, а именно там и лежит потерянная выручка.
-    Повтор исключён условием «по лиду ещё нет черновика»: следующий ход будет
-    уже через `_pending_inbound`, когда клиент ответит. Протухшие черновики
-    (`expired`) не в счёт — по ним клиенту ничего не ушло, значит лид не должен
-    из-за них замолчать навсегда.
+    Правило собственника (23.09.2026): на вопросы клиента отвечаем всегда, а
+    молчащего трогаем не более `max_followups` раз подряд с паузой в пару
+    рабочих дней. Дальше лид ждёт — статус остаётся `active`, и как только
+    клиент напишет, разговор подхватит `_pending_inbound`, а счётчик
+    обнулится сам, потому что считается от последнего входящего.
 
-    В ключ идемпотентности входит дата последнего сообщения чата: иначе строка,
-    оставшаяся от прошлой попытки, молча гасит вставку через ON CONFLICT, и тик
-    крутится вхолостую — отбор игнорирует `expired`, а уникальный индекс нет.
+    Пауза отмеряется от последнего исходящего в чате, включая ручное сообщение
+    менеджера: если человек только что написал сам, агент сверху не пишет.
+
+    Ключ идемпотентности — лид плюс сегодняшняя дата, и ровно то же условие
+    стоит в отборе («сегодня по лиду черновиков ещё не было»). Если отбор и
+    ключ расходятся, `ON CONFLICT DO NOTHING` молча гасит вставку и тик
+    крутится вхолостую без единой ошибки — уже обжигались.
     """
     return db._fetchall("""
         SELECT l.campaign, l.lead_id, l.contact_id, l.chat_id, l.chat_type,
                l.lead_name, l.contact_name, l.replies_sent,
                'silent:' || l.lead_id || ':' ||
-                 to_char((SELECT max(sent_at) FROM wazzup_messages w WHERE w.chat_id = l.chat_id),
-                         'YYYYMMDD') AS message_id, NULL AS inbound_text,
-               (SELECT max(sent_at) FROM wazzup_messages w WHERE w.chat_id = l.chat_id) AS sent_at,
+                 to_char(now() AT TIME ZONE 'Europe/Moscow', 'YYYYMMDD') AS message_id,
+               NULL AS inbound_text,
+               (SELECT max(w.sent_at) AT TIME ZONE 'UTC' FROM wazzup_messages w
+                 WHERE w.chat_id = l.chat_id) AS sent_at,
                'silent' AS source
         FROM sales_dialog_leads l
         WHERE l.campaign = %s AND l.status = 'active'
-          AND l.replies_sent < %s
-          AND (SELECT max(sent_at) FROM wazzup_messages w WHERE w.chat_id = l.chat_id)
-              < now() - (%s || ' days')::interval
+          AND (SELECT max(w.sent_at) AT TIME ZONE 'UTC' FROM wazzup_messages w
+                WHERE w.chat_id = l.chat_id) < now() - (%s || ' days')::interval
+          AND (SELECT count(*) FROM sales_dialog_messages d
+                WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
+                  AND d.verdict = 'sent'
+                  AND d.sent_at > coalesce(
+                      (SELECT max(w.sent_at) AT TIME ZONE 'UTC' FROM wazzup_messages w
+                        WHERE w.chat_id = l.chat_id AND w.is_outbound = false),
+                      '-infinity'::timestamptz)) < %s
+          AND coalesce((SELECT max(w.sent_at) AT TIME ZONE 'UTC' FROM wazzup_messages w
+                         WHERE w.chat_id = l.chat_id AND w.is_outbound = true),
+                       '-infinity'::timestamptz) <= %s
           AND NOT EXISTS (
               SELECT 1 FROM sales_dialog_messages d
               WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
-                AND d.verdict <> 'expired')
-    """, (campaign, max_replies, str(silent_days)))
+                AND d.created_at >= date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')
+                                    AT TIME ZONE 'Europe/Moscow')
+    """, (campaign, str(silent_days), max_followups, not_before))
 
 
 def _heartbeat(db, status: str, problem: bool = False) -> None:
@@ -581,7 +618,8 @@ def _heartbeat(db, status: str, problem: bool = False) -> None:
     """
     try:
         payload = {"at": datetime.now(MSK).isoformat(timespec="seconds"),
-                   "status": status[:400], "code": PROMPT_VERSION}
+                   "status": status[:400], "code": PROMPT_VERSION,
+                   "build": CODE_VERSION}
         v = json.dumps(payload, ensure_ascii=False)
         key = SETTINGS_PREFIX + ("_lasterror" if problem else "_heartbeat")
         db._execute("""INSERT INTO bot_settings (key, value) VALUES (%s, %s)
@@ -627,13 +665,18 @@ async def _tick_campaign(app, db, campaign: str) -> None:
         _heartbeat(db, f"дневной потолок отправок исчерпан: {(sent_today or {}).get('n')}")
         return
 
-    max_replies = cfg.get("max_replies_per_lead", 8)
     # Ответ живому клиенту важнее, чем оживление молчащего диалога.
-    rows = _pending_inbound(db, campaign, max_replies)
+    rows = _pending_inbound(db, campaign)
     n_inbound = len(rows)
     if cfg.get("revive", True):
         seen = {r["lead_id"] for r in rows}
-        rows += [r for r in _pending_silent(db, campaign, cfg.get("silent_days", 3), max_replies)
+        # Пауза между двумя касаниями молчащего диалога — в рабочих днях, чтобы
+        # пятничное сообщение не превращалось в воскресное.
+        not_before = workdays_ago(now, cfg.get("followup_workdays", 2))
+        rows += [r for r in _pending_silent(db, campaign,
+                                            cfg.get("silent_days", 3),
+                                            cfg.get("max_followups", 2),
+                                            not_before)
                  if r["lead_id"] not in seen]
     _heartbeat(db, f"очередь: входящих {n_inbound}, оживление {len(rows) - n_inbound}")
     if not rows:

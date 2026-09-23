@@ -2,9 +2,9 @@
 
 Гоняется: `python3 -m pytest test_sales_dialog.py -q` из ~/code/f2b.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
-from sales_dialog import check_prices, in_window
+from sales_dialog import check_prices, in_window, workdays_ago
 
 MSK = timezone(timedelta(hours=3))
 PRICES = {
@@ -71,6 +71,23 @@ def test_window_custom_hours():
 
 
 # ── стилевые запреты ──────────────────────────────────────────────────────────
+def test_workdays_ago_skips_weekend():
+    # Пятница 25.09.2026 минус два рабочих дня — среда 23-го, а не воскресенье.
+    fri = datetime(2026, 9, 25, 16, 0, tzinfo=MSK)
+    assert workdays_ago(fri, 2).date() == date(2026, 9, 23)
+
+
+def test_workdays_ago_over_weekend():
+    # Понедельник минус два рабочих дня — четверг прошлой недели.
+    mon = datetime(2026, 9, 28, 10, 0, tzinfo=MSK)
+    assert workdays_ago(mon, 2).date() == date(2026, 9, 24)
+
+
+def test_workdays_ago_zero():
+    now = datetime(2026, 9, 23, 12, 0, tzinfo=MSK)
+    assert workdays_ago(now, 0) == now
+
+
 def test_style_masculine_caught():
     """Инесса — женщина; мужской род выдаёт, что пишет не она."""
     from sales_dialog import check_style
