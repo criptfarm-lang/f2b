@@ -1448,8 +1448,10 @@ def mark_attracted_approved_in_text(text: str, approved_at: str) -> str:
 
 
 def build_attracted_buyer_text(order_name: str, client_name: str, manager_name: str,
-                               items: list[dict]) -> str:
-    """Сообщение закупщику: только его позиции – прайс, цена в заказе, рентабельность."""
+                               items: list[dict], order_comment: str = "") -> str:
+    """Сообщение закупщику: только его позиции – прайс, цена в заказе, рентабельность.
+    Комментарий заказа из МС (поле «Комментарий», `description`) идёт хвостом –
+    в нём менеджер объясняет, почему цена такая. У собственника его нет."""
     from datetime import datetime, timezone, timedelta
     sent_at = datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M")
     client_type = (items[0].get("client_type") or "") if items else ""
@@ -1468,6 +1470,10 @@ def build_attracted_buyer_text(order_name: str, client_name: str, manager_name: 
             f"   прайс {_fmt_money(it['min_price'])} ₽ · в заказе "
             f"{_fmt_money(it['order_price'])} ₽ · {margin_s}"
         )
+    comment = " ".join((order_comment or "").split())
+    if comment:
+        lines.append("")
+        lines.append(f"💬 _из заказа:_ {_md(comment[:400])}")
     return "\n".join(lines)
 
 
@@ -1934,7 +1940,8 @@ async def check_approval_needed(order_href: str, bot, db):
         # никто не закроет (заказ повис бы навсегда).
         if buyer_chat_id:
             buyer_text = build_attracted_buyer_text(
-                order_name, agent_name, manager_name, attracted_items)
+                order_name, agent_name, manager_name, attracted_items,
+                order_comment=order.get("description") or "")
             buyer_kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Согласовать", callback_data=f"appr_buyer|{alert_id}"),
             ]])
