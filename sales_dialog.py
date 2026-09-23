@@ -536,11 +536,17 @@ def _pending_silent(db, campaign: str, silent_days: int) -> list:
     уже через `_pending_inbound`, когда клиент ответит. Протухшие черновики
     (`expired`) не в счёт — по ним клиенту ничего не ушло, значит лид не должен
     из-за них замолчать навсегда.
+
+    В ключ идемпотентности входит дата последнего сообщения чата: иначе строка,
+    оставшаяся от прошлой попытки, молча гасит вставку через ON CONFLICT, и тик
+    крутится вхолостую — отбор игнорирует `expired`, а уникальный индекс нет.
     """
     return db._fetchall("""
         SELECT l.campaign, l.lead_id, l.contact_id, l.chat_id, l.chat_type,
                l.lead_name, l.contact_name, l.replies_sent,
-               'silent:' || l.lead_id AS message_id, NULL AS inbound_text,
+               'silent:' || l.lead_id || ':' ||
+                 to_char((SELECT max(sent_at) FROM wazzup_messages w WHERE w.chat_id = l.chat_id),
+                         'YYYYMMDD') AS message_id, NULL AS inbound_text,
                (SELECT max(sent_at) FROM wazzup_messages w WHERE w.chat_id = l.chat_id) AS sent_at,
                'silent' AS source
         FROM sales_dialog_leads l
