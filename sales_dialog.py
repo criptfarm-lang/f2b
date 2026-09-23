@@ -35,7 +35,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "multichat-1"
+CODE_VERSION = "no-intro-size"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -531,6 +531,33 @@ def check_style(text: str) -> list:
     return problems
 
 
+INTRO_MARKERS = re.compile(
+    r"(меня зовут|теперь я веду|дальше (ваш вопрос )?веду|дальше я веду|"
+    r"я теперь ваш менеджер|перед[аё]ли мне ваш вопрос|на связи инесса|инесса, f2b)",
+    re.I)
+
+
+def polish(text: str) -> str:
+    """Правки собственника, которые дешевле сделать кодом, чем ждать от модели.
+
+    1. Представляться не надо (23.09.2026): клиент уже в переписке, а лишняя
+       строка «меня зовут, теперь я веду ваш вопрос» только добавляет шума.
+       Вырезаем предложение с представлением, остальное сообщение не трогаем.
+    2. Размер рыбы называем «размер», а не «развес». Слова однокоренные по
+       склонению, поэтому замена корня сохраняет падеж: развесом → размером.
+    """
+    if not text:
+        return text
+    out = []
+    for para in text.split("\n"):
+        parts = re.split(r"(?<=[.!?])\s+", para)
+        kept = [x for x in parts if not INTRO_MARKERS.search(x)]
+        out.append(" ".join(kept).strip() if len(kept) != len(parts) else para)
+    text = "\n".join(out)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return re.sub(r"(?i)развес", lambda m: "Размер" if m.group(0)[0].isupper() else "размер", text)
+
+
 # ─── тик ──────────────────────────────────────────────────────────────────────
 def _pending_inbound(db, campaign: str) -> list:
     """Клиент написал, и после его сообщения мы ещё не отвечали.
@@ -715,8 +742,9 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
     if not draft:
         _heartbeat(db, f"генерация не дала результата, lead={row['lead_id']}", problem=True)
         return
+    draft["text"] = polish(draft.get("text") or "")
     problems = (check_prices(draft, ctx["prices"], allowed_numbers(ctx.get("city")))
-                + check_style(draft.get("text") or ""))
+                + check_style(draft["text"]))
     action = draft["action"]
     if problems:
         # Цена разошлась со справочником или текст нарушает запреты — не отправляем.

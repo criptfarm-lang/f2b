@@ -4,7 +4,7 @@
 """
 from datetime import date, datetime, timedelta, timezone
 
-from sales_dialog import check_prices, delivery_target, in_window, workdays_ago
+from sales_dialog import check_prices, delivery_target, in_window, polish, workdays_ago
 
 MSK = timezone(timedelta(hours=3))
 PRICES = {
@@ -239,6 +239,26 @@ def test_normal_card_has_send_button():
     from sales_dialog import _keyboard
     labels = [b.text for row in _keyboard(7, "reply").inline_keyboard for b in row]
     assert labels[0] == "Отправить"
+
+
+def test_polish_drops_introduction():
+    t = ("Добрый день. Меня зовут Инесса, компания F2B – теперь я веду ваш вопрос.\n\n"
+         "По форели Трим ПР: 1420 ₽/кг.")
+    out = polish(t)
+    assert "Меня зовут" not in out
+    assert out.startswith("Добрый день.")
+    assert "1420" in out
+
+
+def test_polish_keeps_normal_text():
+    t = "Добрый день. По треске цена 620 ₽/кг, привезём завтра."
+    assert polish(t) == t
+
+
+def test_polish_renames_razves_keeping_case():
+    assert polish("Развес 1.3–1.5 кг") == "Размер 1.3–1.5 кг"
+    assert polish("два развеса: 0.6–1.0 и 1.3–1.5") == "два размера: 0.6–1.0 и 1.3–1.5"
+    assert polish("по развесу подберём") == "по размеру подберём"
 
 
 def test_delivery_goes_to_chat_of_the_draft():
