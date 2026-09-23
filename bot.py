@@ -5016,6 +5016,12 @@ async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TY
 MS_STATE_AGREED_ID = "005f3651-9a9a-11f0-0a80-03a900027474"
 _OWNER_WAIT_MARK = "\n\n☑️"   # хвост «собственник согласовал, ждём закупщика»
 
+# Статусы конвейера ПОСЛЕ «Согласован». Если заказ уже там (его двигали руками,
+# пока ждали второе «да») — ставить «Согласован» нельзя, это откат назад.
+# Кейс 04293 от 23.09.2026: заказ дошёл до «Документы готовы», кнопка закупщика
+# вернула его в «Согласован». По имени, а не UUID — устойчиво к смене UUID.
+MS_STATES_AFTER_AGREED = {"Собирается", "Собран", "Документы готовы", "Отгружен"}
+
 
 def _msk_hhmm() -> str:
     from datetime import datetime, timezone, timedelta
@@ -5070,8 +5076,10 @@ async def _notify_owners(bot, alert_row: dict, text: str):
             logger.warning(f"approval: уведомление {chat_id} → {e}")
 
 
-async def _agree_order_in_ms(order_id: str) -> str:
-    """Ставит заказу «Согласован». 'already' – уже стоял, 'ok' – поставили, 'fail'."""
+async def _agree_order_in_ms(order_id: str) -> tuple:
+    """Ставит заказу «Согласован». Возвращает (код, имя_текущего_статуса):
+    'already' – уже стоял, 'ahead' – заказ ушёл дальше по конвейеру (не трогаем),
+    'ok' – поставили, 'fail' – не смогли."""
     from moysklad import set_order_state, get_headers, MS_BASE
     import aiohttp
     try:
@@ -5082,12 +5090,17 @@ async def _agree_order_in_ms(order_id: str) -> str:
             ) as r:
                 if r.status == 200:
                     ord_data = await r.json()
-                    cur = ord_data.get("state", {}).get("meta", {}).get("href", "").split("/")[-1]
+                    st = ord_data.get("state") or {}
+                    cur = st.get("meta", {}).get("href", "").split("/")[-1]
+                    name = (st.get("name") or "").strip()
                     if cur == MS_STATE_AGREED_ID:
-                        return "already"
+                        return "already", name
+                    if name in MS_STATES_AFTER_AGREED:
+                        logger.info(f"_agree_order_in_ms: заказ {order_id} уже «{name}» – статус не трогаем")
+                        return "ahead", name
     except Exception as e:
         logger.warning(f"_agree_order_in_ms idempotency check: {e}")
-    return "ok" if await set_order_state(order_id, MS_STATE_AGREED_ID) else "fail"
+    return ("ok" if await set_order_state(order_id, MS_STATE_AGREED_ID) else "fail"), ""
 
 
 async def _handle_buyer_approval(query, context, alert_id: int):
@@ -5137,7 +5150,17 @@ async def _handle_buyer_approval(query, context, alert_id: int):
         return
 
     # Собственник согласовал раньше – теперь оба «да», меняем статус.
-    res = await _agree_order_in_ms(row["order_id"])
+    res, cur_state = await _agree_order_in_ms(row["order_id"])
+    if res == "ahead":
+        # Заказ за время ожидания уже ушёл дальше по конвейеру – откатывать нельзя.
+        db.close_approval_alert(alert_id, closed_by=row.get("owner_approved_by") or user.id)
+        text = new_base + f"\n\n✅ Согласовано обоими в {t} · заказ уже «{cur_state}», статус в МС не меняли"
+        db.set_approval_alert_text(alert_id, text)
+        await _edit_owner_messages(context.bot, row, text)
+        await _notify_owners(context.bot, row,
+            f"🟢 {ATTRACTED_APPROVER_DONE} привлечённые по заказу {order_name} "
+            f"({client_name}) – заказ уже «{cur_state}», статус в МС не меняли")
+        return
     if res == "fail":
         text = new_base + tail
         db.set_approval_alert_text(alert_id, text)
@@ -5160,13 +5183,14 @@ async def _finalize_two_step(query, context, alert_id: int, row: dict):
     и правим светофор у всех согласующих."""
     from notifier import _md
     user = query.from_user
-    res = await _agree_order_in_ms(row["order_id"])
+    res, cur_state = await _agree_order_in_ms(row["order_id"])
     if res == "fail":
         await query.answer("❌ Ошибка смены статуса в МС", show_alert=True)
         return
     db.close_approval_alert(alert_id, closed_by=user.id)
     base = (row.get("alert_text") or "").split(_OWNER_WAIT_MARK)[0]
-    text = base + f"\n\n✅ Согласовал: {_md(user.full_name)} в {_msk_hhmm()}"
+    tail = (f" · заказ уже «{cur_state}», статус в МС не меняли" if res == "ahead" else "")
+    text = base + f"\n\n✅ Согласовал: {_md(user.full_name)} в {_msk_hhmm()}{tail}"
     db.set_approval_alert_text(alert_id, text)
     if not await _edit_owner_messages(context.bot, row, text):
         try:
@@ -5225,8 +5249,6 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         except Exception:
             colors = {}
 
-    MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
-
     # --- appr_ok ---
     if action == "appr_ok":
         # Если уже закрыт — молча подтверждаем
@@ -5261,43 +5283,26 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     if action == "appr_confirm":
-        from moysklad import set_order_state, get_headers, MS_BASE
-        import aiohttp
-
-        # Idempotency: GET state перед PATCH
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{MS_BASE}/entity/customerorder/{order_id}",
-                    headers=get_headers(),
-                    params={"expand": "state"},
-                ) as r:
-                    if r.status == 200:
-                        ord_data = await r.json()
-                        cur_state_id = ord_data.get("state", {}).get("meta", {}).get(
-                            "href", "").split("/")[-1]
-                        if cur_state_id == MS_STATE_AGREED:
-                            db.close_approval_alert(alert_id, closed_by=user.id)
-                            await query.answer("Уже согласовано ✓", show_alert=False)
-                            return
-        except Exception as e:
-            logger.warning(f"appr_confirm idempotency check: {e}")
-
-        ok = await set_order_state(order_id, MS_STATE_AGREED)
-        if ok:
-            from datetime import datetime, timezone, timedelta
-            now_msk = datetime.now(timezone(timedelta(hours=3)))
+        # Одна ступень (привлечённых в заказе нет). Идемпотентность и защита от
+        # отката назад — в _agree_order_in_ms (единая точка правды).
+        res, cur_state = await _agree_order_in_ms(order_id)
+        if res == "already":
             db.close_approval_alert(alert_id, closed_by=user.id)
-            try:
-                await query.edit_message_text(
-                    query.message.text + f"\n\n✅ Согласовал: {user.full_name} в {now_msk.strftime('%H:%M')}",
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                # Если это confirmation-сообщение (без кнопок ниже) — просто отвечаем
-                await query.message.reply_text("✅ Согласовано")
-        else:
+            await query.answer("Уже согласовано ✓", show_alert=False)
+            return
+        if res == "fail":
             await query.answer("❌ Ошибка смены статуса в МС", show_alert=True)
+            return
+        db.close_approval_alert(alert_id, closed_by=user.id)
+        tail = (f" · заказ уже «{cur_state}», статус в МС не меняли" if res == "ahead" else "")
+        try:
+            await query.edit_message_text(
+                query.message.text + f"\n\n✅ Согласовал: {user.full_name} в {_msk_hhmm()}{tail}",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            # Если это confirmation-сообщение (без кнопок ниже) — просто отвечаем
+            await query.message.reply_text("✅ Согласовано" + tail)
         return
 
     # --- appr_cancel ---
