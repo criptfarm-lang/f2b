@@ -337,6 +337,43 @@ SCHEMA = {
 }
 
 
+# На Amvera msk0 связь с api.anthropic.com держится только на anthropic==0.40.0 +
+# httpx==0.27.2 (memory feedback_pin_anthropic_httpx_on_amvera): новые версии SDK
+# в этом контейнере не устанавливают соединение. Поэтому ни `thinking`, ни
+# `output_config` использовать нельзя — этот SDK их не знает. Схему просим
+# текстом и парсим сами, как это делает wazzup_classifier.
+JSON_RULE = """
+
+ФОРМАТ ОТВЕТА. Верни ТОЛЬКО JSON, без markdown-обёртки и без пояснений:
+{"action": "reply|escalate|close",
+ "text": "текст сообщения клиенту",
+ "reason": "почему так решила, одна фраза",
+ "price_claims": [{"code": "код из справочника", "name": "позиция",
+                   "price": число, "price_type": "opt|horeca|spec"}],
+ "escalate_to_owner": "что передать собственнику, если action=escalate, иначе пустая строка"}
+Если цен в сообщении нет — price_claims пустой список."""
+
+
+def parse_draft(raw: str) -> dict | None:
+    """Достаёт JSON из ответа модели. Терпим к ```json-обёртке и болтовне вокруг."""
+    txt = (raw or "").strip()
+    if txt.startswith("```"):
+        txt = txt.split("\n", 1)[1] if "\n" in txt else txt
+        txt = txt.rsplit("```", 1)[0].strip()
+        if txt.startswith("json"):
+            txt = txt[4:].lstrip()
+    try:
+        return json.loads(txt)
+    except json.JSONDecodeError:
+        start, end = txt.find("{"), txt.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(txt[start:end + 1])
+            except json.JSONDecodeError:
+                return None
+        return None
+
+
 async def generate_draft(ctx: dict) -> dict | None:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
@@ -345,14 +382,19 @@ async def generate_draft(ctx: dict) -> dict | None:
     client = AsyncAnthropic(api_key=api_key)
     try:
         resp = await client.messages.create(
-            model=MODEL, max_tokens=16000,
-            thinking={"type": "adaptive"},
-            system=ctx["system"],
+            model=MODEL, max_tokens=8000,
+            system=ctx["system"] + JSON_RULE,
             messages=[{"role": "user", "content": ctx["user"]}],
-            output_config={"format": {"type": "json_schema", "schema": SCHEMA}},
         )
-        text = next(b.text for b in resp.content if b.type == "text")
-        return json.loads(text)
+        draft = parse_draft(resp.content[0].text)
+        if not draft or "text" not in draft:
+            logger.warning("sales_dialog: ответ модели не разобран: %r", (resp.content[0].text or "")[:200])
+            return None
+        draft.setdefault("action", "reply")
+        draft.setdefault("price_claims", [])
+        draft.setdefault("reason", "")
+        draft.setdefault("escalate_to_owner", "")
+        return draft
     except Exception as e:
         logger.warning("sales_dialog: генерация не удалась: %s: %s", type(e).__name__, e)
         return None
@@ -539,6 +581,7 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
     ctx = await build_context(db, session, row)
     draft = await generate_draft(ctx)
     if not draft:
+        _heartbeat(db, f"генерация не дала результата, lead={row['lead_id']}")
         return
     problems = (check_prices(draft, ctx["prices"], allowed_numbers(ctx.get("city")))
                 + check_style(draft.get("text") or ""))

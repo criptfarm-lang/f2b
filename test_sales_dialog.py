@@ -251,3 +251,25 @@ def test_already_handled_draft_is_not_sent_twice():
     db = FakeDB({"msg": _msg(verdict="sent")})
     ok, info = asyncio.run(_do_send(db, 7, "текст"))
     assert not ok and "уже обработан" in info
+
+
+# ── разбор ответа модели (SDK 0.40.0 без structured outputs) ─────────────────
+def test_parse_plain_json():
+    from sales_dialog import parse_draft
+    assert parse_draft('{"action":"reply","text":"привет"}')["text"] == "привет"
+
+
+def test_parse_markdown_wrapped():
+    from sales_dialog import parse_draft
+    assert parse_draft('```json\n{"action":"reply","text":"привет"}\n```')["action"] == "reply"
+
+
+def test_parse_with_surrounding_chatter():
+    from sales_dialog import parse_draft
+    assert parse_draft('Вот ответ: {"action":"reply","text":"привет"} — готово')["text"] == "привет"
+
+
+def test_parse_garbage_returns_none():
+    from sales_dialog import parse_draft
+    assert parse_draft("совсем не json") is None
+    assert parse_draft("") is None
