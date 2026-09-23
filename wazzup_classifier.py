@@ -476,8 +476,16 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
                     )
                 except Exception as e:
                     logger.warning(f"wazzup_classifier: assortment_requests insert failed: {e}")
-                if bot_app is not None:
-                    await _send_request_alert(bot_app, db, m, result)
+                # TG-алерт собственнику ОТКЛЮЧЁН 23.09.2026 по прямому указанию
+                # («запросы по номенклатуре больше мне в личку не отправляй»).
+                # Заявка по-прежнему пишется в procurement.assortment_requests
+                # и видна в дашборде закупок — теряется только триаж кнопками
+                # «В работу / Контроль / Наш ас-т / Ложный» из TG.
+                # Вернуть = раскомментировать вызов ниже (получатель в
+                # _send_request_alert — OWNER_CHAT_ID; чтобы слать закупщику,
+                # менять там же).
+                # if bot_app is not None:
+                #     await _send_request_alert(bot_app, db, m, result)
         except Exception as e:
             logger.warning(f"wazzup_classifier: db save failed for {m['message_id']}: {e}")
             stats["errors"] += 1
