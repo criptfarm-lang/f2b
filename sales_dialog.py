@@ -35,7 +35,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "edit-by-reply"
+CODE_VERSION = "history-all-chats"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -44,8 +44,9 @@ ANTHROPIC_VERSION = "2023-06-01"
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 AMO_BASE = f"https://{os.getenv('AMO_SUBDOMAIN', 'victorfishtobiz')}.amocrm.ru/api/v4"
 
-# Сколько последних сообщений чата отдаём модели.
-HISTORY_LIMIT = 25
+# Сколько последних сообщений отдаём модели. 25 было мало: в переговорах
+# на два месяца требования клиента оставались за пределом окна.
+HISTORY_LIMIT = 60
 # Прайс обновляем не чаще раза в час — он меняется редко, а позиций под две сотни.
 PRICE_TTL_SEC = 3600
 
@@ -256,10 +257,18 @@ def _known_names(db, row: dict, lead: dict) -> list:
     return out
 
 
-def _history(db, chat_id: str) -> list:
-    rows = db._fetchall("""SELECT sent_at, is_outbound, COALESCE(text,'') AS text
-                           FROM wazzup_messages WHERE chat_id=%s
-                           ORDER BY sent_at DESC LIMIT %s""", (chat_id, HISTORY_LIMIT))
+def _history(db, chats: list) -> list:
+    """Переписка по ВСЕМ чатам лида, слитая в одну ленту по времени.
+
+    У части клиентов разговор идёт в двух чатах сразу – с разными людьми одной
+    компании. Айс Фиш 23.09.2026: в одном чате технолог месяц объясняла, что ей
+    нужен тузлучный посол и потолок 1500 ₽, в другом закупщик отказывался от
+    временного сотрудничества. Агент видел один чат из двух и написал мимо.
+    """
+    rows = db._fetchall("""SELECT sent_at, is_outbound, chat_id, COALESCE(text,'') AS text
+                           FROM wazzup_messages WHERE chat_id = ANY(%s)
+                           ORDER BY sent_at DESC LIMIT %s""",
+                        (list(chats), HISTORY_LIMIT))
     return list(reversed(rows))
 
 
@@ -327,9 +336,18 @@ def _format_prices(rows: list) -> str:
 async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
     """Готовит всё, что уходит в модель. Переписка — обезличенная."""
     lead = await _amo_lead(session, row["lead_id"])
-    history = _history(db, row["chat_id"])
+    lead_row = db._fetchone("""SELECT all_chat_ids FROM sales_dialog_leads
+                               WHERE campaign=%s AND lead_id=%s""",
+                            (row["campaign"], row["lead_id"]))
+    chats = (lead_row or {}).get("all_chat_ids") or [row["chat_id"]]
+    history = _history(db, chats)
+    # Ветки помечаем, только когда их правда несколько: иначе лишний шум в промпте.
+    branches = {h.get("chat_id") for h in history if h.get("chat_id")}
+    order = {cid: i + 1 for i, cid in enumerate(sorted(branches))}
     raw = "\n".join(
-        f"[{h['sent_at']:%d.%m %H:%M}] {'МЕНЕДЖЕР' if h['is_outbound'] else 'КЛИЕНТ'}: {h['text']}"
+        (f"[{h['sent_at']:%d.%m %H:%M}]"
+         + (f"[ветка {order.get(h.get('chat_id'), 1)}]" if len(branches) > 1 else "")
+         + f" {'МЕНЕДЖЕР' if h['is_outbound'] else 'КЛИЕНТ'}: {h['text']}")
         for h in history)
     names = _known_names(db, row, lead)
     safe = anonymize(raw, contact_name=names[0] if names else None, extra_names=names[1:])
