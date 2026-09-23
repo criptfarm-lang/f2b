@@ -455,8 +455,10 @@ def _pending_silent(db, campaign: str, silent_days: int) -> list:
 
     Без этой ветки агент только реагировал бы на новые сообщения и никогда не
     возвращался к молчащим лидам, а именно там и лежит потерянная выручка.
-    Повтор исключён условием «по лиду ещё нет ни одного черновика»: следующий
-    ход будет уже через `_pending_inbound`, когда клиент ответит.
+    Повтор исключён условием «по лиду ещё нет черновика»: следующий ход будет
+    уже через `_pending_inbound`, когда клиент ответит. Протухшие черновики
+    (`expired`) не в счёт — по ним клиенту ничего не ушло, значит лид не должен
+    из-за них замолчать навсегда.
     """
     return db._fetchall("""
         SELECT l.campaign, l.lead_id, l.contact_id, l.chat_id, l.chat_type,
@@ -470,7 +472,8 @@ def _pending_silent(db, campaign: str, silent_days: int) -> list:
               < now() - (%s || ' days')::interval
           AND NOT EXISTS (
               SELECT 1 FROM sales_dialog_messages d
-              WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id)
+              WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
+                AND d.verdict <> 'expired')
     """, (campaign, str(silent_days)))
 
 
