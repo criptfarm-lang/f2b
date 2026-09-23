@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 MSK = timezone(timedelta(hours=3))
 MODEL = "claude-opus-5"
-PROMPT_VERSION = "sales-dialog-v6"
+PROMPT_VERSION = "sales-dialog-v7"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -83,6 +83,7 @@ def ensure_tables(db) -> None:
         draft_text         TEXT,
         action             TEXT,
         reason             TEXT,
+        need_check         TEXT,
         price_claims       JSONB,
         model              TEXT,
         prompt_version     TEXT,
@@ -357,7 +358,8 @@ JSON_RULE = """
  "reason": "почему так решила, одна фраза",
  "price_claims": [{"code": "код из справочника", "name": "позиция",
                    "price": число, "price_type": "opt|horeca|spec"}],
- "escalate_to_owner": "что передать собственнику, если action=escalate, иначе пустая строка"}
+ "escalate_to_owner": "что передать собственнику, если action=escalate, иначе пустая строка",
+ "need_check": "что ты обещала уточнить, если обещала; иначе пустая строка"}
 Если цен в сообщении нет — price_claims пустой список."""
 
 
@@ -433,6 +435,7 @@ async def generate_draft(ctx: dict, db=None) -> dict | None:
         draft.setdefault("price_claims", [])
         draft.setdefault("reason", "")
         draft.setdefault("escalate_to_owner", "")
+        draft.setdefault("need_check", "")
         return draft
     except Exception as e:
         logger.warning("sales_dialog: генерация не удалась: %s: %s", type(e).__name__, e)
@@ -645,12 +648,12 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
 
     saved = db._fetchone("""INSERT INTO sales_dialog_messages
         (campaign, lead_id, chat_id, inbound_message_id, inbound_text, draft_text,
-         action, reason, price_claims, model, prompt_version, verdict)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'draft')
+         action, reason, need_check, price_claims, model, prompt_version, verdict)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'draft')
         ON CONFLICT (inbound_message_id, prompt_version) DO NOTHING
         RETURNING id""",
         (campaign, row["lead_id"], row["chat_id"], row["message_id"], row["inbound_text"],
-         draft.get("text"), action, draft.get("reason"),
+         draft.get("text"), action, draft.get("reason"), draft.get("need_check"),
          json.dumps(draft.get("price_claims"), ensure_ascii=False), MODEL, PROMPT_VERSION))
     db._execute("""UPDATE sales_dialog_leads SET last_inbound_at=%s
                    WHERE campaign=%s AND lead_id=%s""", (row["sent_at"], campaign, row["lead_id"]))
@@ -683,8 +686,12 @@ def _card_text(db, msg: dict) -> str:
     else:
         head += "\n\nДиалог затих, агент пишет первым."
     if msg.get("action") == "escalate":
-        return f"{head}\n\nАгент не берётся отвечать сам: {msg.get('reason', '')}\n\nЕго черновик:\n{msg.get('draft_text', '')}"
-    return f"{head}\n\nОтвет от имени Инессы:\n{msg.get('draft_text', '')}"
+        return (f"{head}\n\nАгент не берётся отвечать сам: {msg.get('reason', '')}"
+                f"\n\nЕго черновик:\n{msg.get('draft_text', '')}")
+    tail = ""
+    if msg.get("need_check"):
+        tail = f"\n\nОбещала уточнить: {msg['need_check']}"
+    return f"{head}\n\nОтвет от имени Инессы:\n{msg.get('draft_text', '')}{tail}"
 
 
 def _keyboard(row_id: int, action: str):
