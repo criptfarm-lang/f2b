@@ -41,7 +41,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "inbound-first"
+CODE_VERSION = "inbound-first-start25"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -1002,6 +1002,12 @@ async def _tick_campaign(app, db, campaign: str) -> None:
         return
     now = datetime.now(MSK)
     if not in_window(now, cfg):
+        return
+    # Отложенный старт: кампанию можно держать включённой, но не давать ей
+    # работать до нужного дня — пересборка промпта закончилась вечером, а
+    # начинать договорились утром.
+    not_before = cfg.get("not_before_date")
+    if not_before and now.date().isoformat() < not_before:
         return
 
     # Ответ клиента идёт вне очереди: он ждать не должен (собственник 24.09.2026).
