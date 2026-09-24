@@ -31,11 +31,16 @@ from reactivation_campaign import CHANNEL_IDS, WAZZUP_API_URL
 logger = logging.getLogger(__name__)
 
 MSK = timezone(timedelta(hours=3))
+# Кому агент передаёт лид кнопкой «Передать Инессе».
+INESSA_AMO_USER = 11544494
+INESSA_TG_CHAT = 1435133158        # moysklad.PDZ_MANAGER_TG_IDS["скляр"]
+ATTRACT_PIPELINE = 10873622        # воронка ПРИВЛЕЧЕНИЕ
+ATTRACT_FIRST_STATUS = 85554794    # этап «Первичный контакт»
 MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "bargain-floors"
+CODE_VERSION = "hand-real"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -223,6 +228,66 @@ async def _ms_price_rows(session: aiohttp.ClientSession) -> list:
     _price_cache.update({"at": now, "rows": out})
     logger.info("sales_dialog: прайс обновлён, позиций %s", len(out))
     return out
+
+
+async def _amo_write(session: aiohttp.ClientSession, path: str, payload, method: str = "PATCH"):
+    token = os.getenv("AMO_ACCESS_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        async with session.request(method, f"{AMO_BASE}{path}", headers=headers, json=payload,
+                                   timeout=aiohttp.ClientTimeout(total=40)) as r:
+            body = (await r.text())[:300]
+            if r.status not in (200, 201):
+                logger.warning("sales_dialog: amo %s %s → %s %s", method, path, r.status, body)
+            return r.status in (200, 201)
+    except Exception as e:
+        logger.warning("sales_dialog: amo %s %s: %s", method, path, e)
+        return False
+
+
+async def hand_to_manager(app, db, msg: dict) -> str:
+    """Передача лида Инессе: ответственный, воронка, задача и сообщение ей в Telegram.
+
+    Кнопка называется «Передать Инессе», значит передавать надо по-настоящему:
+    до 24.09.2026 она только заставляла агента замолчать, а человек об этом
+    не узнавал, и клиент оставался без ответа.
+    """
+    lead_id = msg["lead_id"]
+    lead = db._fetchone("""SELECT lead_name, contact_name, chat_type FROM sales_dialog_leads
+                           WHERE campaign=%s AND lead_id=%s""", (msg["campaign"], lead_id))
+    done = []
+    async with aiohttp.ClientSession() as session:
+        ok = await _amo_write(session, f"/leads/{lead_id}",
+                              {"pipeline_id": ATTRACT_PIPELINE, "status_id": ATTRACT_FIRST_STATUS,
+                               "responsible_user_id": INESSA_AMO_USER})
+        done.append("сделка у Инессы" if ok else "сделку передать не вышло")
+
+        full = await _amo_lead(session, lead_id)
+        contacts = [c["id"] for c in ((full.get("_embedded") or {}).get("contacts") or [])]
+        if contacts:
+            ok_c = await _amo_write(session, "/contacts",
+                                    [{"id": c, "responsible_user_id": INESSA_AMO_USER} for c in contacts])
+            done.append("контакты переданы" if ok_c else "контакты передать не вышло")
+
+        till = int((datetime.now(MSK) + timedelta(hours=3)).timestamp())
+        ok_t = await _amo_write(session, "/tasks", [{
+            "entity_id": lead_id, "entity_type": "leads", "responsible_user_id": INESSA_AMO_USER,
+            "task_type_id": 1, "complete_till": till,
+            "text": "Ответить клиенту: диалог передан от агента"}], method="POST")
+        done.append("задача поставлена" if ok_t else "задачу поставить не вышло")
+
+    who = (lead or {}).get("lead_name") or f"сделка {lead_id}"
+    text = (f"Передаю тебе диалог: {who}\n"
+            f"https://{os.getenv('AMO_SUBDOMAIN', 'victorfishtobiz')}.amocrm.ru/leads/detail/{lead_id}\n\n"
+            f"Последнее от клиента: {(msg.get('inbound_text') or '—')[:300]}\n\n"
+            f"Что готовил агент (не отправлено):\n{(msg.get('draft_text') or '—')[:600]}")
+    try:
+        await app.bot.send_message(INESSA_TG_CHAT, text)
+        done.append("Инессе написали")
+    except Exception as e:
+        logger.warning("sales_dialog: сообщение Инессе не ушло lead=%s: %s", lead_id, e)
+        done.append("сообщение в Telegram не ушло")
+    return ", ".join(done)
 
 
 async def _amo_lead(session: aiohttp.ClientSession, lead_id: int) -> dict:
@@ -1074,12 +1139,16 @@ def register(app, db) -> None:
             db._execute("UPDATE sales_dialog_messages SET verdict='skipped' WHERE id=%s", (row_id,))
             await q.edit_message_text(base + "\n\n[не отвечаем]")
         elif action == "hand":
-            msg = db._fetchone("SELECT campaign, lead_id FROM sales_dialog_messages WHERE id=%s", (row_id,))
+            msg = db._fetchone("SELECT * FROM sales_dialog_messages WHERE id=%s", (row_id,))
             db._execute("UPDATE sales_dialog_messages SET verdict='handed' WHERE id=%s", (row_id,))
             if msg:
                 db._execute("""UPDATE sales_dialog_leads SET status='handed'
                                WHERE campaign=%s AND lead_id=%s""", (msg["campaign"], msg["lead_id"]))
-            await q.edit_message_text(base + "\n\n[передано Инессе, агент по этому лиду молчит]")
+                await q.answer("Передаю…")
+                what = await hand_to_manager(app, db, msg)
+            else:
+                what = "черновик не найден"
+            await q.edit_message_text(base + f"\n\n[передано Инессе: {what}. Агент по этому лиду молчит]")
         elif action == "edit":
             context.user_data["sd_edit_row"] = (row_id, datetime.now(timezone.utc))
             await q.edit_message_text(base + "\n\n[жду твой текст — ответом на карточку "

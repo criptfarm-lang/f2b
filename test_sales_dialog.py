@@ -228,6 +228,47 @@ def test_bargain_without_floor_is_escalated(monkeypatch):
     assert problems and "http 500" in problems[0]
 
 
+class FakeBot:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id, text, **kw):
+        self.sent.append((chat_id, text))
+
+
+class FakeApp:
+    def __init__(self):
+        self.bot = FakeBot()
+
+
+def test_hand_to_manager_writes_and_pings(monkeypatch):
+    """Передача лида: правки в amoCRM плюс сообщение Инессе с контекстом."""
+    calls = []
+
+    async def fake_write(session, path, payload, method="PATCH"):
+        calls.append((method, path))
+        return True
+
+    async def fake_lead(session, lead_id):
+        return {"_embedded": {"contacts": [{"id": 555}]}}
+
+    monkeypatch.setattr(sales_dialog, "_amo_write", fake_write)
+    monkeypatch.setattr(sales_dialog, "_amo_lead", fake_lead)
+    app = FakeApp()
+    db = FakeDB({"lead": {"lead_name": "ИП Волков", "contact_name": "Пётр", "chat_type": "max"}})
+    msg = _msg(lead_id=44548679, inbound_text="дайте цену на треску",
+               draft_text="Треска лойн – 1630 ₽/кг.")
+    what = asyncio.run(sales_dialog.hand_to_manager(app, db, msg))
+
+    assert ("PATCH", "/leads/44548679") in calls
+    assert ("PATCH", "/contacts") in calls
+    assert ("POST", "/tasks") in calls
+    chat_id, text = app.bot.sent[0]
+    assert chat_id == sales_dialog.INESSA_TG_CHAT
+    assert "44548679" in text and "дайте цену на треску" in text
+    assert "Инессе написали" in what
+
+
 # ── карточка подтверждения и отправка ─────────────────────────────────────────
 class FakeDB:
     """Заглушка БД: отдаёт заранее заданные строки, запоминает UPDATE-и."""
