@@ -40,6 +40,7 @@ from moysklad import (
     load_supplier_card,
     compute_supply_dates,
 )
+import supply_request_match as srm
 
 logger = logging.getLogger(__name__)
 
@@ -183,8 +184,19 @@ def _worst(colors: list[str]) -> str:
     return max(present, key=lambda c: rank[c]) if present else "white"
 
 
-async def _compute_position_blocks(order: dict) -> list[dict]:
-    """По каждой товарной позиции — оборот и цена (параллельно, с общим таймаутом)."""
+def _load_requests_safe() -> list[dict] | None:
+    """Заявки менеджеров за окно — один запрос на весь заказ. None — БД недоступна
+    (тогда блок «Заявка» не выводим вовсе, а не пугаем ложным красным)."""
+    try:
+        return srm.load_recent_requests(_db())
+    except Exception as e:
+        logger.warning(f"supply_svetofor: заявки не прочитаны: {e}")
+        return None
+
+
+async def _compute_position_blocks(order: dict, requests: list[dict] | None = None) -> list[dict]:
+    """По каждой товарной позиции — оборот и цена (параллельно, с общим таймаутом),
+    плюс блок «Заявка» (локальный расчёт по уже загруженным заявкам)."""
     positions = (order.get("positions") or {}).get("rows", []) or []
     goods = []
     for p in positions:
@@ -194,6 +206,8 @@ async def _compute_position_blocks(order: dict) -> list[dict]:
         goods.append({
             "pid": a.get("id"),
             "name": a.get("name", ""),
+            "path": a.get("pathName") or "",
+            "uom": ((a.get("uom") or {}).get("name") or ""),
             "qty": p.get("quantity") or 0,
             "price": (p.get("price", 0) or 0) / 100,
         })
@@ -212,8 +226,17 @@ async def _compute_position_blocks(order: dict) -> list[dict]:
             logger.warning(f"price fail {g['name']}: {price!r}")
             price = {"color": "yellow", "found": False, "last_price": None,
                      "diff_rub": 0, "diff_pct": 0}
+        # Блок «Заявка» — только по привлечённым товарам (сырьё и ГП заявками
+        # не сопровождаются, красный там был бы шумом).
+        req_block = None
+        if requests is not None and srm.is_attracted(g.get("path")):
+            try:
+                req_block = srm.match_position(g["name"], g["qty"], g["price"],
+                                               requests, uom=g.get("uom"))
+            except Exception as e:
+                logger.warning(f"request match fail {g['name']}: {e!r}")
         # g уже содержит числовой "price" (цена в заказе) — ценовой блок кладём отдельным ключом.
-        return {**g, "turn": turn, "price_block": price}
+        return {**g, "turn": turn, "price_block": price, "req_block": req_block}
 
     try:
         results = await asyncio.wait_for(
@@ -291,10 +314,16 @@ def _build_supply_alert_text(order: dict, pos_blocks: list[dict],
     else:
         lines.append("\n*Позиции:*")
         for b in pos_blocks[:_MAX_POS_SHOWN]:
-            t = b["turn"]; pr = b["price_block"]
+            t = b["turn"]; pr = b["price_block"]; rq = b.get("req_block")
             chilled = " ❄️" if is_chilled_position(b["name"]) else ""
             name = (b["name"] or "")[:52]
-            lines.append(f"{_icon(_worst([t['color'], pr['color']]))} {name}{chilled} — {_fmt_qty(b['qty'])} кг")
+            pos_colors = [t["color"], pr["color"]]
+            if rq:
+                pos_colors.append(rq["color"])
+            lines.append(f"{_icon(_worst(pos_colors))} {name}{chilled} — {_fmt_qty(b['qty'])} кг")
+            # Заявка (только привлечённые товары)
+            if rq:
+                lines.append(srm.format_line(rq, _icon))
             # Оборот
             if t.get("days") is None:
                 lines.append("   Оборот: ⚪ нет расхода за 60 дн — смотреть вручную")
@@ -389,7 +418,8 @@ async def check_supply_approval_needed(order: dict, app) -> bool:
         {"contact_person": "", "max": "", "telegram": "", "whatsapp": "", "site": "",
          "contract_signed": False, "contract_number": "", "signer_role": "", "signer_name": ""}
     dates = compute_supply_dates(order)
-    pos_blocks = await _compute_position_blocks(order)
+    requests = _load_requests_safe()
+    pos_blocks = await _compute_position_blocks(order, requests)
 
     text = _build_supply_alert_text(order, pos_blocks, card, dates)
 

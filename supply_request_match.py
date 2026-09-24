@@ -299,6 +299,7 @@ def match_position(name: str, qty: float, price: float, requests: list[dict],
     markup_pct = None
     if non_kg:
         price_target = price_min = None
+        price_note = ""
     elif price_target and price and price > 0:
         markup_pct = (price_target - price) / price * 100
         if markup_pct >= MARKUP_GREEN_PCT:
@@ -307,7 +308,10 @@ def match_position(name: str, qty: float, price: float, requests: list[dict],
             colors.append("yellow")
         else:
             colors.append("red")
-    price_note = "" if price_target else "цены в заявке нет"
+    if non_kg:
+        price_note = ""
+    else:
+        price_note = "" if price_target else "цены в заявке нет"
 
     rank = {"red": 3, "yellow": 2, "green": 1, "white": 0}
     color = max(colors, key=lambda c: rank[c])
