@@ -51,7 +51,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "photo-and-cut"
+CODE_VERSION = "batches-by-date"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -129,6 +129,10 @@ def ensure_tables(db) -> None:
     # Кому вернуть лид, когда агент его раскачает.
     db._execute("""ALTER TABLE sales_dialog_leads
                    ADD COLUMN IF NOT EXISTS prev_responsible_user_id BIGINT""")
+    # Дата, раньше которой лид в работу не берём: пул набирается впрок, а
+    # разбирается по столько в день, сколько человек успевает утвердить.
+    db._execute("""ALTER TABLE sales_dialog_leads
+                   ADD COLUMN IF NOT EXISTS activate_on DATE""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_leads_status_idx
                    ON sales_dialog_leads (campaign, status)""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_messages_lead_idx
@@ -1018,6 +1022,8 @@ def _pending_silent(db, campaign: str, silent_days: int,
             ORDER BY w.sent_at DESC LIMIT 1
         ) lastin ON true
         WHERE l.campaign = %s AND l.status = 'active'
+          AND (l.activate_on IS NULL
+               OR l.activate_on <= (now() AT TIME ZONE 'Europe/Moscow')::date)
           AND (SELECT max(w.sent_at) AT TIME ZONE 'UTC' FROM wazzup_messages w
                 WHERE w.chat_id = ANY(c.ids)) < now() - (%s || ' days')::interval
           AND (SELECT count(*) FROM sales_dialog_messages d
