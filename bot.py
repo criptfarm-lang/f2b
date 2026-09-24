@@ -7974,6 +7974,13 @@ def main():
             saved = 0
             for msg in messages:
                 text = msg.get("text", "")
+                # Вложение без подписи: раньше такие сообщения терялись целиком,
+                # и фото от клиента не попадало в переписку (24.09.2026).
+                content_uri = msg.get("contentUri") or ""
+                if not text and content_uri:
+                    kind = (msg.get("type") or "").lower()
+                    text = {"image": "[фото]", "video": "[видео]", "audio": "[голосовое]",
+                            "document": "[документ]"}.get(kind, "[вложение]")
                 chat_type = msg.get("chatType", "")
                 chat_id_val = msg.get("chatId", "")
                 channel_id_val = msg.get("channelId", "")
@@ -8130,6 +8137,7 @@ def main():
                     text=text,
                     is_outbound=is_outbound,
                     sent_at=sent_at,
+                    content_uri=content_uri,
                 )
                 if ok:
                     saved += 1

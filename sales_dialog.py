@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -50,7 +51,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "hand-back-to-owner"
+CODE_VERSION = "photo-and-cut"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -438,6 +439,42 @@ def winning_openers(db, campaign: str, hours: int = 48, limit: int = 5) -> str:
     return "\n".join("— " + (r["t"] or "").strip().split("\n")[0][:110] for r in rows if r["t"])
 
 
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
+IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+
+
+async def fetch_client_images(session: aiohttp.ClientSession, history: list, limit: int = 2) -> list:
+    """Фото, которые прислал клиент, — модели они нужны глазами.
+
+    Собственник 24.09.2026: когда клиент говорит «беру Трим С дешевле», дело
+    почти всегда в фактической разделке и размере пласта, а не в цене как
+    таковой. Правильный ход — попросить фото и предложить аналог по нему,
+    поэтому присланные фото уходят в модель вместе с перепиской.
+    """
+    out = []
+    for h in reversed(history):
+        if len(out) >= limit:
+            break
+        if h.get("is_outbound") or not h.get("content_uri"):
+            continue
+        try:
+            async with session.get(h["content_uri"], timeout=aiohttp.ClientTimeout(total=40)) as r:
+                if r.status != 200:
+                    continue
+                ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if ctype not in IMAGE_TYPES:
+                    continue
+                raw = await r.content.read(MAX_IMAGE_BYTES + 1)
+                if len(raw) > MAX_IMAGE_BYTES:
+                    continue
+        except Exception as e:
+            logger.warning("sales_dialog: вложение не скачалось: %s", e)
+            continue
+        out.append({"type": "image", "source": {"type": "base64", "media_type": ctype,
+                                                "data": base64.b64encode(raw).decode()}})
+    return out
+
+
 def recent_openers(db, campaign: str, limit: int = 12) -> str:
     """Первые строки последних отправленных сообщений — чтобы не повторяться.
 
@@ -486,7 +523,8 @@ def _history(db, chats: list) -> list:
     нужен тузлучный посол и потолок 1500 ₽, в другом закупщик отказывался от
     временного сотрудничества. Агент видел один чат из двух и написал мимо.
     """
-    rows = db._fetchall("""SELECT sent_at, is_outbound, chat_id, COALESCE(text,'') AS text
+    rows = db._fetchall("""SELECT sent_at, is_outbound, chat_id, COALESCE(text,'') AS text,
+                                  content_uri
                            FROM wazzup_messages WHERE chat_id = ANY(%s)
                            ORDER BY sent_at DESC LIMIT %s""",
                         (list(chats), HISTORY_LIMIT))
@@ -621,8 +659,10 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
 {objections}
 
 Напиши сообщение клиенту."""
+    images = await fetch_client_images(session, history)
     return {"system": (PROMPTS_DIR / "sales_dialog_system.md").read_text(encoding="utf-8"),
-            "user": user, "leaks": leaks, "prices": {p["code"]: p for p in prices},
+            "user": user, "images": images, "leaks": leaks,
+            "prices": {p["code"]: p for p in prices},
             "last_inbound": last_in, "names": names, "city": city}
 
 
@@ -709,9 +749,10 @@ async def generate_draft(ctx: dict, db=None) -> dict | None:
     if not api_key:
         logger.error("sales_dialog: ANTHROPIC_API_KEY не задан")
         return None
+    content = [{"type": "text", "text": ctx["user"]}] + list(ctx.get("images") or [])
     payload = {"model": MODEL, "max_tokens": 8000,
                "system": ctx["system"] + JSON_RULE,
-               "messages": [{"role": "user", "content": ctx["user"]}]}
+               "messages": [{"role": "user", "content": content}]}
     headers = {"x-api-key": api_key, "anthropic-version": ANTHROPIC_VERSION,
                "content-type": "application/json"}
     try:

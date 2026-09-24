@@ -2276,18 +2276,25 @@ class Database:
     def save_wazzup_message(self, message_id: str, channel_id: str, chat_type: str,
                             chat_id: str, contact_name: str, manager_id: str,
                             manager_name: str, text: str, is_outbound: bool,
-                            sent_at: str) -> bool:
-        """Сохраняет сообщение из Wazzup. Возвращает True если новое."""
+                            sent_at: str, content_uri: str = "") -> bool:
+        """Сохраняет сообщение из Wazzup. Возвращает True если новое.
+
+        `content_uri` — ссылка на вложение. До 24.09.2026 сообщения без текста
+        не сохранялись вовсе, и присланное клиентом фото исчезало из переписки:
+        агент не знал, что оно было.
+        """
         try:
             with self.conn.cursor() as cur:
+                cur.execute("""ALTER TABLE wazzup_messages
+                               ADD COLUMN IF NOT EXISTS content_uri TEXT""")
                 cur.execute(
                     """INSERT INTO wazzup_messages
                        (message_id, channel_id, chat_type, chat_id, contact_name,
-                        manager_id, manager_name, text, is_outbound, sent_at)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        manager_id, manager_name, text, is_outbound, sent_at, content_uri)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                        ON CONFLICT (message_id) DO NOTHING RETURNING id""",
                     (message_id, channel_id, chat_type, chat_id, contact_name,
-                     manager_id, manager_name, text, is_outbound, sent_at)
+                     manager_id, manager_name, text, is_outbound, sent_at, content_uri or None)
                 )
                 row = cur.fetchone()
                 self.conn.commit()
