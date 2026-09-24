@@ -243,7 +243,7 @@ class FakeApp:
 
 
 def test_hand_to_manager_writes_and_pings(monkeypatch):
-    """Передача лида: правки в amoCRM плюс сообщение Инессе с контекстом."""
+    """Передача лида: правки в amoCRM плюс сообщение менеджеру с контекстом."""
     calls = []
 
     async def fake_write(session, path, payload, method="PATCH"):
@@ -256,7 +256,12 @@ def test_hand_to_manager_writes_and_pings(monkeypatch):
     monkeypatch.setattr(sales_dialog, "_amo_write", fake_write)
     monkeypatch.setattr(sales_dialog, "_amo_lead", fake_lead)
     app = FakeApp()
-    db = FakeDB({"lead": {"lead_name": "ИП Волков", "contact_name": "Пётр", "chat_type": "max"}})
+    async def fake_active(session, uid):
+        return True
+
+    monkeypatch.setattr(sales_dialog, "_amo_user_active", fake_active)
+    db = FakeDB({"lead": {"lead_name": "ИП Волков", "contact_name": "Пётр", "chat_type": "max",
+                          "prev_responsible_user_id": None}})
     msg = _msg(lead_id=44548679, inbound_text="дайте цену на треску",
                draft_text="Треска лойн – 1630 ₽/кг.")
     what = asyncio.run(sales_dialog.hand_to_manager(app, db, msg))
@@ -267,7 +272,7 @@ def test_hand_to_manager_writes_and_pings(monkeypatch):
     chat_id, text = app.bot.sent[0]
     assert chat_id == sales_dialog.INESSA_TG_CHAT
     assert "44548679" in text and "дайте цену на треску" in text
-    assert "Инессе написали" in what
+    assert "менеджеру написали" in what
 
 
 # ── карточка подтверждения и отправка ─────────────────────────────────────────
@@ -324,7 +329,7 @@ def test_escalated_card_has_no_send_button():
     kb = _keyboard(7, "escalate")
     labels = [b.text for row in kb.inline_keyboard for b in row]
     assert "Отправить" not in labels
-    assert "Передать Инессе" in labels
+    assert "Вернуть менеджеру" in labels
 
 
 def test_normal_card_has_send_button():
@@ -440,6 +445,58 @@ def test_draft_sent_when_no_new_inbound():
     finally:
         sales_dialog._deliver = orig
     assert ok is True and sent["text"] == "текст"
+
+
+def test_hand_returns_to_previous_manager(monkeypatch):
+    """Раскачанный лид возвращается тому менеджеру, который вёл его до агента."""
+    calls = []
+
+    async def fake_write(session, path, payload, method="PATCH"):
+        calls.append((method, path, payload))
+        return True
+
+    async def fake_lead(session, lead_id):
+        return {"_embedded": {"contacts": []}}
+
+    async def fake_active(session, uid):
+        return True
+
+    monkeypatch.setattr(sales_dialog, "_amo_write", fake_write)
+    monkeypatch.setattr(sales_dialog, "_amo_lead", fake_lead)
+    monkeypatch.setattr(sales_dialog, "_amo_user_active", fake_active)
+    app = FakeApp()
+    db = FakeDB({"lead": {"lead_name": "ИП Волков", "chat_type": "max",
+                          "prev_responsible_user_id": 12625622}})      # Баласанян
+    asyncio.run(sales_dialog.hand_to_manager(app, db, _msg()))
+    lead_patch = next(p for m, path, p in calls if path.startswith("/leads/"))
+    assert lead_patch["responsible_user_id"] == 12625622
+    assert app.bot.sent[0][0] == sales_dialog.MANAGER_TG[12625622]
+
+
+def test_hand_falls_back_to_inessa_if_manager_left(monkeypatch):
+    """Менеджер уволен — лид уходит Инессе, а не в пустоту."""
+    calls = []
+
+    async def fake_write(session, path, payload, method="PATCH"):
+        calls.append((method, path, payload))
+        return True
+
+    async def fake_lead(session, lead_id):
+        return {"_embedded": {"contacts": []}}
+
+    async def fake_active(session, uid):
+        return False
+
+    monkeypatch.setattr(sales_dialog, "_amo_write", fake_write)
+    monkeypatch.setattr(sales_dialog, "_amo_lead", fake_lead)
+    monkeypatch.setattr(sales_dialog, "_amo_user_active", fake_active)
+    app = FakeApp()
+    db = FakeDB({"lead": {"lead_name": "ИП Волков", "chat_type": "max",
+                          "prev_responsible_user_id": 13553106}})      # уволенный
+    what = asyncio.run(sales_dialog.hand_to_manager(app, db, _msg()))
+    lead_patch = next(p for m, path, p in calls if path.startswith("/leads/"))
+    assert lead_patch["responsible_user_id"] == sales_dialog.INESSA_AMO_USER
+    assert "не работает" in what
 
 
 def test_expired_draft_is_not_sent():

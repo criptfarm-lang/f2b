@@ -171,6 +171,35 @@ def norm_caliber(*parts: str | None) -> str | None:
     return None
 
 
+def caliber_fits(a: str | None, b: str | None) -> bool:
+    """Совпадают ли калибры. Диапазоны считаем одинаковыми, если они существенно
+    перекрываются (≥50% меньшего): «30-40» и «30/45» — один товар, а «10-20» и
+    «20-40» (молодой осьминог против крупного) — разные."""
+    if not a or not b:
+        return True
+    if a == b:
+        return True
+    ra, rb = _caliber_range(a), _caliber_range(b)
+    if not ra or not rb:
+        return False
+    lo = max(ra[0], rb[0])
+    hi = min(ra[1], rb[1])
+    if hi < lo:
+        return False
+    span = min(ra[1] - ra[0], rb[1] - rb[0])
+    if span <= 0:                      # точечный калибр — достаточно попадания
+        return True
+    return (hi - lo) / span >= 0.5
+
+
+def _caliber_range(c: str) -> tuple[float, float] | None:
+    m = _CALIBER_RE.search(c)
+    if not m:
+        return None
+    lo, hi = float(m.group(1)), float(m.group(2))
+    return (lo, hi) if lo <= hi else (hi, lo)
+
+
 def is_attracted(path: str | None) -> bool:
     return bool(path) and path.startswith(ATTRACTED_PREFIX)
 
@@ -248,7 +277,7 @@ def match_position(name: str, qty: float, price: float, requests: list[dict],
 
     # Признак заявки, который не задан, конфликтом не считается.
     def _fits(r: dict) -> bool:
-        if caliber and r.get("caliber") and r["caliber"] != caliber:
+        if not caliber_fits(caliber, r.get("caliber")):
             return False
         if cut and r.get("cut") and r["cut"] != cut:
             return False
@@ -269,7 +298,7 @@ def match_position(name: str, qty: float, price: float, requests: list[dict],
                 "reason": f"на «{canon}» просили другое ({', '.join(others)}), в заказе {want}"}
 
     # Заявки с совпавшим калибром — вперёд: они точнее описывают заказанное.
-    matched.sort(key=lambda r: (r.get("caliber") != caliber, r.get("created_at")), reverse=False)
+    matched.sort(key=lambda r: (r.get("caliber") != caliber, r.get("created_at")))
 
     volume_req = sum(float(r["volume_kg"]) for r in matched if r.get("volume_kg"))
     prices = [float(r["target_price_rub_kg"]) for r in matched if r.get("target_price_rub_kg")]

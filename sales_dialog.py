@@ -32,16 +32,25 @@ from reactivation_campaign import CHANNEL_IDS, WAZZUP_API_URL
 logger = logging.getLogger(__name__)
 
 MSK = timezone(timedelta(hours=3))
-# Кому агент передаёт лид кнопкой «Передать Инессе».
+# Раскачанный лид возвращается менеджеру, который вёл его до агента; если тот
+# уволен (в amoCRM `rights.is_active = false`) — Инессе (собственник 24.09.2026).
 INESSA_AMO_USER = 11544494
 INESSA_TG_CHAT = 1435133158        # moysklad.PDZ_MANAGER_TG_IDS["скляр"]
+# amoCRM id → Telegram, канон состава — moysklad.PDZ_MANAGER_TG_IDS.
+MANAGER_TG = {
+    11544494: 1435133158,          # Инесса Скляр
+    12625622: 595181729,           # Карина Баласанян
+    12788698: 8021969241,          # Елена Мерзлякова
+    13665786: 683079752,           # Денис Коликов
+    13746010: 649712597,           # Ирина Дьяченко
+}
 ATTRACT_PIPELINE = 10873622        # воронка ПРИВЛЕЧЕНИЕ
 ATTRACT_FIRST_STATUS = 85554794    # этап «Первичный контакт»
 MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "inbound-first-start25"
+CODE_VERSION = "hand-back-to-owner"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -116,6 +125,9 @@ def ensure_tables(db) -> None:
     # цифры на карточке и мог судить о торге, а не только о тексте.
     db._execute("""ALTER TABLE sales_dialog_messages
                    ADD COLUMN IF NOT EXISTS bargain JSONB""")
+    # Кому вернуть лид, когда агент его раскачает.
+    db._execute("""ALTER TABLE sales_dialog_leads
+                   ADD COLUMN IF NOT EXISTS prev_responsible_user_id BIGINT""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_leads_status_idx
                    ON sales_dialog_leads (campaign, status)""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_messages_lead_idx
@@ -246,33 +258,55 @@ async def _amo_write(session: aiohttp.ClientSession, path: str, payload, method:
         return False
 
 
-async def hand_to_manager(app, db, msg: dict) -> str:
-    """Передача лида Инессе: ответственный, воронка, задача и сообщение ей в Telegram.
+async def _amo_user_active(session: aiohttp.ClientSession, user_id: int) -> bool:
+    """Работает ли ещё этот менеджер: у уволенных в amoCRM `rights.is_active = false`."""
+    token = os.getenv("AMO_ACCESS_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        async with session.get(f"{AMO_BASE}/users/{user_id}", headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status != 200:
+                return False
+            d = await r.json()
+            return bool((d.get("rights") or {}).get("is_active"))
+    except Exception as e:
+        logger.warning("sales_dialog: проверка пользователя %s: %s", user_id, e)
+        return False
 
-    Кнопка называется «Передать Инессе», значит передавать надо по-настоящему:
-    до 24.09.2026 она только заставляла агента замолчать, а человек об этом
-    не узнавал, и клиент оставался без ответа.
+
+async def hand_to_manager(app, db, msg: dict) -> str:
+    """Возврат раскачанного лида человеку: сделка, контакты, задача и сообщение в Telegram.
+
+    Возвращаем тому менеджеру, который вёл лид до агента, — он помнит клиента и
+    его историю. Если менеджер уже не работает, лид идёт Инессе (собственник,
+    24.09.2026). До этого дня кнопка вообще ничего не передавала: ответственным
+    оставался пользователь «Эф», задачи не было, человек ничего не знал.
     """
     lead_id = msg["lead_id"]
-    lead = db._fetchone("""SELECT lead_name, contact_name, chat_type FROM sales_dialog_leads
-                           WHERE campaign=%s AND lead_id=%s""", (msg["campaign"], lead_id))
+    lead = db._fetchone("""SELECT lead_name, contact_name, chat_type, prev_responsible_user_id
+                           FROM sales_dialog_leads WHERE campaign=%s AND lead_id=%s""",
+                        (msg["campaign"], lead_id))
+    prev = (lead or {}).get("prev_responsible_user_id")
     done = []
     async with aiohttp.ClientSession() as session:
+        target = prev if prev and await _amo_user_active(session, prev) else INESSA_AMO_USER
+        if prev and target != prev:
+            done.append("прежний менеджер не работает, отдаём Инессе")
         ok = await _amo_write(session, f"/leads/{lead_id}",
                               {"pipeline_id": ATTRACT_PIPELINE, "status_id": ATTRACT_FIRST_STATUS,
-                               "responsible_user_id": INESSA_AMO_USER})
-        done.append("сделка у Инессы" if ok else "сделку передать не вышло")
+                               "responsible_user_id": target})
+        done.append("сделка передана" if ok else "сделку передать не вышло")
 
         full = await _amo_lead(session, lead_id)
         contacts = [c["id"] for c in ((full.get("_embedded") or {}).get("contacts") or [])]
         if contacts:
             ok_c = await _amo_write(session, "/contacts",
-                                    [{"id": c, "responsible_user_id": INESSA_AMO_USER} for c in contacts])
+                                    [{"id": c, "responsible_user_id": target} for c in contacts])
             done.append("контакты переданы" if ok_c else "контакты передать не вышло")
 
         till = int((datetime.now(MSK) + timedelta(hours=3)).timestamp())
         ok_t = await _amo_write(session, "/tasks", [{
-            "entity_id": lead_id, "entity_type": "leads", "responsible_user_id": INESSA_AMO_USER,
+            "entity_id": lead_id, "entity_type": "leads", "responsible_user_id": target,
             "task_type_id": 1, "complete_till": till,
             "text": "Ответить клиенту: диалог передан от агента"}], method="POST")
         done.append("задача поставлена" if ok_t else "задачу поставить не вышло")
@@ -282,12 +316,16 @@ async def hand_to_manager(app, db, msg: dict) -> str:
             f"https://{os.getenv('AMO_SUBDOMAIN', 'victorfishtobiz')}.amocrm.ru/leads/detail/{lead_id}\n\n"
             f"Последнее от клиента: {(msg.get('inbound_text') or '—')[:300]}\n\n"
             f"Что готовил агент (не отправлено):\n{(msg.get('draft_text') or '—')[:600]}")
-    try:
-        await app.bot.send_message(INESSA_TG_CHAT, text)
-        done.append("Инессе написали")
-    except Exception as e:
-        logger.warning("sales_dialog: сообщение Инессе не ушло lead=%s: %s", lead_id, e)
-        done.append("сообщение в Telegram не ушло")
+    chat = MANAGER_TG.get(target)
+    if chat:
+        try:
+            await app.bot.send_message(chat, text)
+            done.append("менеджеру написали")
+        except Exception as e:
+            logger.warning("sales_dialog: сообщение менеджеру не ушло lead=%s: %s", lead_id, e)
+            done.append("сообщение в Telegram не ушло")
+    else:
+        done.append("Telegram менеджера неизвестен, не писали")
     return ", ".join(done)
 
 
@@ -1150,7 +1188,7 @@ def _keyboard(row_id: int, action: str):
         rows.append([InlineKeyboardButton("Отправить", callback_data=f"sd:send:{row_id}")])
     rows.append([InlineKeyboardButton("Правка", callback_data=f"sd:edit:{row_id}"),
                  InlineKeyboardButton("Не отвечать", callback_data=f"sd:skip:{row_id}")])
-    rows.append([InlineKeyboardButton("Передать Инессе", callback_data=f"sd:hand:{row_id}")])
+    rows.append([InlineKeyboardButton("Вернуть менеджеру", callback_data=f"sd:hand:{row_id}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1280,7 +1318,7 @@ def register(app, db) -> None:
                 what = await hand_to_manager(app, db, msg)
             else:
                 what = "черновик не найден"
-            await q.edit_message_text(base + f"\n\n[передано Инессе: {what}. Агент по этому лиду молчит]")
+            await q.edit_message_text(base + f"\n\n[возвращено менеджеру: {what}. Агент по этому лиду молчит]")
         elif action == "edit":
             context.user_data["sd_edit_row"] = (row_id, datetime.now(timezone.utc))
             await q.edit_message_text(base + "\n\n[жду твой текст — ответом на карточку "
