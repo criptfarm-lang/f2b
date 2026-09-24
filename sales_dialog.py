@@ -35,7 +35,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "edit-any-message"
+CODE_VERSION = "bargain-floors"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -106,6 +106,10 @@ def ensure_tables(db) -> None:
     # пользователя и терялась, стоило прийти следующей карточке.
     db._execute("""ALTER TABLE sales_dialog_messages
                    ADD COLUMN IF NOT EXISTS tg_message_id BIGINT""")
+    # Уступки по цене: что предложено, прайс и порог — чтобы собственник видел
+    # цифры на карточке и мог судить о торге, а не только о тексте.
+    db._execute("""ALTER TABLE sales_dialog_messages
+                   ADD COLUMN IF NOT EXISTS bargain JSONB""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_leads_status_idx
                    ON sales_dialog_leads (campaign, status)""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_messages_lead_idx
@@ -538,8 +542,18 @@ def check_prices(draft: dict, prices: dict, allowed: set | None = None) -> list:
             problems.append(f"кода {c['code']} нет в справочнике")
             continue
         actual = p.get(c["price_type"])
-        if not actual or abs(float(actual) - float(c["price"])) > 0.01:
-            problems.append(f"{c['code']}: сказано {c['price']}, в МойСклад {actual}")
+        if not actual:
+            problems.append(f"{c['code']}: нет цены типа «{c['price_type']}»")
+            continue
+        said, listed = float(c["price"]), float(actual)
+        if said > listed + 0.01:
+            problems.append(f"{c['code']}: сказано {said}, в МойСклад {listed}")
+        elif said < listed - 0.01:
+            # Ниже прайса — это торг. Допустим он или нет, решает пол из дашборда,
+            # проверка асинхронная, поэтому здесь только помечаем.
+            draft.setdefault("bargain", []).append(
+                {"code": c["code"], "price": said, "list_price": listed,
+                 "price_type": c["price_type"]})
     declared = {str(int(c["price"])) for c in draft.get("price_claims") or []}
     # Тариф перевозчика человек называет округлённо («около 14 400» вместо 14 417),
     # и это нормально. Цены на товар округлять нельзя — они сверены точно выше.
@@ -552,6 +566,55 @@ def check_prices(draft: dict, prices: dict, allowed: set | None = None) -> list:
         if any(abs(val - a) <= max(a * 0.03, 1) for a in loose):
             continue
         problems.append(f"в тексте число {num.strip()} ₽, не объявленное в price_claims")
+    return problems
+
+
+DASHBOARD_URL = os.getenv("FISHKI_URL", "https://fishki.f2b.group")
+# На сколько процентов агенту разрешено уступать от прайса за один шаг торга.
+BARGAIN_STEP_PCT = 3
+
+
+async def price_floor(session: aiohttp.ClientSession, db, sku_code: str) -> dict:
+    """Пороги цены по позиции из дашборда менеджера («согласование цены»).
+
+    Считает их `price_approval.evaluate` — тот же расчёт, что видит менеджер,
+    поэтому агент торгуется по тем же правилам и ничего не дублирует. Токен
+    лежит в общей таблице `bot_settings`.
+    """
+    row = db._fetchone("SELECT value FROM bot_settings WHERE key='price_floors_token'")
+    token = (row or {}).get("value")
+    if not token:
+        return {"error": "нет токена price_floors_token"}
+    url = f"{DASHBOARD_URL}/api/price/floors"
+    try:
+        async with session.get(url, params={"sku": sku_code, "token": token},
+                               timeout=aiohttp.ClientTimeout(total=40)) as r:
+            if r.status != 200:
+                return {"error": f"http {r.status}"}
+            return await r.json()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+async def check_bargain(session, db, draft: dict) -> list:
+    """Торг в пределах правил ценообразования: ниже пола — только через собственника.
+
+    Клиенты, особенно новые, почти всегда просят ниже прайса. Агент вправе
+    уступать, но нижняя граница — порог из дашборда (для новых и спящих это
+    «минимум», то есть безубыточность плюс вклад). Всё, что ниже, — эскалация.
+    """
+    problems = []
+    for b in draft.get("bargain") or []:
+        fl = await price_floor(session, db, b["code"])
+        if fl.get("error") or fl.get("floor") is None:
+            problems.append(f"{b['code']}: цена {b['price']} ниже прайса {b['list_price']}, "
+                            f"порог посчитать не удалось ({fl.get('error', 'нет данных')})")
+            continue
+        floor = float(fl.get("floor_pay") or fl["floor"])
+        b["floor"] = round(floor)
+        if b["price"] < floor - 0.5:
+            problems.append(f"{b['code']}: предложено {b['price']:.0f}, ниже порога "
+                            f"{floor:.0f} ({fl.get('status_label') or fl.get('status') or ''})")
     return problems
 
 
@@ -748,13 +811,13 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     if not in_window(now, cfg):
         return
 
-    # Не бежим впереди собственника: пока карточки ждут его решения, новые не
-    # собираем. Иначе за час набегает два десятка сообщений, и разобрать их
-    # быстрее, чем они приходят, физически нельзя (23.09.2026).
+    # Одна карточка за раз. Следующая уходит, только когда по текущей принято
+    # решение: 24.09.2026 собственник ещё печатал правку, а сверху прилетела
+    # новая карточка — его текст ушёл в пустоту, а разговор смешался.
     pending = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages
                               WHERE campaign=%s AND verdict IN ('draft','edited')""", (campaign,))
     n_pending = (pending or {}).get("n", 0)
-    if n_pending >= cfg.get("max_pending", 3):
+    if n_pending >= cfg.get("max_pending", 1):
         _heartbeat(db, f"ждут решения {n_pending} карточек, новые не собираю")
         return
 
@@ -813,6 +876,10 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
     draft["text"] = polish(draft.get("text") or "")
     problems = (check_prices(draft, ctx["prices"], allowed_numbers(ctx.get("city")))
                 + check_style(draft["text"]))
+    # Уступка ниже прайса проверяется порогами дашборда, а не на глаз.
+    problems += await check_bargain(session, db, draft)
+    if draft.get("bargain") and not problems:
+        logger.info("sales_dialog: торг lead=%s %s", row["lead_id"], draft["bargain"])
     action = draft["action"]
     if problems:
         # Цена разошлась со справочником или текст нарушает запреты — не отправляем.
@@ -822,14 +889,16 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
 
     saved = db._fetchone("""INSERT INTO sales_dialog_messages
         (campaign, lead_id, chat_id, chat_type, inbound_message_id, inbound_text, draft_text,
-         action, reason, need_check, price_claims, model, prompt_version, verdict)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'draft')
+         action, reason, need_check, price_claims, bargain, model, prompt_version, verdict)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'draft')
         ON CONFLICT (inbound_message_id, prompt_version) DO NOTHING
         RETURNING id""",
         (campaign, row["lead_id"], row["chat_id"], row.get("chat_type"),
          row["message_id"], row["inbound_text"],
          draft.get("text"), action, draft.get("reason"), draft.get("need_check"),
-         json.dumps(draft.get("price_claims"), ensure_ascii=False), MODEL, PROMPT_VERSION))
+         json.dumps(draft.get("price_claims"), ensure_ascii=False),
+         json.dumps(draft.get("bargain"), ensure_ascii=False) if draft.get("bargain") else None,
+         MODEL, PROMPT_VERSION))
     db._execute("""UPDATE sales_dialog_leads SET last_inbound_at=%s
                    WHERE campaign=%s AND lead_id=%s""", (row["sent_at"], campaign, row["lead_id"]))
     logger.info("sales_dialog: черновик lead=%s action=%s", row["lead_id"], action)
@@ -866,8 +935,14 @@ def _card_text(db, msg: dict) -> str:
         return (f"{head}\n\nАгент не берётся отвечать сам: {msg.get('reason', '')}"
                 f"\n\nЕго черновик:\n{msg.get('draft_text', '')}")
     tail = ""
+    bargain = msg.get("bargain")
+    if isinstance(bargain, str):
+        bargain = json.loads(bargain)
+    for b in bargain or []:
+        tail += (f"\n\nУступка: {b['code']} – {b['price']:.0f} ₽ при прайсе {b['list_price']:.0f}"
+                 + (f", порог {b['floor']}" if b.get("floor") else ""))
     if msg.get("need_check"):
-        tail = f"\n\nОбещала уточнить: {msg['need_check']}"
+        tail += f"\n\nОбещала уточнить: {msg['need_check']}"
     return f"{head}\n\nОтвет от имени Инессы:\n{msg.get('draft_text', '')}{tail}"
 
 

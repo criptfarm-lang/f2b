@@ -21,11 +21,21 @@ def test_price_ok():
     assert check_prices(draft, PRICES) == []
 
 
-def test_price_mismatch_caught():
-    draft = {"text": "масляная филе – 890 ₽/кг", "price_claims": [
-        {"code": "14001", "name": "Масляная", "price": 890.0, "price_type": "spec"}]}
+def test_price_above_list_caught():
+    """Выше прайса — ошибка: такую цену клиенту называть нельзя."""
+    draft = {"text": "масляная филе – 1010 ₽/кг", "price_claims": [
+        {"code": "14001", "name": "Масляная", "price": 1010.0, "price_type": "spec"}]}
     problems = check_prices(draft, PRICES)
     assert problems and "950" in problems[0]
+
+
+def test_price_below_list_is_bargain_not_error():
+    """Ниже прайса — это торг: сверка его не заворачивает, решает порог из дашборда."""
+    draft = {"text": "масляная филе – 890 ₽/кг", "price_claims": [
+        {"code": "14001", "name": "Масляная", "price": 890.0, "price_type": "spec"}]}
+    assert check_prices(draft, PRICES) == []
+    assert draft["bargain"] == [{"code": "14001", "price": 890.0,
+                                 "list_price": 950.0, "price_type": "spec"}]
 
 
 def test_unknown_code_caught():
@@ -174,12 +184,48 @@ def test_rounded_delivery_tariff_allowed():
     assert check_prices(draft, PRICES, allowed_numbers("Омск")) == []
 
 
-def test_product_price_rounding_still_flagged():
-    """А вот цену товара округлять нельзя: 950 названо как 900."""
+def test_product_price_rounding_up_still_flagged():
+    """Округлить цену товара ВВЕРХ нельзя: 950 названо как 990."""
     from sales_dialog import check_prices
-    draft = {"text": "масляная – 900 ₽/кг", "price_claims": [
-        {"code": "14001", "name": "Масляная", "price": 900.0, "price_type": "spec"}]}
+    draft = {"text": "масляная – 990 ₽/кг", "price_claims": [
+        {"code": "14001", "name": "Масляная", "price": 990.0, "price_type": "spec"}]}
     assert check_prices(draft, PRICES)
+
+
+def test_bargain_below_floor_blocked(monkeypatch):
+    """Уступка ниже порога ценообразования не уходит клиенту."""
+    draft = {"bargain": [{"code": "14001", "price": 700.0, "list_price": 950.0}]}
+
+    async def fake_floor(session, db, sku):
+        return {"floor": 820.0, "floor_pay": 820.0, "status_label": "новый"}
+
+    monkeypatch.setattr(sales_dialog, "price_floor", fake_floor)
+    problems = asyncio.run(sales_dialog.check_bargain(None, None, draft))
+    assert problems and "820" in problems[0]
+
+
+def test_bargain_above_floor_passes(monkeypatch):
+    """Уступка в пределах порога проходит, порог запоминается для карточки."""
+    draft = {"bargain": [{"code": "14001", "price": 900.0, "list_price": 950.0}]}
+
+    async def fake_floor(session, db, sku):
+        return {"floor": 820.0, "floor_pay": 820.0, "status_label": "новый"}
+
+    monkeypatch.setattr(sales_dialog, "price_floor", fake_floor)
+    assert asyncio.run(sales_dialog.check_bargain(None, None, draft)) == []
+    assert draft["bargain"][0]["floor"] == 820
+
+
+def test_bargain_without_floor_is_escalated(monkeypatch):
+    """Порог не посчитался — молча уступать нельзя."""
+    draft = {"bargain": [{"code": "14001", "price": 900.0, "list_price": 950.0}]}
+
+    async def fake_floor(session, db, sku):
+        return {"error": "http 500"}
+
+    monkeypatch.setattr(sales_dialog, "price_floor", fake_floor)
+    problems = asyncio.run(sales_dialog.check_bargain(None, None, draft))
+    assert problems and "http 500" in problems[0]
 
 
 # ── карточка подтверждения и отправка ─────────────────────────────────────────
