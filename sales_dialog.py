@@ -35,7 +35,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "history-all-chats"
+CODE_VERSION = "edit-any-message"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -845,6 +845,8 @@ _CB = re.compile(r"^sd:(send|edit|skip|hand):(\d+)$")
 # Сколько черновик живёт до протухания: ответ на утреннее сообщение, ушедший
 # вечером, хуже молчания.
 APPROVAL_TTL_MIN = 180
+# Сколько ждём текст после нажатия «Правка», если он пришёл не ответом на карточку.
+EDIT_WAIT_SEC = 1800
 
 
 def _owner_id() -> int:
@@ -1004,8 +1006,9 @@ def register(app, db) -> None:
                                WHERE campaign=%s AND lead_id=%s""", (msg["campaign"], msg["lead_id"]))
             await q.edit_message_text(base + "\n\n[передано Инессе, агент по этому лиду молчит]")
         elif action == "edit":
-            context.user_data["sd_edit_row"] = row_id
-            await q.edit_message_text(base + "\n\n[жду твой текст ответом на это сообщение]")
+            context.user_data["sd_edit_row"] = (row_id, datetime.now(timezone.utc))
+            await q.edit_message_text(base + "\n\n[жду твой текст — ответом на карточку "
+                                             "или просто следующим сообщением]")
         elif action == "send":
             msg = db._fetchone("SELECT draft_text FROM sales_dialog_messages WHERE id=%s", (row_id,))
             ok, info = await _do_send(db, row_id, (msg or {}).get("draft_text") or "")
@@ -1013,33 +1016,47 @@ def register(app, db) -> None:
         await q.answer()
 
     async def on_edit_reply(update, context):
-        """Ответ собственника на карточку — это правка именно её черновика.
+        """Текст собственника после «Правки» — это правка черновика.
 
-        Раньше id черновика жил в одной ячейке `user_data`: следующая карточка
-        затирала предыдущую, а любой посторонний ответ боту её съедал. Теперь
-        черновик ищется по сообщению, на которое отвечают, поэтому карточки
-        можно править в любом порядке и даже не нажимая «Правка».
+        Ловим любое его сообщение, не только ответ-реплай: 24.09.2026 правка
+        «Готовы предложить 2210р» была написана обычным сообщением и уехала в
+        общий гейт «бот только оповещает». Порядок такой:
+        1) ответ на карточку — правим её черновик, по `tg_message_id`;
+        2) иначе — черновик, по которому недавно нажали «Правка»;
+        3) иначе молчим и пропускаем сообщение дальше.
         """
+        from telegram.ext import ApplicationHandlerStop
+
         if not update.effective_message:
             return
         reply_to = update.effective_message.reply_to_message
-        row = None
+        row_id = None
         if reply_to:
             row = db._fetchone("SELECT id FROM sales_dialog_messages WHERE tg_message_id=%s",
                                (reply_to.message_id,))
-        row_id = (row or {}).get("id") or context.user_data.pop("sd_edit_row", None)
+            row_id = (row or {}).get("id")
+        if not row_id:
+            pending = context.user_data.get("sd_edit_row")
+            if pending:
+                candidate, at = pending
+                fresh = (datetime.now(timezone.utc) - at).total_seconds() <= EDIT_WAIT_SEC
+                context.user_data.pop("sd_edit_row", None)
+                if fresh:
+                    row_id = candidate
         if not row_id:
             return
         context.user_data.pop("sd_edit_row", None)
-        text = update.effective_message.text or "" 
+        text = update.effective_message.text or ""
         db._execute("UPDATE sales_dialog_messages SET verdict='edited', final_text=%s WHERE id=%s",
                     (text, row_id))
         ok, info = await _do_send(db, row_id, text)
         await update.effective_message.reply_text(
             "Отправлено клиенту." if ok else f"Не отправлено: {info}")
+        # Иначе следом ответит общий гейт «я только присылаю уведомления».
+        raise ApplicationHandlerStop
 
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^sd:"))
     # Группа -1: общий гейт «бот только оповещает» стоит там же и ловит только
     # сообщения, начинающиеся с «/», поэтому обычный ответ до нас доходит.
     app.add_handler(MessageHandler(
-        filters.REPLY & filters.TEXT & filters.User(_owner_id()), on_edit_reply), group=-1)
+        filters.TEXT & ~filters.COMMAND & filters.User(_owner_id()), on_edit_reply), group=-1)
