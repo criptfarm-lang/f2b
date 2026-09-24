@@ -555,6 +555,14 @@ class Database:
                 UNIQUE (chat_id, tg_msg_id)
             )""",
             "CREATE INDEX IF NOT EXISTS idx_market_intel_unprocessed ON market_intel_messages (processed_at) WHERE processed_at IS NULL",
+            # original_filename (29.05) добавлялась ALTER'ом в проде — фиксируем здесь,
+            # чтобы чистая БД поднималась без ручных шагов.
+            "ALTER TABLE market_intel_messages ADD COLUMN IF NOT EXISTS original_filename TEXT",
+            # author_signature (24.09.2026) — подпись админа канала «Мониторинг».
+            # Приходит только когда в настройках канала включено «Подписывать сообщения»;
+            # без неё все посты канала обезличены. Нужна для пятничной сводки дисциплины:
+            # сколько прайсов принесли Кристина и Александра.
+            "ALTER TABLE market_intel_messages ADD COLUMN IF NOT EXISTS author_signature TEXT",
             # ── ПДЗ-автоматика (план 2026-05-20, Фаза 2) ───────────────────────
             # Снимок состояния всех customerorder с заполненным ppm_initial.
             # Cron 13:55 и 14:00 МСК пишет сюда. Источник правды для сравнения
@@ -1306,22 +1314,30 @@ class Database:
         file_ext: Optional[str] = None,
         forward_from: Optional[str] = None,
         original_filename: Optional[str] = None,
+        author_signature: Optional[str] = None,
     ) -> Optional[int]:
         """Сохраняет сообщение из канала «Мониторинг». Возвращает id или None если уже есть (UNIQUE chat_id, tg_msg_id).
 
         original_filename (29.05) — оригинальное имя файла из Telegram (например
         "ЯКИМАЛ Прайс МАЙ 2026.xlsx"). Главный контекст для Sonnet когда caption
         и forward_from пустые: имя файла часто содержит бренд поставщика.
+
+        author_signature (24.09.2026) — подпись админа канала («Кристина Павленко»,
+        «Александра Белякова»). Есть только при включённой настройке канала
+        «Подписывать сообщения», иначе None. Используется в пятничной сводке
+        дисциплины для счёта прайсов по людям.
         """
         self._ensure_connection()
         with self.conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO market_intel_messages
-                   (tg_msg_id, chat_id, posted_at, msg_type, text_raw, file_path, file_ext, forward_from, original_filename)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   (tg_msg_id, chat_id, posted_at, msg_type, text_raw, file_path, file_ext, forward_from,
+                    original_filename, author_signature)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (chat_id, tg_msg_id) DO NOTHING
                    RETURNING id""",
-                (tg_msg_id, chat_id, posted_at, msg_type, text_raw, file_path, file_ext, forward_from, original_filename),
+                (tg_msg_id, chat_id, posted_at, msg_type, text_raw, file_path, file_ext, forward_from,
+                 original_filename, author_signature),
             )
             row = cur.fetchone()
             self.conn.commit()
@@ -1330,7 +1346,7 @@ class Database:
     def get_unprocessed_market_intel(self, limit: int = 100) -> List[Dict]:
         return self._fetchall(
             """SELECT id, tg_msg_id, chat_id, posted_at, msg_type, text_raw,
-                      file_path, file_ext, forward_from, original_filename, created_at
+                      file_path, file_ext, forward_from, original_filename, author_signature, created_at
                FROM market_intel_messages
                WHERE processed_at IS NULL
                ORDER BY posted_at ASC

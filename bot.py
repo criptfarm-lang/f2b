@@ -2704,6 +2704,12 @@ async def handle_market_intel_post(update: Update, context: ContextTypes.DEFAULT
                 if hasattr(forward_from, "title"):
                     forward_from = forward_from.title
 
+    # Подпись автора поста. Есть только если в настройках канала включено
+    # «Подписывать сообщения» (включено 24.09.2026) — иначе Telegram отдаёт пост
+    # от имени канала и различить Кристину с Александрой нечем. Нужна для блока
+    # «закупочный контур» в пятничной сводке дисциплины.
+    author_signature = (getattr(msg, "author_signature", None) or "").strip() or None
+
     # Скачиваем медиа на persistent volume (если есть)
     file_path = None
     if file_id:
@@ -2728,11 +2734,13 @@ async def handle_market_intel_post(update: Update, context: ContextTypes.DEFAULT
         file_ext=file_ext,
         forward_from=forward_from,
         original_filename=original_filename,
+        author_signature=author_signature,
     )
     if saved_id:
         logger.info(
             f"market_intel: saved id={saved_id} tg_msg={msg.message_id} type={msg_type} "
-            f"file={'yes' if file_path else 'no'} fwd={forward_from or '-'}"
+            f"file={'yes' if file_path else 'no'} fwd={forward_from or '-'} "
+            f"author={author_signature or '-'}"
         )
     else:
         logger.info(f"market_intel: duplicate tg_msg={msg.message_id} skipped")
