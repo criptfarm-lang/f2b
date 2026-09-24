@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import sys
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -40,7 +41,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "hand-real"
+CODE_VERSION = "inbound-first"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -302,6 +303,119 @@ async def _amo_lead(session: aiohttp.ClientSession, lead_id: int) -> dict:
         return {}
 
 
+# Поля карточки, из которых видно, с чем человек пришёл. Остальное (метрики,
+# идентификаторы Яндекса, IP) в промпт не идёт — это шум и персональные данные.
+LEAD_FIELDS_USEFUL = {"Комментарий", "Специализация", "Тип возражения", "Текущая блокировка",
+                      "Бюджет", "Регион", "Город"}
+SEARCH_RE = re.compile(r"[?&]text=([^&]+)")
+
+
+def lead_brief(lead: dict) -> str:
+    """С чем клиент пришёл: поисковый запрос, комментарий менеджера, направление.
+
+    У холодного сайт-лида переписки нет, и без этого блока модель писала всем
+    одно и то же «по охлаждёнке сейчас актуально…» (24.09.2026, 12 одинаковых
+    сообщений подряд). Здесь лежит то, что делает первое сообщение конкретным.
+    """
+    out = []
+    for f in (lead.get("custom_fields_values") or []):
+        name = f.get("field_name") or ""
+        vals = [str(v.get("value")) for v in (f.get("values") or []) if v.get("value")]
+        if not vals:
+            continue
+        if name in LEAD_FIELDS_USEFUL:
+            out.append(f"{name}: {', '.join(vals)[:200]}")
+        elif name == "referrer":
+            m = SEARCH_RE.search(vals[0])
+            if m:
+                q = urllib.parse.unquote_plus(m.group(1))
+                out.append(f"пришёл по поисковому запросу: «{q[:80]}»")
+    return "\n".join(out)
+
+
+def site_request(notes: list) -> str:
+    """Текст заявки с сайта из примечаний: что человек смотрел и откуда он."""
+    out = []
+    for n in notes:
+        p = n.get("params") or {}
+        txt = str(p.get("text") or "")
+        if "Данные с сайта" in txt or "посещенные страницы" in txt:
+            for line in txt.splitlines():
+                if line.startswith(("последняя страница", "посещенные страницы")):
+                    out.append(line.strip())
+        elif "Дополнительная информация" in txt:
+            for line in txt.splitlines():
+                if line.strip().startswith("Дата и время"):
+                    zone = re.search(r"\(([^)]+)\)", line)
+                    if zone:
+                        out.append(f"часовой пояс заявки: {zone.group(1)}")
+    return "\n".join(dict.fromkeys(out))[:400]
+
+
+async def _amo_notes(session: aiohttp.ClientSession, lead_id: int) -> list:
+    token = os.getenv("AMO_ACCESS_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    url = f"{AMO_BASE}/leads/{lead_id}/notes?limit=20"
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status != 200:
+                return []
+            return ((await r.json()).get("_embedded") or {}).get("notes") or []
+    except Exception as e:
+        logger.warning("sales_dialog: примечания лида %s: %s", lead_id, e)
+        return []
+
+
+CARD_HEADER_RE = re.compile(
+    r"^\s*(Ответ от имени [^:]*:|Клиент:|Его черновик:|Агент не бер[её]тся[^\n]*|"
+    r"Обещала уточнить:[^\n]*|Уступка:[^\n]*|Диалог затих[^\n]*)\s*", re.I | re.M)
+
+
+def strip_card_header(text: str) -> str:
+    """Собственник правит текст, копируя его из карточки — служебные строки убираем.
+
+    24.09.2026 клиенту ушло сообщение, начинавшееся с «Ответ от имени Инессы:».
+    """
+    return CARD_HEADER_RE.sub("", text or "").strip()
+
+
+def winning_openers(db, campaign: str, hours: int = 48, limit: int = 5) -> str:
+    """Зачины, после которых клиент отвечал — материал для следующих сообщений.
+
+    Считаем по факту: есть ли входящее в чате в течение `hours` после отправки.
+    Пока данных мало, список будет коротким — это нормально, он растёт сам.
+    """
+    rows = db._fetchall("""
+        SELECT coalesce(m.final_text, m.draft_text) AS t
+        FROM sales_dialog_messages m
+        JOIN sales_dialog_leads l ON l.campaign = m.campaign AND l.lead_id = m.lead_id
+        WHERE m.campaign = %s AND m.verdict = 'sent' AND m.sent_at IS NOT NULL
+          AND EXISTS (
+              SELECT 1 FROM wazzup_messages w
+              WHERE w.chat_id = ANY(coalesce(l.all_chat_ids, ARRAY[l.chat_id]))
+                AND w.is_outbound = false
+                AND w.sent_at AT TIME ZONE 'UTC' > m.sent_at
+                AND w.sent_at AT TIME ZONE 'UTC' < m.sent_at + (%s || ' hours')::interval)
+        ORDER BY m.id DESC LIMIT %s""", (campaign, str(hours), limit))
+    return "\n".join("— " + (r["t"] or "").strip().split("\n")[0][:110] for r in rows if r["t"])
+
+
+def recent_openers(db, campaign: str, limit: int = 12) -> str:
+    """Первые строки последних отправленных сообщений — чтобы не повторяться.
+
+    Без этого агент писал холодным лидам один и тот же зачин десяток раз подряд.
+    """
+    rows = db._fetchall("""SELECT coalesce(final_text, draft_text) AS t FROM sales_dialog_messages
+                           WHERE campaign=%s AND verdict='sent'
+                           ORDER BY id DESC LIMIT %s""", (campaign, limit))
+    outs = []
+    for r in rows:
+        first = (r["t"] or "").strip().split("\n")[0]
+        if first:
+            outs.append("— " + first[:110])
+    return "\n".join(outs)
+
+
 # ─── сбор контекста ───────────────────────────────────────────────────────────
 def _known_names(db, row: dict, lead: dict) -> list:
     """Все имена, которые надо замаскировать.
@@ -439,10 +553,24 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
     first_time = not (already or {}).get("n")
     days = (datetime.now() - history[-1]["sent_at"]).days if history else 0
 
+    notes = await _amo_notes(session, row["lead_id"])
+    brief = lead_brief(lead)
+    site = site_request(notes)
+    openers = recent_openers(db, row["campaign"])
+    worked = winning_openers(db, row["campaign"])
     user = f"""ПЕРЕПИСКА (последнее сообщение {days} дн. назад):
-{safe}
+{safe if safe.strip() else "— переписки нет, это первое обращение к клиенту"}
 
 КАРТОЧКА: «{lead.get('name', '')}», лид с сайта f2b.group.
+{brief if brief else "дополнительных данных по заявке нет"}
+{site}
+
+ТАК НАЧИНАЛИСЬ ПОСЛЕДНИЕ ОТПРАВЛЕННЫЕ СООБЩЕНИЯ ДРУГИМ КЛИЕНТАМ
+(повторять эти зачины и структуру нельзя, найди свой заход под этого клиента):
+{openers if openers else "— пока ничего не отправляли"}
+
+НА ЭТИ ЗАХОДЫ КЛИЕНТЫ ОТВЕЧАЛИ (копировать дословно нельзя, но приём рабочий):
+{worked if worked else "— статистики пока нет"}
 {"Ты пишешь в этот чат ВПЕРВЫЕ — до тебя его вёл другой менеджер." if first_time else "Ты уже писала в этот чат, представляться повторно не нужно."}
 
 ДОСТАВКА:
@@ -876,15 +1004,15 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     if not in_window(now, cfg):
         return
 
-    # Одна карточка за раз. Следующая уходит, только когда по текущей принято
-    # решение: 24.09.2026 собственник ещё печатал правку, а сверху прилетела
-    # новая карточка — его текст ушёл в пустоту, а разговор смешался.
+    # Ответ клиента идёт вне очереди: он ждать не должен (собственник 24.09.2026).
+    # Придержать можно только инициативу в молчащий диалог — чтобы карточки не
+    # сыпались быстрее, чем человек успевает по ним решать.
+    rows = _pending_inbound(db, campaign)
+    n_inbound = len(rows)
+
     pending = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages
                               WHERE campaign=%s AND verdict IN ('draft','edited')""", (campaign,))
     n_pending = (pending or {}).get("n", 0)
-    if n_pending >= cfg.get("max_pending", 1):
-        _heartbeat(db, f"ждут решения {n_pending} карточек, новые не собираю")
-        return
 
     # Суточный потолок: защита от лавины, если очередь вдруг окажется большой.
     sent_today = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages
@@ -896,10 +1024,7 @@ async def _tick_campaign(app, db, campaign: str) -> None:
         _heartbeat(db, f"дневной потолок отправок исчерпан: {(sent_today or {}).get('n')}")
         return
 
-    # Ответ живому клиенту важнее, чем оживление молчащего диалога.
-    rows = _pending_inbound(db, campaign)
-    n_inbound = len(rows)
-    if cfg.get("revive", True):
+    if cfg.get("revive", True) and n_pending < cfg.get("max_pending", 1):
         seen = {r["lead_id"] for r in rows}
         # Пауза между двумя касаниями молчащего диалога — в рабочих днях, чтобы
         # пятничное сообщение не превращалось в воскресное.
@@ -909,7 +1034,8 @@ async def _tick_campaign(app, db, campaign: str) -> None:
                                             cfg.get("max_followups", 2),
                                             not_before)
                  if r["lead_id"] not in seen]
-    _heartbeat(db, f"очередь: входящих {n_inbound}, оживление {len(rows) - n_inbound}")
+    _heartbeat(db, f"очередь: входящих {n_inbound}, оживление {len(rows) - n_inbound}, "
+                   f"ждут решения {n_pending}")
     if not rows:
         return
     cap = cfg.get("drafts_per_tick", 1)

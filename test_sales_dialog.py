@@ -6,7 +6,8 @@ import asyncio
 from datetime import date, datetime, timedelta, timezone
 
 import sales_dialog
-from sales_dialog import check_prices, delivery_target, in_window, mrm_price, polish, workdays_ago
+from sales_dialog import (check_prices, delivery_target, in_window, lead_brief, mrm_price,
+                          polish, strip_card_header, workdays_ago)
 
 MSK = timezone(timedelta(hours=3))
 PRICES = {
@@ -330,6 +331,29 @@ def test_normal_card_has_send_button():
     from sales_dialog import _keyboard
     labels = [b.text for row in _keyboard(7, "reply").inline_keyboard for b in row]
     assert labels[0] == "Отправить"
+
+
+def test_strip_card_header_removes_service_lines():
+    t = "Ответ от имени Инессы: Адреса приняла, по цене сориентируйте пожалуйста"
+    assert strip_card_header(t) == "Адреса приняла, по цене сориентируйте пожалуйста"
+
+
+def test_strip_card_header_keeps_normal_text():
+    t = "Добрый день. По треске 1630 ₽/кг, есть."
+    assert strip_card_header(t) == t
+
+
+def test_lead_brief_picks_useful_fields():
+    lead = {"custom_fields_values": [
+        {"field_name": "referrer", "values": [{"value": "https://yandex.ru/search/?text=купить+форель+оптом&clid=1"}]},
+        {"field_name": "Комментарий", "values": [{"value": "Якутск контакт Афанасий"}]},
+        {"field_name": "Специализация", "values": [{"value": "ОПТ"}]},
+        {"field_name": "_ym_uid", "values": [{"value": "1780965298943707632"}]},
+    ]}
+    b = lead_brief(lead)
+    assert "купить форель оптом" in b
+    assert "Якутск" in b and "ОПТ" in b
+    assert "1780965298943707632" not in b        # метрики в промпт не идут
 
 
 def test_mrm_price_minus_100():
