@@ -890,6 +890,22 @@ async def _pdz_escalate_by_payment_gap(app: Application, db, today_rows: list) -
     )
     from datetime import timedelta
 
+    # Алерты собственнику копим и отправляем ОДНИМ сообщением в конце:
+    # раньше на каждого клиента уходил отдельный пуш, и при пачке эскалаций
+    # собственник получал «разом много сообщений» (правка 25.09.2026).
+    stop_alerts: list = []
+    prepay_alerts: list = []
+
+    def _alert_line(a_name: str, m_tag: str, a_id: str, reason: str, debt: float) -> str:
+        tag_display = PDZ_MANAGER_TAG_MAP.get(m_tag, m_tag or "—")
+        safe_name = (a_name or "—").replace("*", "").replace("_", "")
+        safe_tag = (tag_display or "—").replace("*", "").replace("_", "")
+        safe_aid = (a_id or "—").replace("*", "").replace("_", "")
+        return (
+            f"• {safe_name} — {fmt_money(debt)} · {reason} · {safe_tag}\n"
+            f"  `/snimi_stop {safe_aid}`"
+        )
+
     for aid, info in agents.items():
         overdue_days = info["max_days_overdue"]
         no_pay = info["days_no_pay"]
@@ -948,28 +964,9 @@ async def _pdz_escalate_by_payment_gap(app: Application, db, today_rows: list) -
                     summary["stop_shipments"] += 1
                 db.mark_pdz_escalation_done(aid, 3)
                 if owner_id:
-                    tag_display = PDZ_MANAGER_TAG_MAP.get(manager_tag, manager_tag or "—")
-                    safe_name = (agent_name or "—").replace("*", "").replace("_", "")
-                    safe_tag = (tag_display or "—").replace("*", "").replace("_", "")
-                    safe_aid = (aid or "—").replace("*", "").replace("_", "")
-                    text = (
-                        f"🚫 *СТОП ОТГРУЗОК:* {safe_name}\n"
-                        f"Причина: {reason_txt}\n"
-                        f"Менеджер: {safe_tag}\n"
-                        f"Долг: {fmt_money(total_unpaid)}\n\n"
-                        f"Для снятия: `/snimi_stop {safe_aid}`"
+                    stop_alerts.append(
+                        _alert_line(agent_name, manager_tag, aid, reason_txt, total_unpaid)
                     )
-                    try:
-                        await app.bot.send_message(
-                            chat_id=owner_id,
-                            text=text,
-                            parse_mode="Markdown",
-                            disable_web_page_preview=True,
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"_pdz_escalate_by_payment_gap: TG-алерт собственнику (stop): {e}"
-                        )
             except Exception as e:
                 logger.error(f"_pdz_escalate_by_payment_gap: set_stop_shipments для {agent_name}: {e}")
                 summary["errors"].append(f"stop3:{aid}:{e}")
@@ -988,31 +985,45 @@ async def _pdz_escalate_by_payment_gap(app: Application, db, today_rows: list) -
                     summary["prepayment_only"] += 1
                 db.mark_pdz_escalation_done(aid, 4)
                 if owner_id:
-                    tag_display = PDZ_MANAGER_TAG_MAP.get(manager_tag, manager_tag or "—")
-                    safe_name = (agent_name or "—").replace("*", "").replace("_", "")
-                    safe_tag = (tag_display or "—").replace("*", "").replace("_", "")
-                    safe_aid = (aid or "—").replace("*", "").replace("_", "")
-                    text = (
-                        f"🚫 *ТОЛЬКО ПРЕДОПЛАТА:* {safe_name}\n"
-                        f"Причина: {reason_txt}\n"
-                        f"Менеджер: {safe_tag}\n"
-                        f"Долг: {fmt_money(total_unpaid)}\n\n"
-                        f"Для снятия: `/snimi_stop {safe_aid}`"
+                    prepay_alerts.append(
+                        _alert_line(agent_name, manager_tag, aid, reason_txt, total_unpaid)
                     )
-                    try:
-                        await app.bot.send_message(
-                            chat_id=owner_id,
-                            text=text,
-                            parse_mode="Markdown",
-                            disable_web_page_preview=True,
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"_pdz_escalate_by_payment_gap: TG-алерт собственнику (prepay): {e}"
-                        )
             except Exception as e:
                 logger.error(f"_pdz_escalate_by_payment_gap: set_prepayment_only для {agent_name}: {e}")
                 summary["errors"].append(f"prepay:{aid}:{e}")
+
+    # ── Одно сводное сообщение собственнику по всем новым автостопам ────
+    if owner_id and (stop_alerts or prepay_alerts):
+        parts: list = ["🚫 *Автостоп по ПДЗ*"]
+        if prepay_alerts:
+            parts.append(f"\n*Только предоплата* ({len(prepay_alerts)}):")
+            parts.extend(prepay_alerts)
+        if stop_alerts:
+            parts.append(f"\n*Стоп отгрузок* ({len(stop_alerts)}):")
+            parts.extend(stop_alerts)
+        chunks: list = []
+        cur = ""
+        for block in parts:
+            piece = block if not cur else f"{cur}\n{block}"
+            if len(piece) > 3800 and cur:
+                chunks.append(cur)
+                cur = block
+            else:
+                cur = piece
+        if cur:
+            chunks.append(cur)
+        for chunk in chunks:
+            try:
+                await app.bot.send_message(
+                    chat_id=owner_id,
+                    text=chunk,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error(
+                    f"_pdz_escalate_by_payment_gap: сводный TG-алерт собственнику: {e}"
+                )
 
     return summary
 
