@@ -577,7 +577,6 @@ class Database:
                 agent_name TEXT,
                 manager_tag TEXT,
                 ppm_initial DATE,
-                ppm_new DATE,
                 payed_sum NUMERIC(14,2),
                 total_sum NUMERIC(14,2)
             )""",
@@ -608,21 +607,21 @@ class Database:
             # cron в день копилось ×3 = 53к дублей в БД (на 23к уникальных).
             # save_pdz_snapshot теперь использует ON CONFLICT DO UPDATE.
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_pdz_snapshots_date_order ON pdz_snapshots (snap_date, order_id)",
-            # Журнал обещаний оплаты. event_type = 'set' | 'moved' | 'broken'.
-            """CREATE TABLE IF NOT EXISTS promise_log (
-                id SERIAL PRIMARY KEY,
-                occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                order_id TEXT NOT NULL,
-                order_name TEXT,
-                agent_id TEXT,
-                agent_name TEXT,
-                manager_tag TEXT,
-                event_type TEXT NOT NULL,
-                old_ppm_new DATE,
-                new_ppm_new DATE
+            # 2026-09-25: журнал обещаний (promise_log) выведен из обращения
+            # вместе с полем «НОВАЯ дата оплаты». Таблица в проде остаётся с
+            # историей, но больше не пишется и не читается.
+            # Состояние платежей клиента — признак работы с долгом вместо
+            # отменённого поля. Пишется вместе со снимком ПДЗ.
+            """CREATE TABLE IF NOT EXISTS pdz_payment_state (
+                snap_date DATE NOT NULL,
+                agent_id TEXT NOT NULL,
+                last_payment_date DATE,
+                amount_window NUMERIC(14,2),
+                payments_count INT,
+                window_days INT,
+                PRIMARY KEY (snap_date, agent_id)
             )""",
-            "CREATE INDEX IF NOT EXISTS idx_promise_log_agent_time ON promise_log (agent_id, occurred_at)",
-            "CREATE INDEX IF NOT EXISTS idx_promise_log_order_time ON promise_log (order_id, occurred_at)",
+            "CREATE INDEX IF NOT EXISTS idx_pdz_payment_state_agent ON pdz_payment_state (agent_id)",
             # ── ПДЗ Фаза 6: эскалация переносов и стоп-флаги ────────────────────
             # Один контрагент — одна активная запись (PK agent_id + removed_at IS NULL).
             # Чтобы пересоздать с новым статусом — сначала remove_client_stop_flag,
@@ -895,7 +894,7 @@ class Database:
         """Batch insert строк снимка состояния заказов.
 
         Каждый row — dict с ключами: snap_date, order_id, order_name,
-        agent_id, agent_name, manager_tag, ppm_initial, ppm_new,
+        agent_id, agent_name, manager_tag, ppm_initial,
         payed_sum, total_sum, agent_balance (опционально, может быть None).
         Возвращает число вставленных записей.
         """
@@ -911,7 +910,6 @@ class Database:
                 r.get("agent_name"),
                 r.get("manager_tag"),
                 r.get("ppm_initial"),
-                r.get("ppm_new"),
                 r.get("payed_sum"),
                 r.get("total_sum"),
                 r.get("agent_balance"),
@@ -931,11 +929,11 @@ class Database:
             cur.executemany(
                 """INSERT INTO pdz_snapshots
                    (snap_date, order_id, order_name, agent_id, agent_name,
-                    manager_tag, ppm_initial, ppm_new, payed_sum,
+                    manager_tag, ppm_initial, payed_sum,
                     total_sum, agent_balance, coverage_residual_45d,
                     overdue_fifo_days, overdue_fifo_amount, overdue_fifo_url,
                     overdue_fifo_count)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (snap_date, order_id) DO UPDATE SET
                      snap_at = EXCLUDED.snap_at,
                      order_name = EXCLUDED.order_name,
@@ -943,7 +941,6 @@ class Database:
                      agent_name = EXCLUDED.agent_name,
                      manager_tag = EXCLUDED.manager_tag,
                      ppm_initial = EXCLUDED.ppm_initial,
-                     ppm_new = EXCLUDED.ppm_new,
                      payed_sum = EXCLUDED.payed_sum,
                      total_sum = EXCLUDED.total_sum,
                      agent_balance = EXCLUDED.agent_balance,
@@ -962,7 +959,7 @@ class Database:
         """Возвращает все строки снимка за указанную дату (для отладки)."""
         return self._fetchall(
             """SELECT id, snap_at, snap_date, order_id, order_name, agent_id,
-                      agent_name, manager_tag, ppm_initial, ppm_new,
+                      agent_name, manager_tag, ppm_initial,
                       payed_sum, total_sum, agent_balance, coverage_residual_45d,
                       overdue_fifo_days, overdue_fifo_amount, overdue_fifo_url,
                       overdue_fifo_count
@@ -986,7 +983,7 @@ class Database:
         return self._fetchall(
             """SELECT DISTINCT ON (order_id)
                       id, snap_at, snap_date, order_id, order_name, agent_id,
-                      agent_name, manager_tag, ppm_initial, ppm_new,
+                      agent_name, manager_tag, ppm_initial,
                       payed_sum, total_sum, agent_balance, coverage_residual_45d,
                       overdue_fifo_days, overdue_fifo_amount, overdue_fifo_url,
                       overdue_fifo_count
@@ -1021,7 +1018,7 @@ class Database:
             """
             SELECT DISTINCT ON (order_id)
                    id, snap_at, snap_date, order_id, order_name, agent_id,
-                   agent_name, manager_tag, ppm_initial, ppm_new,
+                   agent_name, manager_tag, ppm_initial,
                    payed_sum, total_sum, agent_balance, coverage_residual_45d,
                    overdue_fifo_days, overdue_fifo_amount, overdue_fifo_url,
                    overdue_fifo_count
@@ -1032,113 +1029,74 @@ class Database:
             (prev_date,),
         )
 
-    def save_promise_events(self, events: List[Dict]) -> int:
-        """Batch insert событий в promise_log.
+    def save_pdz_payment_state(self, snap_date, payments: Dict, window_days: int = 30) -> int:
+        """Сохраняет состояние платежей по контрагентам на дату снимка.
 
-        Каждый event — dict с ключами: order_id, order_name, agent_id, agent_name,
-        manager_tag, event_type ('set'|'moved'|'broken'), old_ppm_new, new_ppm_new.
-        Возвращает число вставленных записей.
+        payments — результат moysklad.fetch_payments_by_agent():
+        {agent_id: {"amount": float, "last_date": date|None, "count": int}}.
+
+        Заменяет отменённое поле «НОВАЯ дата оплаты» как признак работы с
+        долгом: вместо «менеджер пересогласовал дату» смотрим «клиент платил».
         """
-        if not events:
+        if not payments:
             return 0
         self._ensure_connection()
         params = [
             (
-                e.get("order_id"),
-                e.get("order_name"),
-                e.get("agent_id"),
-                e.get("agent_name"),
-                e.get("manager_tag"),
-                e.get("event_type"),
-                e.get("old_ppm_new"),
-                e.get("new_ppm_new"),
+                snap_date,
+                aid,
+                v.get("last_date"),
+                v.get("amount") or 0,
+                v.get("count") or 0,
+                window_days,
             )
-            for e in events
+            for aid, v in payments.items() if aid
         ]
         with self.conn.cursor() as cur:
             cur.executemany(
-                """INSERT INTO promise_log
-                   (order_id, order_name, agent_id, agent_name, manager_tag,
-                    event_type, old_ppm_new, new_ppm_new)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                """INSERT INTO pdz_payment_state
+                   (snap_date, agent_id, last_payment_date, amount_window,
+                    payments_count, window_days)
+                   VALUES (%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (snap_date, agent_id) DO UPDATE SET
+                     last_payment_date = EXCLUDED.last_payment_date,
+                     amount_window = EXCLUDED.amount_window,
+                     payments_count = EXCLUDED.payments_count,
+                     window_days = EXCLUDED.window_days""",
                 params,
             )
             self.conn.commit()
         return len(params)
 
-    # ─── ПДЗ Фаза 4.5: счётчики срывов обещаний по клиентам ───────────────
-    def get_promise_breaks_count(self, agent_ids: list, days_window: int = 90) -> dict:
-        """Возвращает {agent_id: count} — число срывов (event_type='broken')
-        по каждому agent_id за последние `days_window` дней.
+    def get_pdz_payment_state(self, snap_date=None) -> Dict[str, Dict]:
+        """Состояние платежей на дату (по умолчанию — последнюю доступную).
 
-        Batch SQL — один запрос на всех agent_ids. Если список пустой —
-        возвращает {}. Если у agent_id нет срывов, его в результате не будет
-        (вызывающий код может .get(aid, 0)).
+        Возвращает {agent_id: {"last_payment_date": date|None,
+                               "amount_window": float, "payments_count": int}}.
+        Клиента нет в словаре → за окно он не платил ни разу.
         """
-        if not agent_ids:
+        self._ensure_connection()
+        if snap_date is None:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT MAX(snap_date) AS d FROM pdz_payment_state")
+                row = cur.fetchone()
+                snap_date = row.get("d") if row else None
+        if not snap_date:
             return {}
-        # Уникальный список (на случай дублей), фильтруем пустые.
-        unique_ids = [a for a in {x for x in agent_ids if x}]
-        if not unique_ids:
-            return {}
-        days = int(days_window)
-        sql = (
-            "SELECT agent_id, COUNT(*) AS cnt FROM promise_log "
-            "WHERE agent_id = ANY(%s) AND event_type='broken' "
-            f"AND occurred_at >= NOW() - INTERVAL '{days} days' "
-            "GROUP BY agent_id"
+        rows = self._fetchall(
+            """SELECT agent_id, last_payment_date, amount_window, payments_count
+               FROM pdz_payment_state WHERE snap_date = %s""",
+            (snap_date,),
         )
-        rows = self._fetchall(sql, (unique_ids,))
-        return {r["agent_id"]: int(r["cnt"]) for r in rows}
+        return {
+            r["agent_id"]: {
+                "last_payment_date": r.get("last_payment_date"),
+                "amount_window": float(r.get("amount_window") or 0),
+                "payments_count": int(r.get("payments_count") or 0),
+            }
+            for r in rows if r.get("agent_id")
+        }
 
-    def get_promise_breaks_top(self, limit: int = 30, days_window: int = 90) -> list:
-        """Топ контрагентов по числу broken-событий за `days_window` дней.
-
-        Возвращает список dict с полями:
-            {agent_id, agent_name, manager_tag, breaks_count, last_break_at}
-
-        Группировка по agent_id; agent_name и manager_tag берутся из
-        последнего broken-события. Сортировка breaks_count DESC, далее
-        last_break_at DESC. Лимит — `limit`.
-        """
-        days = int(days_window)
-        lim = int(limit)
-        sql = (
-            "SELECT agent_id, "
-            "       (SELECT agent_name FROM promise_log p2 "
-            "          WHERE p2.agent_id = p.agent_id AND p2.event_type='broken' "
-            f"          AND p2.occurred_at >= NOW() - INTERVAL '{days} days' "
-            "          ORDER BY p2.occurred_at DESC LIMIT 1) AS agent_name, "
-            "       (SELECT manager_tag FROM promise_log p3 "
-            "          WHERE p3.agent_id = p.agent_id AND p3.event_type='broken' "
-            f"          AND p3.occurred_at >= NOW() - INTERVAL '{days} days' "
-            "          ORDER BY p3.occurred_at DESC LIMIT 1) AS manager_tag, "
-            "       COUNT(*) AS breaks_count, "
-            "       MAX(occurred_at) AS last_break_at "
-            "FROM promise_log p "
-            "WHERE event_type='broken' "
-            f"  AND occurred_at >= NOW() - INTERVAL '{days} days' "
-            "  AND agent_id IS NOT NULL AND agent_id <> '' "
-            "GROUP BY agent_id "
-            "ORDER BY breaks_count DESC, last_break_at DESC "
-            f"LIMIT {lim}"
-        )
-        rows = self._fetchall(sql)
-        out = []
-        for r in rows:
-            out.append({
-                "agent_id": r.get("agent_id"),
-                "agent_name": r.get("agent_name"),
-                "manager_tag": r.get("manager_tag"),
-                "breaks_count": int(r.get("breaks_count") or 0),
-                "last_break_at": r.get("last_break_at"),
-            })
-        return out
-
-    # ─── ПДЗ Фаза 6: client_stop_flags (эскалация) ─────────────────────────
-    # status: 'stop_shipments' (3 срыва) | 'prepayment_only' (4+ срывов).
-    # «Активный» = removed_at IS NULL. Уникальный индекс гарантирует, что в
-    # один момент времени у agent_id максимум одна активная запись.
     def set_client_stop_flag(
         self,
         agent_id: str,
@@ -1754,7 +1712,7 @@ class Database:
     # ── Кэш HTML-отчёта «Дебиторка» (ПДЗ Фаза 5) ─────────────────────────────
     # Готовый HTML-документ кладём в bot_settings.pdz_html_cache. Регенерация —
     # cron 14:15 МСК (после фиксации срывов в 14:02 + дайджестов в 14:10) и
-    # ручной запуск через /pdz_html. Источник данных — pdz_snapshots + promise_log.
+    # ручной запуск через /pdz_html. Источник данных — pdz_snapshots + pdz_payment_state.
     # Чтение — handle_pdz_html в bot.py, по защищённой ссылке `report_links`.
 
     def get_pdz_html_cache(self) -> str | None:

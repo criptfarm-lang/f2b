@@ -113,7 +113,7 @@ def setup_scheduler(app: Application, db):
 
     # 12:52 МСК — обработка событий обещаний (Фаза 3). Между snapshot 12:50
     # и дайджестом менеджерам 13:00. Сравнивает сегодняшний и вчерашний
-    # snapshot, пишет события в promise_log и шлёт TG-алерт собственнику
+    # snapshot, эскалирует по неплатежам и шлёт TG-алерт собственнику
     # при изменении ppm_initial («Дата планируемой оплаты», менять нельзя).
     scheduler.add_job(
         _pdz_run_and_record,
@@ -143,8 +143,8 @@ def setup_scheduler(app: Application, db):
     )
 
     # 13:05 МСК — регенерация HTML-отчёта «Дебиторка» (Фаза 5).
-    # Идёт после 12:52 (фиксация срывов в promise_log) и 13:00 (дайджесты
-    # менеджерам). Источник — БД (pdz_snapshots + promise_log), МС API не
+    # Идёт после 12:52 (эскалация) и 13:00 (дайджесты
+    # менеджерам). Источник — БД (pdz_snapshots + pdz_payment_state), МС API не
     # дёргается. Шлёт собственнику ссылку с токеном TTL 24ч.
     scheduler.add_job(
         _pdz_run_and_record,
@@ -618,6 +618,22 @@ async def pdz_take_snapshot_job(app: Application, db):
         logger.info(f"pdz_take_snapshot_job: вставлено {inserted} строк")
     except Exception as e:
         logger.error(f"pdz_take_snapshot_job: {e}", exc_info=True)
+        return
+
+    # Состояние платежей клиентов — источник для эскалации и сводок вместо
+    # отменённой 25.09.2026 «НОВОЙ даты оплаты». Отдельный try: снимок заказов
+    # уже сохранён, падение здесь не должно его обесценить.
+    try:
+        from moysklad import fetch_payments_by_agent, PDZ_PAYMENT_WINDOW_DAYS
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        payments = await fetch_payments_by_agent()
+        snap_date = _dt.now(_ZI("Europe/Moscow")).date()
+        saved = db.save_pdz_payment_state(snap_date, payments, PDZ_PAYMENT_WINDOW_DAYS)
+        logger.info(f"pdz_take_snapshot_job: состояние платежей по {saved} контрагентам")
+    except Exception as e:
+        logger.error(f"pdz_take_snapshot_job: состояние платежей: {e}", exc_info=True)
 
 
 # ─── ПДЗ Фаза 3: обработка событий + аудит исходной даты ─────────────────
@@ -648,17 +664,21 @@ def _fmt_date(d) -> str:
 
 
 async def pdz_process_events_job(app: Application, db):
-    """Cron 14:02 МСК — основная обработка событий обещаний (Фаза 3).
+    """Cron 14:02 МСК — аудит даты оплаты и эскалация по неплатежам.
 
     Шаги:
       a. today  = pdz_take_snapshot()  (свежий API-запрос; мы сразу после 14:00
-         и хотим максимально актуальное состояние для сравнения).
+         и хотим максимально актуальное состояние).
       b. yesterday = db.get_last_snapshot_before(today_date).
-      c. events = compute_promise_events(today, yesterday) → save_promise_events.
+      c. эскалация по связке «просрочка + отсутствие платежей» (см.
+         _pdz_escalate_by_payment_gap).
       d. initial_changes = await audit_ppm_initial_changes(today, yesterday).
       e. Для каждого initial_change — TG-сообщение собственнику OWNER_CHAT_ID.
 
     Сообщения группируются по 10 на одно TG-message (защита от rate-limit).
+
+    25.09.2026: журнал обещаний (set/moved/broken) убран вместе с полем
+    «НОВАЯ дата оплаты» — см. plans/2026-09-25-отмена-новой-даты-оплаты.md.
     """
     from datetime import datetime as _dt
     from zoneinfo import ZoneInfo as _ZI
@@ -669,7 +689,6 @@ async def pdz_process_events_job(app: Application, db):
     try:
         from moysklad import (
             pdz_take_snapshot,
-            compute_promise_events,
             audit_ppm_initial_changes,
         )
 
@@ -677,36 +696,22 @@ async def pdz_process_events_job(app: Application, db):
         today_date = _dt.now(_ZI("Europe/Moscow")).date()
         yesterday_rows = db.get_last_snapshot_before(today_date)
 
-        # Сохраняем сегодняшний срез сюда же — чтобы /pdz_events_test был
+        # Сохраняем сегодняшний срез сюда же — чтобы ручной прогон был
         # самодостаточным (даже если 14:00-cron почему-то не отработал).
-        # Если cron 14:00 уже отписал тот же snap_date — будет дубль, и это
-        # нормально (для compute_promise_events используется именно `today_rows`,
-        # а get_last_snapshot_before берёт ПРОШЛЫЕ даты). На текущий день
-        # дублирующая запись не мешает.
         try:
             inserted_now = db.save_pdz_snapshot(today_rows)
             logger.info(f"pdz_process_events_job: snapshot up-sert {inserted_now} строк")
         except Exception as e:
             logger.warning(f"pdz_process_events_job: повторный save_pdz_snapshot: {e}")
 
-        events = compute_promise_events(today_rows, yesterday_rows)
-        saved = db.save_promise_events(events)
-        sets = sum(1 for e in events if e["event_type"] == "set")
-        moved = sum(1 for e in events if e["event_type"] == "moved")
-        broken = sum(1 for e in events if e["event_type"] == "broken")
-        logger.info(
-            f"pdz_process_events_job: events={len(events)} (set={sets}, moved={moved}, broken={broken}); saved={saved}"
-        )
-
-        # ── Фаза 6: эскалация по числу срывов ───────────────────────────
-        # Для каждого broken-события считаем число срывов за 90д у этого
-        # контрагента и реагируем:
-        #   2 → задача менеджеру в МС (через create_task).
-        #   3 → set_client_stop_flag(stop_shipments) + TG-алерт собственнику.
-        #   4+ → set_client_stop_flag(prepayment_only) + TG-алерт.
+        # ── Эскалация по неплатежам (правило от 25.09.2026) ─────────────
+        # Смотрим связку «глубина просрочки + отсутствие приходов денег»:
+        #   ≥14 дн просрочки и ≥14 дн без платежей → задача менеджеру в МС.
+        #   ≥14 дн просрочки и ≥21 дн без платежей → СТОП отгрузок + алерт.
+        #   ≥30 дн просрочки и ≥21 дн без платежей → только предоплата + алерт.
         # Дедуп: db.is_pdz_escalation_done(agent_id, level) → не повторять.
         try:
-            escalation_summary = await _pdz_escalate_broken_events(app, db, events)
+            escalation_summary = await _pdz_escalate_by_payment_gap(app, db, today_rows)
             logger.info(
                 f"pdz_process_events_job: escalations="
                 f"tasks_created={escalation_summary['tasks_created']}, "
@@ -768,66 +773,115 @@ async def pdz_process_events_job(app: Application, db):
                         logger.error(f"pdz_process_events_job: TG-алерт собственнику: {e}")
 
         return {
-            "events_total": len(events),
-            "set": sets,
-            "moved": moved,
-            "broken": broken,
             "initial_changes": len(initial_changes),
             "escalation": escalation_summary,
         }
     except Exception as e:
         logger.error(f"pdz_process_events_job: {e}", exc_info=True)
-        return {"events_total": 0, "set": 0, "moved": 0, "broken": 0, "initial_changes": 0, "error": str(e)}
+        return {"initial_changes": 0, "error": str(e)}
 
 
-async def _pdz_escalate_broken_events(app: Application, db, events: list) -> dict:
-    """Реакция на broken-события (Фаза 6).
+# Пороги эскалации (25.09.2026). Считаем не «сколько раз менеджер перенёс
+# обещание» (поле отменено), а факт: клиент в просрочке и денег от него нет.
+# Порог по числу срывов не годится — у клиента с десятками отгрузок срывов
+# всегда много, и под стоп попадали бы крупнейшие плательщики (замер 25.09:
+# правило «3 срыва за 90 дней» дало бы 74 клиента, включая Биг Маму и Фугу).
+PDZ_ESC_TASK_OVERDUE_DAYS = 14      # задача менеджеру
+PDZ_ESC_TASK_NOPAY_DAYS = 14
+PDZ_ESC_STOP_OVERDUE_DAYS = 14      # стоп отгрузок
+PDZ_ESC_STOP_NOPAY_DAYS = 21
+PDZ_ESC_PREPAY_OVERDUE_DAYS = 30    # только предоплата
+PDZ_ESC_PREPAY_NOPAY_DAYS = 21
 
-    Для каждого уникального agent_id, по которому в `events` есть >=1 broken:
-      - получаем breaks_count = db.get_promise_breaks_count за 90д;
-      - выбираем максимальный уровень эскалации (2/3/4+), который ещё не
-        выполнен (db.is_pdz_escalation_done);
-      - выполняем соответствующее действие и помечаем его как done.
+
+async def _pdz_escalate_by_payment_gap(app: Application, db, today_rows: list) -> dict:
+    """Эскалация по связке «глубина просрочки + отсутствие приходов денег».
+
+    Для каждого контрагента из снимка считаем:
+      - max_days_overdue — по заказам, где ppm_initial + GRACE прошла и заказ
+        не оплачен, у клиента отрицательное сальдо;
+      - days_no_pay — дней с последнего прихода денег (paymentin/cashin) по
+        данным `pdz_payment_state`; клиента нет в таблице → платежей за всё
+        окно не было, берём длину окна.
+
+    Уровни (дедуп через db.is_pdz_escalation_done):
+      2 → задача менеджеру в МС.
+      3 → set_client_stop_flag(stop_shipments) + TG-алерт собственнику.
+      4 → set_client_stop_flag(prepayment_only) + TG-алерт.
+
+    Долг в алерте — по сальдо контрагента, а не по сумме неоплаченных заказов:
+    payedSum в МС не отражает неразнесённые платежи (см. память
+    reference_f2b_ms_payedSum_unreliable).
 
     Возвращает сводку (для логирования и теста).
     """
+    from moysklad import _pdz_classify, PDZ_PAYMENT_WINDOW_DAYS, _to_date
+
     summary = {
         "tasks_created": 0,
         "stop_shipments": 0,
         "prepayment_only": 0,
         "skipped_done": 0,
+        "candidates": 0,
         "errors": [],
     }
 
-    # Собираем уникальные клиенты, которые ИМЕННО СЕГОДНЯ сорвали обещание.
-    broken_agents: dict = {}  # agent_id → {agent_name, manager_tag, order_id, order_name}
-    for ev in events or []:
-        if ev.get("event_type") != "broken":
-            continue
-        aid = ev.get("agent_id")
-        if not aid or aid in broken_agents:
-            continue
-        broken_agents[aid] = {
-            "agent_name": ev.get("agent_name"),
-            "manager_tag": ev.get("manager_tag"),
-            "order_id": ev.get("order_id"),
-            "order_name": ev.get("order_name"),
-        }
+    today = datetime.now(MSK).date()
 
-    if not broken_agents:
+    try:
+        pay_state = db.get_pdz_payment_state() or {}
+    except Exception as e:
+        logger.error(f"_pdz_escalate_by_payment_gap: get_pdz_payment_state: {e}")
+        return summary
+    if not pay_state:
+        # Состояния платежей ещё нет (первый прогон после деплоя) — без него
+        # правило неполное, молча выходим: лучше не эскалировать, чем ошибочно.
+        logger.warning("_pdz_escalate_by_payment_gap: pdz_payment_state пуст, пропуск")
         return summary
 
-    # breaks_count за 90д батчем для всех затронутых клиентов.
-    try:
-        breaks_map = db.get_promise_breaks_count(list(broken_agents.keys()), days_window=90)
-    except Exception as e:
-        logger.error(f"_pdz_escalate_broken_events: get_promise_breaks_count failed: {e}")
-        breaks_map = {}
+    # Шаг 1: собрать по клиенту максимальную глубину просрочки и сальдо.
+    agents: dict = {}
+    for r in today_rows or []:
+        aid = r.get("agent_id") or ""
+        if not aid:
+            continue
+        bal_raw = r.get("agent_balance")
+        try:
+            balance = float(bal_raw) if bal_raw is not None else None
+        except Exception:
+            balance = None
+        if balance is None or balance >= 0:
+            continue  # клиент не должен — не эскалируем
+        try:
+            total = float(r.get("total_sum") or 0)
+            payed = float(r.get("payed_sum") or 0)
+        except Exception:
+            continue
+        if payed >= total:
+            continue
+        status, _effective, days_overdue = _pdz_classify(_to_date(r.get("ppm_initial")), today)
+        if status != "overdue":
+            continue
+        a = agents.setdefault(aid, {
+            "agent_name": r.get("agent_name") or "—",
+            "manager_tag": (r.get("manager_tag") or "").lower(),
+            "debt": abs(balance),
+            "max_days_overdue": 0,
+        })
+        if days_overdue > a["max_days_overdue"]:
+            a["max_days_overdue"] = days_overdue
+
+    # Шаг 2: добавить разрыв по платежам.
+    for aid, a in agents.items():
+        st = pay_state.get(aid) or {}
+        last = st.get("last_payment_date")
+        last = _to_date(last) if last else None
+        a["days_no_pay"] = (today - last).days if last else PDZ_PAYMENT_WINDOW_DAYS
+        a["last_payment_date"] = last
 
     owner_raw = os.getenv("OWNER_CHAT_ID")
     owner_id = int(owner_raw) if owner_raw else None
 
-    # Импортируем тут, чтобы не плодить циклические импорты при загрузке модуля.
     from moysklad import (
         find_employee_id_by_tag,
         create_task as ms_create_task,
@@ -836,74 +890,58 @@ async def _pdz_escalate_broken_events(app: Application, db, events: list) -> dic
     )
     from datetime import timedelta
 
-    for aid, info in broken_agents.items():
-        count = int(breaks_map.get(aid, 0))
-        if count < 2:
-            # 1 срыв = молча по плану.
-            continue
-        agent_name = info.get("agent_name") or "—"
-        manager_tag = (info.get("manager_tag") or "").lower()
-        order_id = info.get("order_id")
-        order_name = info.get("order_name")
+    for aid, info in agents.items():
+        overdue_days = info["max_days_overdue"]
+        no_pay = info["days_no_pay"]
+        agent_name = info["agent_name"]
+        manager_tag = info["manager_tag"]
+        total_unpaid = info["debt"]
 
-        # Считаем общий долг клиента по последнему снимку — для алерта собственнику.
-        total_unpaid = 0.0
-        try:
-            latest = db.get_latest_snapshot() or []
-            for r in latest:
-                if (r.get("agent_id") or "") != aid:
-                    continue
-                bal_raw = r.get("agent_balance")
-                try:
-                    balance = float(bal_raw) if bal_raw is not None else None
-                except Exception:
-                    balance = None
-                if balance is not None and balance >= 0:
-                    continue
-                try:
-                    t = float(r.get("total_sum") or 0)
-                    p = float(r.get("payed_sum") or 0)
-                except Exception:
-                    t, p = 0.0, 0.0
-                if p < t:
-                    total_unpaid += (t - p)
-        except Exception as e:
-            logger.warning(f"_pdz_escalate_broken_events: total_unpaid for {aid} failed: {e}")
+        hit_task = (overdue_days >= PDZ_ESC_TASK_OVERDUE_DAYS
+                    and no_pay >= PDZ_ESC_TASK_NOPAY_DAYS)
+        hit_stop = (overdue_days >= PDZ_ESC_STOP_OVERDUE_DAYS
+                    and no_pay >= PDZ_ESC_STOP_NOPAY_DAYS)
+        hit_prepay = (overdue_days >= PDZ_ESC_PREPAY_OVERDUE_DAYS
+                      and no_pay >= PDZ_ESC_PREPAY_NOPAY_DAYS)
+        if not hit_task:
+            continue
+        summary["candidates"] += 1
+        reason_txt = f"просрочка {overdue_days} дн, без платежей {no_pay} дн"
 
         # ── Уровень 2: задача менеджеру в МС ───────────────────────────
-        if count >= 2 and not db.is_pdz_escalation_done(aid, 2):
+        if hit_task and not db.is_pdz_escalation_done(aid, 2):
             try:
                 assignee_id = await find_employee_id_by_tag(manager_tag)
                 if not assignee_id:
                     logger.warning(
-                        f"_pdz_escalate_broken_events: не нашли сотрудника МС по тегу '{manager_tag}'"
+                        f"_pdz_escalate_by_payment_gap: не нашли сотрудника МС по тегу '{manager_tag}'"
                         f" (клиент {agent_name}); задача не поставлена"
                     )
                 else:
                     due_msk = datetime.now(MSK) + timedelta(days=2)
                     desc = (
-                        f"2-й перенос обещания у клиента {agent_name}. "
-                        f"Согласовать с руководителем при необходимости."
+                        f"Клиент {agent_name}: {reason_txt}. "
+                        f"Связаться и зафиксировать, когда будет оплата."
                     )
                     await ms_create_task(assignee_id, desc, due_msk)
                     summary["tasks_created"] += 1
                 db.mark_pdz_escalation_done(aid, 2)
             except Exception as e:
                 logger.error(
-                    f"_pdz_escalate_broken_events: create_task для {agent_name} ({manager_tag}): {e}"
+                    f"_pdz_escalate_by_payment_gap: create_task для {agent_name} ({manager_tag}): {e}"
                 )
                 summary["errors"].append(f"task:{aid}:{e}")
-        elif count >= 2 and db.is_pdz_escalation_done(aid, 2):
+        elif hit_task and db.is_pdz_escalation_done(aid, 2):
             summary["skipped_done"] += 1
 
         # ── Уровень 3: stop_shipments + TG-алерт собственнику ──────────
-        if count >= 3 and not db.is_pdz_escalation_done(aid, 3):
+        if hit_stop and not db.is_pdz_escalation_done(aid, 3):
             try:
                 changed = db.set_client_stop_flag(
                     agent_id=aid,
                     agent_name=agent_name,
                     status="stop_shipments",
-                    reason="3-й перенос обещания",
+                    reason=reason_txt,
                     set_by="auto",
                 )
                 if changed:
@@ -916,7 +954,7 @@ async def _pdz_escalate_broken_events(app: Application, db, events: list) -> dic
                     safe_aid = (aid or "—").replace("*", "").replace("_", "")
                     text = (
                         f"🚫 *СТОП ОТГРУЗОК:* {safe_name}\n"
-                        f"Причина: 3-й перенос обещания\n"
+                        f"Причина: {reason_txt}\n"
                         f"Менеджер: {safe_tag}\n"
                         f"Долг: {fmt_money(total_unpaid)}\n\n"
                         f"Для снятия: `/snimi_stop {safe_aid}`"
@@ -930,20 +968,20 @@ async def _pdz_escalate_broken_events(app: Application, db, events: list) -> dic
                         )
                     except Exception as e:
                         logger.error(
-                            f"_pdz_escalate_broken_events: TG-алерт собственнику (stop): {e}"
+                            f"_pdz_escalate_by_payment_gap: TG-алерт собственнику (stop): {e}"
                         )
             except Exception as e:
-                logger.error(f"_pdz_escalate_broken_events: set_stop_shipments для {agent_name}: {e}")
+                logger.error(f"_pdz_escalate_by_payment_gap: set_stop_shipments для {agent_name}: {e}")
                 summary["errors"].append(f"stop3:{aid}:{e}")
 
         # ── Уровень 4+: prepayment_only + TG-алерт собственнику ────────
-        if count >= 4 and not db.is_pdz_escalation_done(aid, 4):
+        if hit_prepay and not db.is_pdz_escalation_done(aid, 4):
             try:
                 changed = db.set_client_stop_flag(
                     agent_id=aid,
                     agent_name=agent_name,
                     status="prepayment_only",
-                    reason=f"{count}-й перенос обещания (4+)",
+                    reason=reason_txt,
                     set_by="auto",
                 )
                 if changed:
@@ -956,7 +994,7 @@ async def _pdz_escalate_broken_events(app: Application, db, events: list) -> dic
                     safe_aid = (aid or "—").replace("*", "").replace("_", "")
                     text = (
                         f"🚫 *ТОЛЬКО ПРЕДОПЛАТА:* {safe_name}\n"
-                        f"Причина: {count}-й перенос обещания\n"
+                        f"Причина: {reason_txt}\n"
                         f"Менеджер: {safe_tag}\n"
                         f"Долг: {fmt_money(total_unpaid)}\n\n"
                         f"Для снятия: `/snimi_stop {safe_aid}`"
@@ -970,10 +1008,10 @@ async def _pdz_escalate_broken_events(app: Application, db, events: list) -> dic
                         )
                     except Exception as e:
                         logger.error(
-                            f"_pdz_escalate_broken_events: TG-алерт собственнику (prepay): {e}"
+                            f"_pdz_escalate_by_payment_gap: TG-алерт собственнику (prepay): {e}"
                         )
             except Exception as e:
-                logger.error(f"_pdz_escalate_broken_events: set_prepayment_only для {agent_name}: {e}")
+                logger.error(f"_pdz_escalate_by_payment_gap: set_prepayment_only для {agent_name}: {e}")
                 summary["errors"].append(f"prepay:{aid}:{e}")
 
     return summary
@@ -1005,6 +1043,15 @@ async def pdz_send_digests_job(app: Application, db) -> dict:
         f"pdz_send_digests_job стартовала в {datetime.now(MSK):%Y-%m-%d %H:%M %Z}"
     )
 
+    # Вчерашний снимок — для дельты «за сутки» в шапке сводки.
+    try:
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        yesterday_rows = db.get_last_snapshot_before(_dt.now(_ZI("Europe/Moscow")).date())
+    except Exception as e:
+        logger.warning(f"pdz_send_digests_job: вчерашний снимок недоступен: {e}")
+        yesterday_rows = None
+
     report: dict = {}
     for tag, manager_name in PDZ_MANAGER_TAG_MAP.items():
         try:
@@ -1035,7 +1082,18 @@ async def pdz_send_digests_job(app: Application, db) -> dict:
             }
             continue
 
-        messages = pdz_send_manager_digest_text(items, manager_name)
+        delta = None
+        if yesterday_rows:
+            try:
+                prev = await pdz_overdue_for_manager(tag, db=db, rows=yesterday_rows)
+                delta = round(
+                    sum(float(i.get("total_unpaid", 0) or 0) for i in items)
+                    - sum(float(p.get("total_unpaid", 0) or 0) for p in prev), 2
+                )
+            except Exception as e:
+                logger.warning(f"pdz_send_digests_job: дельта для {tag}: {e}")
+
+        messages = pdz_send_manager_digest_text(items, manager_name, delta=delta)
         sent = 0
         for i, msg in enumerate(messages):
             try:
@@ -1071,13 +1129,16 @@ async def pdz_send_digests_job(app: Application, db) -> dict:
 
 
 async def pdz_send_owner_pending_job(app: Application, db) -> dict:
-    """Cron 16:05 МСК — пинг собственнику по необработанным после 16:00.
+    """Cron 16:05 МСК — вечерняя сводка собственнику по просрочке менеджеров.
 
-    Собирает по менеджерам клиентов, где менеджер не пересогласовал
-    `ppm_new` в будущее (см. pdz_unprocessed_for_owner).
+    По каждому менеджеру: сумма просрочки, число клиентов, дельта за сутки,
+    худший клиент по дням. Ниже — список его клиентов.
 
-    Если у всех всё проставлено — отправляет «✅ Все менеджеры обработали
-    просрочки до 16:00».
+    Если просрочки нет ни у кого — отправляет «✅ Просрочек нет».
+
+    25.09.2026: раньше это был пинг «кто не проставил НОВУЮ дату оплаты».
+    Поле отменено, признак «обработал» больше не существует — см.
+    plans/2026-09-25-отмена-новой-даты-оплаты.md.
     """
     from moysklad import (
         PDZ_MANAGER_TAG_MAP,
@@ -1115,16 +1176,31 @@ async def pdz_send_owner_pending_job(app: Application, db) -> dict:
         return {"status": "error", "error": str(e)}
 
     if not by_tag:
-        text = "✅ Все менеджеры обработали просрочки до 16:00"
+        text = "✅ Просрочек нет ни у одного менеджера"
         try:
             await app.bot.send_message(chat_id=owner_id, text=text)
         except Exception as e:
             logger.error(f"pdz_send_owner_pending_job: send_message OK: {e}")
         return {"status": "all_clear", "managers": 0}
 
+    # Дельта за сутки по каждому менеджеру — из вчерашнего снимка теми же правилами.
+    prev_totals: dict = {}
+    try:
+        yesterday_rows = db.get_last_snapshot_before(datetime.now(MSK).date())
+        if yesterday_rows:
+            from moysklad import pdz_overdue_for_manager
+            for _tag in PDZ_MANAGER_TAG_MAP:
+                prev_items = await pdz_overdue_for_manager(_tag, db=db, rows=yesterday_rows)
+                prev_totals[_tag] = sum(float(i.get("total_unpaid", 0) or 0) for i in prev_items)
+    except Exception as e:
+        logger.warning(f"pdz_send_owner_pending_job: дельта за сутки недоступна: {e}")
+
     # Формируем сводку. Группировка по менеджеру, внутри — клиенты по
     # total_unpaid убыванию (уже отсортированы pdz_unprocessed_for_owner).
-    lines: list[str] = ["⚠️ *16:00 — не проставлены новые даты:*", ""]
+    grand_total = sum(
+        sum(a["total_unpaid"] for a in agents) for agents in by_tag.values()
+    )
+    lines: list[str] = [f"📊 *Просрочка на 16:00 — {fmt_money(grand_total)}*", ""]
 
     # Сортируем менеджеров по сумме просрочки (убывание).
     tag_totals = [
@@ -1133,27 +1209,27 @@ async def pdz_send_owner_pending_job(app: Application, db) -> dict:
     ]
     tag_totals.sort(key=lambda x: x[1], reverse=True)
 
-    def _breaks_word(cnt: int) -> str:
-        if cnt % 10 == 1 and cnt % 100 != 11:
-            return "срыв"
-        if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
-            return "срыва"
-        return "срывов"
-
     for tag, total, agents in tag_totals:
         manager_name = PDZ_MANAGER_TAG_MAP.get(tag, tag)
-        # Берём фамилию (первое слово после имени) для заголовка — в плане
-        # пример "Скляр — 3 клиента · 280 000 ₽".
         surname = manager_name.split()[-1] if manager_name else tag
         cnt = len(agents)
         word = "клиент" if cnt % 10 == 1 and cnt % 100 != 11 else (
             "клиента" if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14) else "клиентов"
         )
-        lines.append(f"*{surname}* — {cnt} {word} · {fmt_money(total)}")
+        head = f"*{surname}* — {cnt} {word} · {fmt_money(total)}"
+        prev = prev_totals.get(tag)
+        if prev is not None:
+            d = round(total - prev, 2)
+            if abs(d) >= 1:
+                head += f" · за сутки {'🔺 +' if d > 0 else '🔻 '}{fmt_money(abs(d))}"
+        worst = max(agents, key=lambda a: int(a.get("max_days_overdue", 0) or 0))
+        worst_name = (worst.get("agent_name") or "—").replace("*", "").replace("_", "")
+        head += f"\nДольше всех: {worst_name} — {int(worst.get('max_days_overdue', 0) or 0)} дн"
+        lines.append(head)
         for a in agents:
             name = (a.get("agent_name") or "—").replace("*", "").replace("_", "")
             url = a.get("ms_url_first_order") or "#"
-            breaks = int(a.get("breaks_count", 0) or 0)
+            no_pay = a.get("days_no_pay")
             # Фаза 6: префикс стоп-флага.
             stop_status = a.get("stop_status")
             if stop_status == "stop_shipments":
@@ -1162,8 +1238,8 @@ async def pdz_send_owner_pending_job(app: Application, db) -> dict:
                 stop_prefix = "🚫 ПРЕДОПЛАТА "
             else:
                 stop_prefix = ""
-            prefix = stop_prefix + ("🔴 " if breaks > 0 else "")
-            suffix = f" ({breaks} {_breaks_word(breaks)} за 90д)" if breaks > 0 else ""
+            prefix = stop_prefix + ("🔴 " if (no_pay or 0) >= 21 else "")
+            suffix = f" · без платежей {int(no_pay)} дн" if no_pay else ""
             lines.append(
                 f"• {prefix}[{name}]({url}) · {a.get('max_days_overdue', 0)} дн · "
                 f"{fmt_money(a.get('total_unpaid', 0))}{suffix}"
@@ -1218,7 +1294,7 @@ async def pdz_generate_html_job(app: Application, db) -> dict:
 
     Шаги:
       1. render_pdz_html_from_db(db) — собирает HTML из последнего snapshot
-         и promise_log (МС API не дёргается).
+         и pdz_payment_state (МС API не дёргается).
       2. db.set_pdz_html_cache(html) — атомарно перезаписывает кэш.
       3. db.create_report_link(mgr_filter='pdz', ttl_minutes=24*60) — токен на 24ч.
       4. Шлёт собственнику в ЛС ссылку `https://<host>/pdz?token=...`.

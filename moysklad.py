@@ -1454,7 +1454,7 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
     """Просроченная дебиторка через Заказы покупателей.
     Грузим все заказы (или конкретного агента), фильтруем локально:
     - ppm_initial + PDZ_GRACE_DAYS < сегодня (МСК) — лаг от первой даты
-    - effective_due_date (ppm_new or ppm_initial) < сегодня
+    - effective_due_date (ppm_initial) < сегодня
     - payedSum < sum (не оплачен)
     """
     try:
@@ -1534,27 +1534,20 @@ async def get_overdue_demands(tag: str = None, query: str = None) -> list:
             agent_not_overdue = {}
 
             for order in all_orders:
-                # Два custom-атрибута: «Дата планируемой оплаты» (ppm_initial)
-                # и «НОВАЯ дата оплаты» (ppm_new). См. pdz_take_snapshot.
+                # Custom-атрибут «Дата планируемой оплаты» (ppm_initial).
                 ppm_initial_raw = None
-                ppm_new_raw = None
                 for attr in order.get("attributes", []) or []:
-                    name = attr.get("name")
-                    if name == "Дата планируемой оплаты":
+                    if attr.get("name") == "Дата планируемой оплаты":
                         ppm_initial_raw = attr.get("value")
-                    elif name == "НОВАЯ дата оплаты":
-                        ppm_new_raw = attr.get("value")
+                        break
                 if not ppm_initial_raw:
                     continue
 
                 ppm_initial = _parse_ms_date(ppm_initial_raw)
-                ppm_new = _parse_ms_date(ppm_new_raw)
                 if not ppm_initial:
                     continue
 
-                status, effective, days_overdue = _pdz_classify(
-                    ppm_initial, ppm_new, today
-                )
+                status, effective, days_overdue = _pdz_classify(ppm_initial, today)
                 if status == "skip":
                     continue
 
@@ -1732,7 +1725,7 @@ PDZ_MANAGER_TG_IDS = {
 
 # Технический лаг от первой обещанной даты (ppm_initial). В пределах этого окна
 # заказ НЕ показывается как просрочка (банковский день, деньги в пути). Перенос
-# (ppm_new) второго лага не получает — отсчёт всегда от первой даты.
+# Отсчёт всегда от даты планируемой оплаты.
 PDZ_GRACE_DAYS = 3
 
 
@@ -1759,7 +1752,7 @@ async def pdz_take_snapshot() -> list:
     """Снимок состояния всех customerorder с заполненным `ppm_initial`.
 
     Тянет все заказы (пагинация по 100, expand=agent,attributes), для каждого
-    собирает: исходную дату оплаты (ppm_initial), новую дату оплаты (ppm_new),
+    собирает: дату планируемой оплаты (ppm_initial),
     менеджера (по тегу контрагента), payed_sum/total_sum (в рублях, не копейках).
 
     Заказы без `ppm_initial` (старые до введения поля) пропускаются.
@@ -1807,19 +1800,15 @@ async def pdz_take_snapshot() -> list:
                 # Атрибуты — список с {name, value, ...}. customentity-значение
                 # = вложенный объект с meta.href и id.
                 ppm_initial_raw = None
-                ppm_new_raw = None
                 for attr in order.get("attributes", []) or []:
-                    name = attr.get("name")
-                    if name == "Дата планируемой оплаты":
+                    if attr.get("name") == "Дата планируемой оплаты":
                         ppm_initial_raw = attr.get("value")
-                    elif name == "НОВАЯ дата оплаты":
-                        ppm_new_raw = attr.get("value")
+                        break
 
                 ppm_initial = _parse_ms_date(ppm_initial_raw)
                 if not ppm_initial:
                     # Пустые ppm_initial не пишем — старые заказы до введения поля.
                     continue
-                ppm_new = _parse_ms_date(ppm_new_raw)
 
                 agent = order.get("agent", {}) or {}
                 agent_id = agent.get("id") or ""
@@ -1850,7 +1839,6 @@ async def pdz_take_snapshot() -> list:
                     "agent_name": agent_name,
                     "manager_tag": manager_tag,
                     "ppm_initial": ppm_initial,
-                    "ppm_new": ppm_new,
                     "payed_sum": payed_sum,
                     "total_sum": total_sum,
                     "agent_balance": None,  # обогащается ниже
@@ -1978,7 +1966,6 @@ async def pdz_take_snapshot() -> list:
                         "agent_name": name,
                         "manager_tag": manager_tag,
                         "ppm_initial": None,
-                        "ppm_new": None,
                         "payed_sum": 0.0,
                         "total_sum": 0.0,
                         "agent_balance": bal,
@@ -2098,36 +2085,63 @@ def _to_date(value):
     return None
 
 
-def _pdz_classify(ppm_initial, ppm_new, today):
+def _pdz_classify(ppm_initial, today):
     """Классифицирует заказ по статусу просрочки с учётом PDZ_GRACE_DAYS.
 
     Возвращает (status, effective, days_overdue):
-      - status='skip'     — ppm_initial пуст или effective пуст
-      - status='in_срок'  — effective >= today (срок не наступил)
-      - status='in_grace' — effective < today, но today <= ppm_initial + GRACE
+      - status='skip'     — ppm_initial пуст
+      - status='in_срок'  — ppm_initial >= today (срок не наступил)
+      - status='in_grace' — ppm_initial < today, но today <= ppm_initial + GRACE
         (формально срок прошёл, но лаг ещё активен)
-      - status='overdue'  — effective < today И today > ppm_initial + GRACE
-      effective = ppm_new if ppm_new else ppm_initial.
+      - status='overdue'  — today > ppm_initial + GRACE
+      effective = ppm_initial (единственная дата оплаты в заказе).
       days_overdue = (today - effective).days, и >0 только для 'overdue'.
 
-    Логика лага: даём PDZ_GRACE_DAYS дней технического зазора от ПЕРВОЙ
-    обещанной даты. Перенос (ppm_new) повторный лаг не получает — если клиент
-    сам перенёс на позже, эта дата считается жёстко.
+    Логика лага: даём PDZ_GRACE_DAYS дней технического зазора от даты оплаты.
 
     in_grace в FIFO трактуется как in_срок (защищён балансом контрагента),
     чтобы real_overdue = |balance| − in_сroк не раздувалось.
+
+    25.09.2026: поле «НОВАЯ дата оплаты» (ppm_new) отменено собственником —
+    за 4 месяца им воспользовались в 66 случаях из 3671, действующих записей
+    не осталось ни одной. См. plans/2026-09-25-отмена-новой-даты-оплаты.md.
     """
     if ppm_initial is None:
         return ("skip", None, 0)
-    effective = ppm_new if ppm_new is not None else ppm_initial
-    if effective is None:
-        return ("skip", None, 0)
+    effective = ppm_initial
     if effective >= today:
         return ("in_срок", effective, 0)
     from datetime import timedelta as _td
     if today <= ppm_initial + _td(days=PDZ_GRACE_DAYS):
         return ("in_grace", effective, 0)
     return ("overdue", effective, (today - effective).days)
+
+
+def _pdz_days_no_pay_map(db, agent_ids: list, today) -> dict:
+    """{agent_id: дней с последнего прихода денег}. None — данных нет.
+
+    Источник — `pdz_payment_state` (пишется вместе со снимком ПДЗ). Клиента
+    нет в таблице → за всё окно платежей не было, возвращаем длину окна.
+    Заменяет счётчик срывов обещаний, который считался по отменённому полю
+    «НОВАЯ дата оплаты».
+    """
+    if not agent_ids or db is None or not hasattr(db, "get_pdz_payment_state"):
+        return {}
+    try:
+        state = db.get_pdz_payment_state() or {}
+    except Exception as e:
+        logger.warning(f"_pdz_days_no_pay_map: {e}")
+        return {}
+    if not state:
+        return {}
+    out: dict = {}
+    for aid in agent_ids:
+        if not aid:
+            continue
+        last = (state.get(aid) or {}).get("last_payment_date")
+        last = _to_date(last) if last else None
+        out[aid] = (today - last).days if last else PDZ_PAYMENT_WINDOW_DAYS
+    return out
 
 
 def _pdz_lifo_cover(overdue_orders: list, real_overdue: float) -> list:
@@ -2167,75 +2181,6 @@ def _pdz_lifo_cover(overdue_orders: list, real_overdue: float) -> list:
         covered.append({**o, "unpaid_sum": round(take, 2)})
         remaining -= take
     return covered
-
-
-def compute_promise_events(today_rows: list, yesterday_rows: list) -> list:
-    """Сравнивает текущий снимок (today_rows) со вчерашним (yesterday_rows)
-    и возвращает список событий обещаний для записи в promise_log.
-
-    Логика по каждому заказу из today_rows:
-      - `event_type='set'`     — у заказа `old.ppm_new IS NULL`, `new.ppm_new IS NOT NULL`
-        → обещание поставлено впервые.
-      - `event_type='moved'`   — `old.ppm_new IS NOT NULL`, `new.ppm_new IS NOT NULL`
-        и они РАЗНЫЕ даты → обещание перенесено.
-      - `event_type='broken'`  — `new.ppm_new IS NOT NULL`, `new.ppm_new < today`,
-        `new.payed_sum < new.total_sum`, `old.ppm_new == new.ppm_new` (т.е. за день
-        ничего не пересогласовали и дата прошла без оплаты).
-
-    Возвращаемые dict'ы готовы к Database.save_promise_events().
-    """
-    from datetime import datetime
-    from zoneinfo import ZoneInfo as _ZI
-    today = datetime.now(_ZI("Europe/Moscow")).date()
-
-    yesterday_by_id = {r.get("order_id"): r for r in (yesterday_rows or []) if r.get("order_id")}
-
-    events: list = []
-    for new_row in today_rows or []:
-        order_id = new_row.get("order_id")
-        if not order_id:
-            continue
-        old_row = yesterday_by_id.get(order_id)
-
-        new_ppm = _to_date(new_row.get("ppm_new"))
-        old_ppm = _to_date(old_row.get("ppm_new")) if old_row else None
-
-        new_payed = new_row.get("payed_sum") or 0
-        new_total = new_row.get("total_sum") or 0
-
-        event_type = None
-        # set: было пусто (или строки вчера не было), сейчас стоит
-        if new_ppm is not None and old_ppm is None:
-            event_type = "set"
-        # moved: было непусто, сейчас непусто, и они РАЗНЫЕ
-        elif new_ppm is not None and old_ppm is not None and new_ppm != old_ppm:
-            event_type = "moved"
-        # broken: за день ничего не пересогласовали (даты одинаковые),
-        # дата уже в прошлом, и не оплачено
-        elif (
-            new_ppm is not None
-            and old_ppm is not None
-            and new_ppm == old_ppm
-            and new_ppm < today
-            and float(new_payed) < float(new_total)
-        ):
-            event_type = "broken"
-
-        if not event_type:
-            continue
-
-        events.append({
-            "order_id": order_id,
-            "order_name": new_row.get("order_name"),
-            "agent_id": new_row.get("agent_id"),
-            "agent_name": new_row.get("agent_name"),
-            "manager_tag": new_row.get("manager_tag"),
-            "event_type": event_type,
-            "old_ppm_new": old_ppm,
-            "new_ppm_new": new_ppm,
-        })
-
-    return events
 
 
 async def _audit_who_changed_order(order_id: str) -> Optional[str]:
@@ -2485,10 +2430,13 @@ def _row_fifo(r: dict):
     )
 
 
-async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: bool = True) -> list:
+async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: bool = True,
+                                  rows: list = None) -> list:
     """Список просроченных заказов конкретного менеджера для TG-дайджеста.
 
     Источник данных:
+      - Если переданы `rows` — считает по ним (используется для дельты за
+        сутки: те же правила на вчерашнем снимке).
       - Если передан `db` — читает последний снимок из БД (`db.get_latest_snapshot()`).
         Мгновенно. Это основной путь для cron 14:10 и тестов.
       - Если `db=None` — fallback на свежий `pdz_take_snapshot()` (~30 сек,
@@ -2496,7 +2444,7 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
 
     Критерий «просрочен» (с учётом PDZ_GRACE_DAYS = 3):
       - ppm_initial + GRACE < сегодня (МСК)  ← лаг от первой обещанной даты
-      - effective_due_date = ppm_new if ppm_new is not None else ppm_initial
+      - effective_due_date = ppm_initial
       - effective_due_date < сегодня
       - payed_sum < total_sum
       - manager_tag совпадает (case-insensitive)
@@ -2522,10 +2470,11 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
         return []
     tag_lower = manager_tag.lower()
 
-    if db is not None:
-        rows = db.get_latest_snapshot()
-    else:
-        rows = await pdz_take_snapshot()
+    if rows is None:
+        if db is not None:
+            rows = db.get_latest_snapshot()
+        else:
+            rows = await pdz_take_snapshot()
 
     # Привязку клиент→менеджер берём по ЖИВЫМ тегам МС, а не по замороженному в снимке
     # manager_tag: теги периодически меняют, и без этого чужой клиент «залипает» у старого
@@ -2563,9 +2512,8 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
             bucket["overdue_fifo"] = _row_fifo(r)
         if bucket["balance"] is None and agent_balance is not None:
             bucket["balance"] = agent_balance
-        ppm_new = _to_date(r.get("ppm_new"))
         ppm_initial = _to_date(r.get("ppm_initial"))
-        status, effective, days_overdue = _pdz_classify(ppm_initial, ppm_new, today)
+        status, effective, days_overdue = _pdz_classify(ppm_initial, today)
         if status == "skip":
             continue
         payed = float(r.get("payed_sum") or 0)
@@ -2732,14 +2680,11 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
             "ms_url_first_order": first_url,
         })
 
-    # Обогащение счётчиком срывов за 90 дней (Фаза 4.5).
+    # Обогащение разрывом по платежам (25.09.2026, вместо счётчика срывов
+    # обещаний — поле «НОВАЯ дата оплаты» отменено).
     if db is not None and grouped:
-        try:
-            ids = [g.get("agent_id") for g in grouped if g.get("agent_id")]
-            breaks_map = db.get_promise_breaks_count(ids, days_window=90)
-        except Exception as e:
-            logger.warning(f"pdz_overdue_for_manager({manager_tag}): breaks_count failed: {e}")
-            breaks_map = {}
+        ids = [g.get("agent_id") for g in grouped if g.get("agent_id")]
+        pay_map = _pdz_days_no_pay_map(db, ids, today)
         # Обогащение стоп-флагами (Фаза 6).
         stop_map: dict = {}
         if hasattr(db, "get_stop_flag_map"):
@@ -2750,11 +2695,11 @@ async def pdz_overdue_for_manager(manager_tag: str, db=None, group_by_agent: boo
                 stop_map = {}
         for g in grouped:
             aid = g.get("agent_id") or ""
-            g["breaks_count"] = int(breaks_map.get(aid, 0))
+            g["days_no_pay"] = pay_map.get(aid)
             g["stop_status"] = stop_map.get(aid)
     else:
         for g in grouped:
-            g.setdefault("breaks_count", 0)
+            g.setdefault("days_no_pay", None)
             g.setdefault("stop_status", None)
 
     grouped.sort(key=lambda x: x["total_unpaid"], reverse=True)
@@ -2772,16 +2717,8 @@ def _order_word_ru(cnt: int) -> str:
     return "заказов"
 
 
-def _breaks_word_ru(cnt: int) -> str:
-    """Русское склонение «срыв/срыва/срывов» по числу."""
-    if cnt % 10 == 1 and cnt % 100 != 11:
-        return "срыв"
-    if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
-        return "срыва"
-    return "срывов"
-
-
-def pdz_send_manager_digest_text(items: list, manager_name: str = None) -> list:
+def pdz_send_manager_digest_text(items: list, manager_name: str = None,
+                                 delta: float = None) -> list:
     """Формирует список TG-сообщений (Markdown) с дайджестом просрочек для одного
     менеджера. Каждое сообщение ≤3500 символов (запас от лимита TG 4096).
 
@@ -2791,8 +2728,12 @@ def pdz_send_manager_digest_text(items: list, manager_name: str = None) -> list:
     Формат строки клиента:
         [Имя клиента](ms_url_first_order) · K заказа · M дн · S руб.
 
-    Заголовок (одно сообщение в начале):
-        📋 Просрочки — клиентов: N
+    Заголовок (одно сообщение в начале) — итог по менеджеру:
+        📋 Просрочка: S ₽ · клиентов: N
+        За сутки: 🔺 +X ₽          (если delta передана)
+        Дольше всех: Клиент — D дн
+
+    delta — изменение суммы просрочки за сутки (₽); None — не показываем.
 
     Возвращает [] если items пуст (тишина = всё хорошо).
 
@@ -2803,7 +2744,20 @@ def pdz_send_manager_digest_text(items: list, manager_name: str = None) -> list:
     if not items:
         return []
 
-    header = f"📋 *Просрочки* — клиентов: {len(items)}"
+    total_debt = sum(float(it.get("total_unpaid", 0) or 0) for it in items)
+    worst = max(items, key=lambda it: int(it.get("max_days_overdue", 0) or 0))
+    worst_name = (worst.get("agent_name") or "—").replace("*", "").replace("_", "")
+    worst_days = int(worst.get("max_days_overdue", 0) or 0)
+
+    header_lines = [
+        f"📋 *Просрочка: {fmt_money(total_debt)}* · клиентов: {len(items)}",
+    ]
+    if delta is not None:
+        sign = "+" if delta > 0 else ""
+        arrow = "🔺" if delta > 0 else ("🔻" if delta < 0 else "▪️")
+        header_lines.append(f"За сутки: {arrow} {sign}{fmt_money(delta)}")
+    header_lines.append(f"Дольше всех: {worst_name} — {worst_days} дн")
+    header = "\n".join(header_lines)
     chunks: list[list[str]] = [[header, ""]]
     current_len = len(header) + 2
 
@@ -2811,7 +2765,7 @@ def pdz_send_manager_digest_text(items: list, manager_name: str = None) -> list:
         name = (it.get("agent_name") or "—").replace("*", "").replace("_", "")
         url = it.get("ms_url_first_order") or "#"
         cnt = int(it.get("orders_count", 0) or 0)
-        breaks = int(it.get("breaks_count", 0) or 0)
+        no_pay = it.get("days_no_pay")
         # Фаза 6: префикс стоп-флага (🚫 СТОП / 🚫 ПРЕДОПЛАТА). Может идти
         # вместе с 🔴 (срывами). Пример: «🚫 СТОП 🔴 [Клиент] ...».
         stop_status = it.get("stop_status")
@@ -2820,8 +2774,9 @@ def pdz_send_manager_digest_text(items: list, manager_name: str = None) -> list:
             stop_prefix = "🚫 СТОП "
         elif stop_status == "prepayment_only":
             stop_prefix = "🚫 ПРЕДОПЛАТА "
-        prefix = stop_prefix + ("🔴 " if breaks > 0 else "")
-        suffix = f" ({breaks} {_breaks_word_ru(breaks)} за 90д)" if breaks > 0 else ""
+        # 🔴 — клиент давно не платил вообще (не по этому заказу, а в принципе).
+        prefix = stop_prefix + ("🔴 " if (no_pay or 0) >= 21 else "")
+        suffix = f" · без платежей {int(no_pay)} дн" if no_pay else ""
         line = (
             f"{prefix}[{name}]({url}) · {cnt} {_order_word_ru(cnt)} · "
             f"{it.get('max_days_overdue', 0)} дн · "
@@ -2837,15 +2792,14 @@ def pdz_send_manager_digest_text(items: list, manager_name: str = None) -> list:
 
 
 def pdz_unprocessed_for_owner(db, live_map=None) -> dict:
-    """Для пинга собственнику в 16:05 МСК. Группирует «необработанных» клиентов
-    по тегу менеджера.
+    """Для вечерней сводки собственнику в 16:05 МСК. Группирует просроченных
+    клиентов по тегу менеджера.
 
-    «Необработанный заказ» (из последнего snapshot, с PDZ_GRACE_DAYS = 3):
+    «Просроченный заказ» (из последнего snapshot, с PDZ_GRACE_DAYS = 3):
       - manager_tag входит в PDZ_MANAGER_TAG_MAP
       - ppm_initial + GRACE < today  ← лаг от первой обещанной даты
-      - effective_due_date = ppm_new if ppm_new else ppm_initial; effective < today
+      - effective_due_date = ppm_initial; effective < today
       - payed_sum < total_sum
-      - ppm_new is None ИЛИ ppm_new < today (= менеджер НЕ пересогласовал в будущее)
       - agent_balance < 0 (None/≥0 → пропуск, как в pdz_overdue_for_manager)
 
     Возврат: {manager_tag: [agent_dict, ...]}, где agent_dict — то же поле, что
@@ -2871,9 +2825,8 @@ def pdz_unprocessed_for_owner(db, live_map=None) -> dict:
             row_tag = (r.get("manager_tag") or "").lower()
         if not row_tag or row_tag not in PDZ_MANAGER_TAG_MAP:
             continue
-        ppm_new = _to_date(r.get("ppm_new"))
         ppm_initial = _to_date(r.get("ppm_initial"))
-        status, effective, days_overdue = _pdz_classify(ppm_initial, ppm_new, today)
+        status, effective, days_overdue = _pdz_classify(ppm_initial, today)
         if status == "skip":
             continue
         payed = float(r.get("payed_sum") or 0)
@@ -2898,9 +2851,7 @@ def pdz_unprocessed_for_owner(db, live_map=None) -> dict:
             # в «необработанные» не идёт.
             bucket["in_сroк_unpaid_total"] = round(bucket["in_сroк_unpaid_total"] + unpaid, 2)
             continue
-        # «Необработан»: ppm_new пустой ИЛИ < today.
-        # (status='overdue' → effective < today И today > ppm_initial+GRACE
-        # — оба варианта = «менеджер не пересогласовал на будущее».)
+        # Просрочен: today > ppm_initial + GRACE.
 
         order_id = r.get("order_id") or ""
         bucket["overdue"].append({
@@ -2988,26 +2939,21 @@ def pdz_unprocessed_for_owner(db, live_map=None) -> dict:
         if grouped:
             result[tag] = grouped
 
-    # Обогащение счётчиком срывов за 90 дней (Фаза 4.5).
-    breaks_map: dict = {}
+    # Обогащение разрывом по платежам и стоп-флагами.
+    pay_map: dict = {}
     if db is not None and all_ids:
-        try:
-            breaks_map = db.get_promise_breaks_count(all_ids, days_window=90)
-        except Exception as e:
-            logger.warning(f"pdz_unprocessed_for_owner: breaks_count failed: {e}")
-            breaks_map = {}
-    # Обогащение стоп-флагами (Фаза 6).
+        pay_map = _pdz_days_no_pay_map(db, list(all_ids), today)
     stop_map: dict = {}
     if db is not None and all_ids and hasattr(db, "get_stop_flag_map"):
         try:
-            stop_map = db.get_stop_flag_map(all_ids) or {}
+            stop_map = db.get_stop_flag_map(list(all_ids)) or {}
         except Exception as e:
             logger.warning(f"pdz_unprocessed_for_owner: stop_flag_map failed: {e}")
             stop_map = {}
-    for tag, grouped in result.items():
-        for g in grouped:
+    for tag, agents in result.items():
+        for g in agents:
             aid = g.get("agent_id") or ""
-            g["breaks_count"] = int(breaks_map.get(aid, 0))
+            g["days_no_pay"] = pay_map.get(aid)
             g["stop_status"] = stop_map.get(aid)
 
     return result
@@ -5187,7 +5133,7 @@ async def compute_overdue_color(agent_id: str) -> dict:
     (`pdz_overdue_for_manager`):
       1. balance из /report/counterparty/{id}; balance≥0 → green.
       2. Тянем все customerorder агента, классифицируем _pdz_classify
-         (учитывает PDZ_GRACE_DAYS=3 и ppm_new).
+         (учитывает PDZ_GRACE_DAYS=3).
       3. real_overdue = max(0, |balance| − sum(unpaid в-сроке+in_grace)).
          Хвосты по payedSum, перекрытые приходами, скрываются.
       4. Cashflow-страховка: если за 45 дней приходы покрыли opening
@@ -5257,23 +5203,19 @@ async def compute_overdue_color(agent_id: str) -> dict:
     overdue_orders: list = []
     for o in all_orders:
         ppm_initial_raw = None
-        ppm_new_raw = None
         for attr in o.get("attributes", []):
-            nm = attr.get("name")
-            if nm == "Дата планируемой оплаты":
+            if attr.get("name") == "Дата планируемой оплаты":
                 ppm_initial_raw = attr.get("value")
-            elif nm == "НОВАЯ дата оплаты":
-                ppm_new_raw = attr.get("value")
+                break
         ppm_initial = _parse_ms_date(ppm_initial_raw) if ppm_initial_raw else None
         if ppm_initial is None:
             continue
-        ppm_new = _parse_ms_date(ppm_new_raw) if ppm_new_raw else None
         total = (o.get("sum", 0) or 0) / 100
         payed = (o.get("payedSum", 0) or 0) / 100
         unpaid = round(total - payed, 2)
         if unpaid <= 0:
             continue
-        status, effective, days_overdue = _pdz_classify(ppm_initial, ppm_new, today)
+        status, effective, days_overdue = _pdz_classify(ppm_initial, today)
         if status in ("in_срок", "in_grace"):
             in_сroк_total = round(in_сroк_total + unpaid, 2)
         elif status == "overdue":
@@ -5423,6 +5365,76 @@ async def _fetch_incoming_payments(agent_id: str, since_iso: str) -> list[dict]:
         except Exception as e:
             logger.error(f"_fetch_incoming_payments[{entity}]: {e}")
     return results
+
+
+# ─── PDZ: состояние платежей клиента (2026-09-25) ────────────────────────
+# Заменяет отменённое поле «НОВАЯ дата оплаты» как признак работы с долгом.
+# Вопрос «менеджер пересогласовал дату?» больше не задаём — смотрим факт:
+# платил ли клиент вообще. См. plans/2026-09-25-отмена-новой-даты-оплаты.md.
+PDZ_PAYMENT_WINDOW_DAYS = 30
+
+
+async def fetch_payments_by_agent(window_days: int = PDZ_PAYMENT_WINDOW_DAYS) -> dict:
+    """Приходы денег по ВСЕМ контрагентам за окно, одним проходом по МС.
+
+    Возвращает {agent_id: {"amount": сумма ₽, "last_date": date|None, "count": N}}.
+
+    Почему не `_fetch_incoming_payments` в цикле: та функция тянет по одному
+    контрагенту (2 запроса на клиента). На ~700 должниках это тысячи запросов
+    и гарантированный rate-limit МС. Здесь — выборка всех paymentin+cashin
+    за окно с фильтром по moment, ~1-2 страницы на сущность.
+    """
+    from datetime import datetime, timedelta
+
+    today = _now_msk().date()
+    since_dt = datetime.combine(today, datetime.min.time()) - timedelta(days=window_days)
+    since_iso = since_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    out: dict = {}
+    async with aiohttp.ClientSession() as session:
+        for entity in ("paymentin", "cashin"):
+            offset = 0
+            while True:
+                url = (
+                    f"{MS_BASE}/entity/{entity}"
+                    f"?filter=moment>={since_iso}&limit=1000&offset={offset}"
+                )
+                try:
+                    async with session.get(
+                        url, headers=get_headers(),
+                        timeout=aiohttp.ClientTimeout(total=60),
+                    ) as resp:
+                        if resp.status != 200:
+                            logger.warning(f"fetch_payments_by_agent[{entity}]: {resp.status}")
+                            break
+                        data = await resp.json()
+                except Exception as e:
+                    logger.error(f"fetch_payments_by_agent[{entity}]: {e}")
+                    break
+
+                rows = data.get("rows", []) or []
+                for row in rows:
+                    if not row.get("applicable", True):
+                        continue
+                    href = ((row.get("agent") or {}).get("meta") or {}).get("href", "")
+                    aid = href.rsplit("/", 1)[-1].split("?")[0] if href else ""
+                    if not aid:
+                        continue
+                    moment = _parse_ms_date(row.get("moment"))
+                    rec = out.setdefault(aid, {"amount": 0.0, "last_date": None, "count": 0})
+                    rec["amount"] = round(rec["amount"] + (row.get("sum", 0) or 0) / 100, 2)
+                    rec["count"] += 1
+                    if moment and (rec["last_date"] is None or moment > rec["last_date"]):
+                        rec["last_date"] = moment
+
+                size = (data.get("meta", {}) or {}).get("size", 0)
+                offset += len(rows)
+                if not rows or offset >= size:
+                    break
+                await asyncio.sleep(0.15)
+
+    logger.info(f"fetch_payments_by_agent: платежи за {window_days} дн по {len(out)} контрагентам")
+    return out
 
 
 # ─── PDZ: страховка взаиморасчётами за окно (2026-06-08) ─────────────────

@@ -3185,7 +3185,7 @@ async def cmd_pdz_snapshot_test(update: Update, context: ContextTypes.DEFAULT_TY
             lines.append(
                 f"• `{r.get('order_name','?')}` · {r.get('agent_name','?')} · "
                 f"тег={r.get('manager_tag') or '—'} · "
-                f"исх={r.get('ppm_initial')} · нов={r.get('ppm_new') or '—'} · "
+                f"исх={r.get('ppm_initial')} · "
                 f"{r.get('payed_sum')}/{r.get('total_sum')} · "
                 f"balance={bal_str}"
             )
@@ -3229,7 +3229,7 @@ async def cmd_pdz_html(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/pdz_html` — ручной запуск регенерации HTML-отчёта «Дебиторка» (Фаза 5).
 
     Только собственник (OWNER_CHAT_ID). Запускает pdz_generate_html_job —
-    тот рендерит HTML из БД (snapshot + promise_log, без МС API), кладёт в
+    тот рендерит HTML из БД (snapshot + pdz_payment_state, без МС API), кладёт в
     кэш и шлёт собственнику ссылку с токеном TTL 24ч. Команда отвечает
     краткой сводкой результата."""
     user = update.effective_user
@@ -3307,20 +3307,13 @@ async def cmd_pdz_overdue_test(update: Update, context: ContextTypes.DEFAULT_TYP
             return "заказа"
         return "заказов"
 
-    def breaks_word(cnt: int) -> str:
-        if cnt % 10 == 1 and cnt % 100 != 11:
-            return "срыв"
-        if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
-            return "срыва"
-        return "срывов"
-
     for it in items:
         name = (it.get("agent_name") or "—").replace("*", "").replace("_", "")
         url = it.get("ms_url_first_order") or "#"
         cnt = it.get("orders_count", 0)
-        breaks = int(it.get("breaks_count", 0) or 0)
-        prefix = "🔴 " if breaks > 0 else ""
-        suffix = f" ({breaks} {breaks_word(breaks)} за 90д)" if breaks > 0 else ""
+        no_pay = it.get("days_no_pay")
+        prefix = "🔴 " if (no_pay or 0) >= 21 else ""
+        suffix = f" · без платежей {int(no_pay)} дн" if no_pay else ""
         line = (
             f"{prefix}[{name}]({url}) · {cnt} {order_word(cnt)} · "
             f"{it.get('max_days_overdue', 0)} дн · "
@@ -3460,13 +3453,16 @@ async def cmd_pdz_send_owner_pending_test(update: Update, context: ContextTypes.
         await update.message.reply_text(f"ℹ️ status={status}")
 
 
-async def cmd_pdz_breaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/pdz_breaks` — топ-30 клиентов по числу срывов обещаний за 90 дней.
+async def cmd_pdz_nopay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/pdz_nopay` — топ-30 должников, дольше всех не плативших.
 
-    Источник — таблица `promise_log` (event_type='broken'). Если в окне нет
-    зафиксированных срывов (а так будет в первые дни после старта Фазы 4) —
-    выводим «📭 За 90 дней нет зафиксированных срывов». Доступ — только
-    собственник (OWNER_CHAT_ID).
+    Источник — `pdz_payment_state` (приходы paymentin/cashin за окно) плюс
+    последний снимок ПДЗ. Долг берём по сальдо контрагента, а не по сумме
+    неоплаченных заказов: payedSum в МС не отражает неразнесённые платежи.
+    Доступ — только собственник (OWNER_CHAT_ID).
+
+    25.09.2026: заменила `/pdz_breaks` (топ срывов обещаний) — поле «НОВАЯ
+    дата оплаты» отменено, журнал обещаний больше не пополняется.
     """
     user = update.effective_user
     if not user or user.id != OWNER_CHAT_ID:
@@ -3474,70 +3470,72 @@ async def cmd_pdz_breaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+    from moysklad import PDZ_PAYMENT_WINDOW_DAYS, fmt_money
+
+    today = _dt.now(_ZI("Europe/Moscow")).date()
+
     try:
-        rows = db.get_promise_breaks_top(limit=30, days_window=90)
+        pay_state = db.get_pdz_payment_state() or {}
+        latest_snap = db.get_latest_snapshot() or []
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
         return
 
-    if not rows:
-        await update.message.reply_text("📭 За 90 дней нет зафиксированных срывов")
-        return
-
-    def breaks_word(cnt: int) -> str:
-        if cnt % 10 == 1 and cnt % 100 != 11:
-            return "срыв"
-        if cnt % 10 in (2, 3, 4) and cnt % 100 not in (12, 13, 14):
-            return "срыва"
-        return "срывов"
-
-    # URL первого заказа клиента — берём любой свежий заказ из последнего
-    # snapshot по этому agent_id (используем уже хранящийся в БД ms_url).
-    try:
-        latest_snap = db.get_latest_snapshot() or []
-    except Exception as e:
-        latest_snap = []
-        logger.warning(f"cmd_pdz_breaks: get_latest_snapshot failed: {e}")
-    agent_url_map: dict = {}
+    # Должники по сальдо из снимка + URL любого их заказа.
+    agents: dict = {}
     for r in latest_snap:
         aid = r.get("agent_id") or ""
-        if not aid or aid in agent_url_map:
+        if not aid:
             continue
+        bal_raw = r.get("agent_balance")
+        try:
+            balance = float(bal_raw) if bal_raw is not None else None
+        except Exception:
+            balance = None
+        if balance is None or balance >= 0:
+            continue
+        a = agents.setdefault(aid, {
+            "name": r.get("agent_name") or "—",
+            "tag": r.get("manager_tag") or "—",
+            "debt": abs(balance),
+            "url": None,
+        })
         order_id = r.get("order_id") or ""
-        # «fifo:<agent_id>» — строка снимка без заказа (должник только по сальдо).
-        if order_id and not order_id.startswith("fifo:"):
-            agent_url_map[aid] = f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}"
+        if a["url"] is None and order_id and not order_id.startswith("fifo:"):
+            a["url"] = f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}"
 
-    from datetime import datetime as _dt, timezone as _tz
-    now_utc = _dt.now(_tz.utc)
+    if not agents:
+        await update.message.reply_text("📭 Должников по сальдо нет")
+        return
 
-    header = "🔴 *Срывы обещаний за 90 дней — топ-30*"
+    rows = []
+    for aid, a in agents.items():
+        last = (pay_state.get(aid) or {}).get("last_payment_date")
+        if last:
+            try:
+                days = (today - last).days
+            except Exception:
+                days = PDZ_PAYMENT_WINDOW_DAYS
+        else:
+            days = PDZ_PAYMENT_WINDOW_DAYS  # платежей за всё окно не было
+        rows.append({**a, "days_no_pay": days, "has_payment": bool(last)})
+    rows.sort(key=lambda x: (-x["days_no_pay"], -x["debt"]))
+    rows = rows[:30]
+
+    header = f"🔴 *Без платежей — топ-30* (окно {PDZ_PAYMENT_WINDOW_DAYS} дн)"
     chunks: list[list[str]] = [[header, ""]]
     cur_len = len(header) + 2
 
     for r in rows:
-        aid = r.get("agent_id") or ""
-        name = (r.get("agent_name") or "—").replace("*", "").replace("_", "")
-        cnt = int(r.get("breaks_count", 0) or 0)
-        tag = r.get("manager_tag") or "—"
-        url = agent_url_map.get(aid)
-
-        last_at = r.get("last_break_at")
-        days_ago_str = "?"
-        if last_at is not None:
-            try:
-                if isinstance(last_at, _dt):
-                    if last_at.tzinfo is None:
-                        last_at = last_at.replace(tzinfo=_tz.utc)
-                    delta_days = (now_utc - last_at).days
-                    days_ago_str = str(max(0, delta_days))
-            except Exception:
-                days_ago_str = "?"
-
-        client_label = f"[{name}]({url})" if url else name
+        name = (r["name"] or "—").replace("*", "").replace("_", "")
+        label = f"[{name}]({r['url']})" if r.get("url") else name
+        days_str = (f"{r['days_no_pay']} дн"
+                    if r["has_payment"] else f"{PDZ_PAYMENT_WINDOW_DAYS}+ дн")
         line = (
-            f"{client_label} · {cnt} {breaks_word(cnt)} · "
-            f"последний {days_ago_str} дн назад · менеджер: {tag}"
+            f"{label} · без платежей {days_str} · "
+            f"долг {fmt_money(r['debt'])} · менеджер: {r['tag']}"
         )
         if cur_len + len(line) + 1 > 3500:
             chunks.append([])
@@ -3545,15 +3543,10 @@ async def cmd_pdz_breaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chunks[-1].append(line)
         cur_len += len(line) + 1
 
-    for chunk in chunks:
-        if not chunk:
-            continue
+    for part in ["\n".join(c) for c in chunks if c]:
         await update.message.reply_text(
-            "\n".join(chunk),
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
+            part, parse_mode="Markdown", disable_web_page_preview=True
         )
-
 
 async def cmd_assortment_hits(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/assortment_hits [YYYY-MM]` — сверка «Наш ас-т» за месяц.
@@ -6852,6 +6845,8 @@ def main():
         "/statuses", "/статусы",
         # владелец: проверка контрагента перед отгрузкой (внутри owner_only-гейт)
         "/svetofor", "/svetofor_batch",
+        # владелец: должники, которые дольше всех не платят (owner_only внутри)
+        "/pdz_nopay",
     }
 
     async def _commands_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6949,7 +6944,7 @@ def main():
     app.add_handler(CommandHandler("pdz_send_digests_test_now", cmd_pdz_send_digests_test_now))
     app.add_handler(CommandHandler("pdz_send_owner_pending_test", cmd_pdz_send_owner_pending_test))
     # Фаза 4.5: топ-30 клиентов по срывам обещаний за 90 дней (только собственник).
-    app.add_handler(CommandHandler("pdz_breaks", cmd_pdz_breaks))
+    app.add_handler(CommandHandler("pdz_nopay", cmd_pdz_nopay))
     # ПДЗ Фаза 6 — управление стоп-флагами (только OWNER_CHAT_ID).
     app.add_handler(CommandHandler("snimi_stop", cmd_snimi_stop))
     app.add_handler(CommandHandler("list_stops", cmd_list_stops))
@@ -8214,7 +8209,7 @@ def main():
 
         Доступ — только по токену из `report_links` с mgr_filter='pdz'.
         Отдаёт закэшированный HTML (cron 14:15 МСК пишет в bot_settings.pdz_html_cache).
-        Если кэш пуст — рендерит на лету из последнего snapshot + promise_log.
+        Если кэш пуст — рендерит на лету из последнего snapshot + pdz_payment_state.
         НЕ дёргает МойСклад API.
         """
         token = request.query.get("token", "")
@@ -8297,7 +8292,7 @@ def main():
                 "days_overdue":     int(x.get("max_days_overdue") or 0),
                 "amount_rub":       round(float(x.get("total_unpaid") or 0), 2),
                 "orders_count":     int(x.get("orders_count") or 0),
-                "breaks_count":     int(x.get("breaks_count") or 0),
+                "days_no_pay":      x.get("days_no_pay"),
                 "ms_url":           x.get("ms_url_first_order"),
                 # Вне штрафа: тег «суд» (живой) ИЛИ точечный список — блёкло, не в расчёт.
                 "penalty_excluded": ((x.get("agent_id") or "") in court_ids

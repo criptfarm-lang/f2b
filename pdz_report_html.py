@@ -3,7 +3,7 @@ HTML-отчёт «Дебиторка» — Фаза 5 плана 2026-05-20-пд
 
 Источник данных:
   - последний snapshot из `pdz_snapshots` (db.get_latest_snapshot)
-  - журнал срывов из `promise_log` (db.get_promise_breaks_top + breaks_count)
+  - разрыв по платежам из `pdz_payment_state` (db.get_pdz_payment_state)
 
 НЕ дёргает МойСклад API — генерация чисто из БД (~мгновенно).
 
@@ -85,10 +85,10 @@ def build_pdz_payload(db) -> dict:
       - updated_at (datetime|None) — самая свежая snap_at
       - kpi: total_debt, debtors_count, broken_90d, oldest_overdue_days
       - debtors: список dict {agent_id, agent_name, manager_tag, orders_count,
-                              days_overdue, breaks_count, total_unpaid, ms_url}
-      - managers: список dict {manager_tag, debtors_count, breaks_count, total_debt}
-      - top_violators: список dict {agent_id, agent_name, breaks_count,
-                                    days_since_last_break, manager_tag}
+                              days_overdue, days_no_pay, total_unpaid, ms_url}
+      - managers: список dict {manager_tag, debtors_count, nopay_clients, total_debt}
+      - top_violators: список dict {agent_id, agent_name, days_no_pay,
+                                    days_overdue, total_unpaid, manager_tag}
     """
     rows = db.get_latest_snapshot() or []
     today = datetime.now(MSK).date()
@@ -108,10 +108,10 @@ def build_pdz_payload(db) -> dict:
     # Шаг 1: собрать per-agent overdue + in_сroк_unpaid + work-метрики.
     #
     # work_total = заказы где ppm_initial + GRACE < today И payed < sum
-    #              (формально просрочено с учётом лага — работа менеджера).
-    # work_touched = из work_total те где ppm_new is not null (менеджер
-    #                открыл карточку и поставил новую дату — неважно в прошлое
-    #                или будущее).
+    #              (формально просрочено с учётом лага — объём работы).
+    # 25.09.2026: метрика «тронул карточку» (заполнил «НОВУЮ дату оплаты»)
+    # убрана вместе с полем. Работа по клиенту меряется фактом прихода денег
+    # — колонка «без платежей».
     # Заказы в grace-окне не считаются ни «к работе», ни «просроченными» —
     # их защищает технический лаг от первой обещанной даты.
     by_agent_raw: dict[str, dict] = {}
@@ -140,7 +140,6 @@ def build_pdz_payload(db) -> dict:
             "overdue": [],
             "in_сroк_unpaid_total": 0.0,
             "work_total": 0,
-            "work_touched": 0,
         })
         if bucket["overdue_fifo"] is None:
             bucket["overdue_fifo"] = _row_fifo(r)
@@ -148,17 +147,14 @@ def build_pdz_payload(db) -> dict:
             bucket["agent_balance"] = balance
         if payed >= total:
             continue
-        ppm_new = _to_date(r.get("ppm_new"))
         ppm_initial = _to_date(r.get("ppm_initial"))
-        status, effective, days_overdue = _pdz_classify(ppm_initial, ppm_new, today)
+        status, effective, days_overdue = _pdz_classify(ppm_initial, today)
         if status == "skip":
             continue
         unpaid = round(total - payed, 2)
         # Работа менеджера — по ppm_initial + GRACE (синхронно с дайджестом).
         if ppm_initial is not None and today > ppm_initial + timedelta(days=PDZ_GRACE_DAYS):
             bucket["work_total"] += 1
-            if ppm_new is not None:
-                bucket["work_touched"] += 1
         if status in ("in_срок", "in_grace"):
             bucket["in_сroк_unpaid_total"] = round(bucket["in_сroк_unpaid_total"] + unpaid, 2)
             continue
@@ -219,20 +215,18 @@ def build_pdz_payload(db) -> dict:
             "agent_name": data["agent_name"],
             "manager_tag": data["manager_tag"],
             "orders_count": data["work_total"],          # всего заказов клиента с просроч. ppm_initial
-            "orders_touched": data["work_touched"],      # из них с заполн. «Новой датой оплаты»
             "days_overdue": days_overdue_val,
             "total_unpaid": total_unpaid_val,
             "ms_url": ms_url_val,
         })
 
-    # Обогащение срывами за 90 дней
-    breaks_map: dict[str, int] = {}
+    # Обогащение разрывом по платежам (вместо срывов обещаний, 25.09.2026)
+    pay_state: dict = {}
     try:
-        ids = [g["agent_id"] for g in debtors if g.get("agent_id")]
-        if ids and hasattr(db, "get_promise_breaks_count"):
-            breaks_map = db.get_promise_breaks_count(ids, days_window=90) or {}
+        if hasattr(db, "get_pdz_payment_state"):
+            pay_state = db.get_pdz_payment_state() or {}
     except Exception:
-        breaks_map = {}
+        pay_state = {}
     # Фаза 6: обогащение стоп-флагами для колонки «Статус».
     stop_map: dict[str, str] = {}
     try:
@@ -243,7 +237,9 @@ def build_pdz_payload(db) -> dict:
         stop_map = {}
     for g in debtors:
         aid = g.get("agent_id") or ""
-        g["breaks_count"] = int(breaks_map.get(aid, 0))
+        last_pay = (pay_state.get(aid) or {}).get("last_payment_date")
+        last_pay = _to_date(last_pay) if last_pay else None
+        g["days_no_pay"] = (today - last_pay).days if last_pay else None
         g["stop_status"] = stop_map.get(aid)
 
     debtors.sort(key=lambda x: x["total_unpaid"], reverse=True)
@@ -254,23 +250,17 @@ def build_pdz_payload(db) -> dict:
     debtors_count = len(debtors)
     oldest_overdue_days = max((d["days_overdue"] for d in debtors), default=0)
 
-    # Срывов за 90д всего — из promise_log: возьмём top без лимита и просуммируем
-    # (на топ-1000 точно хватит — масштаб ОП на 5 менеджеров).
-    broken_90d = 0
-    try:
-        if hasattr(db, "get_promise_breaks_top"):
-            top_all = db.get_promise_breaks_top(limit=1000, days_window=90) or []
-            broken_90d = sum(int(r.get("breaks_count") or 0) for r in top_all)
-    except Exception:
-        broken_90d = 0
+    # Должников, от которых не было денег ≥21 дня (порог стоп-флага).
+    nopay_21d = sum(
+        1 for d in debtors
+        if d.get("days_no_pay") is None or int(d.get("days_no_pay") or 0) >= 21
+    )
 
     # По менеджерам.
     # debtors_count / total_debt берём из FIFO-отфильтрованных debtors.
-    # А orders_total / orders_touched (метрика «отработано») считаем НЕЗАВИСИМО
-    # от FIFO: по всем заказам в snapshot с ppm_initial < today И payed < sum.
-    # Иначе если клиент ушёл из FIFO (хвосты перекрыты приходами), вся работа
-    # менеджера по нему теряется — плитка показывает 0% даже когда менеджер
-    # реально отработал десятки заказов.
+    # orders_total (объём просроченных заказов) считаем НЕЗАВИСИМО от FIFO:
+    # по всем заказам в snapshot с ppm_initial < today И payed < sum — иначе
+    # у клиента, чьи хвосты перекрыты приходами, работа менеджера теряется.
     by_mgr: dict[str, dict] = {}
     for d in debtors:
         tag = (d.get("manager_tag") or "—").lower() or "—"
@@ -279,14 +269,12 @@ def build_pdz_payload(db) -> dict:
             by_mgr[tag] = {
                 "manager_tag": tag,
                 "debtors_count": 1,
-                "breaks_count": int(d.get("breaks_count") or 0),
                 "total_debt": d["total_unpaid"],
                 "orders_total": 0,    # заполним ниже из всех snapshot-rows
-                "orders_touched": 0,
+                "nopay_clients": 0,
             }
         else:
             m["debtors_count"] += 1
-            m["breaks_count"] += int(d.get("breaks_count") or 0)
             m["total_debt"] = round(m["total_debt"] + d["total_unpaid"], 2)
 
     # Независимый pass по snapshot: считаем работу менеджера по ВСЕМ заказам
@@ -301,61 +289,41 @@ def build_pdz_payload(db) -> dict:
         if payed >= total:
             continue
         ppm_initial = _to_date(r.get("ppm_initial"))
-        # ppm_initial <= today: включаем заказы, у которых срок истекает
-        # сегодня — менеджер мог проактивно открыть и поставить «Новую дату».
         if not ppm_initial or ppm_initial > today:
             continue
-        ppm_new = _to_date(r.get("ppm_new"))
         m = by_mgr.setdefault(tag, {
             "manager_tag": tag,
             "debtors_count": 0,
-            "breaks_count": 0,
             "total_debt": 0,
             "orders_total": 0,
-            "orders_touched": 0,
+            "nopay_clients": 0,
         })
         m["orders_total"] += 1
-        if ppm_new is not None:
-            m["orders_touched"] += 1
+
+    for d in debtors:
+        tag = (d.get("manager_tag") or "—").lower() or "—"
+        m = by_mgr.get(tag)
+        if m is None:
+            continue
+        nd = d.get("days_no_pay")
+        if nd is None or int(nd) >= 21:
+            m["nopay_clients"] += 1
 
     managers = sorted(by_mgr.values(), key=lambda x: x["total_debt"], reverse=True)
 
-    # Топ-нарушители за 90д
-    top_violators: list[dict] = []
-    try:
-        if hasattr(db, "get_promise_breaks_top"):
-            raw_top = db.get_promise_breaks_top(limit=20, days_window=90) or []
-            for r in raw_top:
-                last = r.get("last_break_at")
-                days_since = None
-                if last:
-                    try:
-                        if isinstance(last, str):
-                            last_dt = datetime.fromisoformat(last)
-                        else:
-                            last_dt = last
-                        if last_dt.tzinfo is None:
-                            last_dt = last_dt.replace(tzinfo=MSK)
-                        delta = datetime.now(MSK) - last_dt.astimezone(MSK)
-                        days_since = max(0, int(delta.total_seconds() // 86400))
-                    except Exception:
-                        days_since = None
-                top_violators.append({
-                    "agent_id": r.get("agent_id") or "",
-                    "agent_name": r.get("agent_name") or "—",
-                    "breaks_count": int(r.get("breaks_count") or 0),
-                    "days_since_last_break": days_since,
-                    "manager_tag": r.get("manager_tag") or "—",
-                })
-    except Exception:
-        top_violators = []
+    # Топ клиентов, от которых дольше всего нет денег.
+    top_violators = sorted(
+        [d for d in debtors if (d.get("days_no_pay") is None or int(d.get("days_no_pay") or 0) >= 21)],
+        key=lambda d: (-(d.get("days_no_pay") if d.get("days_no_pay") is not None else 999),
+                       -float(d.get("total_unpaid") or 0)),
+    )[:20]
 
     return {
         "updated_at": updated_at,
         "kpi": {
             "total_debt": total_debt,
             "debtors_count": debtors_count,
-            "broken_90d": broken_90d,
+            "nopay_21d": nopay_21d,
             "oldest_overdue_days": oldest_overdue_days,
         },
         "debtors": debtors_top,
@@ -431,7 +399,7 @@ def _render_kpi(kpi: dict) -> str:
     parts = [
         ("Общий долг", _fmt_money(kpi["total_debt"])),
         ("Клиентов в просрочке", str(kpi["debtors_count"])),
-        ("Срывов за 90 дней", str(kpi["broken_90d"])),
+        ("Без платежей 21+ дн", str(kpi.get("nopay_21d", 0))),
         ("Самая старая просрочка",
          (f"{kpi['oldest_overdue_days']} дн" if kpi["oldest_overdue_days"] else "—")),
     ]
@@ -450,13 +418,15 @@ def _render_debtors(debtors: list) -> str:
                 '<div class="empty">Должников нет</div></div>')
     rows = []
     for d in debtors:
-        breaks = int(d.get("breaks_count") or 0)
+        no_pay = d.get("days_no_pay")
         days = int(d.get("days_overdue") or 0)
         stop_status = d.get("stop_status")
-        breaks_cell = (
-            f'<span class="bad-break">{breaks}</span>' if breaks > 0
-            else f'<span class="muted">0</span>'
-        )
+        if no_pay is None:
+            nopay_cell = '<span class="bad-break">30+</span>'
+        elif int(no_pay) >= 21:
+            nopay_cell = f'<span class="bad-break">{int(no_pay)}</span>'
+        else:
+            nopay_cell = f'<span class="muted">{int(no_pay)}</span>' 
         # Фаза 6: класс строки и значок статуса. Приоритет — стоп-флаг.
         if stop_status == "prepayment_only":
             row_cls = ' class="row-prepayment-only"'
@@ -468,20 +438,7 @@ def _render_debtors(debtors: list) -> str:
             row_cls = ' class="row-old-overdue"' if days > 90 else ''
             status_cell = '<span class="muted">—</span>'
 
-        # Обработано = сколько просроченных заказов клиента имеют заполненную
-        # «Новую дату оплаты». Логика 2026-05-27: если менеджер физически
-        # открыл заказ в МС и поставил ppm_new — это значит «начал отрабатывать»
-        # (даже если эта новая дата уже в прошлом = срыв обещания).
         orders_total = int(d.get("orders_count") or 0)
-        orders_touched = int(d.get("orders_touched") or 0)
-        if orders_total == 0:
-            touched_cell = '<span class="muted">—</span>'
-        elif orders_touched == 0:
-            touched_cell = f'<span class="bad-break">0/{orders_total}</span>'
-        elif orders_touched < orders_total:
-            touched_cell = f'<span style="color:#d97706">{orders_touched}/{orders_total}</span>'
-        else:
-            touched_cell = f'<span style="color:#059669">{orders_touched}/{orders_total}</span>'
 
         rows.append(
             f'<tr{row_cls}>'
@@ -489,9 +446,8 @@ def _render_debtors(debtors: list) -> str:
             f'{_esc(d.get("agent_name"))}</a></td>'
             f'<td>{_esc(d.get("manager_tag") or "—")}</td>'
             f'<td class="num">{orders_total}</td>'
-            f'<td class="num">{touched_cell}</td>'
             f'<td class="num">{days}</td>'
-            f'<td class="num">{breaks_cell}</td>'
+            f'<td class="num">{nopay_cell}</td>'
             f'<td>{status_cell}</td>'
             f'<td class="num">{_esc(_fmt_money(d.get("total_unpaid")))}</td>'
             f'</tr>'
@@ -501,9 +457,9 @@ def _render_debtors(debtors: list) -> str:
         '<thead><tr>'
         '<th>Клиент</th><th>Менеджер</th>'
         '<th class="num">Заказов</th>'
-        '<th class="num" title="Сколько заказов клиента менеджер уже открыл и проставил «Новую дату оплаты»">Обработано</th>'
         '<th class="num">Дней просрочки</th>'
-        '<th class="num">Срывов 90д</th><th>Статус</th><th class="num">Долг</th>'
+        '<th class="num" title="Дней с последнего прихода денег от клиента">Без платежей</th>'
+        '<th>Статус</th><th class="num">Долг</th>'
         '</tr></thead>'
         f'<tbody>{"".join(rows)}</tbody>'
         '</table>'
@@ -535,13 +491,14 @@ def _render_managers(managers: list) -> str:
         name = DISPLAY.get(tag, m.get("manager_tag") or "—")
         debtors_n = int(m.get("debtors_count") or 0)
         orders_total = int(m.get("orders_total") or 0)
-        orders_touched = int(m.get("orders_touched") or 0)
-        breaks = int(m.get("breaks_count") or 0)
+        nopay_clients = int(m.get("nopay_clients") or 0)
         debt = m.get("total_debt") or 0
 
-        pct = (orders_touched * 100 // orders_total) if orders_total > 0 else 0
+        # Доля клиентов менеджера, от которых деньги всё же приходят.
+        paying = debtors_n - nopay_clients
+        pct = (paying * 100 // debtors_n) if debtors_n > 0 else 0
 
-        if orders_total == 0:
+        if debtors_n == 0:
             bar_color = "#9ca3af"
         elif pct == 0:
             bar_color = "#dc2626"  # красный
@@ -558,10 +515,10 @@ def _render_managers(managers: list) -> str:
             <span>{debtors_n} клиент{'ов' if debtors_n%10 not in (1,2,3,4) or debtors_n%100 in (11,12,13,14) else ('а' if debtors_n%10 in (2,3,4) else '')}</span>
             <span>•</span>
             <span>{orders_total} заказ{'ов' if orders_total%10 not in (1,2,3,4) or orders_total%100 in (11,12,13,14) else ('а' if orders_total%10 in (2,3,4) else '')}</span>
-            {f'<span>•</span><span class="mgr-breaks">{breaks} срыв{"ов" if breaks%10 not in (1,2,3,4) or breaks%100 in (11,12,13,14) else ("а" if breaks%10 in (2,3,4) else "")} 90д</span>' if breaks > 0 else ''}
+            {f'<span>•</span><span class="mgr-breaks">{nopay_clients} без платежей 21+ дн</span>' if nopay_clients > 0 else ''}
           </div>
           <div class="mgr-progress-label">
-            <span>Отработано: <strong>{orders_touched}/{orders_total}</strong></span>
+            <span>Платят: <strong>{paying}/{debtors_n}</strong></span>
             <span style="color:{bar_color}"><strong>{pct}%</strong></span>
           </div>
           <div class="mgr-progress-bar">
@@ -582,19 +539,20 @@ def _render_violators(top_violators: list) -> str:
     if not top_violators:
         return (
             '<div class="section">'
-            '<div class="section-title">Топ-нарушители за 90 дней</div>'
-            '<div class="empty">Срывов обещаний за 90 дней нет</div>'
+            '<div class="section-title">Дольше всех без денег</div>'
+            '<div class="empty">Все должники платили за последние 3 недели</div>'
             '</div>'
         )
     rows = []
     for v in top_violators:
-        days_since = v.get("days_since_last_break")
-        last_str = "—" if days_since is None else f"{int(days_since)} дн назад"
+        nd = v.get("days_no_pay")
+        nopay_str = "30+ дн" if nd is None else f"{int(nd)} дн"
         rows.append(
             f'<tr>'
             f'<td>{_esc(v.get("agent_name"))}</td>'
-            f'<td class="num"><span class="bad-break">{int(v.get("breaks_count") or 0)}</span></td>'
-            f'<td>{_esc(last_str)}</td>'
+            f'<td class="num"><span class="bad-break">{_esc(nopay_str)}</span></td>'
+            f'<td class="num">{int(v.get("days_overdue") or 0)}</td>'
+            f'<td class="num">{_esc(_fmt_money(v.get("total_unpaid")))}</td>'
             f'<td>{_esc(v.get("manager_tag") or "—")}</td>'
             f'</tr>'
         )
@@ -602,8 +560,9 @@ def _render_violators(top_violators: list) -> str:
         '<table>'
         '<thead><tr>'
         '<th>Клиент</th>'
-        '<th class="num">Срывов</th>'
-        '<th>Последний срыв</th>'
+        '<th class="num">Без платежей</th>'
+        '<th class="num">Дней просрочки</th>'
+        '<th class="num">Долг</th>'
         '<th>Менеджер</th>'
         '</tr></thead>'
         f'<tbody>{"".join(rows)}</tbody>'
