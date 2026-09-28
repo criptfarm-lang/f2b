@@ -687,3 +687,43 @@ def test_progress_line_counts_done(monkeypatch):
                      "refused": 1, "pending": 1, "lost": 1}]
     row = batch_progress(DB(), "c")[0]
     assert row["sent"] + row["taken"] + row["refused"] == 10
+
+
+# ── подпись по менеджеру (28.09.2026: Денису шли сообщения от имени Инессы) ────
+def test_persona_by_manager():
+    from sales_dialog import persona_for
+    assert persona_for(13665786)["first"] == "Денис"
+    assert persona_for(11544494)["first"] == "Инесса"
+    assert persona_for(None)["first"] == "Инесса"          # карточка собственника
+
+
+def test_system_prompt_has_manager_name_and_gender():
+    from sales_dialog import persona_for, system_prompt
+    denis = system_prompt(persona_for(13665786))
+    assert "Денис Коликов" in denis and "Инесса Скляр" not in denis
+    assert "в мужском роде" in denis
+    inessa = system_prompt(persona_for(11544494))
+    assert "Инесса Скляр" in inessa and "в женском роде" in inessa
+    for ph in ("{{AGENT_FULL}}", "{{AGENT_FIRST}}", "{{GENDER_RULE}}"):
+        assert ph not in denis and ph not in inessa
+
+
+def test_style_check_gender_aware():
+    from sales_dialog import check_style
+    # У Инессы мужской род — ошибка, у Дениса он правильный.
+    assert check_style("Понял, уточнил и отправил", "f")
+    assert check_style("Понял, уточнил и отправил", "m") == []
+    assert check_style("Поняла, уточнила и отправила", "m")
+    assert check_style("Поняла, уточнила и отправила", "f") == []
+
+
+def test_style_check_still_catches_calls():
+    from sales_dialog import check_style
+    assert any("звонк" in p for p in check_style("Давайте созвонимся, наберу вас", "m"))
+
+
+def test_card_signed_by_assignee():
+    from sales_dialog import _card_text
+    db = FakeDB({"lead": {"lead_name": "Олива", "chat_type": "max"}, "msg": _msg()})
+    card = _card_text(db, _msg(assignee_amo_id=13665786))
+    assert "Ответ от имени Денис" in card

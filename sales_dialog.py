@@ -45,13 +45,47 @@ MANAGER_TG = {
     13665786: 683079752,           # Денис Коликов
     13746010: 649712597,           # Ирина Дьяченко
 }
+# Кто подписывает черновик. Карточка уходит менеджеру партии, и писать он должен
+# от своего имени: 28.09.2026 Денису пришли сообщения от имени Инессы. Пол нужен
+# не для вежливости, а для сверки: глаголы о себе должны быть в его роде.
+PERSONAS = {
+    11544494: {"first": "Инесса", "full": "Инесса Скляр", "gender": "f"},
+    13665786: {"first": "Денис", "full": "Денис Коликов", "gender": "m"},
+    12625622: {"first": "Карина", "full": "Карина Баласанян", "gender": "f"},
+    12788698: {"first": "Елена", "full": "Елена Мерзлякова", "gender": "f"},
+    13746010: {"first": "Ирина", "full": "Ирина Дьяченко", "gender": "f"},
+}
+# Карточку без адресата (партия собственника) по-прежнему подписывает Инесса.
+DEFAULT_PERSONA = PERSONAS[11544494]
+
+GENDER_RULE = {
+    "f": ("Ты женщина. Все глаголы о себе — в женском роде: «поняла», «прошла», «уточнила», "
+          "«посмотрела», «отправила». Мужской род выдаёт, что пишет не {first}."),
+    "m": ("Ты мужчина. Все глаголы о себе — в мужском роде: «понял», «прошёл», «уточнил», "
+          "«посмотрел», «отправил». Женский род выдаёт, что пишет не {first}."),
+}
+
+
+def persona_for(amo_id) -> dict:
+    return PERSONAS.get(amo_id) or DEFAULT_PERSONA
+
+
+def system_prompt(persona: dict) -> str:
+    """Системный промпт под конкретного менеджера: имя, подпись и род глаголов."""
+    raw = (PROMPTS_DIR / "sales_dialog_system.md").read_text(encoding="utf-8")
+    rule = GENDER_RULE[persona["gender"]].format(first=persona["first"])
+    return (raw.replace("{{AGENT_FULL}}", persona["full"])
+               .replace("{{AGENT_FIRST}}", persona["first"])
+               .replace("{{GENDER_RULE}}", rule))
+
+
 ATTRACT_PIPELINE = 10873622        # воронка ПРИВЛЕЧЕНИЕ
 ATTRACT_FIRST_STATUS = 85554794    # этап «Первичный контакт»
 MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "manager-batches"
+CODE_VERSION = "persona-per-manager"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -777,6 +811,11 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
     site = site_request(notes)
     openers = recent_openers(db, row["campaign"])
     worked = winning_openers(db, row["campaign"])
+    persona = persona_for(row.get("assignee_amo_id"))
+    wrote = "писала" if persona["gender"] == "f" else "писал"
+    first_touch_note = ("Ты пишешь в этот чат ВПЕРВЫЕ — до тебя его вёл другой менеджер."
+                        if first_time else
+                        f"Ты уже {wrote} в этот чат, представляться повторно не нужно.")
     user = f"""ПЕРЕПИСКА (последнее сообщение {days} дн. назад):
 {safe if safe.strip() else "— переписки нет, это первое обращение к клиенту"}
 
@@ -790,7 +829,7 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
 
 НА ЭТИ ЗАХОДЫ КЛИЕНТЫ ОТВЕЧАЛИ (копировать дословно нельзя, но приём рабочий):
 {worked if worked else "— статистики пока нет"}
-{"Ты пишешь в этот чат ВПЕРВЫЕ — до тебя его вёл другой менеджер." if first_time else "Ты уже писала в этот чат, представляться повторно не нужно."}
+{first_touch_note}
 
 ДОСТАВКА:
 {delivery_note(city)}
@@ -803,7 +842,7 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
 
 Напиши сообщение клиенту."""
     images = await fetch_client_images(session, history)
-    return {"system": (PROMPTS_DIR / "sales_dialog_system.md").read_text(encoding="utf-8"),
+    return {"system": system_prompt(persona), "persona": persona,
             "user": user, "images": images, "leaks": leaks,
             "prices": {p["code"]: p for p in prices},
             "last_inbound": last_in, "names": names, "city": city}
@@ -1044,19 +1083,29 @@ async def check_bargain(session, db, draft: dict, prices: dict | None = None) ->
     return problems
 
 
-def check_style(text: str) -> list:
+MASC_RE = re.compile(r"\b(понял|прошёл|прошел|посмотрел|уточнил|написал|сделал|проверил|"
+                     r"добавил|отправил|подготовил|связался|рад|готов)\b")
+FEM_RE = re.compile(r"\b(поняла|прошла|посмотрела|уточнила|написала|сделала|проверила|"
+                    r"добавила|отправила|подготовила|связалась|рада|готова)\b")
+
+
+def check_style(text: str, gender: str = "f") -> list:
     """Стилевые запреты, которые нельзя доверять одному промпту.
 
-    Мужской род от первого лица (23.09.2026 модель написала «Понял, торопить не
-    буду» от имени Инессы) и любое упоминание звонка — собственник запретил
-    звонки отдельно, пилот только переписка.
+    Род от первого лица (23.09.2026 модель написала «Понял, торопить не буду» от
+    имени Инессы) и любое упоминание звонка — собственник запретил звонки
+    отдельно, пилот только переписка. Род сверяем с полом того менеджера, чьё имя
+    стоит под сообщением: у Дениса правильный род как раз мужской.
     """
     problems = []
-    masc = re.findall(r"\b(понял|прошёл|прошел|посмотрел|уточнил|написал|сделал|проверил|"
-                      r"добавил|отправил|подготовил|связался|уточню-ка|рад|готов)\b",
-                      (text or "").lower())
-    if masc:
-        problems.append("мужской род от первого лица: " + ", ".join(sorted(set(masc))))
+    low = (text or "").lower()
+    # Женские формы вычитаем первыми: «поняла» содержит в себе «понял».
+    fem = set(FEM_RE.findall(low))
+    masc = set(MASC_RE.findall(FEM_RE.sub(" ", low)))
+    wrong = masc if gender == "f" else fem
+    if wrong:
+        label = "мужской" if gender == "f" else "женский"
+        problems.append(f"{label} род от первого лица: " + ", ".join(sorted(wrong)))
     call = re.findall(r"\b(позвон\w*|созвон\w*|наберу|набер[её]м|перезвон\w*|звонок|"
                       r"телефон\w* для связи)\b", (text or "").lower())
     if call:
@@ -1541,7 +1590,7 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
         return
     draft["text"] = polish(draft.get("text") or "")
     problems = (check_prices(draft, ctx["prices"], allowed_numbers(ctx.get("city")))
-                + check_style(draft["text"]))
+                + check_style(draft["text"], ctx["persona"]["gender"]))
     # Уступка ниже прайса проверяется порогами дашборда, а не на глаз.
     problems += await check_bargain(session, db, draft, ctx["prices"])
     if draft.get("bargain") and not problems:
@@ -1610,7 +1659,8 @@ def _card_text(db, msg: dict) -> str:
                  + (f", порог {b['floor']}" if b.get("floor") else ""))
     if msg.get("need_check"):
         tail += f"\n\nОбещала уточнить: {msg['need_check']}"
-    return f"{head}\n\nОтвет от имени Инессы:\n{msg.get('draft_text', '')}{tail}"
+    who_signs = persona_for(msg.get("assignee_amo_id"))["first"]
+    return f"{head}\n\nОтвет от имени {who_signs}:\n{msg.get('draft_text', '')}{tail}"
 
 
 def _keyboard(row_id: int, action: str, to_manager: bool = False):
