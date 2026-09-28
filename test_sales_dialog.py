@@ -777,3 +777,29 @@ def test_mrm_discount_removed_when_floor_unknown(monkeypatch):
     monkeypatch.setattr(sales_dialog, "price_floor", fake_floor)
     out = asyncio.run(sales_dialog.mrm_guard(None, None, _mrm_rows()))
     assert out[0]["opt"] == 1790.0 and out[0]["mrm_discount_off"]
+
+
+# ── шапка карточки не должна уезжать клиенту (28.09.2026, чат «ФАРШ») ──────────
+def test_strip_card_header_removes_whole_card_head():
+    from sales_dialog import strip_card_header
+    raw = ("ФАРШ · max · сделка 41740283\n\n"
+           "Диалог затих, агент пишет первым.\n\n"
+           "Ответ от имени Инессы:\n"
+           "У нас охлаждённое филе Трим С – 1890 ₽/кг.\nПривезти пласт на пробу?")
+    out = strip_card_header(raw)
+    assert out.startswith("У нас охлаждённое филе")
+    assert "сделка 41740283" not in out and "Диалог затих" not in out
+    assert "Ответ от имени" not in out
+
+
+def test_card_trace_blocks_send():
+    from sales_dialog import CARD_TRACE_RE
+    assert CARD_TRACE_RE.search("ФАРШ · max · сделка 41740283")
+    assert CARD_TRACE_RE.search("Ответ от имени Дениса:")
+    assert not CARD_TRACE_RE.search("Форель филе Трим С – 1890 ₽/кг, привезти пробу?")
+
+
+def test_strip_keeps_plain_text():
+    from sales_dialog import strip_card_header
+    t = "Клиенту: форель 1890 ₽/кг"          # «Клиент:» с двоеточием — служебная, а это нет
+    assert strip_card_header(t) == t

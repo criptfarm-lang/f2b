@@ -85,7 +85,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "mrm-guard"
+CODE_VERSION = "card-trace-guard"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -593,13 +593,21 @@ async def _amo_notes(session: aiohttp.ClientSession, lead_id: int) -> list:
 
 CARD_HEADER_RE = re.compile(
     r"^\s*(Ответ от имени [^:]*:|Клиент:|Его черновик:|Агент не бер[её]тся[^\n]*|"
-    r"Обещала уточнить:[^\n]*|Уступка:[^\n]*|Диалог затих[^\n]*)\s*", re.I | re.M)
+    r"Обещал[аи]? уточнить:[^\n]*|Уступка:[^\n]*|Диалог затих[^\n]*|"
+    # Первая строка карточки: «Имя клиента · max · сделка 41740283».
+    r"[^\n]*·[^\n]*сделка\s*\d+[^\n]*)\s*", re.I | re.M)
+# Если после чистки в тексте всё ещё видны следы карточки — отправлять нельзя.
+CARD_TRACE_RE = re.compile(r"(Ответ от имени|·\s*сделка\s*\d+|Диалог затих)", re.I)
 
 
 def strip_card_header(text: str) -> str:
-    """Собственник правит текст, копируя его из карточки — служебные строки убираем.
+    """Человек правит текст, копируя его из карточки — служебные строки убираем.
 
     24.09.2026 клиенту ушло сообщение, начинавшееся с «Ответ от имени Инессы:».
+    28.09.2026 повторилось хуже: в чат «ФАРШ» уехала вся шапка карточки вместе с
+    строкой «Диалог затих, агент пишет первым» — фильтр существовал, но его никто
+    не вызывал. Теперь он стоит на пути правки, а `_do_send` дополнительно
+    отказывается отправлять текст, в котором следы карточки остались.
     """
     return CARD_HEADER_RE.sub("", text or "").strip()
 
@@ -1834,6 +1842,11 @@ async def _do_send(db, row_id: int, text: str) -> tuple[bool, str]:
         # Ответ на утреннее сообщение, ушедший вечером, хуже молчания.
         db._execute("UPDATE sales_dialog_messages SET verdict='expired' WHERE id=%s", (row_id,))
         return False, f"черновик устарел ({int(age_min)} мин), не отправлен"
+    if not (text or "").strip():
+        return False, "текст пустой"
+    if CARD_TRACE_RE.search(text):
+        # 28.09.2026 в чат клиента уехала шапка карточки: «ФАРШ · max · сделка …».
+        return False, "в тексте остались служебные строки карточки, не отправлено"
     fresh = newer_inbound(db, msg)
     if fresh:
         db._execute("UPDATE sales_dialog_messages SET verdict='stale' WHERE id=%s", (row_id,))
@@ -1949,7 +1962,7 @@ def register(app, db) -> None:
         if not row_id:
             return
         context.user_data.pop("sd_edit_row", None)
-        text = update.effective_message.text or ""
+        text = strip_card_header(update.effective_message.text or "")
         db._execute("UPDATE sales_dialog_messages SET verdict='edited', final_text=%s WHERE id=%s",
                     (text, row_id))
         ok, info = await _do_send(db, row_id, text)
