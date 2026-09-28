@@ -248,7 +248,11 @@ async def _classify_batch(client: AsyncAnthropic, dialogues: list[dict]) -> list
     return signals
 
 
-async def _enrich_with_amocrm(signals: list[dict]) -> None:
+# Воронка «ЗАКУПКИ» в amoCRM: сделка там = чат с поставщиком, а не с клиентом.
+PROCUREMENT_PIPELINE_ID = 8683542
+
+
+async def _enrich_with_amocrm(signals: list[dict], db=None) -> None:
     """Дорезолвить по каждому чату сделку в amoCRM и ответственного менеджера.
 
     Менеджер в Wazzup-сообщениях часто пуст (webhook для входящих не присылает
@@ -258,13 +262,16 @@ async def _enrich_with_amocrm(signals: list[dict]) -> None:
     responsible и заодно кладём lead_id, чтобы дайджест давал ссылку в сделку.
 
     Мутируем сигналы на месте: проставляем `lead_id`, и если manager_name пуст —
-    заполняем именем ответственного. Резолв — один раз на чат (кэш), не на сигнал.
+    заполняем именем ответственного; сделка в воронке «ЗАКУПКИ» помечается
+    `_procurement`. Резолв — один раз на чат (кэш), не на сигнал.
     """
     try:
         from wazzup_classifier import (
+            _chat_phone,
             _resolve_amocrm_lead_id,
             _resolve_amocrm_responsible,
         )
+        from amocrm import get_lead
     except Exception as e:  # модуль/зависимость недоступны — дайджест без ссылок
         logger.info("chat_digest: amoCRM-обогащение пропущено: %s", e)
         return
@@ -279,9 +286,12 @@ async def _enrich_with_amocrm(signals: list[dict]) -> None:
             chats[cid] = s.get("contact_name")
 
     async def _resolve(cid: str, contact_name: str | None):
-        lead_id = await _resolve_amocrm_lead_id(cid, contact_name)
+        lead_id = await _resolve_amocrm_lead_id(
+            cid, contact_name, phone=_chat_phone(db, cid))
         _, resp_name = await _resolve_amocrm_responsible(lead_id)
-        return cid, lead_id, resp_name
+        lead = await get_lead(int(lead_id)) if lead_id else None
+        procurement = (lead or {}).get("pipeline_id") == PROCUREMENT_PIPELINE_ID
+        return cid, lead_id, resp_name, procurement
 
     resolved = await asyncio.gather(
         *[_resolve(cid, name) for cid, name in chats.items()],
@@ -291,15 +301,48 @@ async def _enrich_with_amocrm(signals: list[dict]) -> None:
     for r in resolved:
         if isinstance(r, Exception):
             continue
-        cid, lead_id, resp_name = r
-        by_chat[cid] = (lead_id, resp_name)
+        cid, lead_id, resp_name, procurement = r
+        by_chat[cid] = (lead_id, resp_name, procurement)
 
     for s in signals:
-        lead_id, resp_name = by_chat.get(s.get("chat_id"), (None, None))
+        lead_id, resp_name, procurement = by_chat.get(s.get("chat_id"), (None, None, False))
         if lead_id:
             s["lead_id"] = lead_id
+        if procurement:
+            s["_procurement"] = True
         if not s.get("manager_name") and resp_name:
             s["manager_name"] = resp_name
+
+
+def _drop_procurement(db, signals: list[dict]) -> list[dict]:
+    """Убрать сигналы из переписки с поставщиками.
+
+    Сводка — про клиентов, а закупщики (Белякова, Павленко) пишут и клиентам,
+    и поставщикам, поэтому по менеджеру не отсечь. Признак чата закупки:
+    сделка в воронке «ЗАКУПКИ» или ручная разметка/подпись «отдел снабжения»
+    (wazzup_classifier._is_procurement_chat без проверки ответственного).
+    28.09.2026 жалоба Беляковой поставщику «Пелагика ДВ» на отсутствие ВСД
+    попала в протокол логистики как клиентская проблема.
+    """
+    try:
+        from wazzup_classifier import _is_procurement_chat
+    except Exception:
+        _is_procurement_chat = None
+    cache: dict[str, bool] = {}
+    kept = []
+    for s in signals:
+        cid = s.get("chat_id")
+        if cid not in cache:
+            cache[cid] = bool(s.get("_procurement")) or bool(
+                _is_procurement_chat and _is_procurement_chat(db, cid, None))
+        if cache[cid]:
+            continue
+        s.pop("_procurement", None)
+        kept.append(s)
+    if len(kept) < len(signals):
+        logger.info("chat_digest: убрано %d сигналов из чатов закупки",
+                    len(signals) - len(kept))
+    return kept
 
 
 async def analyze(db, hours: int = 24) -> list[dict]:
@@ -320,7 +363,8 @@ async def analyze(db, hours: int = 24) -> list[dict]:
 
     results = await asyncio.gather(*[_run(b) for b in batches])
     signals = [s for batch in results for s in batch]
-    await _enrich_with_amocrm(signals)
+    await _enrich_with_amocrm(signals, db)
+    signals = _drop_procurement(db, signals)
     logger.info(
         "chat_digest: %d диалогов, %d батчей, %d сигналов",
         len(dialogues), len(batches), len(signals),

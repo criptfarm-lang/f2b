@@ -80,26 +80,61 @@ FEWSHOT = [
 ]
 
 
-async def _resolve_amocrm_lead_id(chat_id: Optional[str], contact_name: Optional[str]) -> Optional[int]:
+def _chat_phone(db, chat_id: Optional[str]) -> Optional[str]:
+    """Телефон чата MAX/Telegram из wazzup_contacts.
+
+    В chat_id этих каналов телефона нет, но Wazzup в какой-то момент присылает
+    контакт чата с именем-номером («79037340812» или «Контакт 79037340812»).
+    """
+    if db is None or not chat_id:
+        return None
+    try:
+        rows = db._fetchall(
+            "SELECT contact_name FROM wazzup_contacts WHERE chat_id = %s "
+            "ORDER BY updated_at DESC",
+            (str(chat_id),),
+        )
+    except Exception as e:
+        logger.info(f"wazzup_classifier: phone lookup failed chat_id={chat_id}: {e}")
+        return None
+    for r in rows or []:
+        m = re.search(r"(?<!\d)(\d{11})(?!\d)", r.get("contact_name") or "")
+        if m:
+            return m.group(1)
+    return None
+
+
+async def _resolve_amocrm_lead_id(chat_id: Optional[str], contact_name: Optional[str],
+                                  phone: Optional[str] = None) -> Optional[int]:
     """Best-effort резолв chat_id (Wazzup) → lead_id (amoCRM).
 
-    WhatsApp chat_id формата '<phone>@c.us' → достаём phone → find_contact_by_phone →
-    активный lead через get_leads_by_contact.
-    Telegram chat_id числовой — телефона из него не достать, fallback по contact_name.
+    Телефон: из WhatsApp chat_id '<phone>@c.us' или переданный `phone`
+    (для MAX/Telegram — из wazzup_contacts, см. _chat_phone).
+    По имени — только если в amoCRM ровно один контакт с ТАКИМ ЖЕ именем:
+    поиск amoCRM по подстроке, и «Михаил» раньше молча цеплял первого из
+    десятков Михаилов (28.09.2026 сигнал «Ресторана Дома» ушёл в протокол
+    логистики под сделкой «Честной рыбы»). Лучше без ссылки, чем чужой клиент.
     При любой ошибке возвращаем None — фронт даст пользователю кнопку «🔍 Найти в amoCRM».
     """
     if not chat_id:
         return None
     try:
-        from amocrm import find_contact_by_phone, find_contact_by_name, get_leads_by_contact
+        from amocrm import amo_get, find_contact_by_phone, get_leads_by_contact
 
         contact = None
         m = re.match(r"^(\d{10,13})@", chat_id)
         if m:
-            contact = await find_contact_by_phone(m.group(1))
+            phone = m.group(1)
+        if phone:
+            contact = await find_contact_by_phone(phone)
         if not contact and contact_name:
-            contacts = await find_contact_by_name(contact_name)
-            contact = contacts[0] if contacts else None
+            want = " ".join(contact_name.lower().split())
+            # limit 250: find_contact_by_name берёт 10, а на «Михаил ЧР» amoCRM
+            # отдаёт полсотни «Михаилов», и точный контакт в первую десятку не попадает
+            found = await amo_get("/contacts", params={"query": contact_name, "limit": 250})
+            same = [c for c in ((found or {}).get("_embedded") or {}).get("contacts", [])
+                    if " ".join((c.get("name") or "").lower().split()) == want]
+            contact = same[0] if len(same) == 1 else None
         if not contact:
             return None
         leads = await get_leads_by_contact(int(contact["id"]))
@@ -420,7 +455,8 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
                 # Best-effort: каждый шаг может вернуть None, фронт покажет
                 # fallback-кнопку «🔍 Найти в amoCRM» и имя из Wazzup как backup.
                 amocrm_lead_id = await _resolve_amocrm_lead_id(
-                    m.get("chat_id"), m.get("contact_name")
+                    m.get("chat_id"), m.get("contact_name"),
+                    phone=_chat_phone(db, m.get("chat_id")),
                 )
                 resp_user_id, resp_name = await _resolve_amocrm_responsible(amocrm_lead_id)
 
