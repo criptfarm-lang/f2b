@@ -162,7 +162,10 @@ def _is_procurement_chat(db, chat_id: Optional[str], resp_name: Optional[str]) -
     Сигналы (любой достаточен):
     1. amoCRM responsible сделки — закупщик (Павленко/Белякова).
     2. Ручная разметка чата в wazzup_contact_map (источник правды собственника):
-       role 'игнор'/'закупщик', company_name '__ignore__' или тег «поставщик».
+       role 'игнор', company_name '__ignore__' или тег «поставщик».
+       Роль «закупщик» тут НЕ признак: это закупщик на стороне клиента
+       (все такие чаты – покупатели, в т.ч. ФУГУ МОСКОУ), до 28.09.2026 их
+       заявки молча отсекались как переписка с поставщиком.
        Самый надёжный сигнал — для Telegram-чатов amoCRM-резолв по имени
        нестабилен (дубли контактов), а тут разметка курируется руками.
     3. В чате есть исходящее с подписью «отдел снабжения» за последние 30 дней.
@@ -177,7 +180,7 @@ def _is_procurement_chat(db, chat_id: Optional[str], resp_name: Optional[str]) -
         row = db._fetchone(
             "SELECT 1 FROM wazzup_contact_map "
             "WHERE chat_id = %s AND ("
-            "  lower(coalesce(role, '')) IN ('игнор', 'закупщик') "
+            "  lower(coalesce(role, '')) = 'игнор' "
             "  OR company_name = '__ignore__' "
             "  OR lower(coalesce(tags, '')) LIKE %s) "
             "LIMIT 1",
