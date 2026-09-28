@@ -85,7 +85,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "card-trace-guard"
+CODE_VERSION = "slice-and-freeze"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -1172,6 +1172,10 @@ def check_style(text: str, gender: str = "f") -> list:
                       r"телефон\w* для связи)\b", (text or "").lower())
     if call:
         problems.append("упоминание звонка: " + ", ".join(sorted(set(call))))
+    # Инъект клиенту не называем никогда (собственник 28.09.2026).
+    inject = re.findall(r"\bинъе[кц]\w*", low)
+    if inject:
+        problems.append("упоминание инъекта: " + ", ".join(sorted(set(inject))))
     return problems
 
 
@@ -1651,6 +1655,11 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
         _heartbeat(db, f"генерация не дала результата, lead={row['lead_id']}", problem=True)
         return
     draft["text"] = polish(draft.get("text") or "")
+    # Пустой текст при action=reply — брак генерации: 28.09.2026 на «Спасибо,
+    # большое)» пришла карточка без ответа, и её пришлось отклонять.
+    if draft.get("action") == "reply" and not draft["text"].strip():
+        draft["action"] = "escalate"
+        draft["reason"] = "модель не написала текст ответа – нужен человек"
     problems = (check_prices(draft, ctx["prices"], allowed_numbers(ctx.get("city")))
                 + check_style(draft["text"], ctx["persona"]["gender"]))
     # Уступка ниже прайса проверяется порогами дашборда, а не на глаз.

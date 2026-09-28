@@ -803,3 +803,11 @@ def test_strip_keeps_plain_text():
     from sales_dialog import strip_card_header
     t = "Клиенту: форель 1890 ₽/кг"          # «Клиент:» с двоеточием — служебная, а это нет
     assert strip_card_header(t) == t
+
+
+def test_inject_word_banned():
+    """Инъект клиенту не называем никогда (собственник 28.09.2026)."""
+    from sales_dialog import check_style
+    assert any("инъект" in p for p in check_style("Слоение шло от инъекта", "f"))
+    assert any("инъект" in p for p in check_style("там инъекцию делают", "f"))
+    assert check_style("Слоение шло от сырья", "f") == []
