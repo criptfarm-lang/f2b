@@ -553,3 +553,137 @@ def test_answer_text_empty_content():
     from sales_dialog import answer_text
     assert answer_text({"content": []}) == ""
     assert answer_text({}) == ""
+
+
+# ── партии менеджеров (план 2026-09-25) ───────────────────────────────────────
+def test_slot_quota_grows_every_seven_minutes():
+    """Отправка с 9:00 по одной карточке в 7 минут (собственник 25.09.2026)."""
+    from sales_dialog import slot_quota
+    cfg = {"slot_start_hour": 9, "slot_minutes": 7, "daily_target": 30}
+    assert slot_quota(datetime(2026, 9, 29, 8, 59, tzinfo=MSK), cfg) == 0
+    assert slot_quota(datetime(2026, 9, 29, 9, 0, tzinfo=MSK), cfg) == 1
+    assert slot_quota(datetime(2026, 9, 29, 9, 6, tzinfo=MSK), cfg) == 1
+    assert slot_quota(datetime(2026, 9, 29, 9, 7, tzinfo=MSK), cfg) == 2
+    # К 12:30 прошло 210 минут — ровно 30 слотов, потолок дня.
+    assert slot_quota(datetime(2026, 9, 29, 12, 30, tzinfo=MSK), cfg) == 30
+    assert slot_quota(datetime(2026, 9, 29, 18, 0, tzinfo=MSK), cfg) == 30
+
+
+class QueueDB:
+    """Заглушка под отбор очереди: отдаёт статистику по адресатам."""
+
+    def __init__(self, stats):
+        self.stats = stats
+
+    def _fetchall(self, sql, params=None):
+        return self.stats
+
+    def _fetchone(self, sql, params=None):
+        return None
+
+    def _execute(self, sql, params=None):
+        pass
+
+
+def _silent_row(lead_id, amo):
+    return {"lead_id": lead_id, "assignee_amo_id": amo, "campaign": "c"}
+
+
+def test_allowed_silent_respects_slots_per_manager():
+    """Каждому менеджеру своя квота: у кого выдано по норме — тому пока не даём."""
+    from sales_dialog import _allowed_silent
+    db = QueueDB([{"assignee_amo_id": 13665786, "pending": 0, "today": 2},
+                  {"assignee_amo_id": 11544494, "pending": 0, "today": 0}])
+    cfg = {"slot_start_hour": 9, "slot_minutes": 7, "daily_target": 30, "max_pending": 1}
+    now = datetime(2026, 9, 29, 9, 8, tzinfo=MSK)          # квота 2
+    out = _allowed_silent(db, "c", [_silent_row(1, 13665786), _silent_row(2, 11544494)], cfg, now)
+    assert [r["lead_id"] for r in out] == [2]
+
+
+def test_allowed_silent_holds_when_card_pending():
+    """Пока карточка у менеджера не решена, вторую не выдаём."""
+    from sales_dialog import _allowed_silent
+    db = QueueDB([{"assignee_amo_id": 13665786, "pending": 1, "today": 1}])
+    cfg = {"slot_start_hour": 9, "slot_minutes": 7, "daily_target": 30, "max_pending": 1}
+    now = datetime(2026, 9, 29, 11, 0, tzinfo=MSK)
+    assert _allowed_silent(db, "c", [_silent_row(1, 13665786)], cfg, now) == []
+
+
+def test_allowed_silent_one_hanging_card_does_not_block_other_manager():
+    """Висящая карточка Коликова не должна останавливать партию Скляр."""
+    from sales_dialog import _allowed_silent
+    db = QueueDB([{"assignee_amo_id": 13665786, "pending": 1, "today": 5},
+                  {"assignee_amo_id": 11544494, "pending": 0, "today": 5}])
+    cfg = {"slot_start_hour": 9, "slot_minutes": 7, "daily_target": 30, "max_pending": 1}
+    now = datetime(2026, 9, 29, 11, 0, tzinfo=MSK)
+    out = _allowed_silent(db, "c", [_silent_row(1, 13665786), _silent_row(2, 11544494)], cfg, now)
+    assert [r["lead_id"] for r in out] == [2]
+
+
+def test_offer_price_replaces_all_types():
+    from sales_dialog import apply_offers
+    rows = [{"code": "11043", "name": "Лосось ОХЛ Трим Д Мурманск", "opt": 2750.0,
+             "horeca": 2750.0, "spec": None, "stock": 0, "own": True}]
+    out = apply_offers(rows, {"11043": 2490.0})[0]
+    assert out["opt"] == out["horeca"] == out["spec"] == out["offer"] == 2490.0
+
+
+def test_offer_price_accepted_by_check_prices():
+    """Цена предложения проходит сверку, даже если типа «спец» в прайсе нет."""
+    prices = {"11043": {"code": "11043", "opt": 2490.0, "horeca": 2490.0,
+                        "spec": 2490.0, "offer": 2490.0, "stock": 0}}
+    draft = {"text": "лосось охл. Трим Д – 2490 ₽/кг", "price_claims": [
+        {"code": "11043", "name": "Лосось", "price": 2490.0, "price_type": "spec"}]}
+    assert check_prices(draft, prices) == []
+
+
+def test_below_offer_price_is_escalation():
+    """Ниже согласованной цены предложения агент не торгуется вообще."""
+    from sales_dialog import check_bargain
+    prices = {"11043": {"code": "11043", "offer": 2490.0, "opt": 2490.0,
+                        "horeca": 2490.0, "spec": 2490.0}}
+    draft = {"bargain": [{"code": "11043", "price": 2400.0, "list_price": 2490.0,
+                          "price_type": "opt"}]}
+    problems = asyncio.run(check_bargain(None, None, draft, prices))
+    assert problems and "ниже согласованной цены предложения" in problems[0]
+
+
+def test_manager_card_has_take_button():
+    from sales_dialog import _keyboard
+    kb = _keyboard(7, "reply", to_manager=True)
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    assert "Забрать" in labels and "Вернуть менеджеру" not in labels
+
+
+def test_owner_card_keeps_hand_button():
+    from sales_dialog import _keyboard
+    kb = _keyboard(7, "reply")
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    assert "Вернуть менеджеру" in labels and "Забрать" not in labels
+
+
+def test_card_goes_to_assigned_manager():
+    from sales_dialog import card_recipient
+    db = FakeDB({"lead": {"assignee_amo_id": 13665786}})
+    chat, amo = card_recipient(db, _msg(assignee_amo_id=13665786))
+    assert chat == sales_dialog.MANAGER_TG[13665786] and amo == 13665786
+
+
+def test_card_without_assignee_goes_to_owner(monkeypatch):
+    from sales_dialog import card_recipient
+    monkeypatch.setenv("OWNER_CHAT_ID", "777")
+    db = FakeDB({"lead": {"assignee_amo_id": None}})
+    chat, amo = card_recipient(db, _msg(assignee_amo_id=None))
+    assert chat == 777 and amo is None
+
+
+def test_progress_line_counts_done(monkeypatch):
+    """Разобрано = отправлено + забрано + отклонено, висящие не считаются."""
+    from sales_dialog import batch_progress
+
+    class DB:
+        def _fetchall(self, sql, params=None):
+            return [{"assignee_amo_id": 13665786, "issued": 12, "sent": 7, "taken": 2,
+                     "refused": 1, "pending": 1, "lost": 1}]
+    row = batch_progress(DB(), "c")[0]
+    assert row["sent"] + row["taken"] + row["refused"] == 10

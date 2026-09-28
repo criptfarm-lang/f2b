@@ -51,7 +51,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "batches-by-date"
+CODE_VERSION = "manager-batches"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -133,6 +133,24 @@ def ensure_tables(db) -> None:
     # разбирается по столько в день, сколько человек успевает утвердить.
     db._execute("""ALTER TABLE sales_dialog_leads
                    ADD COLUMN IF NOT EXISTS activate_on DATE""")
+    # Чья это карточка. NULL — собственника, иначе amoCRM id менеджера: с
+    # 29.09.2026 партии спящих разбирают Коликов и Скляр, каждый свою.
+    db._execute("""ALTER TABLE sales_dialog_leads
+                   ADD COLUMN IF NOT EXISTS assignee_amo_id BIGINT""")
+    # Кнопка «Забрать»: когда менеджер взял диалог себе и какая сделка создана.
+    db._execute("""ALTER TABLE sales_dialog_leads
+                   ADD COLUMN IF NOT EXISTS taken_at TIMESTAMPTZ""")
+    db._execute("""ALTER TABLE sales_dialog_leads
+                   ADD COLUMN IF NOT EXISTS new_lead_id BIGINT""")
+    # Адресат карточки фиксируется в самой карточке: лид могут передать другому,
+    # а решение по уже отправленной карточке должен принимать тот, кому её послали.
+    db._execute("""ALTER TABLE sales_dialog_messages
+                   ADD COLUMN IF NOT EXISTS assignee_amo_id BIGINT""")
+    # Сколько раз уже напоминали по этой карточке и когда в последний раз.
+    db._execute("""ALTER TABLE sales_dialog_messages
+                   ADD COLUMN IF NOT EXISTS ping_count INT NOT NULL DEFAULT 0""")
+    db._execute("""ALTER TABLE sales_dialog_messages
+                   ADD COLUMN IF NOT EXISTS pinged_at TIMESTAMPTZ""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_leads_status_idx
                    ON sales_dialog_leads (campaign, status)""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_messages_lead_idx
@@ -332,6 +350,83 @@ async def hand_to_manager(app, db, msg: dict) -> str:
     else:
         done.append("Telegram менеджера неизвестен, не писали")
     return ", ".join(done)
+
+
+AGENT_TAG = "ведёт агент"        # создавать теги через API в этом аккаунте нельзя, ставим готовый
+
+
+async def take_by_manager(app, db, msg: dict, amo_user: int) -> str:
+    """Менеджер забрал диалог себе: новая сделка, контакты, задача, агент молчит.
+
+    Спящие лиды приходят из закрытых сделок — закрытую сделку не переоткрываем,
+    её история остаётся историей, а работа продолжается в новой сделке воронки
+    ПРИВЛЕЧЕНИЕ на том менеджере, который нажал кнопку (собственник 25.09.2026).
+    """
+    lead_id = msg["lead_id"]
+    lead = db._fetchone("""SELECT lead_name, contact_name, chat_type, contact_id
+                           FROM sales_dialog_leads WHERE campaign=%s AND lead_id=%s""",
+                        (msg["campaign"], lead_id))
+    name = (lead or {}).get("lead_name") or f"сделка {lead_id}"
+    done, new_id = [], None
+    async with aiohttp.ClientSession() as session:
+        full = await _amo_lead(session, lead_id)
+        contacts = [c["id"] for c in ((full.get("_embedded") or {}).get("contacts") or [])]
+        if not contacts and (lead or {}).get("contact_id"):
+            contacts = [lead["contact_id"]]
+        payload = [{
+            "name": f"{name} – агент разбудил",
+            "pipeline_id": ATTRACT_PIPELINE, "status_id": ATTRACT_FIRST_STATUS,
+            "responsible_user_id": amo_user,
+            "_embedded": {"tags": [{"name": AGENT_TAG}],
+                          **({"contacts": [{"id": c} for c in contacts]} if contacts else {})},
+        }]
+        created = await _amo_json(session, "/leads", payload, method="POST")
+        new_id = (((created or {}).get("_embedded") or {}).get("leads") or [{}])[0].get("id")
+        done.append(f"сделка {new_id} создана" if new_id else "сделку создать не вышло")
+
+        if contacts:
+            ok_c = await _amo_write(session, "/contacts",
+                                    [{"id": c, "responsible_user_id": amo_user} for c in contacts])
+            done.append("контакты переданы" if ok_c else "контакты передать не вышло")
+
+        if new_id:
+            note = (f"Диалог забран у агента.\n\nПоследнее от клиента: "
+                    f"{(msg.get('inbound_text') or '—')[:500]}\n\n"
+                    f"Черновик агента (не отправлен):\n{(msg.get('draft_text') or '—')[:1000]}\n\n"
+                    f"Прежняя сделка: {lead_id}")
+            await _amo_write(session, f"/leads/{new_id}/notes",
+                             [{"note_type": "common", "params": {"text": note}}], method="POST")
+            till = int((datetime.now(MSK) + timedelta(hours=3)).timestamp())
+            ok_t = await _amo_write(session, "/tasks", [{
+                "entity_id": new_id, "entity_type": "leads", "responsible_user_id": amo_user,
+                "task_type_id": 1, "complete_till": till,
+                "text": "Ответить клиенту: диалог забран у агента"}], method="POST")
+            done.append("задача поставлена" if ok_t else "задачу поставить не вышло")
+
+    db._execute("""UPDATE sales_dialog_leads SET status='taken', taken_at=now(), new_lead_id=%s
+                   WHERE campaign=%s AND lead_id=%s""", (new_id, msg["campaign"], lead_id))
+    if app and new_id:
+        sub = os.getenv("AMO_SUBDOMAIN", "victorfishtobiz")
+        await notify_owner(app, f"{name}: диалог забрал менеджер, сделка "
+                                f"https://{sub}.amocrm.ru/leads/detail/{new_id}")
+    return ", ".join(done)
+
+
+async def _amo_json(session: aiohttp.ClientSession, path: str, payload, method: str = "POST"):
+    """Как `_amo_write`, но возвращает тело ответа: при создании нужен id."""
+    token = os.getenv("AMO_ACCESS_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        async with session.request(method, f"{AMO_BASE}{path}", headers=headers, json=payload,
+                                   timeout=aiohttp.ClientTimeout(total=40)) as r:
+            body = await r.text()
+            if r.status not in (200, 201):
+                logger.warning("sales_dialog: amo %s %s → %s %s", method, path, r.status, body[:300])
+                return None
+            return json.loads(body) if body else {}
+    except Exception as e:
+        logger.warning("sales_dialog: amo %s %s: %s", method, path, e)
+        return None
 
 
 async def _amo_lead(session: aiohttp.ClientSession, lead_id: int) -> dict:
@@ -587,13 +682,57 @@ def delivery_note(city: str | None) -> str:
             "точный расчёт под вес и объём делает менеджер.")
 
 
+def offer_prices(db) -> dict:
+    """Цены предложения: `{код: цена}` из `bot_settings`, ключ `sales_dialog:price_overrides`.
+
+    Собственник задаёт их вручную под волну (25.09.2026), и они главнее прайса
+    МойСклада: там цена может быть и выше, и ниже, а клиенту в этой волне
+    называем именно эту. В МойСклад агент не пишет — правило read-only.
+    """
+    row = db._fetchone("SELECT value FROM bot_settings WHERE key=%s",
+                       (SETTINGS_PREFIX + "price_overrides",))
+    try:
+        raw = json.loads((row or {}).get("value") or "{}")
+    except Exception:
+        logger.warning("sales_dialog: price_overrides не разобрались")
+        return {}
+    out = {}
+    for code, val in raw.items():
+        try:
+            out[str(code)] = float(val)
+        except (TypeError, ValueError):
+            logger.warning("sales_dialog: цена предложения %s не число: %r", code, val)
+    return out
+
+
+def apply_offers(rows: list, offers: dict) -> list:
+    """Накладывает цены предложения на справочник, не портя кэш прайса."""
+    if not offers:
+        return rows
+    out = []
+    for p in rows:
+        price = offers.get(str(p.get("code")))
+        if price is None:
+            out.append(p)
+            continue
+        # Все три типа равны цене предложения: какой бы тип модель ни выбрала,
+        # клиенту уйдёт одна и та же согласованная цифра.
+        out.append({**p, "opt": price, "horeca": price, "spec": price, "offer": price})
+    return out
+
+
 def _format_prices(rows: list) -> str:
     """В промпт идут позиции с остатком, все спеццены и вся своя готовая продукция."""
-    return "\n".join(
-        f"{p['code']} | {p['name']} | опт {p['opt']} | horeca {p['horeca'] or '-'} | "
-        f"спец {p['spec'] or '-'} | остаток {p['stock']} | "
-        f"{'наше производство' if p.get('own') else 'привлечённый товар'}"
-        for p in rows if p["stock"] > 0 or p["spec"] or p.get("own"))
+    def line(p):
+        own = "наше производство" if p.get("own") else "привлечённый товар"
+        if p.get("offer"):
+            return (f"{p['code']} | {p['name']} | ЦЕНА ПРЕДЛОЖЕНИЯ {p['offer']} "
+                    f"(ниже не опускаться, торг — только через руководителя) | "
+                    f"остаток {p['stock']} | {own}")
+        return (f"{p['code']} | {p['name']} | опт {p['opt']} | horeca {p['horeca'] or '-'} | "
+                f"спец {p['spec'] or '-'} | остаток {p['stock']} | {own}")
+    return "\n".join(line(p) for p in rows
+                     if p["stock"] > 0 or p["spec"] or p.get("own") or p.get("offer"))
 
 
 async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
@@ -624,7 +763,7 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
     # Москва даже у клиента, который писал «мы не в МСК находимся» (23.09.2026).
     client_text = " ".join(h["text"] for h in history if not h["is_outbound"])
     city = find_city(client_text + " " + (lead.get("name") or ""))
-    prices = await _ms_price_rows(session)
+    prices = apply_offers(await _ms_price_rows(session), offer_prices(db))
     objections = (PROMPTS_DIR / "objections.md").read_text(encoding="utf-8")[:4000]
     last_in = next((h for h in reversed(history) if not h["is_outbound"]), None)
     already = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages
@@ -817,7 +956,9 @@ def check_prices(draft: dict, prices: dict, allowed: set | None = None) -> list:
         if not p:
             problems.append(f"кода {c['code']} нет в справочнике")
             continue
-        actual = p.get(c["price_type"])
+        # Цена предложения главнее типа: она согласована собственником под волну,
+        # и назвать её можно, даже если модель выбрала тип, которого в прайсе нет.
+        actual = p.get("offer") or p.get(c["price_type"])
         if not actual:
             problems.append(f"{c['code']}: нет цены типа «{c['price_type']}»")
             continue
@@ -872,15 +1013,24 @@ async def price_floor(session: aiohttp.ClientSession, db, sku_code: str) -> dict
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-async def check_bargain(session, db, draft: dict) -> list:
+async def check_bargain(session, db, draft: dict, prices: dict | None = None) -> list:
     """Торг в пределах правил ценообразования: ниже пола — только через собственника.
 
     Клиенты, особенно новые, почти всегда просят ниже прайса. Агент вправе
     уступать, но нижняя граница — порог из дашборда (для новых и спящих это
     «минимум», то есть безубыточность плюс вклад). Всё, что ниже, — эскалация.
+
+    У позиций с ценой предложения торга нет вовсе: эту цифру собственник задал
+    вручную, и часть таких цен сама лежит около порога (25.09.2026: 40089 по
+    2450 при безубыточности 2491). Ниже неё — сразу к собственнику.
     """
     problems = []
     for b in draft.get("bargain") or []:
+        offer = ((prices or {}).get(b["code"]) or {}).get("offer")
+        if offer and b["price"] < offer - 0.5:
+            problems.append(f"{b['code']}: предложено {b['price']:.0f}, "
+                            f"ниже согласованной цены предложения {offer:.0f}")
+            continue
         fl = await price_floor(session, db, b["code"])
         if fl.get("error") or fl.get("floor") is None:
             problems.append(f"{b['code']}: цена {b['price']} ниже прайса {b['list_price']}, "
@@ -959,7 +1109,7 @@ def _pending_inbound(db, campaign: str) -> list:
     разговор не лезет. Идемпотентность — по `message_id` входящего.
     """
     return db._fetchall("""
-        SELECT l.campaign, l.lead_id, l.contact_id,
+        SELECT l.campaign, l.lead_id, l.contact_id, l.assignee_amo_id,
                m.chat_id, coalesce(m.chat_type, l.chat_type) AS chat_type,
                l.lead_name, l.contact_name, l.replies_sent,
                m.message_id, m.text AS inbound_text, m.sent_at, 'inbound' AS source
@@ -1004,7 +1154,7 @@ def _pending_silent(db, campaign: str, silent_days: int,
     крутится вхолостую без единой ошибки — уже обжигались.
     """
     return db._fetchall("""
-        SELECT l.campaign, l.lead_id, l.contact_id,
+        SELECT l.campaign, l.lead_id, l.contact_id, l.assignee_amo_id,
                coalesce(lastin.chat_id, l.chat_id) AS chat_id,
                coalesce(lastin.chat_type, l.chat_type) AS chat_type,
                l.lead_name, l.contact_name, l.replies_sent,
@@ -1095,6 +1245,12 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     if not_before and now.date().isoformat() < not_before:
         return
 
+    # Протухшие карточки гасим до отбора: иначе одна неразобранная блокирует
+    # очередь до конца дня (25.09.2026 так встали все партии после 11:28).
+    await expire_stale(app, db, campaign)
+    await nudge(app, db, campaign, cfg, now)
+    await daily_digest(app, db, campaign, cfg, now)
+
     # Ответ клиента идёт вне очереди: он ждать не должен (собственник 24.09.2026).
     # Придержать можно только инициативу в молчащий диалог — чтобы карточки не
     # сыпались быстрее, чем человек успевает по ним решать.
@@ -1115,24 +1271,252 @@ async def _tick_campaign(app, db, campaign: str) -> None:
         _heartbeat(db, f"дневной потолок отправок исчерпан: {(sent_today or {}).get('n')}")
         return
 
-    if cfg.get("revive", True) and n_pending < cfg.get("max_pending", 1):
+    if cfg.get("revive", True):
         seen = {r["lead_id"] for r in rows}
         # Пауза между двумя касаниями молчащего диалога — в рабочих днях, чтобы
         # пятничное сообщение не превращалось в воскресное.
         not_before = workdays_ago(now, cfg.get("followup_workdays", 2))
-        rows += [r for r in _pending_silent(db, campaign,
-                                            cfg.get("silent_days", 3),
-                                            cfg.get("max_followups", 2),
-                                            not_before)
-                 if r["lead_id"] not in seen]
+        silent = [r for r in _pending_silent(db, campaign,
+                                             cfg.get("silent_days", 3),
+                                             cfg.get("max_followups", 2),
+                                             not_before)
+                  if r["lead_id"] not in seen]
+        rows += _allowed_silent(db, campaign, silent, cfg, now)
     _heartbeat(db, f"очередь: входящих {n_inbound}, оживление {len(rows) - n_inbound}, "
                    f"ждут решения {n_pending}")
     if not rows:
         return
+    # Потолок на тик — на каждого адресата свой: у Коликова и Скляр партии идут
+    # параллельно, и одна висящая карточка не должна тормозить второго.
     cap = cfg.get("drafts_per_tick", 1)
+    taken: dict = {}
     async with aiohttp.ClientSession() as session:
-        for row in rows[:cap]:
+        for row in rows:
+            key = row.get("assignee_amo_id")
+            if taken.get(key, 0) >= cap:
+                continue
+            taken[key] = taken.get(key, 0) + 1
             await _handle_one(app, db, session, campaign, row, cfg)
+
+
+async def _tell(app, chat: int, text: str) -> None:
+    try:
+        await app.bot.send_message(chat, text)
+    except Exception as e:
+        logger.warning("sales_dialog: сообщение в %s не ушло: %s", chat, e)
+
+
+async def expire_stale(app, db, campaign: str) -> None:
+    """Черновик старше TTL снимаем сами, не дожидаясь кнопки.
+
+    До 25.09.2026 срок проверялся только в момент нажатия «Отправить»: карточка
+    висела в `draft`, `max_pending` держал очередь, и агент стоял с 11:28 до
+    вечера. Теперь тик гасит её сам и говорит адресату, что ответ пересоберётся.
+    """
+    stale = db._fetchall("""SELECT id, lead_id, assignee_amo_id, campaign
+                            FROM sales_dialog_messages
+                            WHERE campaign=%s AND verdict IN ('draft','edited')
+                              AND created_at < now() - (%s || ' minutes')::interval""",
+                         (campaign, str(APPROVAL_TTL_MIN)))
+    for row in stale:
+        db._execute("UPDATE sales_dialog_messages SET verdict='expired' WHERE id=%s", (row["id"],))
+        lead = db._fetchone("""SELECT lead_name FROM sales_dialog_leads
+                               WHERE campaign=%s AND lead_id=%s""", (campaign, row["lead_id"]))
+        who = (lead or {}).get("lead_name") or f"сделка {row['lead_id']}"
+        if app:
+            chat, _ = card_recipient(db, row)
+            await _tell(app, chat, f"{who}: черновик пролежал больше "
+                                   f"{APPROVAL_TTL_MIN // 60} часов и снят. "
+                                   f"Если диалог ещё нужен — соберу заново.")
+
+
+def _nudge_state(db, key: str) -> dict:
+    row = db._fetchone("SELECT value FROM bot_settings WHERE key=%s", (SETTINGS_PREFIX + key,))
+    try:
+        return json.loads((row or {}).get("value") or "{}")
+    except Exception:
+        return {}
+
+
+def _save_nudge_state(db, key: str, state: dict) -> None:
+    v = json.dumps(state, ensure_ascii=False)
+    db._execute("""INSERT INTO bot_settings (key, value) VALUES (%s,%s)
+                   ON CONFLICT (key) DO UPDATE SET value=%s""",
+                (SETTINGS_PREFIX + key, v, v))
+
+
+async def nudge(app, db, campaign: str, cfg: dict, now: datetime) -> None:
+    """Пинги: карточка лежит без решения и клиент ждёт в забранном диалоге.
+
+    Задача собственника (25.09.2026) — чтобы партия из 30 была отработана за
+    день. Замершую работу видно по двум признакам: карточка висит и никто её не
+    трогает; клиент написал в диалог, который менеджер забрал себе, и молчание.
+    """
+    if not app:
+        return
+    first = int(cfg.get("ping_after_min", 20))
+    hang = db._fetchall("""SELECT id, lead_id, campaign, assignee_amo_id, ping_count,
+                                  round(extract(epoch from now() - created_at) / 60) AS age_min
+                           FROM sales_dialog_messages
+                           WHERE campaign=%s AND verdict IN ('draft','edited')
+                             AND created_at < now() - (%s || ' minutes')::interval
+                             AND (pinged_at IS NULL
+                                  OR pinged_at < now() - (%s || ' minutes')::interval)""",
+                        (campaign, str(first), str(first)))
+    for row in hang:
+        if (row["ping_count"] or 0) >= 2:
+            continue
+        lead = db._fetchone("""SELECT lead_name FROM sales_dialog_leads
+                               WHERE campaign=%s AND lead_id=%s""", (campaign, row["lead_id"]))
+        who = (lead or {}).get("lead_name") or f"сделка {row['lead_id']}"
+        chat, amo = card_recipient(db, row)
+        age = int(row["age_min"] or 0)
+        await _tell(app, chat, f"{who}: карточка ждёт решения {age} мин. "
+                               f"Реши её — отправить, поправить, забрать или пропустить.")
+        # Второй пинг дублируем собственнику: значит человек не в работе.
+        if (row["ping_count"] or 0) >= 1 and amo:
+            await notify_owner(app, f"{who}: менеджер не разбирает карточку {age} мин, "
+                                    f"это второе напоминание.")
+        db._execute("""UPDATE sales_dialog_messages
+                       SET ping_count=ping_count+1, pinged_at=now() WHERE id=%s""", (row["id"],))
+
+    # Забранные диалоги: клиент ответил, а менеджер молчит.
+    wait = int(cfg.get("taken_wait_min", 30))
+    state = _nudge_state(db, "_taken_pings")
+    changed = False
+    rows = db._fetchall("""
+        SELECT l.lead_id, l.lead_name, l.assignee_amo_id, l.new_lead_id,
+               m.text, round(extract(epoch from now() - m.sent_at AT TIME ZONE 'UTC') / 60) AS age_min
+        FROM sales_dialog_leads l
+        CROSS JOIN LATERAL (SELECT coalesce(l.all_chat_ids, ARRAY[l.chat_id]) AS ids) c
+        JOIN LATERAL (
+            SELECT w.text, w.sent_at FROM wazzup_messages w
+            WHERE w.chat_id = ANY(c.ids) AND w.is_outbound = false
+            ORDER BY w.sent_at DESC LIMIT 1
+        ) m ON true
+        WHERE l.campaign=%s AND l.status='taken' AND l.assignee_amo_id IS NOT NULL
+          AND m.sent_at AT TIME ZONE 'UTC' < now() - (%s || ' minutes')::interval
+          AND NOT EXISTS (SELECT 1 FROM wazzup_messages o
+                          WHERE o.chat_id = ANY(c.ids) AND o.is_outbound = true
+                            AND o.sent_at > m.sent_at)""", (campaign, str(wait)))
+    for r in rows:
+        age = int(r["age_min"] or 0)
+        seen = state.get(str(r["lead_id"])) or {}
+        stage = int(seen.get("stage", 0))
+        # Первый пинг менеджеру, через час — собственнику, дальше молчим.
+        if stage == 0:
+            chat = MANAGER_TG.get(r["assignee_amo_id"])
+            if chat:
+                sub = os.getenv("AMO_SUBDOMAIN", "victorfishtobiz")
+                link = (f"\nhttps://{sub}.amocrm.ru/leads/detail/{r['new_lead_id']}"
+                        if r.get("new_lead_id") else "")
+                await _tell(app, chat, f"{r['lead_name'] or r['lead_id']}: клиент ждёт ответа "
+                                       f"{age} мин.{link}\nПоследнее от него: "
+                                       f"«{(r['text'] or '')[:200]}»")
+            state[str(r["lead_id"])] = {"stage": 1, "at": now.isoformat(timespec="minutes")}
+            changed = True
+        elif stage == 1 and age >= int(cfg.get("taken_escalate_min", 60)):
+            await notify_owner(app, f"{r['lead_name'] or r['lead_id']}: клиент ждёт ответа "
+                                    f"{age} мин, менеджер забрал диалог и не отвечает.")
+            state[str(r["lead_id"])] = {"stage": 2, "at": now.isoformat(timespec="minutes")}
+            changed = True
+    if changed:
+        _save_nudge_state(db, "_taken_pings", state)
+
+
+def batch_progress(db, campaign: str) -> list:
+    """Прогресс дня по каждому адресату: что выдано и что с этим сделали."""
+    return db._fetchall("""
+        SELECT assignee_amo_id,
+               count(*) AS issued,
+               count(*) FILTER (WHERE verdict='sent') AS sent,
+               count(*) FILTER (WHERE verdict='taken') AS taken,
+               count(*) FILTER (WHERE verdict IN ('skipped','handed')) AS refused,
+               count(*) FILTER (WHERE verdict IN ('draft','edited')) AS pending,
+               count(*) FILTER (WHERE verdict IN ('expired','stale')) AS lost
+        FROM sales_dialog_messages
+        WHERE campaign=%s
+          AND created_at >= date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')
+                            AT TIME ZONE 'Europe/Moscow'
+        GROUP BY assignee_amo_id ORDER BY assignee_amo_id""", (campaign,))
+
+
+AMO_NAMES = {11544494: "Скляр", 12625622: "Баласанян", 12788698: "Мерзлякова",
+             13665786: "Коликов", 13746010: "Дьяченко"}
+
+
+async def daily_digest(app, db, campaign: str, cfg: dict, now: datetime) -> None:
+    """Сводка собственнику в заданные часы: кто сколько разобрал из своих 30."""
+    if not app:
+        return
+    hours = cfg.get("digest_hours") or [13, 18]
+    if now.hour not in [int(h) for h in hours]:
+        return
+    state = _nudge_state(db, "_digest")
+    mark = f"{now.date().isoformat()}:{now.hour}"
+    if state.get("last") == mark:
+        return
+    rows = batch_progress(db, campaign)
+    if not rows:
+        return
+    target = int(cfg.get("daily_target", 30))
+    lines = []
+    for r in rows:
+        amo = r["assignee_amo_id"]
+        name = AMO_NAMES.get(amo, "собственник" if not amo else f"amo {amo}")
+        done = (r["sent"] or 0) + (r["taken"] or 0) + (r["refused"] or 0)
+        lines.append(f"{name}: разобрано {done} из {target} – отправлено {r['sent']}, "
+                     f"забрано {r['taken']}, отклонено {r['refused']}, "
+                     f"висит {r['pending']}, протухло {r['lost']}")
+    await notify_owner(app, f"Партии на {now:%d.%m} в {now.hour}:00\n" + "\n".join(lines))
+    _save_nudge_state(db, "_digest", {"last": mark})
+
+
+def slot_quota(now: datetime, cfg: dict) -> int:
+    """Сколько карточек на оживление положено выдать к этому моменту дня.
+
+    Собственник 25.09.2026: отправка с 9:00, одна карточка раз в 7 минут. Значит
+    к 9:00 положена первая, к 9:07 — вторая и так далее, но не больше дневной
+    цели. Так менеджер получает работу ровным потоком, а не пачкой из 30 писем.
+    """
+    start_hour = int(cfg.get("slot_start_hour", cfg.get("start_hour", 9)))
+    step = max(1, int(cfg.get("slot_minutes", 7)))
+    target = int(cfg.get("daily_target", 30))
+    start = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+    if now < start:
+        return 0
+    return min(target, int((now - start).total_seconds() // 60 // step) + 1)
+
+
+def _allowed_silent(db, campaign: str, silent: list, cfg: dict, now: datetime) -> list:
+    """Фильтр очереди оживления по расписанию и по нагрузке каждого адресата.
+
+    Без адресата (карточки собственника) работает прежнее правило `max_pending`.
+    С адресатом добавляется дневная цель и слоты: сколько карточек этому
+    менеджеру уже выдано за сегодня против того, сколько положено ко времени.
+    """
+    max_pending = int(cfg.get("max_pending", 1))
+    quota = slot_quota(now, cfg)
+    stats = {r["assignee_amo_id"]: r for r in db._fetchall("""
+        SELECT assignee_amo_id,
+               count(*) FILTER (WHERE verdict IN ('draft','edited')) AS pending,
+               count(*) FILTER (WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')
+                                                   AT TIME ZONE 'Europe/Moscow') AS today
+        FROM sales_dialog_messages WHERE campaign=%s GROUP BY assignee_amo_id""", (campaign,))}
+    out = []
+    room: dict = {}
+    for r in silent:
+        amo = r.get("assignee_amo_id")
+        st = stats.get(amo) or {}
+        pending, today = st.get("pending") or 0, st.get("today") or 0
+        planned = room.get(amo, 0)
+        if pending + planned >= max_pending:
+            continue
+        if amo and today + planned >= quota:
+            continue
+        room[amo] = planned + 1
+        out.append(r)
+    return out
 
 
 async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> None:
@@ -1159,7 +1543,7 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
     problems = (check_prices(draft, ctx["prices"], allowed_numbers(ctx.get("city")))
                 + check_style(draft["text"]))
     # Уступка ниже прайса проверяется порогами дашборда, а не на глаз.
-    problems += await check_bargain(session, db, draft)
+    problems += await check_bargain(session, db, draft, ctx["prices"])
     if draft.get("bargain") and not problems:
         logger.info("sales_dialog: торг lead=%s %s", row["lead_id"], draft["bargain"])
     action = draft["action"]
@@ -1171,8 +1555,9 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
 
     saved = db._fetchone("""INSERT INTO sales_dialog_messages
         (campaign, lead_id, chat_id, chat_type, inbound_message_id, inbound_text, draft_text,
-         action, reason, need_check, price_claims, bargain, model, prompt_version, verdict)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'draft')
+         action, reason, need_check, price_claims, bargain, model, prompt_version, verdict,
+         assignee_amo_id)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'draft',%s)
         ON CONFLICT (inbound_message_id, prompt_version) DO NOTHING
         RETURNING id""",
         (campaign, row["lead_id"], row["chat_id"], row.get("chat_type"),
@@ -1180,7 +1565,7 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
          draft.get("text"), action, draft.get("reason"), draft.get("need_check"),
          json.dumps(draft.get("price_claims"), ensure_ascii=False),
          json.dumps(draft.get("bargain"), ensure_ascii=False) if draft.get("bargain") else None,
-         MODEL, PROMPT_VERSION))
+         MODEL, PROMPT_VERSION, row.get("assignee_amo_id")))
     db._execute("""UPDATE sales_dialog_leads SET last_inbound_at=%s
                    WHERE campaign=%s AND lead_id=%s""", (row["sent_at"], campaign, row["lead_id"]))
     logger.info("sales_dialog: черновик lead=%s action=%s", row["lead_id"], action)
@@ -1192,7 +1577,7 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
 # ─── подтверждение собственником и отправка ───────────────────────────────────
 # Отправка клиенту возможна ТОЛЬКО после нажатия кнопки: автономного режима в
 # модуле нет вообще. Механика карточки повторяет `protocol_approval`.
-_CB = re.compile(r"^sd:(send|edit|skip|hand):(\d+)$")
+_CB = re.compile(r"^sd:(send|edit|skip|hand|take):(\d+)$")
 # Сколько черновик живёт до протухания: ответ на утреннее сообщение, ушедший
 # вечером, хуже молчания.
 APPROVAL_TTL_MIN = 180
@@ -1228,24 +1613,52 @@ def _card_text(db, msg: dict) -> str:
     return f"{head}\n\nОтвет от имени Инессы:\n{msg.get('draft_text', '')}{tail}"
 
 
-def _keyboard(row_id: int, action: str):
+def _keyboard(row_id: int, action: str, to_manager: bool = False):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     rows = []
     if action != "escalate":
         rows.append([InlineKeyboardButton("Отправить", callback_data=f"sd:send:{row_id}")])
     rows.append([InlineKeyboardButton("Правка", callback_data=f"sd:edit:{row_id}"),
                  InlineKeyboardButton("Не отвечать", callback_data=f"sd:skip:{row_id}")])
-    rows.append([InlineKeyboardButton("Вернуть менеджеру", callback_data=f"sd:hand:{row_id}")])
+    # Менеджеру возвращать лид некому — он и есть менеджер. Ему нужна обратная
+    # кнопка: забрать диалог себе, со своей сделкой и своей задачей.
+    if to_manager:
+        rows.append([InlineKeyboardButton("Забрать", callback_data=f"sd:take:{row_id}")])
+    else:
+        rows.append([InlineKeyboardButton("Вернуть менеджеру", callback_data=f"sd:hand:{row_id}")])
     return InlineKeyboardMarkup(rows)
+
+
+def card_recipient(db, msg: dict) -> tuple[int, int | None]:
+    """Кому уходит карточка: `(telegram chat, amoCRM id менеджера или None)`.
+
+    Партии спящих с 29.09.2026 разбирают сами менеджеры, каждый свою. Если у
+    карточки адресата нет или его Telegram неизвестен — карточка идёт
+    собственнику, чтобы диалог не остался без человека.
+    """
+    amo = msg.get("assignee_amo_id")
+    if not amo:
+        lead = db._fetchone("""SELECT assignee_amo_id FROM sales_dialog_leads
+                               WHERE campaign=%s AND lead_id=%s""",
+                            (msg["campaign"], msg["lead_id"]))
+        amo = (lead or {}).get("assignee_amo_id")
+    chat = MANAGER_TG.get(amo) if amo else None
+    if not chat:
+        if amo:
+            logger.warning("sales_dialog: Telegram менеджера %s неизвестен, карточка собственнику", amo)
+        return _owner_id(), None
+    return chat, amo
 
 
 async def send_for_approval(app, db, row_id: int) -> None:
     msg = db._fetchone("SELECT * FROM sales_dialog_messages WHERE id=%s", (row_id,))
     if not msg:
         return
+    chat, amo = card_recipient(db, msg)
     try:
-        sent = await app.bot.send_message(_owner_id(), _card_text(db, msg),
-                                          reply_markup=_keyboard(row_id, msg.get("action")))
+        sent = await app.bot.send_message(chat, _card_text(db, msg),
+                                          reply_markup=_keyboard(row_id, msg.get("action"),
+                                                                 to_manager=bool(amo)))
         db._execute("UPDATE sales_dialog_messages SET tg_message_id=%s WHERE id=%s",
                     (sent.message_id, row_id))
     except Exception as e:
@@ -1342,14 +1755,22 @@ def register(app, db) -> None:
 
     async def on_button(update, context):
         q = update.callback_query
-        if not q.from_user or q.from_user.id != _owner_id():
-            await q.answer("Только для руководителя.", show_alert=True)
-            return
         m = _CB.match(q.data or "")
         if not m:
             await q.answer("Не разобрал кнопку")
             return
         action, row_id = m.group(1), int(m.group(2))
+        # Решает тот, кому карточку послали: собственник — по своим, менеджер —
+        # по своей партии. Чужую карточку нажать нельзя.
+        card = db._fetchone("SELECT assignee_amo_id FROM sales_dialog_messages WHERE id=%s",
+                            (row_id,)) or {}
+        allowed = {_owner_id()}
+        card_amo = card.get("assignee_amo_id")
+        if card_amo and MANAGER_TG.get(card_amo):
+            allowed.add(MANAGER_TG[card_amo])
+        if not q.from_user or q.from_user.id not in allowed:
+            await q.answer("Эта карточка не твоя.", show_alert=True)
+            return
         base = (q.message.text or "").split("\n\n[")[0]
 
         if action == "skip":
@@ -1366,6 +1787,19 @@ def register(app, db) -> None:
             else:
                 what = "черновик не найден"
             await q.edit_message_text(base + f"\n\n[возвращено менеджеру: {what}. Агент по этому лиду молчит]")
+        elif action == "take":
+            msg = db._fetchone("SELECT * FROM sales_dialog_messages WHERE id=%s", (row_id,))
+            if not msg:
+                await q.edit_message_text(base + "\n\n[черновик не найден]")
+            elif not card_amo:
+                await q.edit_message_text(base + "\n\n[у карточки нет менеджера, "
+                                                 "забрать может только он]")
+            else:
+                db._execute("UPDATE sales_dialog_messages SET verdict='taken' WHERE id=%s",
+                            (row_id,))
+                await q.answer("Забираю…")
+                what = await take_by_manager(app, db, msg, card_amo)
+                await q.edit_message_text(base + f"\n\n[забрано: {what}. Агент по этому лиду молчит]")
         elif action == "edit":
             context.user_data["sd_edit_row"] = (row_id, datetime.now(timezone.utc))
             await q.edit_message_text(base + "\n\n[жду твой текст — ответом на карточку "
@@ -1392,10 +1826,14 @@ def register(app, db) -> None:
             return
         reply_to = update.effective_message.reply_to_message
         row_id = None
+        who = update.effective_user.id if update.effective_user else None
         if reply_to:
-            row = db._fetchone("SELECT id FROM sales_dialog_messages WHERE tg_message_id=%s",
-                               (reply_to.message_id,))
-            row_id = (row or {}).get("id")
+            row = db._fetchone("""SELECT id, assignee_amo_id FROM sales_dialog_messages
+                                  WHERE tg_message_id=%s""", (reply_to.message_id,))
+            # Правит тот, кому карточка адресована: у менеджеров партии свои.
+            amo = (row or {}).get("assignee_amo_id")
+            mine = who == _owner_id() or (bool(amo) and MANAGER_TG.get(amo) == who)
+            row_id = (row or {}).get("id") if mine else None
         if not row_id:
             pending = context.user_data.get("sd_edit_row")
             if pending:
@@ -1419,5 +1857,7 @@ def register(app, db) -> None:
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^sd:"))
     # Группа -1: общий гейт «бот только оповещает» стоит там же и ловит только
     # сообщения, начинающиеся с «/», поэтому обычный ответ до нас доходит.
+    # Правку пишет тот, кому пришла карточка: собственник или менеджер партии.
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.User(_owner_id()), on_edit_reply), group=-1)
+        filters.TEXT & ~filters.COMMAND
+        & filters.User([_owner_id(), *MANAGER_TG.values()]), on_edit_reply), group=-1)
