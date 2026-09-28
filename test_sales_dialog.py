@@ -727,3 +727,53 @@ def test_card_signed_by_assignee():
     db = FakeDB({"lead": {"lead_name": "Олива", "chat_type": "max"}, "msg": _msg()})
     card = _card_text(db, _msg(assignee_amo_id=13665786))
     assert "Ответ от имени Денис" in card
+
+
+# ── скидка МРМ не должна уводить ниже порога (28.09.2026) ─────────────────────
+def test_is_mrm_only_chilled_murmansk():
+    from sales_dialog import is_mrm
+    assert is_mrm("Лосось атл. (сёмга), ПСГ, ОХЛ., 5-6 кг. Мурманск")
+    assert not is_mrm("Лосось (сёмга) филе, МРМ, ЗАМОРОЖ., Трим Д 1.6-2.0 кг.")
+    assert not is_mrm("Форель ПСГ, ОХЛ, 4.0 + кг. Карелия")
+
+
+def _mrm_rows():
+    return [{"code": "71011", "name": "Лосось атл. (сёмга), ПСГ, ОХЛ., 5-6 кг. Мурманск",
+             "opt": 1690.0, "horeca": 1690.0, "spec": None, "mrm": True,
+             "list": {"opt": 1790.0, "horeca": 1790.0, "spec": None}, "stock": 882.1}]
+
+
+def test_mrm_discount_kept_when_above_floor(monkeypatch):
+    """Закупка упала – скидка проходит, цена со скидкой выше порога."""
+    import sales_dialog
+    sales_dialog._mrm_guard.update({"at": None, "blocked": set()})
+
+    async def fake_floor(session, db, code):
+        return {"floor": 1651.0, "floor_pay": 1651.0}
+    monkeypatch.setattr(sales_dialog, "price_floor", fake_floor)
+    out = asyncio.run(sales_dialog.mrm_guard(None, None, _mrm_rows()))
+    assert out[0]["opt"] == 1690.0 and not out[0].get("mrm_discount_off")
+
+
+def test_mrm_discount_removed_when_below_floor(monkeypatch):
+    """Сырьё подорожало – скидка снимается, агент называет прайсовую цену."""
+    import sales_dialog
+    sales_dialog._mrm_guard.update({"at": None, "blocked": set()})
+
+    async def fake_floor(session, db, code):
+        return {"floor": 1779.0, "floor_pay": 1779.0}
+    monkeypatch.setattr(sales_dialog, "price_floor", fake_floor)
+    out = asyncio.run(sales_dialog.mrm_guard(None, None, _mrm_rows()))
+    assert out[0]["opt"] == 1790.0 and out[0]["mrm_discount_off"]
+
+
+def test_mrm_discount_removed_when_floor_unknown(monkeypatch):
+    """Порог не посчитался – скидку не даём, это дешевле ошибки."""
+    import sales_dialog
+    sales_dialog._mrm_guard.update({"at": None, "blocked": set()})
+
+    async def fake_floor(session, db, code):
+        return {"error": "http 500"}
+    monkeypatch.setattr(sales_dialog, "price_floor", fake_floor)
+    out = asyncio.run(sales_dialog.mrm_guard(None, None, _mrm_rows()))
+    assert out[0]["opt"] == 1790.0 and out[0]["mrm_discount_off"]

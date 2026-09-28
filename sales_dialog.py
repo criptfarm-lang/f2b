@@ -85,7 +85,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "persona-per-manager"
+CODE_VERSION = "mrm-guard"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -235,6 +235,11 @@ def workdays_ago(now: datetime, days: int) -> datetime:
 MRM_DISCOUNT = 100.0
 
 
+def is_mrm(name: str) -> bool:
+    u = (name or "").upper()
+    return "ОХЛ" in u and "МУРМАНСК" in u
+
+
 def mrm_price(name: str, price: float | None) -> float | None:
     """Охлаждённая мурманская рыба идёт клиенту на 100 ₽ дешевле, чем в МойСкладе.
 
@@ -244,10 +249,53 @@ def mrm_price(name: str, price: float | None) -> float | None:
     """
     if price is None:
         return None
-    u = (name or "").upper()
-    if "ОХЛ" in u and "МУРМАНСК" in u and price > MRM_DISCOUNT:
+    if is_mrm(name) and price > MRM_DISCOUNT:
         return round(price - MRM_DISCOUNT, 2)
     return price
+
+
+_mrm_guard: dict = {"at": None, "blocked": set()}
+MRM_GUARD_TTL_SEC = 3600
+
+
+async def mrm_guard(session, db, rows: list) -> list:
+    """Снимает скидку МРМ там, где она уводит цену ниже порога ценообразования.
+
+    Скидка применяется в справочнике до сверки цен, поэтому «прайс минус 100»
+    проходил как прайсовая цена, а не как уступка: 25.09.2026 ПСГ Мурманск 5–6
+    ушёл клиенту по 1690 при безубыточности 1729. Закупка мурманки меняется
+    каждую неделю, поэтому решение не зашито в правило, а считается по текущим
+    порогам — и кэшируется на час, чтобы не дёргать дашборд на каждый черновик.
+    """
+    now = datetime.now(timezone.utc)
+    fresh = (_mrm_guard["at"] and (now - _mrm_guard["at"]).total_seconds() < MRM_GUARD_TTL_SEC)
+    if not fresh:
+        blocked = set()
+        for p in [r for r in rows if r.get("mrm")]:
+            base = (p.get("list") or {}).get("opt")
+            if not base:
+                continue
+            fl = await price_floor(session, db, p["code"])
+            floor = fl.get("floor_pay") or fl.get("floor")
+            if fl.get("error") or floor is None:
+                # Порог не посчитался — скидку не даём: дешевле отказаться от 100 ₽,
+                # чем продать ниже себестоимости.
+                blocked.add(p["code"])
+                continue
+            if float(base) - MRM_DISCOUNT < float(floor):
+                blocked.add(p["code"])
+        _mrm_guard.update({"at": now, "blocked": blocked})
+        if blocked:
+            logger.info("sales_dialog: скидка МРМ снята по %s", sorted(blocked))
+    out = []
+    for p in rows:
+        if p.get("code") in _mrm_guard["blocked"]:
+            listed = p.get("list") or {}
+            out.append({**p, "opt": listed.get("opt"), "horeca": listed.get("horeca"),
+                        "spec": listed.get("spec"), "mrm_discount_off": True})
+        else:
+            out.append(p)
+    return out
 
 
 async def _ms_price_rows(session: aiohttp.ClientSession) -> list:
@@ -290,6 +338,11 @@ async def _ms_price_rows(session: aiohttp.ClientSession) -> list:
                     "opt": mrm_price(name, prices.get("Цена опт")),
                     "horeca": mrm_price(name, prices.get("Цена продажи")),
                     "spec": mrm_price(name, prices.get("Спец.")),
+                    # Цены до скидки — чтобы её можно было снять, если она уводит
+                    # ниже порога: закупка мурманки меняется каждую неделю.
+                    "mrm": is_mrm(name),
+                    "list": {"opt": prices.get("Цена опт"), "horeca": prices.get("Цена продажи"),
+                             "spec": prices.get("Спец.")},
                     "stock": round(r.get("stock") or 0, 1),
                     # Собственное производство делаем под заказ, поэтому нулевой остаток
                     # по нему — не «нет», а «сделаем». Привлечённые товары так нельзя:
@@ -797,7 +850,8 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
     # Москва даже у клиента, который писал «мы не в МСК находимся» (23.09.2026).
     client_text = " ".join(h["text"] for h in history if not h["is_outbound"])
     city = find_city(client_text + " " + (lead.get("name") or ""))
-    prices = apply_offers(await _ms_price_rows(session), offer_prices(db))
+    prices = await mrm_guard(session, db, await _ms_price_rows(session))
+    prices = apply_offers(prices, offer_prices(db))
     objections = (PROMPTS_DIR / "objections.md").read_text(encoding="utf-8")[:4000]
     last_in = next((h for h in reversed(history) if not h["is_outbound"]), None)
     already = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages
