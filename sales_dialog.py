@@ -85,7 +85,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "slice-and-freeze"
+CODE_VERSION = "carry-over-first"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -1304,6 +1304,10 @@ def _pending_silent(db, campaign: str, silent_days: int,
               WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
                 AND d.created_at >= date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')
                                     AT TIME ZONE 'Europe/Moscow')
+        -- Кого не успели разобрать в свой день, тот идёт первым на следующий:
+        -- партия на день ограничена квотой, а не составом пула (собственник
+        -- 28.09.2026 – «тех, кого забыли сегодня, в тот же список»).
+        ORDER BY l.activate_on NULLS FIRST, l.id
     """, (campaign, str(silent_days), max_followups, not_before))
 
 
