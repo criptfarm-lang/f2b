@@ -16,10 +16,19 @@ logger = logging.getLogger(__name__)
 QUIZ_BASE_URL = os.getenv("QUIZ_BASE_URL", "")
 
 MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
-# Статус «НЕ СОГЛАСОВАН» — заказ отклонён/не прошёл согласование, менеджеру
-# нужно его доработать. Сверено с МС 2026-07-16 (GET /entity/customerorder/metadata).
-# План: 2026-07-16-алерт-заказ-не-согласован.md
-MS_STATE_NOT_AGREED = "f7e3f71d-6b0b-11f1-0a80-1a5900237f4c"
+# Заказ отклонён на согласовании, менеджеру нужно его доработать. С 28.09.2026 два
+# статуса по причине: старый «НЕ СОГЛАСОВАН» переименован в «НЕ СОГЛ. ЦЕНА» (UUID
+# тот же), «НЕ СОГЛ. ОПЛАТА» новый. Сверено с МС 2026-09-28 (GET /entity/customerorder/metadata).
+# Планы: 2026-07-16-алерт-заказ-не-согласован.md, 2026-09-28-не-согласован-цена-оплата.md
+MS_STATE_NOT_AGREED_PRICE = "f7e3f71d-6b0b-11f1-0a80-1a5900237f4c"
+MS_STATE_NOT_AGREED_PAY = "5bd05d75-bb48-11f1-0a80-168400582a6f"
+# state_id → (код причины для дедупа, заголовок, что делать менеджеру)
+NOT_AGREED_REASONS = {
+    MS_STATE_NOT_AGREED_PRICE: (1, "НЕ СОГЛАСОВАН ПО ЦЕНЕ",
+                                "Проверьте цены в заказе, доработайте и верните на согласование."),
+    MS_STATE_NOT_AGREED_PAY: (2, "НЕ СОГЛАСОВАН ПО ОПЛАТЕ",
+                              "Решите вопрос оплаты с клиентом и верните заказ на согласование."),
+}
 WAZZUP_API_URL = "https://api.wazzup24.com/v3/message"
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 # UUID дополнительных полей контрагентов в МойСклад
@@ -1069,15 +1078,19 @@ async def sweep_positions_removed(bot, db):
 
 
 async def check_order_not_agreed(order_href: str, bot, db):
-    """При переводе заказа в статус «НЕ СОГЛАСОВАН» — пинг ответственному менеджеру.
+    """При переводе заказа в «НЕ СОГЛ. ЦЕНА» / «НЕ СОГЛ. ОПЛАТА» — пинг ответственному
+    менеджеру с причиной.
 
-    Триггер: state == MS_STATE_NOT_AGREED. Получатель — менеджер (owner заказа,
+    Триггер: state в NOT_AGREED_REASONS. Получатель — менеджер (owner заказа,
     правило: owner заказа = реальный менеджер). Резолв tg-id как в
     check_approval_needed (PDZ_MANAGER_TG_IDS → get_manager_chat_id). Если не
     резолвится — уходит собственнику (OWNER_CHAT_ID) с пометкой, сигнал не теряем.
-    Дедуп — атомарный claim not_agreed_notifications по (order_id, sum_hash):
-    повторный алерт только если сумма заказа изменилась (менеджер доработал →
-    снова не согласовали). План: 2026-07-16-алерт-заказ-не-согласован.md
+    Дедуп — атомарный claim not_agreed_notifications по (order_id, sum_hash), где
+    sum_hash = сумма*10 + код причины: смена причины при той же сумме — новый пинг.
+    Круг «вернули на согласование → снова отклонили» — тоже новый пинг: светофор
+    при новом заходе чистит эти claim'ы (db.reset_not_agreed_claims). И наоборот:
+    отклонение освобождает дедуп светофора, чтобы повторный заход с той же
+    суммой (клиент оплатил) снова дошёл до согласующих.
     """
     try:
         from moysklad import get_headers, PDZ_MANAGER_TG_IDS
@@ -1088,8 +1101,9 @@ async def check_order_not_agreed(order_href: str, bot, db):
             return
 
         state_id = order.get("state", {}).get("meta", {}).get("href", "").split("/")[-1]
-        if state_id != MS_STATE_NOT_AGREED:
+        if state_id not in NOT_AGREED_REASONS:
             return
+        reason_code, reason_title, reason_todo = NOT_AGREED_REASONS[state_id]
 
         order_id = order.get("id") or order_href.split("/")[-1].split("?")[0]
         order_name = order.get("name", order_id)
@@ -1126,16 +1140,20 @@ async def check_order_not_agreed(order_href: str, bot, db):
             logger.error(f"check_order_not_agreed: некому слать по {order_name} (нет менеджера и OWNER_CHAT_ID)")
             return
 
-        # Атомарный дедуп по (order_id, sum_hash) — повтор только при смене суммы.
-        sum_hash = round(order_sum)
+        # Отклонённый заказ вернётся на согласование – светофор должен прийти снова,
+        # даже если сумма не изменилась. Идемпотентно, до дедупа пинга.
+        db.release_approval_dedup(order_id)
+
+        # Атомарный дедуп: сумма + причина.
+        sum_hash = round(order_sum) * 10 + reason_code
         if not db.try_claim_not_agreed_notification(order_id, sum_hash):
             logger.info(f"not-agreed: заказ {order_id} (sum_hash={sum_hash}) уже уведомлялся, пропуск")
             return
 
         text = (
-            f"⚠️ Заказ {order_name} — НЕ СОГЛАСОВАН\n"
+            f"⚠️ Заказ {order_name} – {reason_title}\n"
             f"🏢 {agent_name} · {_fmt_money(order_sum)} ₽\n"
-            f"Требует внимания — проверьте и доработайте."
+            f"{reason_todo}"
             f"{note}"
         )
 
@@ -1185,7 +1203,7 @@ async def manual_send_fishki(order_id: str, db) -> tuple[bool, str]:
 # ============================================================================
 
 # Статусы конвейера ≥ «Согласован» (по имени — устойчиво к смене UUID).
-# «На согласовании», «НЕ СОГЛАСОВАН», «ЗА ЛИМИТОМ», «Возврат» и черновики — НЕ здесь.
+# «На согласовании», «НЕ СОГЛ. ЦЕНА/ОПЛАТА», «ЗА ЛИМИТОМ», «Возврат» и черновики — НЕ здесь.
 FISHKI_SWEEP_STATES = {
     "Согласован", "Собирается", "Собран", "Документы готовы", "Отгружен",
 }
@@ -1705,6 +1723,20 @@ def _build_approval_text(
     return header + "\n".join(lines)
 
 
+def approval_keyboard(alert_id: int, with_ok: bool = True):
+    """Кнопки светофора. with_ok=False – собственник уже согласовал, ждём закупщика
+    (отклонить при этом всё ещё можно)."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    top = []
+    if with_ok:
+        top.append(InlineKeyboardButton("✅ Согласовано", callback_data=f"appr_ok|{alert_id}"))
+    top.append(InlineKeyboardButton("💬 Комментарий", callback_data=f"appr_comment|{alert_id}"))
+    return InlineKeyboardMarkup([top, [
+        InlineKeyboardButton("❌ Не согл. цена", callback_data=f"appr_rej_price|{alert_id}"),
+        InlineKeyboardButton("❌ Не согл. оплата", callback_data=f"appr_rej_pay|{alert_id}"),
+    ]])
+
+
 async def check_approval_needed(order_href: str, bot, db):
     """
     Объединённый алерт согласующим (OWNER + Маланчук, env APPROVERS_CHAT_IDS) при
@@ -1959,11 +1991,11 @@ async def check_approval_needed(order_href: str, bot, db):
                 alert_text = _render(_merge_attracted(price))
                 db.set_approval_alert_text(alert_id, alert_text)
 
+        # Новый заход на согласование – следующее отклонение снова пингует менеджера.
+        db.reset_not_agreed_claims(order_id)
+
         # 8. Клавиатура + fan-out
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Согласовано", callback_data=f"appr_ok|{alert_id}"),
-            InlineKeyboardButton("💬 Комментарий", callback_data=f"appr_comment|{alert_id}"),
-        ]])
+        keyboard = approval_keyboard(alert_id)
 
         approvers = _parse_approvers_chat_ids()
         if not approvers:

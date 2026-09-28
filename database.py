@@ -1569,7 +1569,7 @@ class Database:
             return row is not None
 
     def try_claim_not_agreed_notification(self, order_id: str, sum_hash: int) -> bool:
-        """Атомарный claim для алерта «заказ НЕ СОГЛАСОВАН».
+        """Атомарный claim для алерта «заказ НЕ СОГЛ. ЦЕНА / ОПЛАТА».
 
         Дедуп по (order_id, sum_hash): повторный алерт по тому же заказу уходит
         только если сумма изменилась (менеджер доработал → снова не согласовали).
@@ -1585,6 +1585,22 @@ class Database:
             row = cur.fetchone()
             self.conn.commit()
             return row is not None
+
+    def reset_not_agreed_claims(self, order_id: str):
+        """Заказ снова пришёл на согласование – новый круг: следующее отклонение
+        («НЕ СОГЛ. ЦЕНА/ОПЛАТА») должно пингануть менеджера, даже с той же суммой."""
+        self._execute("DELETE FROM not_agreed_notifications WHERE order_id = %s", (order_id,))
+
+    def release_approval_dedup(self, order_id: str):
+        """Заказ отклонён – освобождаем дедуп светофора (order_id, sum_hash), чтобы
+        повторный заход на согласование с той же суммой (клиент оплатил) снова
+        дошёл до согласующих. sum_hash старых строк → -id: уникально, история и
+        кнопки старого светофора остаются."""
+        self._execute(
+            "UPDATE pending_approval_alerts SET sum_hash = -id "
+            "WHERE order_id = %s AND sum_hash >= 0",
+            (order_id,)
+        )
 
     def try_claim_position_removed(self, order_id: str, event_key: str) -> bool:
         """Атомарный claim для алерта «позиция удалена из заказа при сборке».

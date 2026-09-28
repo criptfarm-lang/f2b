@@ -30,7 +30,7 @@ from telegram.request import HTTPXRequest
 from database import Database
 from notifier import check_order_agreed  # рассылка при согласовании — не трогать!
 from notifier import check_bulk_production_order  # алерт «крупный заказ готовой продукции»
-from notifier import check_order_not_agreed  # пинг менеджеру: заказ НЕ СОГЛАСОВАН
+from notifier import check_order_not_agreed  # пинг менеджеру: НЕ СОГЛ. ЦЕНА / ОПЛАТА
 from scheduler import setup_scheduler, get_group_chat_id, pdz_catch_up_missed_jobs
 from claude_ai import dispatch, smart_answer, parse_product_query
 from amocrm import check_connection as amo_check  # оставляем для совместимости
@@ -5030,11 +5030,8 @@ def _msk_hhmm() -> str:
 
 
 def _approval_kb(alert_id: int, with_ok: bool = True):
-    row = []
-    if with_ok:
-        row.append(InlineKeyboardButton("✅ Согласовано", callback_data=f"appr_ok|{alert_id}"))
-    row.append(InlineKeyboardButton("💬 Комментарий", callback_data=f"appr_comment|{alert_id}"))
-    return InlineKeyboardMarkup([row])
+    from notifier import approval_keyboard
+    return approval_keyboard(alert_id, with_ok=with_ok)
 
 
 def _owner_msgs(alert_row: dict) -> list:
@@ -5102,6 +5099,58 @@ async def _agree_order_in_ms(order_id: str) -> tuple:
     except Exception as e:
         logger.warning(f"_agree_order_in_ms idempotency check: {e}")
     return ("ok" if await set_order_state(order_id, MS_STATE_AGREED_ID) else "fail"), ""
+
+
+async def _reject_order(query, context, alert_id: int, alert_data: dict, reason: str):
+    """Кнопки светофора «❌ Не согл. цена / оплата»: ставим статус в МС и закрываем
+    светофор у всех согласующих. Пинг менеджеру шлёт вебхук смены статуса
+    (check_order_not_agreed) – один путь и для кнопки, и для ручной смены в МС.
+    План: 2026-09-28-не-согласован-цена-оплата.md"""
+    from notifier import MS_STATE_NOT_AGREED_PRICE, MS_STATE_NOT_AGREED_PAY, _md
+    from moysklad import set_order_state, get_headers, MS_BASE
+    import aiohttp
+    user = query.from_user
+    state_id, label = ((MS_STATE_NOT_AGREED_PRICE, "цена") if reason == "price"
+                       else (MS_STATE_NOT_AGREED_PAY, "оплата"))
+    if alert_data.get("closed_at"):
+        await query.answer("Алерт уже закрыт.", show_alert=True)
+        return
+    order_id = alert_data["order_id"]
+    # Заказ уже ушёл дальше по конвейеру (собирают/отгрузили) – откатывать нельзя.
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{MS_BASE}/entity/customerorder/{order_id}",
+                                   headers=get_headers(), params={"expand": "state"}) as r:
+                if r.status == 200:
+                    cur = ((await r.json()).get("state") or {}).get("name", "").strip()
+                    if cur in MS_STATES_AFTER_AGREED:
+                        await query.answer(f"Заказ уже «{cur}» – статус не меняю.", show_alert=True)
+                        return
+    except Exception as e:
+        logger.warning(f"_reject_order: проверка статуса {order_id} → {e}")
+    if not await set_order_state(order_id, state_id):
+        await query.answer("❌ Ошибка смены статуса в МС", show_alert=True)
+        return
+    db.close_approval_alert(alert_id, closed_by=user.id, comment=f"не согласован: {label}")
+    base = (alert_data.get("alert_text") or "").split(_OWNER_WAIT_MARK)[0]
+    text = base + (f"\n\n❌ Не согласовано ({label}): {_md(user.full_name)} в {_msk_hhmm()}"
+                   f" · менеджеру уйдёт пинг")
+    db.set_approval_alert_text(alert_id, text)
+    if not await _edit_owner_messages(context.bot, alert_data, text):
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown")
+        except Exception:
+            await query.message.reply_text(f"❌ Не согласовано ({label})")
+    # Закупщику ждать больше нечего – убираем его кнопку.
+    if alert_data.get("buyer_chat_id") and alert_data.get("buyer_message_id") \
+            and not alert_data.get("buyer_approved_at"):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=alert_data["buyer_chat_id"], message_id=alert_data["buyer_message_id"],
+                text=(alert_data.get("buyer_text") or "") + f"\n\n❌ Заказ не согласован ({label}) – согласовывать не нужно",
+                parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"_reject_order: правка сообщения закупщика → {e}")
 
 
 async def _handle_buyer_approval(query, context, alert_id: int):
@@ -5203,7 +5252,7 @@ async def _finalize_two_step(query, context, alert_id: int, row: dict):
 async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обрабатывает нажатия на кнопки объединённого алерта «На согласовании / ЗА ЛИМИТОМ».
-    Callbacks: appr_ok | appr_confirm | appr_cancel | appr_comment.
+    Callbacks: appr_ok | appr_confirm | appr_cancel | appr_comment | appr_rej_price | appr_rej_pay.
     План: 2026-05-21-объединённый-алерт-на-согласование.md, Фаза 3.
     """
     query = update.callback_query
@@ -5304,6 +5353,12 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         except Exception:
             # Если это confirmation-сообщение (без кнопок ниже) — просто отвечаем
             await query.message.reply_text("✅ Согласовано" + tail)
+        return
+
+    # --- appr_rej_price / appr_rej_pay ---
+    if action in ("appr_rej_price", "appr_rej_pay"):
+        await _reject_order(query, context, alert_id, alert_data,
+                            "price" if action == "appr_rej_price" else "pay")
         return
 
     # --- appr_cancel ---
@@ -8713,7 +8768,7 @@ async def process_ms_webhook(data: dict, bot):
             if action in ("UPDATE", "CREATE"):
                 await check_bulk_production_order(order_href, bot, db)
 
-            # Пинг ответственному менеджеру при переводе заказа в «НЕ СОГЛАСОВАН».
+            # Пинг ответственному менеджеру при переводе заказа в «НЕ СОГЛ. ЦЕНА / ОПЛАТА».
             # Notifier сам проверяет state и делает атомарный дедуп через
             # not_agreed_notifications (UNIQUE order_id+sum_hash).
             # План: 2026-07-16-алерт-заказ-не-согласован.md
