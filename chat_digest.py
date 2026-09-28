@@ -285,11 +285,16 @@ async def _enrich_with_amocrm(signals: list[dict], db=None) -> None:
         if cid not in chats or (not chats[cid] and s.get("contact_name")):
             chats[cid] = s.get("contact_name")
 
+    # не больше 3 чатов разом: пачкой amoCRM отвечает 429, и сигнал молча
+    # остаётся без сделки
+    sem = asyncio.Semaphore(3)
+
     async def _resolve(cid: str, contact_name: str | None):
-        lead_id = await _resolve_amocrm_lead_id(
-            cid, contact_name, phone=_chat_phone(db, cid))
-        _, resp_name = await _resolve_amocrm_responsible(lead_id)
-        lead = await get_lead(int(lead_id)) if lead_id else None
+        async with sem:
+            lead_id = await _resolve_amocrm_lead_id(
+                cid, contact_name, phone=_chat_phone(db, cid))
+            _, resp_name = await _resolve_amocrm_responsible(lead_id)
+            lead = await get_lead(int(lead_id)) if lead_id else None
         procurement = (lead or {}).get("pipeline_id") == PROCUREMENT_PIPELINE_ID
         return cid, lead_id, resp_name, procurement
 
