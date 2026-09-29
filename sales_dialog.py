@@ -98,7 +98,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "untouched-first-2909"
+CODE_VERSION = "batch-inbound-guard-2909"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -1495,6 +1495,13 @@ def _pending_inbound(db, campaign: str) -> list:
             ORDER BY w.sent_at DESC LIMIT 1
         ) m ON true
         WHERE l.campaign = %s AND l.status = 'active'
+          -- Лид партии до своего дня не трогаем, а его старое неотвеченное
+          -- сообщение – не «клиент ждёт», а спящий диалог: им занимается очередь
+          -- оживления по квоте. 29.09.2026 партию на 30.09 записали днём, и агент
+          -- тут же понёс менеджерам ответы на сообщения месячной давности.
+          AND (l.activate_on IS NULL
+               OR (l.activate_on <= (now() AT TIME ZONE 'Europe/Moscow')::date
+                   AND m.sent_at AT TIME ZONE 'UTC' > l.created_at))
           AND NOT EXISTS (
               SELECT 1 FROM sales_dialog_messages d
               WHERE d.inbound_message_id = m.message_id AND d.prompt_version = %s)
