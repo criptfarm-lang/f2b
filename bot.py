@@ -7767,6 +7767,22 @@ def main():
     app.job_queue.run_repeating(_demands_no_order_wrapper, interval=600, first=120)
 
     # ────────────────────────────────────────────────────────────────────
+    # Недельный обзор рынка в канал «Мониторинг» — пятница с 16:00 МСК.
+    # Тик раз в 30 мин, окно и «один раз за неделю» проверяет сам модуль,
+    # поэтому рестарт бота в 16:00 не теряет неделю.
+    # План: 2026-09-29-недельный-обзор-рынка-в-мониторинг.
+    # ────────────────────────────────────────────────────────────────────
+    from weekly_market_report import run_job as _weekly_market_run
+
+    async def _weekly_market_wrapper(context):
+        try:
+            await _weekly_market_run(app, db, MARKET_INTEL_CHAT_ID, OWNER_CHAT_ID)
+        except Exception as e:
+            logger.error(f"weekly_market job wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_weekly_market_wrapper, interval=1800, first=300)
+
+    # ────────────────────────────────────────────────────────────────────
     # Wazzup classifier — дневная сводка собственнику 17:00 МСК.
     # Счётчик за день + топ-5 срочных. Если 0 — «0 запросов, всё тихо».
     # ────────────────────────────────────────────────────────────────────
