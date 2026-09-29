@@ -1740,8 +1740,16 @@ async def nudge(app, db, campaign: str, cfg: dict, now: datetime) -> None:
         who = (lead or {}).get("lead_name") or f"сделка {row['lead_id']}"
         chat, amo = card_recipient(db, row)
         age = int(row["age_min"] or 0)
-        await _tell(app, chat, f"{who}: карточка ждёт решения {age} мин. "
-                               f"Реши её — отправить, поправить, забрать или пропустить.")
+        # Пинг = сама карточка заново внизу чата (собственник 29.09.2026): текст
+        # «ждёт решения» заставлял листать вверх. Старую убираем, чтобы не было двух.
+        old = db._fetchone("SELECT tg_message_id FROM sales_dialog_messages WHERE id=%s",
+                           (row["id"],))
+        if old and old.get("tg_message_id"):
+            try:
+                await app.bot.delete_message(chat, old["tg_message_id"])
+            except Exception as e:
+                logger.info("sales_dialog: старую карточку %s не удалить: %s", row["id"], e)
+        await send_for_approval(app, db, row["id"])
         # Второй пинг дублируем собственнику: значит человек не в работе.
         if (row["ping_count"] or 0) >= 1 and amo:
             await notify_owner(app, f"{who}: менеджер не разбирает карточку {age} мин, "
