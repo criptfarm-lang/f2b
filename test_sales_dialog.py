@@ -947,3 +947,14 @@ def test_remember_keeps_prev_manager():
     p = calls[0]
     assert p[5] == sales_dialog.AGENT_AMO_USER      # ответственный – «Эф»
     assert p[12] == 13746010                         # вернуть – прежнему менеджеру
+
+
+# ── статус карточки «[жду твой текст …]» не должен уезжать клиенту (29.09.2026) ─
+def test_strip_card_header_removes_bracket_status():
+    from sales_dialog import strip_card_header, CARD_TRACE_RE
+    raw = ("Ольга, цена уже с доставкой.\nСобрать один пласт на пробу?\n\n"
+           "[жду твой текст — ответом на карточку или просто следующим сообщением]")
+    out = strip_card_header(raw)
+    assert out == "Ольга, цена уже с доставкой.\nСобрать один пласт на пробу?"
+    assert not CARD_TRACE_RE.search(out)
+    assert CARD_TRACE_RE.search(raw)
