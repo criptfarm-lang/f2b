@@ -7720,6 +7720,32 @@ def main():
     app.job_queue.run_repeating(_fishki_sweep_wrapper, interval=7200, first=180)
 
     # ────────────────────────────────────────────────────────────────────
+    # FISHки: автоотметка «Приз отправлен» по отгрузке 12040 по 0 (каждые 30 мин)
+    # и просьба об отзыве на Яндекс.Картах назавтра в 12:00 МСК (тик 15 мин,
+    # окно 12–18 МСК). План: 2026-09-29-fishki-автоотметка-приза-и-просьба-об-отзыве.
+    # ────────────────────────────────────────────────────────────────────
+    import fishki_prize_watch as _fishki_prize
+
+    async def _fishki_prize_sweep_wrapper(context):
+        try:
+            stats = await _fishki_prize.sweep(app.bot)
+            if stats.get("matched") or stats.get("alerts"):
+                logger.info(f"fishki_prize sweep: {stats}")
+        except Exception as e:
+            logger.error(f"fishki_prize sweep wrapper: {e}", exc_info=True)
+
+    async def _fishki_review_ask_wrapper(context):
+        try:
+            stats = await _fishki_prize.send_due_review_asks(app.bot)
+            if stats.get("sent") or stats.get("failed"):
+                logger.info(f"fishki_prize review_ask: {stats}")
+        except Exception as e:
+            logger.error(f"fishki_prize review_ask wrapper: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_fishki_prize_sweep_wrapper, interval=1800, first=200)
+    app.job_queue.run_repeating(_fishki_review_ask_wrapper, interval=900, first=260)
+
+    # ────────────────────────────────────────────────────────────────────
     # Сторож «заказ ниже прайса без согласования» – добор каждые 30 мин
     # (вебхуки МС теряются). Первый прогон – тихая разметка текущих заказов.
     # План: 2026-09-22-сторож-заказ-ниже-прайса-без-согласования.
