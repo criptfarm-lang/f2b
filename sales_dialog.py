@@ -98,7 +98,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "site-leads-intake"
+CODE_VERSION = "site-leads-carryover"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -726,15 +726,21 @@ async def intake_new(app, db, session: aiohttp.ClientSession, campaign: str, cfg
 
 
 def _remember(db, campaign: str, lead: dict, status: str, note: str, contact: dict | None = None,
-              chat: tuple = ("telegram", None, []), phone: str | None = None) -> None:
+              chat: tuple = ("telegram", None, []), phone: str | None = None,
+              activate_on=None) -> None:
+    # Прежний ответственный – тот, кому «Вернуть менеджеру» отдаст раскачанный
+    # лид (собственник 29.09.2026); уволенного заменит Инесса в `hand_to_manager`.
+    prev = lead.get("responsible_user_id")
     db._execute("""INSERT INTO sales_dialog_leads
         (campaign, lead_id, contact_id, lead_name, contact_name, responsible_user_id,
-         chat_type, chat_id, all_chat_ids, status, note, phone)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+         chat_type, chat_id, all_chat_ids, status, note, phone, prev_responsible_user_id,
+         activate_on)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (campaign, lead_id) DO NOTHING""",
         (campaign, lead["id"], (contact or {}).get("id"), lead.get("name"),
-         (contact or {}).get("name"), AGENT_AMO_USER if status == "active" else lead.get("responsible_user_id"),
-         chat[0], chat[1], chat[2] or None, status, note, phone))
+         (contact or {}).get("name"), AGENT_AMO_USER if status == "active" else prev,
+         chat[0], chat[1], chat[2] or None, status, note, phone,
+         prev if prev != AGENT_AMO_USER else None, activate_on))
 
 
 async def _take_new_lead(app, db, session, campaign: str, lead: dict) -> bool:
@@ -782,8 +788,6 @@ async def _take_new_lead(app, db, session, campaign: str, lead: dict) -> bool:
         return False                      # не перенесли – не берём, повторим на следующем тике
     await _amo_write(session, "/contacts", [{"id": c["id"], "responsible_user_id": AGENT_AMO_USER}
                                             for c in contacts])
-    # Прежнего ответственного не запоминаем: новый лид никто ещё не вёл, и
-    # «Вернуть менеджеру» отдаёт его Инессе (правило пилота 23.09.2026).
     _remember(db, campaign, lead, "active",
               f"новый сайт-лид; до агента был на {lead.get('responsible_user_id')}",
               contact, chat, ch.get("phone"))
@@ -806,9 +810,12 @@ def _pending_first(db, campaign: str) -> list:
                l.chat_id, l.chat_type, l.lead_name, l.contact_name, l.replies_sent,
                'first:' || l.lead_id || ':' ||
                  to_char(now() AT TIME ZONE 'Europe/Moscow', 'YYYYMMDD') AS message_id,
-               NULL AS inbound_text, l.last_inbound_at AS sent_at, 'first' AS source
+               NULL AS inbound_text, l.last_inbound_at AS sent_at, 'first' AS source,
+               l.activate_on
         FROM sales_dialog_leads l
         WHERE l.campaign = %s AND l.status = 'active'
+          AND (l.activate_on IS NULL
+               OR l.activate_on <= (now() AT TIME ZONE 'Europe/Moscow')::date)
           AND NOT EXISTS (
               SELECT 1 FROM sales_dialog_messages d
               WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
@@ -1111,10 +1118,16 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
         created = lead.get("created_at")
         when = (datetime.fromtimestamp(created, MSK).strftime("%d.%m в %H:%M")
                 if created else "недавно")
-        first_touch_note = (f"Клиент САМ оставил заявку на сайте {when}, до тебя ему никто не писал. "
-                            "Это первое сообщение: ответь на его заявку – коротко, от того, с чем "
-                            "он пришёл (страницы, запрос, комментарий), и одним вопросом, который "
-                            "двигает к заказу.")
+        if history:
+            first_touch_note = (f"Клиент оставил заявку на сайте {when}. Менеджер уже писал ему "
+                                "(см. переписку), клиент не ответил. Ты пишешь в этот чат впервые: "
+                                "не повторяй прайс и то, что уже отправлено, зайди от его заявки "
+                                "и одним вопросом, который двигает к заказу.")
+        else:
+            first_touch_note = (f"Клиент САМ оставил заявку на сайте {when}, до тебя ему никто не "
+                                "писал. Это первое сообщение: ответь на его заявку – коротко, от "
+                                "того, с чем он пришёл (страницы, запрос, комментарий), и одним "
+                                "вопросом, который двигает к заказу.")
     elif first_time:
         first_touch_note = "Ты пишешь в этот чат ВПЕРВЫЕ — до тебя его вёл другой менеджер."
     else:
@@ -1622,9 +1635,16 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     rows = _pending_inbound(db, campaign)
     n_inbound = len(rows)
     # Первое сообщение новому лиду – тоже вне очереди: заявка остывает за часы.
+    # Лиды, перенесённые партией (`activate_on`), идут общей очередью по одной
+    # карточке: 29.09.2026 разом переносили 17 открытых сайт-лидов.
+    batch_first = []
     if cfg.get("first_touch"):
         seen = {r["lead_id"] for r in rows}
-        rows += [r for r in _pending_first(db, campaign) if r["lead_id"] not in seen]
+        for r in _pending_first(db, campaign):
+            if r["lead_id"] in seen:
+                continue
+            (batch_first if r.get("activate_on") else rows).append(r)
+        n_inbound = len(rows)
 
     pending = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages
                               WHERE campaign=%s AND verdict IN ('draft','edited')""", (campaign,))
@@ -1650,7 +1670,9 @@ async def _tick_campaign(app, db, campaign: str) -> None:
                                              cfg.get("max_followups", 2),
                                              not_before)
                   if r["lead_id"] not in seen]
-        rows += _allowed_silent(db, campaign, silent, cfg, now)
+        first_ids = {r["lead_id"] for r in batch_first}
+        silent = [r for r in silent if r["lead_id"] not in first_ids]
+        rows += _allowed_silent(db, campaign, batch_first + silent, cfg, now)
     _heartbeat(db, f"очередь: входящих {n_inbound}, первых и оживления {len(rows) - n_inbound}, "
                    f"ждут решения {n_pending}")
     if not rows:

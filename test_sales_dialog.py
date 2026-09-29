@@ -933,3 +933,17 @@ def test_deliver_by_phone_not_found():
     db, s = _PhoneDB(), _Session(400, '{"error":"CHAT_NOT_FOUND"}')
     ok, info = asyncio.run(sales_dialog._deliver(db, s, _phone_msg(), "Добрый день"))
     assert not ok and info.startswith(sales_dialog.NO_TG)
+
+
+def test_remember_keeps_prev_manager():
+    calls = []
+
+    class DB:
+        def _execute(self, sql, params=()):
+            calls.append(params)
+    lead = {"id": 1, "name": "Чуева", "responsible_user_id": 13746010}
+    sales_dialog._remember(DB(), "site-leads-new", lead, "active", "перенос", {"id": 5, "name": "Ч"},
+                           ("max", "m1", ["m1"]), "79000000000")
+    p = calls[0]
+    assert p[5] == sales_dialog.AGENT_AMO_USER      # ответственный – «Эф»
+    assert p[12] == 13746010                         # вернуть – прежнему менеджеру
