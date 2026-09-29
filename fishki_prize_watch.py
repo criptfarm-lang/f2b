@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 MSK = timezone(timedelta(hours=3))
 PRIZE_PRODUCT_ID = "6c6a6355-a11f-11f0-0a80-11aa003658b9"  # 12040 Форель филе, с/с, ЗАМОРОЖ., Трим С 0.9-1.3 кг.
-LOOKBACK_DAYS = 2           # обычный тик: отгрузки, изменённые за 2 суток
+LOOKBACK_DAYS = 3           # ежедневный тик 15:00: отгрузки, изменённые за 3 суток (запас на сбой)
 BACKFILL_DAYS = 60          # первый прогон: хвост неотмеченных призов
 ADDR_ORDERS_DAYS = 180      # адреса победителя – из его заказов за полгода
 SEND_FROM_HOUR, SEND_TO_HOUR = 12, 18   # окно просьбы об отзыве, МСК

@@ -7720,11 +7720,12 @@ def main():
     app.job_queue.run_repeating(_fishki_sweep_wrapper, interval=7200, first=180)
 
     # ────────────────────────────────────────────────────────────────────
-    # FISHки: автоотметка «Приз отправлен» по отгрузке 12040 по 0 (каждые 30 мин)
+    # FISHки: автоотметка «Приз отправлен» по отгрузке 12040 по 0 (раз в день 15:00 МСК)
     # и просьба об отзыве на Яндекс.Картах назавтра в 12:00 МСК (тик 15 мин,
     # окно 12–18 МСК). План: 2026-09-29-fishki-автоотметка-приза-и-просьба-об-отзыве.
     # ────────────────────────────────────────────────────────────────────
     import fishki_prize_watch as _fishki_prize
+    from datetime import time as _fp_time, timezone as _fp_tz
 
     async def _fishki_prize_sweep_wrapper(context):
         try:
@@ -7742,7 +7743,10 @@ def main():
         except Exception as e:
             logger.error(f"fishki_prize review_ask wrapper: {e}", exc_info=True)
 
-    app.job_queue.run_repeating(_fishki_prize_sweep_wrapper, interval=1800, first=200)
+    app.job_queue.run_daily(
+        _fishki_prize_sweep_wrapper,
+        time=_fp_time(hour=12, minute=0, tzinfo=_fp_tz.utc),   # 15:00 МСК
+    )
     app.job_queue.run_repeating(_fishki_review_ask_wrapper, interval=900, first=260)
 
     # ────────────────────────────────────────────────────────────────────
