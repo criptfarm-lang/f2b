@@ -81,11 +81,24 @@ def system_prompt(persona: dict) -> str:
 
 ATTRACT_PIPELINE = 10873622        # воронка ПРИВЛЕЧЕНИЕ
 ATTRACT_FIRST_STATUS = 85554794    # этап «Первичный контакт»
+# Новые сайт-лиды с 29.09.2026 сразу уходят агенту (план
+# `plans/2026-09-29-новые-сайт-лиды-ведёт-агент.md`): воронка «Эф», её
+# «Первичный контакт» и пользователь «Эф» – там же, где пилот 23.09.2026.
+AGENT_PIPELINE = 11331778
+AGENT_FIRST_STATUS = 88823510
+AGENT_AMO_USER = 13548094
+AGENT_TAG_ID = 786137              # «ведёт агент»
+SITE_TAG_IDS = {782551, 782507}    # «сайт», «сайт заявка»
+AMO_FIELD_MAX_ID = 2244321         # MaxId_WZ
+AMO_FIELD_TG_ID = 2224427          # TelegramId_WZ
+# Ответ отправки по номеру, когда Telegram-аккаунта у номера нет: по нему
+# кнопка отдаёт лид Инессе на звонок.
+NO_TG = "номер не нашёлся в Telegram"
 MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "carry-over-first"
+CODE_VERSION = "site-leads-intake"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -185,6 +198,10 @@ def ensure_tables(db) -> None:
                    ADD COLUMN IF NOT EXISTS ping_count INT NOT NULL DEFAULT 0""")
     db._execute("""ALTER TABLE sales_dialog_messages
                    ADD COLUMN IF NOT EXISTS pinged_at TIMESTAMPTZ""")
+    # Телефон из заявки: у трети сайт-лидов чата в мессенджере нет, и первое
+    # сообщение уходит в Telegram по номеру (проверено 29.09.2026).
+    db._execute("""ALTER TABLE sales_dialog_leads
+                   ADD COLUMN IF NOT EXISTS phone TEXT""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_leads_status_idx
                    ON sales_dialog_leads (campaign, status)""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_messages_lead_idx
@@ -384,7 +401,8 @@ async def _amo_user_active(session: aiohttp.ClientSession, user_id: int) -> bool
         return False
 
 
-async def hand_to_manager(app, db, msg: dict) -> str:
+async def hand_to_manager(app, db, msg: dict,
+                          task_text: str = "Ответить клиенту: диалог передан от агента") -> str:
     """Возврат раскачанного лида человеку: сделка, контакты, задача и сообщение в Telegram.
 
     Возвращаем тому менеджеру, который вёл лид до агента, — он помнит клиента и
@@ -418,12 +436,13 @@ async def hand_to_manager(app, db, msg: dict) -> str:
         ok_t = await _amo_write(session, "/tasks", [{
             "entity_id": lead_id, "entity_type": "leads", "responsible_user_id": target,
             "task_type_id": 1, "complete_till": till,
-            "text": "Ответить клиенту: диалог передан от агента"}], method="POST")
+            "text": task_text}], method="POST")
         done.append("задача поставлена" if ok_t else "задачу поставить не вышло")
 
     who = (lead or {}).get("lead_name") or f"сделка {lead_id}"
     text = (f"Передаю тебе диалог: {who}\n"
-            f"https://{os.getenv('AMO_SUBDOMAIN', 'victorfishtobiz')}.amocrm.ru/leads/detail/{lead_id}\n\n"
+            + (f"{task_text}\n" if not task_text.startswith("Ответить клиенту") else "")
+            + f"https://{os.getenv('AMO_SUBDOMAIN', 'victorfishtobiz')}.amocrm.ru/leads/detail/{lead_id}\n\n"
             f"Последнее от клиента: {(msg.get('inbound_text') or '—')[:300]}\n\n"
             f"Что готовил агент (не отправлено):\n{(msg.get('draft_text') or '—')[:600]}")
     chat = MANAGER_TG.get(target)
@@ -589,6 +608,219 @@ async def _amo_notes(session: aiohttp.ClientSession, lead_id: int) -> list:
     except Exception as e:
         logger.warning("sales_dialog: примечания лида %s: %s", lead_id, e)
         return []
+
+
+# ─── приём новых сайт-лидов ───────────────────────────────────────────────────
+def norm_phone(raw: str | None) -> str | None:
+    """Телефон в виде 7XXXXXXXXXX или None, если это не российский мобильный номер."""
+    d = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if len(d) == 10:
+        d = "7" + d
+    elif len(d) == 11 and d.startswith("8"):
+        d = "7" + d[1:]
+    return d if len(d) == 11 and d.startswith("7") else None
+
+
+def contact_channels(contact: dict) -> dict:
+    """Чаты и телефон из карточки контакта: {'max': id, 'telegram': id, 'phone': 7…}."""
+    out = {}
+    for f in contact.get("custom_fields_values") or []:
+        vals = [str(v.get("value")).strip() for v in (f.get("values") or []) if v.get("value")]
+        if not vals:
+            continue
+        if f.get("field_id") == AMO_FIELD_MAX_ID:
+            out["max"] = vals[0]
+        elif f.get("field_id") == AMO_FIELD_TG_ID:
+            out["telegram"] = vals[0]
+        elif f.get("field_code") == "PHONE" and "phone" not in out:
+            for v in vals:
+                if norm_phone(v):
+                    out["phone"] = norm_phone(v)
+                    break
+    return out
+
+
+def pick_chat(channels: dict, last_inbound_chat: str | None = None) -> tuple:
+    """Куда писать первым: `(chat_type, chat_id, all_chat_ids)`.
+
+    Если клиент уже писал в один из чатов – туда, он там и читает. Иначе
+    Telegram раньше MAX: по Telegram отправку проверили 29.09.2026. Нет чатов –
+    `('telegram', None, [])`: первое сообщение уйдёт по номеру телефона.
+    """
+    chats = [(k, channels[k]) for k in ("telegram", "max") if channels.get(k)]
+    ids = [cid for _, cid in chats]
+    for kind, cid in chats:
+        if last_inbound_chat and cid == last_inbound_chat:
+            return kind, cid, ids
+    if chats:
+        return chats[0][0], chats[0][1], ids
+    return "telegram", None, []
+
+
+def is_site_lead(lead: dict) -> bool:
+    tags = {t.get("id") for t in (lead.get("_embedded") or {}).get("tags") or []}
+    return bool(tags & SITE_TAG_IDS) and lead.get("status_id") not in (142, 143)
+
+
+async def _amo_get(session: aiohttp.ClientSession, path: str, params: dict | None = None) -> dict:
+    token = os.getenv("AMO_ACCESS_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        async with session.get(f"{AMO_BASE}{path}", headers=headers, params=params or {},
+                               timeout=aiohttp.ClientTimeout(total=30)) as r:
+            return await r.json() if r.status == 200 else {}
+    except Exception as e:
+        logger.warning("sales_dialog: amo GET %s: %s", path, e)
+        return {}
+
+
+async def _is_customer(session: aiohttp.ClientSession, contact: dict) -> bool:
+    """Контакт из компании, которая уже есть в «Покупателях».
+
+    Покупатели в amoCRM привязаны к компаниям, а не к контактам (проверено
+    29.09.2026), поэтому смотрим компанию контакта. Такой клиент уже чей-то –
+    заявку с сайта от него ведёт менеджер, не агент.
+    """
+    for co in (contact.get("_embedded") or {}).get("companies") or []:
+        full = await _amo_get(session, f"/companies/{co['id']}", {"with": "customers"})
+        if (full.get("_embedded") or {}).get("customers"):
+            return True
+    return False
+
+
+async def intake_new(app, db, session: aiohttp.ClientSession, campaign: str, cfg: dict) -> int:
+    """Забирает агенту сайт-лиды, пришедшие после `intake_from`.
+
+    Раньше их вручную раздавал собственник, и лид ждал менеджера часами (разбор
+    29.09.2026: 4 из 5 открытых сайт-лидов без движения от 96 до 259 часов).
+    Берём любой открытый лид воронки ПРИВЛЕЧЕНИЕ с тегом «сайт» / «сайт заявка»,
+    кто бы ни был ответственным. Не берём действующих покупателей и контакты,
+    которые агент уже ведёт в другой кампании. Возвращает число взятых.
+    """
+    since = cfg.get("intake_from")
+    if not since:
+        return 0
+    # Окно скользит: за неделю лид либо взят, либо записан как исключённый, а
+    # старт от `intake_from` через месяц упрётся в лимит 250 сделок на запрос.
+    ts = max(int(datetime.fromisoformat(since).timestamp()),
+             int((datetime.now(MSK) - timedelta(days=7)).timestamp()))
+    data = await _amo_get(session, "/leads", {
+        "filter[pipeline_id][]": ATTRACT_PIPELINE, "filter[created_at][from]": ts,
+        "with": "contacts", "limit": 250})
+    leads = [l for l in ((data.get("_embedded") or {}).get("leads") or []) if is_site_lead(l)]
+    if not leads:
+        return 0
+    known = {r["lead_id"] for r in db._fetchall(
+        "SELECT lead_id FROM sales_dialog_leads WHERE lead_id = ANY(%s)", ([l["id"] for l in leads],))}
+    taken = 0
+    for lead in leads:
+        if lead["id"] in known:
+            continue
+        try:
+            if await _take_new_lead(app, db, session, campaign, lead):
+                taken += 1
+        except Exception as e:
+            _heartbeat(db, f"{campaign}: приём лида {lead['id']}: {type(e).__name__}: {e}", problem=True)
+            logger.error("sales_dialog: приём лида %s: %s", lead["id"], e, exc_info=True)
+    return taken
+
+
+def _remember(db, campaign: str, lead: dict, status: str, note: str, contact: dict | None = None,
+              chat: tuple = ("telegram", None, []), phone: str | None = None) -> None:
+    db._execute("""INSERT INTO sales_dialog_leads
+        (campaign, lead_id, contact_id, lead_name, contact_name, responsible_user_id,
+         chat_type, chat_id, all_chat_ids, status, note, phone)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (campaign, lead_id) DO NOTHING""",
+        (campaign, lead["id"], (contact or {}).get("id"), lead.get("name"),
+         (contact or {}).get("name"), AGENT_AMO_USER if status == "active" else lead.get("responsible_user_id"),
+         chat[0], chat[1], chat[2] or None, status, note, phone))
+
+
+async def _take_new_lead(app, db, session, campaign: str, lead: dict) -> bool:
+    lead_id = lead["id"]
+    contacts = (lead.get("_embedded") or {}).get("contacts") or []
+    main = next((c for c in contacts if c.get("is_main")), contacts[0] if contacts else None)
+    if not main:
+        _remember(db, campaign, lead, "excluded", "нет контакта")
+        return False
+    contact = await _amo_get(session, f"/contacts/{main['id']}")
+    if not contact:
+        return False                      # amoCRM не ответил – попробуем на следующем тике
+    sub = os.getenv("AMO_SUBDOMAIN", "victorfishtobiz")
+    link = f"https://{sub}.amocrm.ru/leads/detail/{lead_id}"
+    if await _is_customer(session, contact):
+        _remember(db, campaign, lead, "excluded", "действующий покупатель", contact)
+        if app:
+            await notify_owner(app, f"Сайт-лид от действующего покупателя – агенту не отдаю, "
+                                    f"распредели менеджеру: {lead.get('name')}\n{link}")
+        return False
+    busy = db._fetchone("""SELECT campaign FROM sales_dialog_leads
+                           WHERE contact_id=%s AND status='active' LIMIT 1""", (contact["id"],))
+    if busy:
+        _remember(db, campaign, lead, "excluded", f"контакт уже ведёт агент: {busy['campaign']}", contact)
+        return False
+    ch = contact_channels(contact)
+    ids = [v for k, v in ch.items() if k in ("telegram", "max")]
+    last = db._fetchone("""SELECT chat_id FROM wazzup_messages
+                           WHERE chat_id = ANY(%s) AND is_outbound = false
+                           ORDER BY sent_at DESC LIMIT 1""", (ids,)) if ids else None
+    chat = pick_chat(ch, (last or {}).get("chat_id"))
+    if not chat[1] and not ch.get("phone"):
+        _remember(db, campaign, lead, "excluded", "ни чата, ни телефона", contact)
+        if app:
+            await notify_owner(app, f"Сайт-лид без чата и без телефона – агенту писать некуда: "
+                                    f"{lead.get('name')}\n{link}")
+        return False
+
+    tags = [{"id": t["id"]} for t in (lead.get("_embedded") or {}).get("tags") or []]
+    ok = await _amo_write(session, f"/leads/{lead_id}", {
+        "pipeline_id": AGENT_PIPELINE, "status_id": AGENT_FIRST_STATUS,
+        "responsible_user_id": AGENT_AMO_USER,
+        "_embedded": {"tags": tags + [{"id": AGENT_TAG_ID}]}})
+    if not ok:
+        return False                      # не перенесли – не берём, повторим на следующем тике
+    await _amo_write(session, "/contacts", [{"id": c["id"], "responsible_user_id": AGENT_AMO_USER}
+                                            for c in contacts])
+    # Прежнего ответственного не запоминаем: новый лид никто ещё не вёл, и
+    # «Вернуть менеджеру» отдаёт его Инессе (правило пилота 23.09.2026).
+    _remember(db, campaign, lead, "active",
+              f"новый сайт-лид; до агента был на {lead.get('responsible_user_id')}",
+              contact, chat, ch.get("phone"))
+    logger.info("sales_dialog: новый сайт-лид %s взят агентом (%s %s)", lead_id, chat[0],
+                chat[1] or "по номеру")
+    return True
+
+
+def _pending_first(db, campaign: str) -> list:
+    """Новые лиды, которым агент ещё не написал: первое касание.
+
+    Идут вне очереди, как ответы клиентам: заявка с сайта остывает за часы.
+    Черновик на лид – не больше одного в день (ключ `first:<лид>:<дата>`); если
+    собственник его не разобрал и он протух, завтра будет новый. Не пишем, если
+    по лиду уже что-то ушло, собственник нажал «Не отвечать» или «Вернуть
+    менеджеру», или менеджер успел написать в чат сам.
+    """
+    return db._fetchall("""
+        SELECT l.campaign, l.lead_id, l.contact_id, l.assignee_amo_id,
+               l.chat_id, l.chat_type, l.lead_name, l.contact_name, l.replies_sent,
+               'first:' || l.lead_id || ':' ||
+                 to_char(now() AT TIME ZONE 'Europe/Moscow', 'YYYYMMDD') AS message_id,
+               NULL AS inbound_text, l.last_inbound_at AS sent_at, 'first' AS source
+        FROM sales_dialog_leads l
+        WHERE l.campaign = %s AND l.status = 'active'
+          AND NOT EXISTS (
+              SELECT 1 FROM sales_dialog_messages d
+              WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
+                AND (d.verdict IN ('sent', 'draft', 'edited', 'skipped', 'handed', 'taken')
+                     OR d.created_at >= date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')
+                                        AT TIME ZONE 'Europe/Moscow'))
+          AND NOT EXISTS (
+              SELECT 1 FROM wazzup_messages o
+              WHERE o.chat_id = ANY(coalesce(l.all_chat_ids, ARRAY[l.chat_id]))
+                AND o.is_outbound = true AND o.sent_at AT TIME ZONE 'UTC' > l.created_at)
+        ORDER BY l.id
+    """, (campaign,))
 
 
 CARD_HEADER_RE = re.compile(
@@ -836,7 +1068,7 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
     lead_row = db._fetchone("""SELECT all_chat_ids FROM sales_dialog_leads
                                WHERE campaign=%s AND lead_id=%s""",
                             (row["campaign"], row["lead_id"]))
-    chats = (lead_row or {}).get("all_chat_ids") or [row["chat_id"]]
+    chats = (lead_row or {}).get("all_chat_ids") or [c for c in [row["chat_id"]] if c]
     history = _history(db, chats)
     # Ветки помечаем, только когда их правда несколько: иначе лишний шум в промпте.
     branches = {h.get("chat_id") for h in history if h.get("chat_id")}
@@ -875,9 +1107,18 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
     worked = winning_openers(db, row["campaign"])
     persona = persona_for(row.get("assignee_amo_id"))
     wrote = "писала" if persona["gender"] == "f" else "писал"
-    first_touch_note = ("Ты пишешь в этот чат ВПЕРВЫЕ — до тебя его вёл другой менеджер."
-                        if first_time else
-                        f"Ты уже {wrote} в этот чат, представляться повторно не нужно.")
+    if row.get("source") == "first":
+        created = lead.get("created_at")
+        when = (datetime.fromtimestamp(created, MSK).strftime("%d.%m в %H:%M")
+                if created else "недавно")
+        first_touch_note = (f"Клиент САМ оставил заявку на сайте {when}, до тебя ему никто не писал. "
+                            "Это первое сообщение: ответь на его заявку – коротко, от того, с чем "
+                            "он пришёл (страницы, запрос, комментарий), и одним вопросом, который "
+                            "двигает к заказу.")
+    elif first_time:
+        first_touch_note = "Ты пишешь в этот чат ВПЕРВЫЕ — до тебя его вёл другой менеджер."
+    else:
+        first_touch_note = f"Ты уже {wrote} в этот чат, представляться повторно не нужно."
     user = f"""ПЕРЕПИСКА (последнее сообщение {days} дн. назад):
 {safe if safe.strip() else "— переписки нет, это первое обращение к клиенту"}
 
@@ -1355,6 +1596,11 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     if not cfg.get("enabled"):
         return
     now = datetime.now(MSK)
+    # Забираем новые сайт-лиды круглосуточно: ночная заявка не должна утром
+    # уйти менеджеру раньше, чем агенту. Пишет агент всё равно только в окно.
+    if cfg.get("intake"):
+        async with aiohttp.ClientSession() as session:
+            await intake_new(app, db, session, campaign, cfg)
     if not in_window(now, cfg):
         return
     # Отложенный старт: кампанию можно держать включённой, но не давать ей
@@ -1375,6 +1621,10 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     # сыпались быстрее, чем человек успевает по ним решать.
     rows = _pending_inbound(db, campaign)
     n_inbound = len(rows)
+    # Первое сообщение новому лиду – тоже вне очереди: заявка остывает за часы.
+    if cfg.get("first_touch"):
+        seen = {r["lead_id"] for r in rows}
+        rows += [r for r in _pending_first(db, campaign) if r["lead_id"] not in seen]
 
     pending = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages
                               WHERE campaign=%s AND verdict IN ('draft','edited')""", (campaign,))
@@ -1401,7 +1651,7 @@ async def _tick_campaign(app, db, campaign: str) -> None:
                                              not_before)
                   if r["lead_id"] not in seen]
         rows += _allowed_silent(db, campaign, silent, cfg, now)
-    _heartbeat(db, f"очередь: входящих {n_inbound}, оживление {len(rows) - n_inbound}, "
+    _heartbeat(db, f"очередь: входящих {n_inbound}, первых и оживления {len(rows) - n_inbound}, "
                    f"ждут решения {n_pending}")
     if not rows:
         return
@@ -1714,12 +1964,16 @@ def _owner_id() -> int:
 
 
 def _card_text(db, msg: dict) -> str:
-    lead = db._fetchone("""SELECT lead_name, contact_name, chat_type FROM sales_dialog_leads
+    lead = db._fetchone("""SELECT lead_name, contact_name, chat_type, chat_id FROM sales_dialog_leads
                            WHERE campaign=%s AND lead_id=%s""", (msg["campaign"], msg["lead_id"]))
     who = (lead or {}).get("lead_name") or f"сделка {msg['lead_id']}"
-    head = f"{who} · {delivery_target(msg, lead)[1] or ''} · сделка {msg['lead_id']}"
+    chat_id, chat_type = delivery_target(msg, lead)
+    channel = (chat_type or "") + ("" if chat_id else " по номеру")
+    head = f"{who} · {channel} · сделка {msg['lead_id']}"
     if msg.get("inbound_text"):
         head += f"\n\nКлиент: {msg['inbound_text'][:300]}"
+    elif str(msg.get("inbound_message_id") or "").startswith("first:"):
+        head += "\n\nНовая заявка с сайта, агент пишет первым."
     else:
         head += "\n\nДиалог затих, агент пишет первым."
     if msg.get("action") == "escalate":
@@ -1804,20 +2058,66 @@ def delivery_target(msg: dict, lead: dict | None) -> tuple:
 
 async def _deliver(db, session, msg: dict, text: str) -> tuple[bool, str]:
     """Отправка клиенту. Канал и чат берём из карточки лида, не из вольного ввода."""
-    lead = db._fetchone("""SELECT chat_type, chat_id FROM sales_dialog_leads
+    lead = db._fetchone("""SELECT chat_type, chat_id, phone, contact_id FROM sales_dialog_leads
                            WHERE campaign=%s AND lead_id=%s""", (msg["campaign"], msg["lead_id"]))
     chat_id, chat_type = delivery_target(msg, lead)
-    if chat_type not in CHANNEL_IDS or not chat_id:
+    by_phone = not chat_id and chat_type == "telegram" and bool((lead or {}).get("phone"))
+    if chat_type not in CHANNEL_IDS or not (chat_id or by_phone):
         return False, f"неизвестный канал {chat_type}"
-    payload = {"channelId": CHANNEL_IDS[chat_type], "chatType": chat_type,
-               "chatId": str(chat_id), "text": text}
+    payload = {"channelId": CHANNEL_IDS[chat_type], "chatType": chat_type, "text": text}
+    if by_phone:
+        # Wazzup сам находит Telegram-аккаунт по номеру и возвращает его chatId;
+        # нет chatId в ответе – аккаунта нет (проверено 29.09.2026).
+        payload["phone"] = lead["phone"]
+    else:
+        payload["chatId"] = str(chat_id)
     async with session.post(WAZZUP_API_URL, json=payload, headers={
             "Authorization": f"Bearer {os.getenv('WAZZUP_API_KEY', '')}",
             "Content-Type": "application/json"}) as r:
         body = (await r.text())[:300]
-        if r.status in (200, 201):
-            return True, body
-        return False, f"http {r.status}: {body}"
+        ok = r.status in (200, 201)
+    if not by_phone:
+        return (True, body) if ok else (False, f"http {r.status}: {body}")
+    try:
+        found = str((json.loads(body) or {}).get("chatId") or "") if ok else ""
+    except ValueError:
+        found = ""
+    if not found:
+        return False, f"{NO_TG}: {body[:150]}"
+    await _bind_telegram(db, session, msg, lead, found)
+    return True, body
+
+
+async def _bind_telegram(db, session, msg: dict, lead: dict, chat_id: str) -> None:
+    """Номер нашёлся в Telegram: дальше разговор идёт в этом чате.
+
+    Пишем chatId в лид агента, в черновик и в поле TelegramId_WZ контакта –
+    по этому полю интеграция Wazzup находит контакт и не заводит дубль сделки.
+    """
+    db._execute("""UPDATE sales_dialog_leads SET chat_id=%s, all_chat_ids=ARRAY[%s]
+                   WHERE campaign=%s AND lead_id=%s""",
+                (chat_id, chat_id, msg["campaign"], msg["lead_id"]))
+    db._execute("UPDATE sales_dialog_messages SET chat_id=%s WHERE id=%s", (chat_id, msg["id"]))
+    if lead.get("contact_id"):
+        await _amo_write(session, "/contacts", [{
+            "id": lead["contact_id"],
+            "custom_fields_values": [{"field_id": AMO_FIELD_TG_ID, "values": [{"value": chat_id}]}]}])
+
+
+async def _after_send_failure(app, db, row_id: int, info: str) -> str:
+    """Номер не нашёлся в Telegram – писать клиенту некуда, лид идёт Инессе на звонок."""
+    if not info.startswith(NO_TG) or not app:
+        return ""
+    msg = db._fetchone("SELECT * FROM sales_dialog_messages WHERE id=%s", (row_id,))
+    if not msg:
+        return ""
+    db._execute("UPDATE sales_dialog_messages SET verdict='handed' WHERE id=%s", (row_id,))
+    db._execute("""UPDATE sales_dialog_leads SET status='handed'
+                   WHERE campaign=%s AND lead_id=%s""", (msg["campaign"], msg["lead_id"]))
+    what = await hand_to_manager(app, db, msg, task_text=(
+        "Позвонить клиенту: заявка с сайта, чата в мессенджерах нет, "
+        "в Telegram по номеру не нашёлся"))
+    return f". Лид передан на звонок: {what}"
 
 
 def newer_inbound(db, msg: dict) -> dict | None:
@@ -1937,6 +2237,8 @@ def register(app, db) -> None:
         elif action == "send":
             msg = db._fetchone("SELECT draft_text FROM sales_dialog_messages WHERE id=%s", (row_id,))
             ok, info = await _do_send(db, row_id, (msg or {}).get("draft_text") or "")
+            if not ok:
+                info += await _after_send_failure(app, db, row_id, info)
             await q.edit_message_text(base + ("\n\n[отправлено клиенту]" if ok else f"\n\n[не отправлено: {info}]"))
         await q.answer()
 
@@ -1979,6 +2281,8 @@ def register(app, db) -> None:
         db._execute("UPDATE sales_dialog_messages SET verdict='edited', final_text=%s WHERE id=%s",
                     (text, row_id))
         ok, info = await _do_send(db, row_id, text)
+        if not ok:
+            info += await _after_send_failure(app, db, row_id, info)
         await update.effective_message.reply_text(
             "Отправлено клиенту." if ok else f"Не отправлено: {info}")
         # Иначе следом ответит общий гейт «я только присылаю уведомления».

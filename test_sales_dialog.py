@@ -811,3 +811,125 @@ def test_inject_word_banned():
     assert any("инъект" in p for p in check_style("Слоение шло от инъекта", "f"))
     assert any("инъект" in p for p in check_style("там инъекцию делают", "f"))
     assert check_style("Слоение шло от сырья", "f") == []
+
+
+# ─── новые сайт-лиды ведёт агент (план 2026-09-29) ────────────────────────────
+from sales_dialog import contact_channels, is_site_lead, norm_phone, pick_chat
+
+
+def test_norm_phone():
+    assert norm_phone("8 (909) 909-84-51") == "79099098451"
+    assert norm_phone("+7 909 909 84 51") == "79099098451"
+    assert norm_phone("9099098451") == "79099098451"
+    assert norm_phone("12345") is None
+    assert norm_phone(None) is None
+
+
+def test_contact_channels_reads_wz_fields_and_phone():
+    contact = {"custom_fields_values": [
+        {"field_id": 2244321, "values": [{"value": "116796554"}]},
+        {"field_id": 2224427, "values": [{"value": "360092495"}]},
+        {"field_id": 1, "field_code": "PHONE", "values": [{"value": "8 909 909-84-51"}]},
+    ]}
+    assert contact_channels(contact) == {"max": "116796554", "telegram": "360092495",
+                                         "phone": "79099098451"}
+
+
+def test_pick_chat_prefers_where_client_wrote():
+    ch = {"telegram": "t1", "max": "m1"}
+    assert pick_chat(ch, "m1") == ("max", "m1", ["t1", "m1"])
+    assert pick_chat(ch) == ("telegram", "t1", ["t1", "m1"])
+    assert pick_chat({"max": "m1"}) == ("max", "m1", ["m1"])
+
+
+def test_pick_chat_without_chats_goes_by_phone():
+    assert pick_chat({"phone": "79099098451"}) == ("telegram", None, [])
+
+
+def test_is_site_lead():
+    lead = {"status_id": 85554794, "_embedded": {"tags": [{"id": 782551}]}}
+    assert is_site_lead(lead)
+    assert not is_site_lead({**lead, "status_id": 143})
+    assert not is_site_lead({"status_id": 85554794, "_embedded": {"tags": [{"id": 1}]}})
+
+
+class _CardDB:
+    def __init__(self, lead):
+        self.lead = lead
+
+    def _fetchone(self, sql, params=()):
+        return self.lead
+
+
+def test_card_marks_new_site_lead_by_phone():
+    db = _CardDB({"lead_name": "Новый", "contact_name": None, "chat_type": "telegram",
+                  "chat_id": None})
+    msg = {"campaign": "site-leads-new", "lead_id": 1, "chat_id": None, "chat_type": "telegram",
+           "inbound_message_id": "first:1:20260929", "inbound_text": None,
+           "draft_text": "Добрый день", "action": "reply", "assignee_amo_id": None}
+    text = sales_dialog._card_text(db, msg)
+    assert "telegram по номеру" in text
+    assert "Новая заявка с сайта" in text
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status, self._body = status, body
+
+    async def text(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _Session:
+    def __init__(self, status, body):
+        self.resp, self.payloads = _Resp(status, body), []
+
+    def post(self, url, json=None, headers=None):
+        self.payloads.append(json)
+        return self.resp
+
+
+class _PhoneDB:
+    def __init__(self):
+        self.executed = []
+
+    def _fetchone(self, sql, params=()):
+        return {"chat_type": "telegram", "chat_id": None, "phone": "79099098451", "contact_id": 5}
+
+    def _execute(self, sql, params=()):
+        self.executed.append((sql, params))
+
+
+def _phone_msg():
+    return {"id": 7, "campaign": "site-leads-new", "lead_id": 1, "chat_id": None,
+            "chat_type": "telegram"}
+
+
+def test_deliver_by_phone_binds_found_chat(monkeypatch):
+    writes = []
+
+    async def fake_write(session, path, payload, method="PATCH"):
+        writes.append((path, payload))
+        return True
+    monkeypatch.setattr(sales_dialog, "_amo_write", fake_write)
+    db, s = _PhoneDB(), _Session(201, '{"messageId":"x","chatId":"360092495"}')
+    ok, _ = asyncio.run(sales_dialog._deliver(db, s, _phone_msg(), "Добрый день"))
+    assert ok
+    assert s.payloads[0]["phone"] == "79099098451" and "chatId" not in s.payloads[0]
+    assert any("360092495" in str(p) for _, p in db.executed)
+    assert writes and writes[0][1][0]["custom_fields_values"][0]["values"][0]["value"] == "360092495"
+
+
+def test_deliver_by_phone_not_found():
+    db, s = _PhoneDB(), _Session(201, '{"messageId":"x"}')
+    ok, info = asyncio.run(sales_dialog._deliver(db, s, _phone_msg(), "Добрый день"))
+    assert not ok and info.startswith(sales_dialog.NO_TG)
+    db, s = _PhoneDB(), _Session(400, '{"error":"CHAT_NOT_FOUND"}')
+    ok, info = asyncio.run(sales_dialog._deliver(db, s, _phone_msg(), "Добрый день"))
+    assert not ok and info.startswith(sales_dialog.NO_TG)
