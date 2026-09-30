@@ -18,6 +18,7 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import sys
 import urllib.parse
@@ -98,7 +99,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "warm-only-3009"
+CODE_VERSION = "antispam-3009"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -189,6 +190,9 @@ def ensure_tables(db) -> None:
                    ADD COLUMN IF NOT EXISTS taken_at TIMESTAMPTZ""")
     db._execute("""ALTER TABLE sales_dialog_leads
                    ADD COLUMN IF NOT EXISTS new_lead_id BIGINT""")
+    # Мягкий отказ («сейчас не актуально»): отвечать можно, первым – больше никогда.
+    db._execute("""ALTER TABLE sales_dialog_leads
+                   ADD COLUMN IF NOT EXISTS no_initiative BOOLEAN NOT NULL DEFAULT false""")
     # Адресат карточки фиксируется в самой карточке: лид могут передать другому,
     # а решение по уже отправленной карточке должен принимать тот, кому её послали.
     db._execute("""ALTER TABLE sales_dialog_messages
@@ -246,6 +250,189 @@ def workdays_ago(now: datetime, days: int) -> datetime:
         if d.weekday() < 5:
             left -= 1
     return d
+
+
+# ─── антиспам: правила по каналам ─────────────────────────────────────────────
+# План `plans/2026-09-30-антиспам-правила-переписки-агента.md`. 30.09.2026 MAX
+# заблокировал номер F2B за подозрение на спам: накануне ушло 117 сообщений в чаты
+# без единого входящего. Инициатива (агент пишет первым: `silent:` и `first:`)
+# теперь идёт через общий для всех кампаний бюджет канала. Ответы клиенту, который
+# написал сам, бюджетом не ограничены. Настройки – `bot_settings`, ключ
+# `sales_dialog:_channels`, меняются без выкатки.
+CHANNELS_KEY = "_channels"
+DEFAULT_CHANNELS = {
+    "limits": {"telegram": 10, "max": 0, "whatsapp": 0},   # инициатив в день на канал
+    "window": [10, 17],                  # часы МСК, пн–пт
+    "interval_min": [20, 45],            # случайная пауза между инициативами в канале
+    "first_touch_channels": ["telegram"],  # куда первым пишем новому сайт-лиду
+    "first_touch_max_days": 7,           # заявка старше – менеджеру, а не агенту
+    "paused": {},                        # канал -> причина; снимает только собственник
+    "next_at": {},                       # канал -> ISO-время, раньше которого не пишем
+}
+LINK_RE = re.compile(r"https?://|www\.|t\.me/|\b[\w-]+\.(ru|рф|com|group|store)\b", re.I)
+HARD_STOP_RE = re.compile(
+    r"не\s+пиш(и|ите)|больше\s+не\s+пиш|не\s+беспоко|отпиш(и|ите)|удалите|"
+    r"хватит\s+писать|прекратите|не\s+присылайте|\bспам", re.I)
+SOFT_STOP_RE = re.compile(
+    r"не\s*актуальн|не\s+интересн|не\s+интересует|не\s+нужн|не\s+требуется|не\s+надо", re.I)
+SPAM_RE = re.compile(r"\bспам", re.I)
+WAZZUP_TRANSPORT = {"tgapi": "telegram", "telegram": "telegram", "max": "max",
+                    "whatsapp": "whatsapp"}
+
+
+def channel_policy(db) -> dict:
+    """Правила каналов: значения по умолчанию, поверх – то, что лежит в настройках."""
+    saved = _load_cfg(db, CHANNELS_KEY)
+    p = json.loads(json.dumps(DEFAULT_CHANNELS))
+    for k, v in saved.items():
+        if isinstance(v, dict) and isinstance(p.get(k), dict):
+            p[k].update(v)
+        else:
+            p[k] = v
+    return p
+
+
+def is_initiative(row: dict) -> bool:
+    """Агент пишет первым: оживление молчащего диалога или первое касание лида."""
+    key = str(row.get("inbound_message_id") or row.get("message_id") or "")
+    return key.startswith(("silent:", "first:"))
+
+
+def row_channel(row: dict) -> str:
+    # Лид без чата получает первое сообщение по номеру – это Telegram.
+    return row.get("chat_type") or "telegram"
+
+
+def refusal_kind(text: str | None) -> str | None:
+    """«hard» – просят не писать; «soft» – сейчас не нужно; None – не отказ."""
+    t = text or ""
+    if HARD_STOP_RE.search(t):
+        return "hard"
+    if SOFT_STOP_RE.search(t):
+        return "soft"
+    return None
+
+
+def initiatives_used(db) -> dict:
+    """Сколько инициатив по каналам уже выдано сегодня (черновики и отправленные)."""
+    rows = db._fetchall("""
+        SELECT coalesce(chat_type, 'telegram') AS ch, count(*) AS n
+        FROM sales_dialog_messages
+        WHERE (inbound_message_id LIKE %s OR inbound_message_id LIKE %s)
+          AND verdict IN ('draft', 'edited', 'sent')
+          AND created_at >= date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')
+                            AT TIME ZONE 'Europe/Moscow'
+        GROUP BY 1""", ("silent:%", "first:%"))
+    return {r["ch"]: r["n"] for r in rows}
+
+
+def initiative_block(row: dict, policy: dict, used: dict, now: datetime) -> str | None:
+    """Почему агенту нельзя сейчас написать первым; None – можно."""
+    ch = row_channel(row)
+    if ch in (policy.get("paused") or {}):
+        return f"канал {ch} на паузе: {policy['paused'][ch]}"
+    lo, hi = policy.get("window") or [10, 17]
+    if now.weekday() >= 5 or not (lo <= now.hour < hi):
+        return "вне окна инициативы"
+    if used.get(ch, 0) >= int((policy.get("limits") or {}).get(ch, 0)):
+        return f"дневной лимит канала {ch}"
+    nxt = (policy.get("next_at") or {}).get(ch)
+    if nxt and now < datetime.fromisoformat(nxt):
+        return f"пауза между сообщениями в {ch}"
+    if row.get("source") == "first":
+        if ch not in (policy.get("first_touch_channels") or []):
+            return f"первым в {ch} новому лиду не пишем"
+        taken = row.get("taken_at_lead")
+        days = int(policy.get("first_touch_max_days", 7))
+        if taken and now - taken > timedelta(days=days):
+            return f"заявка старше {days} дней"
+    return None
+
+
+def note_initiative(db, policy: dict, ch: str, now: datetime) -> None:
+    """После инициативы канал молчит случайные 20–45 минут: без пачек."""
+    lo, hi = policy.get("interval_min") or [20, 45]
+    at = (now + timedelta(minutes=random.randint(lo, hi))).isoformat()
+    policy.setdefault("next_at", {})[ch] = at
+    saved = _load_cfg(db, CHANNELS_KEY)
+    saved.setdefault("next_at", {})[ch] = at
+    _save_cfg(db, CHANNELS_KEY, saved)
+
+
+async def pause_channel(app, db, ch: str, reason: str) -> None:
+    """Ставит инициативу в канале на паузу и один раз говорит об этом собственнику."""
+    saved = _load_cfg(db, CHANNELS_KEY)
+    paused = saved.setdefault("paused", {})
+    if ch in paused:
+        return
+    paused[ch] = f"{datetime.now(MSK):%d.%m %H:%M} {reason}"[:200]
+    _save_cfg(db, CHANNELS_KEY, saved)
+    logger.warning("sales_dialog: канал %s на паузе: %s", ch, reason)
+    if app:
+        await notify_owner(app, f"Агент: инициатива в {ch} на паузе – {reason}. "
+                                f"Ответы клиентам идут. Снять паузу – команда собственника.")
+
+
+_channels_cache: dict = {"at": None, "states": {}}
+
+
+async def channel_states(session) -> dict:
+    """Состояние каналов Wazzup (кэш 5 минут): {'telegram': 'active', …}."""
+    now = datetime.now(timezone.utc)
+    if _channels_cache["at"] and (now - _channels_cache["at"]).total_seconds() < 300:
+        return _channels_cache["states"]
+    states = {}
+    try:
+        async with session.get("https://api.wazzup24.com/v3/channels", headers={
+                "Authorization": f"Bearer {os.getenv('WAZZUP_API_KEY', '')}"},
+                timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status == 200:
+                for c in await r.json():
+                    ch = WAZZUP_TRANSPORT.get(c.get("transport"))
+                    if ch:
+                        states[ch] = c.get("state")
+    except Exception as e:
+        logger.warning("sales_dialog: состояние каналов Wazzup не прочиталось: %s", e)
+    _channels_cache.update(at=now, states=states)
+    return states
+
+
+async def gate_initiatives(app, db, session, rows: list, now: datetime) -> list:
+    """Пропускает ответы как есть, инициативы – только в пределах правил каналов.
+
+    Первое касание, которое правила не пускают насовсем (канал не тот, заявка
+    старая), отдаёт лид менеджеру: агент по нему больше не пишет.
+    """
+    if not any(is_initiative(r) for r in rows):
+        return rows
+    policy = channel_policy(db)
+    states = await channel_states(session)
+    for ch, limit in (policy.get("limits") or {}).items():
+        st = states.get(ch)
+        if int(limit) > 0 and st and st != "active" and ch not in (policy.get("paused") or {}):
+            await pause_channel(app, db, ch, f"канал в Wazzup в состоянии {st}")
+            policy = channel_policy(db)
+    used = initiatives_used(db)
+    out, took = [], False
+    for r in rows:
+        if not is_initiative(r):
+            out.append(r)
+            continue
+        if took:
+            continue                     # одна инициатива за тик: интервал решает дальше
+        why = initiative_block(r, policy, used, now)
+        if why is None:
+            out.append(r)
+            took = True
+        elif why.startswith(("первым в", "заявка старше")):
+            db._execute("""UPDATE sales_dialog_leads SET status='handed', note=%s
+                           WHERE campaign=%s AND lead_id=%s AND status='active'""",
+                        (f"антиспам: {why}", r["campaign"], r["lead_id"]))
+            if app:
+                await hand_to_manager(app, db, {"campaign": r["campaign"], "lead_id": r["lead_id"]},
+                                      task_text=f"Связаться с клиентом: заявка с сайта, агент "
+                                                f"первым не пишет ({why})")
+    return out
 
 
 # ─── внешние системы ──────────────────────────────────────────────────────────
@@ -811,7 +998,7 @@ def _pending_first(db, campaign: str) -> list:
                'first:' || l.lead_id || ':' ||
                  to_char(now() AT TIME ZONE 'Europe/Moscow', 'YYYYMMDD') AS message_id,
                NULL AS inbound_text, l.last_inbound_at AS sent_at, 'first' AS source,
-               l.activate_on
+               l.activate_on, l.created_at AS taken_at_lead
         FROM sales_dialog_leads l
         WHERE l.campaign = %s AND l.status = 'active'
           AND (l.activate_on IS NULL
@@ -1136,6 +1323,11 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
         first_touch_note = "Ты пишешь в этот чат ВПЕРВЫЕ — до тебя его вёл другой менеджер."
     else:
         first_touch_note = f"Ты уже {wrote} в этот чат, представляться повторно не нужно."
+    if row.get("source") in ("silent", "first"):
+        first_touch_note += (
+            "\nТы пишешь ПЕРВЫМ. Без ссылок и файлов. Закончи мягким выходом своими словами, "
+            "например «если сейчас неактуально – скажите, не буду беспокоить»; формулировку "
+            "каждый раз меняй, одинаковый хвост во многих чатах мессенджер считает спамом.")
     user = f"""ПЕРЕПИСКА (последнее сообщение {days} дн. назад):
 {safe if safe.strip() else "— переписки нет, это первое обращение к клиенту"}
 
@@ -1556,6 +1748,7 @@ def _pending_silent(db, campaign: str, silent_days: int,
           -- 30.09.2026, «нас блокируют из-за подозрений на спам»): 29.09 агент дал
           -- 79 из 117 сообщений в чаты без единого входящего, и MAX-канал отключили.
           AND lastin.chat_id IS NOT NULL
+          AND NOT l.no_initiative
           AND (l.activate_on IS NULL
                OR l.activate_on <= (now() AT TIME ZONE 'Europe/Moscow')::date)
           AND (SELECT max(w.sent_at) AT TIME ZONE 'UTC' FROM wazzup_messages w
@@ -1626,6 +1819,30 @@ async def tick(app, db) -> None:
             logger.error("sales_dialog[%s]: %s", campaign, e, exc_info=True)
 
 
+async def _apply_refusals(app, db, rows: list) -> list:
+    """Отказ клиента во входящем: «не пишите» – стоп навсегда и без ответа,
+    «сейчас не актуально» – ответить можно, первым больше не пишем. Слово
+    «спам» ещё и ставит инициативу в канале на паузу: жалоба – прямой путь к бану.
+    """
+    out = []
+    for r in rows:
+        kind = refusal_kind(r.get("inbound_text"))
+        if kind == "hard":
+            db._execute("""UPDATE sales_dialog_leads SET status='stop', no_initiative=true, note=%s
+                           WHERE campaign=%s AND lead_id=%s""",
+                        (f"клиент просит не писать: «{(r.get('inbound_text') or '')[:120]}»",
+                         r["campaign"], r["lead_id"]))
+            if SPAM_RE.search(r.get("inbound_text") or ""):
+                await pause_channel(app, db, row_channel(r),
+                                    f"клиент {r.get('lead_name') or r['lead_id']} написал «спам»")
+            continue
+        if kind == "soft":
+            db._execute("""UPDATE sales_dialog_leads SET no_initiative=true
+                           WHERE campaign=%s AND lead_id=%s""", (r["campaign"], r["lead_id"]))
+        out.append(r)
+    return out
+
+
 async def _tick_campaign(app, db, campaign: str) -> None:
     cfg = _load_cfg(db, campaign)
     if not cfg.get("enabled"):
@@ -1654,7 +1871,7 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     # Ответ клиента идёт вне очереди: он ждать не должен (собственник 24.09.2026).
     # Придержать можно только инициативу в молчащий диалог — чтобы карточки не
     # сыпались быстрее, чем человек успевает по ним решать.
-    rows = _pending_inbound(db, campaign)
+    rows = await _apply_refusals(app, db, _pending_inbound(db, campaign))
     n_inbound = len(rows)
     # Первое сообщение новому лиду – тоже вне очереди: заявка остывает за часы.
     # Лиды, перенесённые партией (`activate_on`), идут общей очередью по одной
@@ -1704,12 +1921,15 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     cap = cfg.get("drafts_per_tick", 1)
     taken: dict = {}
     async with aiohttp.ClientSession() as session:
+        rows = await gate_initiatives(app, db, session, rows, now)
         for row in rows:
             key = row.get("assignee_amo_id")
             if taken.get(key, 0) >= cap:
                 continue
             taken[key] = taken.get(key, 0) + 1
             await _handle_one(app, db, session, campaign, row, cfg)
+            if is_initiative(row):
+                note_initiative(db, channel_policy(db), row_channel(row), now)
 
 
 async def _tell(app, chat: int, text: str) -> None:
@@ -1968,6 +2188,9 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
         draft["reason"] = "модель не написала текст ответа – нужен человек"
     problems = (check_prices(draft, ctx["prices"], allowed_numbers(ctx.get("city")))
                 + check_style(draft["text"], ctx["persona"]["gender"]))
+    # Ссылка в сообщении первым – один из признаков спама для мессенджеров.
+    if is_initiative(row) and LINK_RE.search(draft["text"]):
+        problems.append("в сообщении первым есть ссылка")
     # Уступка ниже прайса проверяется порогами дашборда, а не на глаз.
     problems += await check_bargain(session, db, draft, ctx["prices"])
     if draft.get("bargain") and not problems:
@@ -2157,7 +2380,15 @@ async def _bind_telegram(db, session, msg: dict, lead: dict, chat_id: str) -> No
 
 
 async def _after_send_failure(app, db, row_id: int, info: str) -> str:
-    """Номер не нашёлся в Telegram – писать клиенту некуда, лид идёт Инессе на звонок."""
+    """Номер не нашёлся в Telegram – писать клиенту некуда, лид идёт Инессе на звонок.
+
+    Ошибка самого Wazzup (http 4xx/5xx) – признак проблемы с каналом, в том числе
+    бана: инициатива в канале встаёт на паузу до решения собственника.
+    """
+    if info.startswith("http ") and app:
+        msg = db._fetchone("SELECT chat_type FROM sales_dialog_messages WHERE id=%s", (row_id,))
+        await pause_channel(app, db, row_channel(msg or {}), f"ошибка отправки: {info[:120]}")
+        return ". Инициатива в канале на паузе"
     if not info.startswith(NO_TG) or not app:
         return ""
     msg = db._fetchone("SELECT * FROM sales_dialog_messages WHERE id=%s", (row_id,))
@@ -2212,6 +2443,18 @@ async def _do_send(db, row_id: int, text: str) -> tuple[bool, str]:
     if CARD_TRACE_RE.search(text):
         # 28.09.2026 в чат клиента уехала шапка карточки: «ФАРШ · max · сделка …».
         return False, "в тексте остались служебные строки карточки, не отправлено"
+    if is_initiative(msg):
+        policy = channel_policy(db)
+        ch = row_channel(msg)
+        if ch in (policy.get("paused") or {}):
+            return False, f"инициатива в {ch} на паузе: {policy['paused'][ch]}"
+        sent_today = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages
+            WHERE (inbound_message_id LIKE %s OR inbound_message_id LIKE %s)
+              AND verdict='sent' AND coalesce(chat_type, 'telegram')=%s
+              AND sent_at >= date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')
+                             AT TIME ZONE 'Europe/Moscow'""", ("silent:%", "first:%", ch))
+        if (sent_today or {}).get("n", 0) >= int((policy.get("limits") or {}).get(ch, 0)):
+            return False, f"дневной лимит сообщений первым в {ch} исчерпан"
     fresh = newer_inbound(db, msg)
     if fresh:
         db._execute("UPDATE sales_dialog_messages SET verdict='stale' WHERE id=%s", (row_id,))

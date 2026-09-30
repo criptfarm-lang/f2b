@@ -958,3 +958,131 @@ def test_strip_card_header_removes_bracket_status():
     assert out == "Ольга, цена уже с доставкой.\nСобрать один пласт на пробу?"
     assert not CARD_TRACE_RE.search(out)
     assert CARD_TRACE_RE.search(raw)
+
+
+# ── антиспам (план 2026-09-30-антиспам-правила-переписки-агента) ──────────────
+POLICY = {"limits": {"telegram": 10, "max": 0, "whatsapp": 0}, "window": [10, 17],
+          "interval_min": [20, 45], "first_touch_channels": ["telegram"],
+          "first_touch_max_days": 7, "paused": {}, "next_at": {}}
+WED_11 = datetime(2026, 10, 7, 11, 0, tzinfo=MSK)
+
+
+def _init_row(ch="telegram", source="silent", **kw):
+    return {"lead_id": 1, "campaign": "c", "chat_type": ch, "source": source,
+            "message_id": f"{source}:1:20261007", **kw}
+
+
+def test_initiative_detected_by_key():
+    from sales_dialog import is_initiative
+    assert is_initiative({"message_id": "silent:1:20261007"})
+    assert is_initiative({"inbound_message_id": "first:1:20261007"})
+    assert not is_initiative({"inbound_message_id": "a1b2-c3d4"})
+
+
+def test_initiative_allowed_within_rules():
+    from sales_dialog import initiative_block
+    assert initiative_block(_init_row(), POLICY, {"telegram": 3}, WED_11) is None
+
+
+def test_initiative_blocked_by_channel_limit():
+    from sales_dialog import initiative_block
+    assert "лимит" in initiative_block(_init_row(), POLICY, {"telegram": 10}, WED_11)
+
+
+def test_max_zero_limit_blocks_initiative():
+    """Пока бан MAX не снят, первым в MAX не пишем вообще."""
+    from sales_dialog import initiative_block
+    assert "лимит" in initiative_block(_init_row("max"), POLICY, {}, WED_11)
+
+
+def test_initiative_blocked_when_paused():
+    from sales_dialog import initiative_block
+    p = {**POLICY, "paused": {"telegram": "30.09 ошибка отправки"}}
+    assert "пауз" in initiative_block(_init_row(), p, {}, WED_11)
+
+
+def test_initiative_blocked_outside_window_and_weekend():
+    from sales_dialog import initiative_block
+    assert "окна" in initiative_block(_init_row(), POLICY, {}, WED_11.replace(hour=17, minute=5))
+    assert "окна" in initiative_block(_init_row(), POLICY, {}, WED_11.replace(hour=9, minute=59))
+    assert "окна" in initiative_block(_init_row(), POLICY, {}, datetime(2026, 10, 10, 12, tzinfo=MSK))
+
+
+def test_initiative_waits_for_random_interval():
+    from sales_dialog import initiative_block
+    p = {**POLICY, "next_at": {"telegram": (WED_11 + timedelta(minutes=10)).isoformat()}}
+    assert "пауза" in initiative_block(_init_row(), p, {}, WED_11)
+    assert initiative_block(_init_row(), p, {}, WED_11 + timedelta(minutes=11)) is None
+
+
+def test_first_touch_only_telegram_and_fresh():
+    from sales_dialog import initiative_block
+    p = {**POLICY, "limits": {"telegram": 10, "max": 5}}
+    assert "первым в max" in initiative_block(_init_row("max", "first"), p, {}, WED_11)
+    old = _init_row(source="first", taken_at_lead=WED_11 - timedelta(days=8))
+    assert "старше" in initiative_block(old, p, {}, WED_11)
+    fresh = _init_row(source="first", taken_at_lead=WED_11 - timedelta(days=2))
+    assert initiative_block(fresh, p, {}, WED_11) is None
+
+
+def test_phone_only_lead_counts_as_telegram():
+    from sales_dialog import row_channel
+    assert row_channel({"chat_type": None}) == "telegram"
+
+
+def test_refusal_hard():
+    from sales_dialog import refusal_kind
+    for t in ("Не пишите мне больше", "больше не пишите", "Прошу не беспокоить", "это спам",
+              "Удалите мой номер", "отпишите нас", "Хватит писать", "не присылайте ничего"):
+        assert refusal_kind(t) == "hard", t
+
+
+def test_refusal_soft():
+    from sales_dialog import refusal_kind
+    for t in ("Пока не актуально", "неактуально", "Нам не интересно", "не нужно, спасибо",
+              "Сейчас не требуется"):
+        assert refusal_kind(t) == "soft", t
+
+
+def test_not_refusal():
+    from sales_dialog import refusal_kind
+    for t in ("Пришлите прайс", "Сколько стоит форель?", "Давайте 30 кг", None, ""):
+        assert refusal_kind(t) is None, t
+
+
+def test_link_detected_in_initiative_text():
+    from sales_dialog import LINK_RE
+    assert LINK_RE.search("Прайс тут: https://f2b.group/price")
+    assert LINK_RE.search("смотрите f2b.group")
+    assert LINK_RE.search("t.me/fishto_biz")
+    assert not LINK_RE.search("Форель филе Трим С 1.4–2.0 кг – 1890 ₽/кг. Прислать образец?")
+
+
+class PolicyDB:
+    """Хранит bot_settings в памяти – для проверки паузы и интервала."""
+    def __init__(self, value=None):
+        self.value = value
+
+    def _fetchone(self, sql, params=None):
+        return {"value": self.value} if self.value is not None else None
+
+    def _execute(self, sql, params=None):
+        self.value = params[1]
+
+
+def test_pause_channel_saved_once():
+    from sales_dialog import channel_policy, pause_channel
+    db = PolicyDB()
+    asyncio.run(pause_channel(None, db, "telegram", "ошибка отправки"))
+    first = channel_policy(db)["paused"]["telegram"]
+    asyncio.run(pause_channel(None, db, "telegram", "другая причина"))
+    assert channel_policy(db)["paused"]["telegram"] == first
+
+
+def test_note_initiative_sets_interval_within_bounds():
+    from sales_dialog import channel_policy, note_initiative
+    db = PolicyDB()
+    note_initiative(db, channel_policy(db), "telegram", WED_11)
+    nxt = datetime.fromisoformat(channel_policy(db)["next_at"]["telegram"])
+    assert WED_11 + timedelta(minutes=20) <= nxt <= WED_11 + timedelta(minutes=45)
+    assert channel_policy(db)["limits"]["max"] == 0      # умолчания не затёрты
