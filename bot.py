@@ -1694,7 +1694,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await message.reply_text("✅ Ответ отправлен руководителю.")
                     return
 
-        # Прочие сообщения в личке — бот не реагирует
+        # Прочие сообщения в личке — бот не реагирует, но пишем их в историю:
+        # иначе ответы сотрудников в личку теряются (30.09.2026: проверка холдингов,
+        # план 2026-09-30-сохранение-личных-сообщений-сотрудников.md).
+        try:
+            db.save_message(chat_id=chat_id, user_id=user.id,
+                            user_name=user.full_name, text=text[:1000])
+        except Exception as e:
+            logger.warning(f"save_message (личка сотрудника): {e}")
         return
 
     if message.forward_origin and chat_id == (user.id if user else None):
