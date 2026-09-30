@@ -302,6 +302,8 @@ def ensure_schema(db):
         )
     """)
     db._execute("ALTER TABLE route_dispatch ADD COLUMN IF NOT EXISTS done JSONB DEFAULT '[]'::jsonb")
+    # Плановое время выезда машины в этот день («ЧЧ:ММ»); NULL = общий дедлайн 09:00.
+    db._execute("ALTER TABLE route_dispatch ADD COLUMN IF NOT EXISTS depart_hm TEXT")
     logger.info("route_dispatch: схема готова")
 
 
@@ -333,6 +335,72 @@ def _upsert_draft(snap_date, unit_id, driver_id, snap):
         """, (snap_date, unit_id, driver_id, json.dumps(snap, ensure_ascii=False)))
     except Exception as e:
         logger.warning("_upsert_draft: %s", e)
+
+
+# ─── Плановое время выезда ───────────────────────────────────────────────────
+# Логист выбирает кнопкой в карточке маршрута; движок статусов (delivery_statuses)
+# сравнивает с ним первый выезд с базы. Не выбрано — общий DEPART_DEFAULT_HM.
+DEPART_DEFAULT_HM = os.getenv("DEPART_DEADLINE_HM", "09:00")
+DEPART_CHOICES = ("07:00", "08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00")
+
+
+def depart_hm(snap_date, unit_id) -> str:
+    """Плановое время выезда машины в день snap_date (или дефолт)."""
+    if _DB is not None:
+        try:
+            r = _DB._fetchone("SELECT depart_hm FROM route_dispatch WHERE snap_date=%s AND unit_id=%s",
+                              (snap_date, unit_id))
+            if r and r.get("depart_hm"):
+                return r["depart_hm"]
+        except Exception as e:
+            logger.warning("depart_hm: %s", e)
+    return DEPART_DEFAULT_HM
+
+
+def _depart_rows(dstr, uid, current) -> list:
+    """Две строки кнопок «Выезд»; выбранное время помечено ●."""
+    btns = [InlineKeyboardButton(("● " if hm == current else "") + hm,
+                                 callback_data=f"rd:dep:{dstr}:{uid}:{hm.replace(':', '')}")
+            for hm in DEPART_CHOICES]
+    return [btns[:4], btns[4:]]
+
+
+def _route_kb(dstr, uid, day_off, current, confirmed=False) -> InlineKeyboardMarkup:
+    rows = [] if confirmed else [
+        [InlineKeyboardButton("✅ Подтвердить", callback_data=f"rd:conf:{dstr}:{uid}")],
+        [InlineKeyboardButton("🔄 Пересобрать", callback_data=f"rd:col:{day_off}")],
+    ]
+    return InlineKeyboardMarkup(rows + _depart_rows(dstr, uid, current))
+
+
+async def cb_depart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «Выезд ЧЧ:ММ» → сохранить плановое время машины на день, отметить в клавиатуре."""
+    q = update.callback_query
+    if not _allowed(q.from_user.id):
+        await _safe_answer(q, "Нет доступа", alert=True)
+        return
+    _, _, dstr, uid, hhmm = q.data.split(":")  # rd:dep:<date>:<uid>:<HHMM>
+    uid = int(uid)
+    hm = f"{hhmm[:2]}:{hhmm[2:]}"
+    if _DB is not None:
+        try:
+            _DB._execute("""
+                INSERT INTO route_dispatch (snap_date, unit_id, depart_hm, updated_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (snap_date, unit_id) DO UPDATE SET depart_hm = EXCLUDED.depart_hm,
+                  updated_at = now()
+            """, (dstr, uid, hm))
+        except Exception as e:
+            logger.warning("cb_depart: %s", e)
+            await _safe_answer(q, "Не сохранилось, попробуй ещё раз", alert=True)
+            return
+    await _safe_answer(q, f"Плановый выезд {rr.UNITS.get(uid, uid)}: {hm}")
+    confirmed = "✅ Подтверждено" in (q.message.caption or "")
+    day_off = (date.fromisoformat(dstr) - datetime.now(_MSK).date()).days
+    try:
+        await q.edit_message_reply_markup(reply_markup=_route_kb(dstr, uid, day_off, hm, confirmed))
+    except Exception as e:
+        logger.warning("cb_depart edit: %s", e)
 
 
 def _stop_on_date(s, d) -> bool:
@@ -691,11 +759,7 @@ async def _collect_and_send(context, target_date, to_chat):
                    f"{_h(note)}\n"
                    f"Маршрут на {_h(date_str)} — {len(stops)} точек (порядок выгрузки):\n"
                    + _h("\n".join(lines)))
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Подтвердить",
-                                  callback_data=f"rd:conf:{target_date.isoformat()}:{uid}")],
-            [InlineKeyboardButton("🔄 Пересобрать", callback_data=f"rd:col:{day_off}")],
-        ])
+        kb = _route_kb(dstr, uid, day_off, depart_hm(target_date, uid))
         await _send_pdf(context.bot, to_chat, pkg["pdf"],
                         f"reestr_{uid}_{target_date.isoformat()}.pdf",
                         caption[:1024], reply_markup=kb)
@@ -767,7 +831,8 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # `done` хранит ОЧИЩЕННЫЕ № документов (_doc_no) — сравниваем так же:
             # в сыром order_no бывают заметки логиста, и счётчик закрытых врал.
             left = len([s for s in stops if _doc_no(s.get("order_no")) not in done_prev])
-            head = f"🚚 <b>{_h(rr.unit_title(uid))}</b>, {_h(date_str)}."
+            head = (f"🚚 <b>{_h(rr.unit_title(uid))}</b>, {_h(date_str)}. "
+                    f"Выезд со склада: {_h(depart_hm(dstr, uid))}.")
             if left == 0:
                 body = "Все точки уже закрыты. ✅"
             else:
@@ -804,7 +869,8 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await q.edit_message_caption(
-            caption=(q.message.caption or "") + f"\n\n✅ Подтверждено → {driver_note}; {sklad_note}.")
+            caption=(q.message.caption or "") + f"\n\n✅ Подтверждено → {driver_note}; {sklad_note}.",
+            reply_markup=_route_kb(dstr, uid, 0, depart_hm(dstr, uid), confirmed=True))
     except Exception as e:
         logger.warning("cb_confirm edit: %s", e)
 
@@ -927,6 +993,7 @@ def register(app: Application, db):
     app.add_handler(CallbackQueryHandler(cb_collect, pattern=r"^rd:col:"))
     app.add_handler(CallbackQueryHandler(cb_confirm, pattern=r"^rd:conf:"))
     app.add_handler(CallbackQueryHandler(cb_sklad_refresh, pattern=r"^rd:sklrf:"))
+    app.add_handler(CallbackQueryHandler(cb_depart, pattern=r"^rd:dep:"))
     # ensure_schema — после хендлеров и best-effort: сбой БД на старте не должен ронять
     # register и глушить кнопки маршрута (та же защита, что в driver_checklist).
     try:

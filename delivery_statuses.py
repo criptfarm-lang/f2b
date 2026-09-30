@@ -300,9 +300,22 @@ def _check_idle(db, uid, name, pos, stops, now_ts, preview, has_open=True):
 
 # ─── Выезд со склада (поздний старт развоза) ─────────────────────────────────
 
-def _dep_deadline_ts(now_ts: int) -> int:
-    """Дедлайн выезда — сегодняшние DEPART_DEADHM по МСК в epoch."""
-    hh, mm = (DEPART_DEADLINE_HM.split(":") + ["0"])[:2]
+def _dep_plan_hm(db, uid, day) -> str:
+    """Плановое время выезда машины в этот день — логист задаёт в карточке маршрута
+    (`route_dispatch.depart_hm`); не задано — общий DEPART_DEADLINE_HM."""
+    try:
+        r = db._fetchone("SELECT depart_hm FROM route_dispatch WHERE snap_date=%s AND unit_id=%s",
+                         (day, uid))
+        if r and r.get("depart_hm"):
+            return r["depart_hm"]
+    except Exception as e:
+        logger.warning("_dep_plan_hm %s: %s", uid, e)
+    return DEPART_DEADLINE_HM
+
+
+def _dep_deadline_ts(now_ts: int, hm: str = None) -> int:
+    """Дедлайн выезда — сегодня в hm (дефолт DEPART_DEADLINE_HM) по МСК в epoch."""
+    hh, mm = ((hm or DEPART_DEADLINE_HM).split(":") + ["0"])[:2]
     d = datetime.fromtimestamp(now_ts, _MSK)
     return int(d.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0).timestamp())
 
@@ -310,8 +323,9 @@ def _dep_deadline_ts(now_ts: int) -> int:
 def _check_departure(db, uid, name, pos, stops, left_base, now_ts, preview):
     """Фиксирует первый выезд машины с базы за день и алертит, если он позже дедлайна.
 
-    Два случая одного события: машина уже уехала, но позже 09:00 — сообщаем факт со
-    временем; машина в 09:00 всё ещё на базе — сообщаем, что развоз не начат. Один
+    Дедлайн — плановое время выезда этой машины на сегодня (`_dep_plan_hm`), по
+    умолчанию 09:00. Два случая одного события: машина уехала позже дедлайна — сообщаем
+    факт со временем; к дедлайну всё ещё на базе — сообщаем, что развоз не начат. Один
     алерт на машину в день (`unit_departure.alerted`)."""
     if not pos or not stops:
         return None    # нет позиции или нечего развозить — не наш случай
@@ -328,24 +342,25 @@ def _check_departure(db, uid, name, pos, stops, left_base, now_ts, preview):
         db._execute("UPDATE unit_departure SET first_out=now() WHERE unit_id=%s AND snap_date=%s",
                     (uid, today))
         first_out = datetime.now(_MSK)
-    deadline = _dep_deadline_ts(now_ts)
+    plan_hm = _dep_plan_hm(db, uid, today)
+    deadline = _dep_deadline_ts(now_ts, plan_hm)
     if row.get("alerted") or now_ts < deadline:
         return None
     out_hm = first_out.astimezone(_MSK).strftime("%H:%M") if first_out else None
     if first_out and first_out.astimezone(_MSK).timestamp() <= deadline:
         return None    # выехала вовремя — алерта нет
-    line = (f"{name}: выезд со склада в {out_hm} — позже {DEPART_DEADLINE_HM}" if out_hm
+    line = (f"{name}: выезд со склада в {out_hm} — позже плана {plan_hm}" if out_hm
             else f"{name}: в {datetime.fromtimestamp(now_ts, _MSK):%H:%M} ещё на базе, "
-                 f"развоз не начат (дедлайн {DEPART_DEADLINE_HM})")
-    return {"line": line, "fire": not preview, "out_hm": out_hm,
+                 f"развоз не начат (план выезда {plan_hm})")
+    return {"line": line, "fire": not preview, "out_hm": out_hm, "plan_hm": plan_hm,
             "points": len(stops), "date": today}
 
 
 async def _departure_alert(bot, unit_name, info):
     text = (f"🕗 Поздний выезд со склада\n{unit_name}\n"
-            + (f"Выехала в {info['out_hm']} (дедлайн {DEPART_DEADLINE_HM}).\n"
+            + (f"Выехала в {info['out_hm']} (план выезда {info['plan_hm']}).\n"
                if info["out_hm"] else
-               f"Ещё не выехала, дедлайн {DEPART_DEADLINE_HM} прошёл.\n")
+               f"Ещё не выехала, план выезда {info['plan_hm']} прошёл.\n")
             + f"Точек в маршруте на сегодня: {info['points']}. Весь день сдвигается.")
     for cid in _unload_recipients():
         try:
@@ -866,7 +881,7 @@ async def run_check(db, bot=None, preview=False) -> list:
                                    client="; ".join((b["s"].get("client") or "")[:30]
                                                     for b in behind[:5]))
 
-            # ── Поздний выезд со склада (дедлайн DEPART_DEADLINE_HM) ──
+            # ── Поздний выезд со склада (план выезда машины, дефолт DEPART_DEADLINE_HM) ──
             dep = _check_departure(db, uid, name, pos, stops, left_base, now_ts, preview)
             if dep:
                 lines.append(dep["line"])
