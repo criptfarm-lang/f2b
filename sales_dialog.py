@@ -98,7 +98,7 @@ MODEL = "claude-opus-5"
 PROMPT_VERSION = "sales-dialog-v7"
 # Версия кода — отдельно от версии промпта: менять PROMPT_VERSION ради
 # наблюдаемости деплоя нельзя, он входит в ключ идемпотентности.
-CODE_VERSION = "batch-inbound-guard-2909"
+CODE_VERSION = "warm-only-3009"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -1552,6 +1552,10 @@ def _pending_silent(db, campaign: str, silent_days: int,
             ORDER BY w.sent_at DESC LIMIT 1
         ) lastin ON true
         WHERE l.campaign = %s AND l.status = 'active'
+          -- Первым пишем только туда, где клиент хоть раз писал сам (собственник
+          -- 30.09.2026, «нас блокируют из-за подозрений на спам»): 29.09 агент дал
+          -- 79 из 117 сообщений в чаты без единого входящего, и MAX-канал отключили.
+          AND lastin.chat_id IS NOT NULL
           AND (l.activate_on IS NULL
                OR l.activate_on <= (now() AT TIME ZONE 'Europe/Moscow')::date)
           AND (SELECT max(w.sent_at) AT TIME ZONE 'UTC' FROM wazzup_messages w
