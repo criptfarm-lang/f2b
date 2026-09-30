@@ -165,6 +165,16 @@ MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 #     callback из bot.py (см. set_429_alert_callback).
 #   - Уступаем окно по заголовку x-ratelimit-remaining: свой счётчик видит только
 #     собственный расход, а заголовок — общий, вместе с чужим.
+#
+#   30.09.2026 — шторм 10:00–11:10 МСК шёл кодом 1073 «Превышено ограничение на
+#     одновременное количество запросов» (заголовок X-Lognex-Auth 429005). Это
+#     отдельный лимит МС: не больше 5 параллельных запросов на пользователя, и его
+#     делят все сервисы под токеном «Эф». Частоту мы держали, а число одновременных
+#     запросов — нет: ~20 фоновых задач бота ходят в МС независимо, статистика
+#     менеджера слала пачки по 10. Теперь не больше _MS_PARALLEL разом на процесс
+#     (бот 3 + f2b-publisher 2 = 5).
+_MS_PARALLEL = 3
+_ms_parallel_sem = asyncio.Semaphore(_MS_PARALLEL)
 _MS_WINDOW_SEC = 3.0
 _MS_UNITS_BUDGET = 30
 _MS_YIELD_BELOW = 12
@@ -316,7 +326,8 @@ def _install_ms_throttle_patch() -> None:
         # Первая попытка
         weight = _request_weight(str(str_or_url))
         await _ms_throttle(weight)
-        resp = await _orig_request(self, method, str_or_url, **kwargs)
+        async with _ms_parallel_sem:
+            resp = await _orig_request(self, method, str_or_url, **kwargs)
         if resp.status != 429:
             await _ms_yield_if_low(resp.headers)
             return resp
@@ -331,7 +342,8 @@ def _install_ms_throttle_patch() -> None:
         resp.release()
         await asyncio.sleep(pause)
         await _ms_throttle(weight)
-        resp = await _orig_request(self, method, str_or_url, **kwargs)
+        async with _ms_parallel_sem:
+            resp = await _orig_request(self, method, str_or_url, **kwargs)
         if resp.status == 429:
             await _record_429()
         return resp
@@ -361,7 +373,8 @@ def _install_httpx_ms_throttle_patch() -> None:
             return await _orig_send(self, request, **kwargs)
         weight = _request_weight(str(request.url))
         await _ms_throttle(weight)
-        resp = await _orig_send(self, request, **kwargs)
+        async with _ms_parallel_sem:
+            resp = await _orig_send(self, request, **kwargs)
         if resp.status_code != 429:
             await _ms_yield_if_low(resp.headers)
             return resp
@@ -370,7 +383,8 @@ def _install_httpx_ms_throttle_patch() -> None:
         await resp.aclose()
         await asyncio.sleep(pause)
         await _ms_throttle(weight)
-        resp = await _orig_send(self, request, **kwargs)
+        async with _ms_parallel_sem:
+            resp = await _orig_send(self, request, **kwargs)
         if resp.status_code == 429:
             await _record_429()
         return resp
@@ -1043,9 +1057,10 @@ async def get_manager_stats_ms(manager_tag: str, active_days: int = 60) -> dict:
                                 return cp_id
                 return None
 
-            # Запускаем батчами по 10
-            for i in range(0, len(cp_list), 10):
-                batch = cp_list[i:i+10]
+            # Батчами по 2: МС держит не больше 5 одновременных запросов на
+            # пользователя, общих для всех сервисов (шторм 1073, 30.09.2026)
+            for i in range(0, len(cp_list), 2):
+                batch = cp_list[i:i+2]
                 results = await _asyncio.gather(*[check_cp(cp_id) for cp_id in batch])
                 for r in results:
                     if r:
