@@ -224,7 +224,71 @@ async def _approve(bot, req_id: int, price: float, from_status: tuple[str, ...],
     else:
         logger.warning("price request %s: chat_id менеджера '%s' не найден – пуш пропущен",
                        req_id, row["manager_tag"])
+    try:
+        await _amend_order_alerts(bot, row, price)
+    except Exception as e:
+        logger.warning("price request %s: правка светофора заказа не удалась (%r)", req_id, e)
     return row
+
+
+ALERT_WINDOW_HOURS = 48     # светофор старше двух суток уже не правим
+
+
+async def _amend_order_alerts(bot, req: dict, price: float) -> None:
+    """Заказ ушёл в светофор раньше, чем согласовали цену – дополняем светофор пометкой.
+
+    Кейс 30.09.2026, заказ 04460: алерт собственнику ушёл в 16:48, цены по нему согласованы
+    в 16:48:53–16:49:30 – позиции в сообщении так и остались красными. Берём открытые
+    светофоры за последние двое суток, пересчитываем по каждому блок цены тем же кодом, что
+    и сам светофор (`compute_price_color` + `apply_dashboard_approvals`: клиент сверяется по
+    id/ИНН в МойСкладе, объём – с допуском, запрос помечается использованным этим заказом).
+    Если наш запрос попал в «согласовано» – дописываем строку и шлём короткое уведомление
+    (правка сообщения уведомления не даёт).
+    """
+    alerts = _all("""SELECT id, order_id, order_name, alert_text, owner_messages, owner_approved_at
+                     FROM pending_approval_alerts
+                     WHERE closed_at IS NULL AND order_id IS NOT NULL
+                       AND sent_at > now() - (%s || ' hours')::interval
+                     ORDER BY id DESC LIMIT 8""", (str(ALERT_WINDOW_HOURS),))
+    if not alerts:
+        return
+    from moysklad import MS_BASE, compute_price_color
+    from notifier import _fmt_money
+    from bot import _edit_owner_messages, _approval_kb, _notify_owners
+    for a in alerts:
+        text = a.get("alert_text") or ""
+        if not text or f"(№{req['id']})" in text:
+            continue
+        try:
+            calc = await compute_price_color(f"{MS_BASE}/entity/customerorder/{a['order_id']}")
+            calc = apply_dashboard_approvals(calc, a["order_name"])
+        except Exception as e:
+            logger.warning("price request %s: заказ %s не пересчитан (%r)", req["id"], a["order_name"], e)
+            continue
+        hit = next((it for it in (calc.get("dashboard_items") or [])
+                    if it.get("dashboard_id") == req["id"]), None)
+        if not hit:
+            continue
+        new_text = (f"{text}\n✅ *Согласовано в дашборде* (№{req['id']}): "
+                    f"{(hit.get('name') or _sku(req))[:48]} – {_fmt_money(hit['order_price'])} ₽ "
+                    f"при прайсе {_fmt_money(hit['min_price'])} ₽")
+        try:
+            done = await _edit_owner_messages(
+                bot, a, new_text, _approval_kb(a["id"], with_ok=not a.get("owner_approved_at")))
+        except Exception as e:
+            logger.warning("price request %s: светофор %s не поправлен (%r)", req["id"], a["order_name"], e)
+            continue
+        if not done:
+            continue
+        _one("UPDATE pending_approval_alerts SET alert_text=%s WHERE id=%s", (new_text, a["id"]))
+        logger.info("price request %s: светофор заказа %s дополнен", req["id"], a["order_name"])
+        try:
+            await _notify_owners(bot, a, f"✅ Заказ {a['order_name']}: цена {_rub(price)} ₽ по позиции "
+                                         f"{_sku(req)} согласована в дашборде (№{req['id']}).")
+        except Exception as e:
+            logger.warning("price request %s: уведомление по заказу %s не ушло (%r)",
+                           req["id"], a["order_name"], e)
+        return      # заказ один – дальше не ищем
 
 
 async def handle_price_request_callback(update, context):
