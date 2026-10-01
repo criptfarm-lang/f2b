@@ -6919,6 +6919,8 @@ def main():
         # аварийная раскладка без Логистики (09.09.2026): без неё в закрытом
         # Wialon логист вообще не может собрать маршрут — команда обязана жить.
         "/dispatch", "/раскладка",
+        # дашборд развозки (автораспределение по машинам, 01.10.2026): личная ссылка
+        "/razvozka", "/развозка",
         "/registry", "/реестр",
         "/sklad", "/склад",
         "/progress", "/ход",
@@ -7420,6 +7422,11 @@ def main():
         manual_route.register(app, db)
     except Exception as e:
         logger.exception(f"manual_route.register упал: {e}")
+    try:
+        import dispatch_link
+        dispatch_link.register(app)
+    except Exception as e:
+        logger.exception(f"dispatch_link.register упал: {e}")
     try:
         import delivery_statuses
         delivery_statuses.register(app, db)
