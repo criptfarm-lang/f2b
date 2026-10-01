@@ -2088,7 +2088,7 @@ def batch_progress(db, campaign: str) -> list:
         GROUP BY assignee_amo_id ORDER BY assignee_amo_id""", (campaign,))
 
 
-AMO_NAMES = {11544494: "Скляр", 12625622: "Баласанян", 12788698: "Мерзлякова",
+AMO_NAMES = {11544494: "Скляр", 12625622: "Баласанян", 12788698: "Белов",
              13665786: "Коликов", 13746010: "Дьяченко"}
 
 

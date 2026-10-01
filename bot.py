@@ -92,11 +92,9 @@ EMPLOYEES = {
         "карина", "карины", "карине", "карину", "кариной",
         "баласанян",
     ],
-    "Елена Мерзлякова": [
-        "елена", "елены", "елене", "елену", "еленой",
-        "мерзлякова", "мерзляковой", "мерзлякову",
-        "марзлякова", "марзляковой",
-        "лена", "лены", "лене", "лену", "леной",
+    "Руслан Белов": [
+        "руслан", "руслана", "руслану", "русланом",
+        "белов", "белова", "белову", "беловым",
     ],
     "Денис Коликов": [
         "денис", "дениса", "денису", "денисом",
@@ -111,7 +109,7 @@ EMPLOYEES = {
 # Менеджеры отдела продаж — "всем менеджерам"
 MOP_MANAGERS = [
     "Карина Баласанян",
-    "Елена Мерзлякова",
+    "Руслан Белов",
     "Инесса Скляр",
     "Ирина Дьяченко",
     "Денис Коликов",
@@ -807,7 +805,7 @@ async def handle_wazzup_link_callback(update: Update, context: ContextTypes.DEFA
             return
         pending["segment"] = segment
         # Спрашиваем менеджера
-        MANAGERS = ["Баласанян К.", "Дьяченко И.", "Мерзлякова Е.", "Скляр И.", "Иванов А."]
+        MANAGERS = ["Баласанян К.", "Дьяченко И.", "Белов Р.", "Скляр И.", "Иванов А."]
         buttons = [[InlineKeyboardButton(m, callback_data=f"wazzup_mgr|{m}|{link_key}")] for m in MANAGERS]
         await query.message.edit_text(
             f"✅ Сегмент: *{segment}*\n\nОтветственный менеджер?",
@@ -1973,13 +1971,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_MANAGER_TAGS = {
             "карина": "баласанян", "баласанян": "баласанян",
             "инесса": "скляр", "скляр": "скляр",
-            "елена": "мерзлякова", "мерзлякова": "мерзлякова",
+            "руслан": "белов", "белов": "белов",
                         "ирина": "дьяченко", "дьяченко": "дьяченко",
         }
         USER_MANAGER_DISPLAY = {
             "баласанян": "Карина Баласанян",
             "скляр": "Инесса Скляр",
-            "мерзлякова": "Елена Мерзлякова",
+            "белов": "Руслан Белов",
             "дьяченко": "Ирина Дьяченко",
         }
         full_name_lower = user.full_name.lower()
@@ -2083,7 +2081,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"👥 *Покупатели {found_name}* за {period_days} дней ({len(buyers)}):\n"]
 
         MANAGER_TAG_MAP = {
-            "баласанян": "Карина Баласанян", "мерзлякова": "Елена Мерзлякова",
+            "баласанян": "Карина Баласанян", "белов": "Руслан Белов",
             "скляр": "Инесса Скляр", "дьяченко": "Ирина Дьяченко",
         }
         SPEC_TAGS = {"опт", "хорека", "розница"}
@@ -2393,7 +2391,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "инесса": "скляр", "скляр": "скляр", "скляр инесса ионасовна": "скляр",
             "карина": "баласанян", "баласанян": "баласанян", "баласанян карина владимировна": "баласанян",
                         "ирина": "дьяченко", "дьяченко": "дьяченко",
-            "елена": "мерзлякова", "лена": "мерзлякова", "мерзлякова": "мерзлякова", "мерзлякова елена владимировна": "мерзлякова",
+            "руслан": "белов", "белов": "белов", "белов руслан владимирович": "белов",
         }
         if manager_filter:
             manager_filter = NAME_MAP.get(manager_filter.lower(), manager_filter.split()[0].lower() if manager_filter else manager_filter)
@@ -3290,7 +3288,7 @@ async def cmd_pdz_html(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_pdz_overdue_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/pdz_overdue_test <тег>` — печатает первые 5 строк просрочки менеджера.
-    Тег — фамилия в нижнем регистре (скляр, баласанян, мерзлякова, дьяченко, коликов).
+    Тег — фамилия в нижнем регистре (скляр, баласанян, белов, дьяченко, коликов).
     Доступ — только собственник."""
     user = update.effective_user
     if not user or user.id != OWNER_CHAT_ID:
@@ -3770,7 +3768,7 @@ async def cmd_test_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     TAGS = {
         "скляр":      "Инесса",
-        "мерзлякова": "Елена",
+        "белов": "Руслан",
         "баласанян":  "Карина",
         "дьяченко":  "Ирина",
     }
@@ -4027,7 +4025,7 @@ async def cmd_refresh_history(update: Update, context: ContextTypes.DEFAULT_TYPE
         from moysklad import get_manager_monthly_history
         TAGS = {
             "скляр": "Инесса Скляр",
-            "мерзлякова": "Елена Мерзлякова",
+            "белов": "Руслан Белов",
             "баласанян": "Карина Баласанян",
             "дьяченко": "Ирина Дьяченко",
         }
@@ -4110,7 +4108,7 @@ async def cmd_lost_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     MANAGERS = {
         "скляр":      "Инесса",
-        "мерзлякова": "Елена",
+        "белов": "Руслан",
         "баласанян":  "Карина",
         "дьяченко":  "Ирина",
     }
@@ -4241,7 +4239,7 @@ async def cmd_new_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     MANAGERS = {
         "скляр":      "Инесса",
-        "мерзлякова": "Елена",
+        "белов": "Руслан",
         "баласанян":  "Карина",
         "дьяченко":  "Ирина",
     }
@@ -4466,7 +4464,7 @@ async def sync_contact_managers() -> int:
 
     TAG_TO_NAME = {
         "скляр":      "Инесса Скляр",
-        "мерзлякова": "Елена Мерзлякова",
+        "белов": "Руслан Белов",
         "баласанян":  "Карина Баласанян",
         "дьяченко":   "Ирина Дьяченко",
     }
@@ -4544,7 +4542,7 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     from moysklad import get_aging_clients
     MANAGER_TAG_MAP = {
-        "баласанян": "Карина", "мерзлякова": "Елена",
+        "баласанян": "Карина", "белов": "Руслан",
         "скляр": "Инесса", "дьяченко": "Ирина",
     }
 
@@ -5451,7 +5449,7 @@ async def _build_report_data() -> dict:
         facts[mgr_name]["attracted"] = attracted.get(mgr_name, 0.0)
         facts[mgr_name]["lost_clients"] = lost.get(mgr_name, 0)
 
-    TAGS = {"скляр":"Инесса Скляр","мерзлякова":"Елена Мерзлякова","баласанян":"Карина Баласанян","дьяченко":"Ирина Дьяченко","коликов":"Денис Коликов","кормилицын":"Антон Кормилицын"}
+    TAGS = {"скляр":"Инесса Скляр","белов":"Руслан Белов","баласанян":"Карина Баласанян","дьяченко":"Ирина Дьяченко","коликов":"Денис Коликов","кормилицын":"Антон Кормилицын"}
 
     # История по месяцам (кэшируется раз в месяц)
     from moysklad import get_manager_monthly_history
@@ -5575,21 +5573,21 @@ async def _build_report_data() -> dict:
         "2026-10": {
             "Инесса Скляр":     {"shipments": 170, "revenue": 22_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
             "Карина Баласанян": {"shipments": 170, "revenue": 6_500_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
-            "Елена Мерзлякова": {"shipments": 55,  "revenue": 8_000_000,  "clients": 20, "new_clients": 5, "attracted": 300_000},
+            "Руслан Белов":     {"shipments": 55,  "revenue": 8_000_000,  "clients": 20, "new_clients": 5, "attracted": 300_000},
             "Ирина Дьяченко":   {"shipments": 10,  "revenue": 4_500_000,  "clients": 5,  "new_clients": 1, "attracted": 12_500},
             "Денис Коликов":    {"shipments": 30,  "revenue": 11_000_000, "clients": 15, "new_clients": 5, "attracted": 50_000},
         },
         "2026-11": {
             "Инесса Скляр":     {"shipments": 170, "revenue": 23_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
             "Карина Баласанян": {"shipments": 170, "revenue": 7_000_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
-            "Елена Мерзлякова": {"shipments": 55,  "revenue": 10_000_000, "clients": 20, "new_clients": 5, "attracted": 300_000},
+            "Руслан Белов":     {"shipments": 55,  "revenue": 10_000_000, "clients": 20, "new_clients": 5, "attracted": 300_000},
             "Ирина Дьяченко":   {"shipments": 10,  "revenue": 5_500_000,  "clients": 5,  "new_clients": 1, "attracted": 12_500},
             "Денис Коликов":    {"shipments": 30,  "revenue": 12_000_000, "clients": 15, "new_clients": 5, "attracted": 50_000},
         },
         "2026-12": {
             "Инесса Скляр":     {"shipments": 170, "revenue": 24_000_000, "clients": 28, "new_clients": 5, "attracted": 1_000_000},
             "Карина Баласанян": {"shipments": 170, "revenue": 7_500_000,  "clients": 44, "new_clients": 5, "attracted": 1_100_000},
-            "Елена Мерзлякова": {"shipments": 55,  "revenue": 12_000_000, "clients": 20, "new_clients": 5, "attracted": 300_000},
+            "Руслан Белов":     {"shipments": 55,  "revenue": 12_000_000, "clients": 20, "new_clients": 5, "attracted": 300_000},
             "Ирина Дьяченко":   {"shipments": 10,  "revenue": 6_500_000,  "clients": 5,  "new_clients": 1, "attracted": 12_500},
             "Денис Коликов":    {"shipments": 30,  "revenue": 13_000_000, "clients": 15, "new_clients": 5, "attracted": 50_000},
         },
@@ -5640,11 +5638,11 @@ async def _build_report_data() -> dict:
     WEEKLY_PLANS = {
         "Инесса Скляр":     {"shipments": 25,  "revenue": 2_000_000,  "clients": 10, "new_clients": 1, "attracted": 250_000},
         "Карина Баласанян": {"shipments": 40,  "revenue": 1_200_000,  "clients": 16, "new_clients": 1, "attracted": 275_000},
-        "Елена Мерзлякова": {"shipments": 10,  "revenue": 1_000_000,  "clients": 5,  "new_clients": 1, "attracted": 75_000},
+        "Руслан Белов":     {"shipments": 10,  "revenue": 1_000_000,  "clients": 5,  "new_clients": 1, "attracted": 75_000},
         "Ирина Дьяченко":   {"shipments": 1,   "revenue": 50_000,     "clients": 1,  "new_clients": 1, "attracted": 12_500},
         "Денис Коликов":    {"shipments": 1,   "revenue": 50_000,     "clients": 1,  "new_clients": 1, "attracted": 12_500},
     }
-    SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Елена Мерзлякова":"Елена","Ирина Дьяченко":"Ирина","Денис Коликов":"Денис","Антон Кормилицын":"Антон"}
+    SHORT_NAMES = {"Инесса Скляр":"Инесса","Карина Баласанян":"Карина","Руслан Белов":"Руслан","Ирина Дьяченко":"Ирина","Денис Коликов":"Денис","Антон Кормилицын":"Антон"}
 
     # Загружаем накопительные недельные цели из БД (set_weekly) — перекрывают WEEKLY_PLANS
     weekly_targets = {}
@@ -6154,7 +6152,7 @@ async def cmd_set_attestation(update: Update, context: ContextTypes.DEFAULT_TYPE
     NAME_MAP = {
         "инесса": "Инесса Скляр", "скляр": "Инесса Скляр",
         "карина": "Карина Баласанян", "баласанян": "Карина Баласанян",
-        "елена": "Елена Мерзлякова", "лена": "Елена Мерзлякова", "мерзлякова": "Елена Мерзлякова",
+        "руслан": "Руслан Белов", "белов": "Руслан Белов",
         "ирина": "Ирина Дьяченко", "дьяченко": "Ирина Дьяченко",
         "денис": "Денис Коликов", "коликов": "Денис Коликов",
     }
@@ -6236,7 +6234,7 @@ def get_weekly_targets(mgr_name: str) -> dict:
 _MGR_NAME_MAP = {
     "инесса": "Инесса Скляр", "скляр": "Инесса Скляр",
     "карина": "Карина Баласанян", "баласанян": "Карина Баласанян",
-    "елена": "Елена Мерзлякова", "лена": "Елена Мерзлякова", "мерзлякова": "Елена Мерзлякова",
+    "руслан": "Руслан Белов", "белов": "Руслан Белов",
     "ирина": "Ирина Дьяченко", "дьяченко": "Ирина Дьяченко",
     "денис": "Денис Коликов", "коликов": "Денис Коликов",
 }
@@ -8751,7 +8749,6 @@ def main():
 
 # Маппинг менеджеров МойСклад → Telegram (username или телефон)
 MANAGERS_CONTACTS = {
-    "Мерзлякова Елена Владимировна":   "+79920035102",
     "Баласанян Карина Владимировна":   "@fatbob183",
     "Скляр Инесса Ионасовна":          "+79622522903",
 }
