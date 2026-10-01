@@ -210,6 +210,12 @@ def ensure_tables(db) -> None:
                    ON sales_dialog_leads (campaign, status)""")
     db._execute("""CREATE INDEX IF NOT EXISTS sales_dialog_messages_lead_idx
                    ON sales_dialog_messages (campaign, lead_id, created_at)""")
+    # Отбор очереди ищет переписку лида по chat_id. Без индекса каждый тик
+    # перебирал всю wazzup_messages по нескольку раз на лид, упирался в
+    # statement_timeout и держал event loop бота по 50 с – водители не могли
+    # открыть чеклист маршрута (29.09–01.10.2026). На бою создан CONCURRENTLY.
+    db._execute("""CREATE INDEX IF NOT EXISTS idx_wazzup_messages_chat_sent
+                   ON wazzup_messages (chat_id, sent_at DESC)""")
 
 
 def _load_cfg(db, campaign: str) -> dict:

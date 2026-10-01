@@ -37,7 +37,11 @@ class Database:
             self._dsn,
             cursor_factory=psycopg2.extras.RealDictCursor,
             connect_timeout=CONNECT_TIMEOUT_SEC,
-            options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS}",
+            # jit=off: на запросах с коррелированными подзапросами планировщик
+            # завышает стоимость, Postgres включает JIT и 5 с из 5,4 тратит на
+            # компиляцию (очередь агента продаж, 01.10.2026; без JIT – 10 мс).
+            # Драйвер синхронный, эти секунды стоит весь бот.
+            options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS} -c jit=off",
         )
         conn.autocommit = False
         return conn
