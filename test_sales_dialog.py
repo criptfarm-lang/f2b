@@ -1086,3 +1086,88 @@ def test_note_initiative_sets_interval_within_bounds():
     nxt = datetime.fromisoformat(channel_policy(db)["next_at"]["telegram"])
     assert WED_11 + timedelta(minutes=20) <= nxt <= WED_11 + timedelta(minutes=45)
     assert channel_policy(db)["limits"]["max"] == 0      # умолчания не затёрты
+
+
+# ── правки по разбору 23.09–02.10.2026 ───────────────────────────────────────
+class ClaimDB(FakeDB):
+    """Карточку уже захватил параллельный вызов: UPDATE … RETURNING пуст."""
+
+    def _fetchone(self, sql, params=None):
+        if "verdict='sending'" in sql:
+            return None
+        return super()._fetchone(sql, params)
+
+
+def test_double_send_delivers_once():
+    """Двойное «Отправить»: второй вызов не захватывает карточку и не шлёт."""
+    db = ClaimDB({"msg": _msg(), "lead": {"all_chat_ids": ["1"], "chat_id": "1"}, "fresh": None})
+    sent = []
+
+    async def fake_deliver(db_, session, msg, text):
+        sent.append(text)
+        return True, "ok"
+
+    orig = sales_dialog._deliver
+    sales_dialog._deliver = fake_deliver
+    try:
+        ok, info = asyncio.run(sales_dialog._do_send(db, 7, "текст"))
+    finally:
+        sales_dialog._deliver = orig
+    assert not ok and "уже отправляется" in info and sent == []
+
+
+def test_send_failure_on_exception_marks_failed():
+    """Сеть упала посреди отправки – карточка не зависает в 'sending'."""
+    db = FakeDB({"msg": _msg(), "lead": {"all_chat_ids": ["1"], "chat_id": "1"}, "fresh": None})
+
+    async def boom(db_, session, msg, text):
+        raise TimeoutError("wazzup")
+
+    orig = sales_dialog._deliver
+    sales_dialog._deliver = boom
+    try:
+        ok, info = asyncio.run(sales_dialog._do_send(db, 7, "текст"))
+    finally:
+        sales_dialog._deliver = orig
+    assert not ok and "TimeoutError" in info
+    assert any("send_failed" in sql for sql, _ in db.executed)
+
+
+def test_price_above_promise_caught():
+    from sales_dialog import check_promises
+    promised = {"40089": {"price": 2550.0, "name": "Сёмга Трим Д Мурманск", "date": "23.09"}}
+    draft = {"price_claims": [{"code": "40089", "price": 2850.0}]}
+    problems = check_promises(draft, promised)
+    assert problems and "2550" in problems[0] and "23.09" in problems[0]
+
+
+def test_price_below_or_equal_promise_ok():
+    from sales_dialog import check_promises
+    promised = {"40089": {"price": 2550.0, "name": "x", "date": "23.09"}}
+    assert check_promises({"price_claims": [{"code": "40089", "price": 2490.0}]}, promised) == []
+    assert check_promises({"price_claims": [{"code": "40089", "price": 2550.0}]}, promised) == []
+    assert check_promises({"price_claims": [{"code": "14001", "price": 9999.0}]}, promised) == []
+
+
+def test_promised_prices_takes_lowest():
+    from sales_dialog import promised_prices
+
+    class RowsDB(FakeDB):
+        def _fetchall(self, sql, params=None):
+            t = datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc)
+            return [{"price_claims": [{"code": "40089", "name": "Сёмга", "price": 2650}], "sent_at": t},
+                    {"price_claims": '[{"code": "40089", "name": "Сёмга", "price": 2490}]',
+                     "sent_at": t + timedelta(days=1)},
+                    {"price_claims": None, "sent_at": t}]
+
+    got = promised_prices(RowsDB({}), 1)
+    assert got["40089"]["price"] == 2490 and got["40089"]["date"] == "02.10"
+
+
+def test_bare_no_is_soft_refusal():
+    from sales_dialog import refusal_kind
+    assert refusal_kind("Нет") == "soft"
+    assert refusal_kind("нет.") == "soft"
+    assert refusal_kind("Пока не нужно, спасибо") == "soft"
+    assert refusal_kind("нет в наличии форели?") is None
+    assert refusal_kind("а с/с вообще не используем") is None   # отказ от формата – не отказ

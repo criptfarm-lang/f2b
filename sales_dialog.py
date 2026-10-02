@@ -280,7 +280,9 @@ HARD_STOP_RE = re.compile(
     r"не\s+пиш(и|ите)|больше\s+не\s+пиш|не\s+беспоко|отпиш(и|ите)|удалите|"
     r"хватит\s+писать|прекратите|не\s+присылайте|\bспам", re.I)
 SOFT_STOP_RE = re.compile(
-    r"не\s*актуальн|не\s+интересн|не\s+интересует|не\s+нужн|не\s+требуется|не\s+надо", re.I)
+    r"не\s*актуальн|не\s+интересн|не\s+интересует|не\s+нужн|не\s+требуется|не\s+надо|"
+    # Голое «Нет» – тоже отказ (Озон Вкус 30.09.2026), «нет в наличии» – нет.
+    r"^\s*нет[\s.!)]*$", re.I)
 SPAM_RE = re.compile(r"\bспам", re.I)
 WAZZUP_TRANSPORT = {"tgapi": "telegram", "telegram": "telegram", "max": "max",
                     "whatsapp": "whatsapp"}
@@ -325,7 +327,7 @@ def initiatives_used(db) -> dict:
         SELECT coalesce(chat_type, 'telegram') AS ch, count(*) AS n
         FROM sales_dialog_messages
         WHERE (inbound_message_id LIKE %s OR inbound_message_id LIKE %s)
-          AND verdict IN ('draft', 'edited', 'sent')
+          AND verdict IN ('draft', 'edited', 'sending', 'sent')
           AND created_at >= date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')
                             AT TIME ZONE 'Europe/Moscow'
         GROUP BY 1""", ("silent:%", "first:%"))
@@ -1012,7 +1014,7 @@ def _pending_first(db, campaign: str) -> list:
           AND NOT EXISTS (
               SELECT 1 FROM sales_dialog_messages d
               WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
-                AND (d.verdict IN ('sent', 'draft', 'edited', 'skipped', 'handed', 'taken')
+                AND (d.verdict IN ('sent', 'sending', 'draft', 'edited', 'skipped', 'handed', 'taken')
                      OR d.created_at >= date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')
                                         AT TIME ZONE 'Europe/Moscow'))
           AND NOT EXISTS (
@@ -1334,6 +1336,14 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
             "\nТы пишешь ПЕРВЫМ. Без ссылок и файлов. Закончи мягким выходом своими словами, "
             "например «если сейчас неактуально – скажите, не буду беспокоить»; формулировку "
             "каждый раз меняй, одинаковый хвост во многих чатах мессенджер считает спамом.")
+    # «Нет», «пока не нужно» в ответ на наше предложение: ещё одно предложение
+    # следом читается как напор (Озон Вкус, Берсеневка, 28–30.09.2026) и
+    # приближает жалобу на спам. Отказ от формата или позиции сюда не попадает.
+    if row.get("source") == "inbound" and refusal_kind(row.get("inbound_text")) == "soft":
+        first_touch_note += (
+            "\nКЛИЕНТ ОТКАЗАЛСЯ («не нужно», «нет»). Ответь одной короткой строкой: прими "
+            "отказ и оставь дверь открытой. Без новой позиции, без цены и без вопроса.")
+    promised = promised_prices(db, row["lead_id"])
     user = f"""ПЕРЕПИСКА (последнее сообщение {days} дн. назад):
 {safe if safe.strip() else "— переписки нет, это первое обращение к клиенту"}
 
@@ -1349,6 +1359,9 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
 {worked if worked else "— статистики пока нет"}
 {first_touch_note}
 
+ЦЕНЫ, КОТОРЫЕ ЭТОМУ КЛИЕНТУ УЖЕ НАЗВАНЫ В ЭТОМ МЕСЯЦЕ (выше не называй, даже если справочник подрос, – обещание держим):
+{format_promised(promised)}
+
 ДОСТАВКА:
 {delivery_note(city)}
 
@@ -1363,7 +1376,7 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
     return {"system": system_prompt(persona), "persona": persona,
             "user": user, "images": images, "leaks": leaks,
             "prices": {p["code"]: p for p in prices},
-            "last_inbound": last_in, "names": names, "city": city}
+            "last_inbound": last_in, "names": names, "city": city, "promised": promised}
 
 
 # ─── генерация ────────────────────────────────────────────────────────────────
@@ -1541,6 +1554,56 @@ def check_prices(draft: dict, prices: dict, allowed: set | None = None) -> list:
             continue
         problems.append(f"в тексте число {num.strip()} ₽, не объявленное в price_claims")
     return problems
+
+
+def promised_prices(db, lead_id: int) -> dict:
+    """Цены, которые агент уже назвал этому клиенту в текущем месяце.
+
+    Агент обещает «держу цену при заказе до конца месяца», поэтому в пределах
+    месяца цена по позиции может только снижаться. Берём только сообщения,
+    ушедшие без правки: в исправленном тексте цифры могли поменяться, а
+    `price_claims` описывают черновик. Код → самая низкая названная цена.
+    """
+    rows = db._fetchall("""SELECT price_claims, sent_at FROM sales_dialog_messages
+        WHERE lead_id=%s AND verdict='sent' AND final_text = draft_text
+          AND sent_at >= date_trunc('month', now() AT TIME ZONE 'Europe/Moscow')
+                         AT TIME ZONE 'Europe/Moscow'
+        ORDER BY sent_at""", (lead_id,))
+    out: dict = {}
+    for r in rows:
+        claims = r.get("price_claims")
+        if isinstance(claims, str):
+            claims = json.loads(claims or "null")
+        for c in claims or []:
+            code, price = str(c.get("code") or ""), c.get("price")
+            if not code or not price:
+                continue
+            if code not in out or float(price) < out[code]["price"]:
+                out[code] = {"price": float(price), "name": c.get("name") or code,
+                             "date": r["sent_at"].astimezone(MSK).strftime("%d.%m")}
+    return out
+
+
+def check_promises(draft: dict, promised: dict) -> list:
+    """Цена выше уже обещанной клиенту – не отправлять.
+
+    23.09.2026 Кибер дому за полчаса назвали по одной позиции 2850, потом 2550,
+    а 28.09 – 2490: клиент видит три цены и перестаёт верить любой.
+    """
+    problems = []
+    for c in draft.get("price_claims") or []:
+        was = promised.get(str(c.get("code")))
+        if was and float(c["price"]) > was["price"] + 0.01:
+            problems.append(f"{c['code']}: {was['date']} клиенту уже назвали {was['price']:.0f}, "
+                            f"сейчас {float(c['price']):.0f} – выше обещанного")
+    return problems
+
+
+def format_promised(promised: dict) -> str:
+    if not promised:
+        return "— в этом месяце цен клиенту не называли"
+    return "\n".join(f"— {v['name']} (код {k}): {v['price']:.0f} ₽/кг, названо {v['date']}"
+                     for k, v in promised.items())
 
 
 DASHBOARD_URL = os.getenv("FISHKI_URL", "https://fishki.f2b.group")
@@ -2193,7 +2256,8 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
         draft["action"] = "escalate"
         draft["reason"] = "модель не написала текст ответа – нужен человек"
     problems = (check_prices(draft, ctx["prices"], allowed_numbers(ctx.get("city")))
-                + check_style(draft["text"], ctx["persona"]["gender"]))
+                + check_style(draft["text"], ctx["persona"]["gender"])
+                + check_promises(draft, ctx.get("promised") or {}))
     # Ссылка в сообщении первым – один из признаков спама для мессенджеров.
     if is_initiative(row) and LINK_RE.search(draft["text"]):
         problems.append("в сообщении первым есть ссылка")
@@ -2466,8 +2530,20 @@ async def _do_send(db, row_id: int, text: str) -> tuple[bool, str]:
         db._execute("UPDATE sales_dialog_messages SET verdict='stale' WHERE id=%s", (row_id,))
         return False, ("клиент ответил после черновика: «"
                        + (fresh.get("text") or "")[:120] + "» – ответ пересобираю")
-    async with aiohttp.ClientSession() as session:
-        ok, info = await _deliver(db, session, msg, text)
+    # Захват карточки одним UPDATE: бот обрабатывает нажатия параллельно
+    # (concurrent_updates), и двойное «Отправить» проходило проверку verdict
+    # дважды – 28–29.09.2026 «Фарш» и «Калачи» получили одно сообщение два раза
+    # с разницей 27 мс. Отправляет только тот вызов, который карточку захватил.
+    claimed = db._fetchone("""UPDATE sales_dialog_messages SET verdict='sending'
+                              WHERE id=%s AND verdict=%s RETURNING id""",
+                           (row_id, msg["verdict"]))
+    if not claimed:
+        return False, "черновик уже отправляется"
+    try:
+        async with aiohttp.ClientSession() as session:
+            ok, info = await _deliver(db, session, msg, text)
+    except Exception as e:
+        ok, info = False, f"{type(e).__name__}: {e}"
     if ok:
         db._execute("""UPDATE sales_dialog_messages SET verdict='sent', final_text=%s, sent_at=now()
                        WHERE id=%s""", (text, row_id))
