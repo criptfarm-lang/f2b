@@ -157,13 +157,15 @@ def setup_scheduler(app: Application, db):
     # 16:00 МСК — сводка по листу контроля дебиторки собственнику в личку
     # (план 2026-09-09). После 15:05 owner_pending, чтобы не сталкиваться с
     # ПДЗ-потоком, и до конца банковского дня 16:00 — приходы за день уже видны.
-    scheduler.add_job(
-        control_list_daily_job,
-        CronTrigger(hour=16, minute=0, timezone=MSK),
-        args=[app, db],
-        id="control_list_daily_1600",
-        misfire_grace_time=3600, coalesce=True,
-    )
+    # Выключена собственником 02.10.2026. Метка в светофоре согласований и
+    # команды /control_* работают; чтобы вернуть сводку – раскомментировать.
+    # scheduler.add_job(
+    #     control_list_daily_job,
+    #     CronTrigger(hour=16, minute=0, timezone=MSK),
+    #     args=[app, db],
+    #     id="control_list_daily_1600",
+    #     misfire_grace_time=3600, coalesce=True,
+    # )
 
     # ПТ 08:00 МСК — пересчёт «% работы на новых клиентах» (MTD) и запись
     # снимка в bot_settings.op_new_share_snapshot. Виджет в /op_report читает
