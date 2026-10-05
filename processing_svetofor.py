@@ -65,6 +65,16 @@ create table if not exists production.processing_svetofor_log (
     analiz_sent_at timestamptz,
     updated_at     timestamptz default now()
 );
+-- Очередь дневной сводки собственнику (05.10.2026, опись сообщений бота, п. 4):
+-- карточки копятся здесь и уходят одним сообщением в DIGEST_HOUR_MSK.
+create table if not exists production.processing_svetofor_digest (
+    processing_id  uuid primary key,
+    name           text,
+    color          text,
+    text_html      text,
+    queued_at      timestamptz default now(),
+    sent_at        timestamptz
+);
 """
 
 
@@ -422,6 +432,14 @@ async def _patch_state(pid: str, state_name: str):
         r.raise_for_status()
 
 
+def _buttons(pid: str, prefix: str = "") -> list[InlineKeyboardButton]:
+    return [
+        InlineKeyboardButton(f"{prefix}✅ Проверено", callback_data=f"svf:ok:{pid}"),
+        InlineKeyboardButton(f"{prefix}Выход" if prefix else "Проверить выход", callback_data=f"svf:vy:{pid}"),
+        InlineKeyboardButton(f"{prefix}Разобраться", callback_data=f"svf:rz:{pid}"),
+    ]
+
+
 def keyboard(pid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Проверено", callback_data=f"svf:ok:{pid}"),
@@ -483,8 +501,19 @@ async def handle_svetofor_callback(update, context):
             doc = await _ms_get(f"/entity/processing/{pid}", {"expand": "state"})
             await _upsert_snapshot(pid, doc.get("name"), doc["moment"], "Проверено")
         _log_upsert(pid, None, state_name, analiz=False)
-        base = q.message.text or ""
-        await q.edit_message_text(f"{base}\n\n→ отмечено: {state_name}", reply_markup=None)
+        rows = (q.message.reply_markup.inline_keyboard if q.message.reply_markup else [])
+        if len(rows) > 1:
+            # Дневная сводка: убираем только строку кнопок этой операции.
+            left = [r for r in rows if not any((b.callback_data or "").endswith(pid) for b in r)]
+            num = next((b.text.split()[0] for r in rows for b in r
+                        if (b.callback_data or "").endswith(pid)), "")
+            await q.edit_message_text(
+                f"{q.message.text_html}\n{html.escape(num)} → отмечено: {state_name}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(left) if left else None)
+        else:
+            await q.edit_message_text(f"{q.message.text_html}\n\n→ отмечено: {state_name}",
+                                      parse_mode="HTML", reply_markup=None)
     except Exception as e:  # noqa: BLE001
         logger.error(f"svetofor callback {action} {pid}: {e}")
         # callback уже отвечен — кнопки оставляем для повтора, ошибку отдельным сообщением
@@ -499,8 +528,10 @@ async def handle_svetofor_callback(update, context):
 
 # ── детект + отправка ────────────────────────────────────────────────────────
 def _recipients() -> list[int]:
+    """Кому карточка уходит сразу. Собственнику – только в дневной сводке
+    (05.10.2026, опись сообщений бота, п. 4)."""
     ids = []
-    for env in ("OWNER_CHAT_ID", "PARTNER_CHAT_ID"):
+    for env in ("PARTNER_CHAT_ID",):
         v = (os.getenv(env) or "").strip()
         if v.lstrip("-").isdigit():
             ids.append(int(v))
@@ -565,8 +596,6 @@ async def poll_job(app, db=None):
         return
 
     recipients = _recipients()
-    owner = (os.getenv("OWNER_CHAT_ID") or "").strip()
-    owner_id = int(owner) if owner.isdigit() else None
     sent = 0
     for r in rows:
         pid = r["id"]
@@ -586,9 +615,8 @@ async def poll_job(app, db=None):
             snap["comment"] = r.get("description")  # комментарий техоперации → под чертой курсивом
             text, parse_mode = render(snap)
             for chat_id in recipients:
-                kb = keyboard(pid) if chat_id == owner_id else None  # кнопки только Виктору
-                await app.bot.send_message(chat_id=chat_id, text=text,
-                                           reply_markup=kb, parse_mode=parse_mode)
+                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+            _digest_enqueue(pid, r.get("name"), text, parse_mode)
             _log_upsert(pid, r.get("name"), state, analiz=(state == ANALIZ_STATE))
             sent += 1
             logger.info(f"svetofor: №{r.get('name')} [{reason}] отправлен ({len(recipients)} получат.)")
@@ -596,3 +624,62 @@ async def poll_job(app, db=None):
             logger.error(f"svetofor: №{r.get('name')} ошибка: {e}")
     if sent:
         logger.info(f"svetofor poll: отправлено {sent}")
+
+
+# ── Дневная сводка собственнику ──────────────────────────────────────────────
+DIGEST_HOUR_MSK = 18
+DIGEST_LIMIT = 3800
+_COLOR_RANK = {"🔴": 0, "🟡": 1, "⚪": 2, "🟢": 3}
+
+
+def _digest_enqueue(pid, name, text, parse_mode):
+    text_html = text if parse_mode == "HTML" else html.escape(text, quote=False)
+    color = text[:1] if text[:1] in _COLOR_RANK else "⚪"
+    with _db().cursor() as cur:
+        cur.execute("""
+            insert into production.processing_svetofor_digest
+              (processing_id, name, color, text_html, queued_at, sent_at)
+            values (%s, %s, %s, %s, now(), null)
+            on conflict (processing_id) do update set
+              name=excluded.name, color=excluded.color, text_html=excluded.text_html,
+              queued_at=now(), sent_at=null
+        """, (pid, name, color, text_html))
+
+
+async def digest_job(app):
+    """Раз в день: все накопленные карточки одним сообщением, красные сверху.
+    Под каждой операцией – строка кнопок. Пустой день – тишина."""
+    owner = (os.getenv("OWNER_CHAT_ID") or "").strip()
+    if not owner.isdigit():
+        return
+    with _db().cursor() as cur:
+        cur.execute("""select processing_id, name, color, text_html
+                       from production.processing_svetofor_digest
+                       where sent_at is null order by queued_at""")
+        items = cur.fetchall()
+    if not items:
+        return
+    items.sort(key=lambda r: _COLOR_RANK.get(r["color"], 2))
+    counts = {c: sum(1 for r in items if r["color"] == c) for c in ("🔴", "🟡", "🟢", "⚪")}
+    head = (f"🏭 <b>Техоперации за день – {len(items)}</b>  "
+            + " ".join(f"{c}{n}" for c, n in counts.items() if n))
+
+    # Делим на сообщения по лимиту; кнопки – только у операций этого сообщения.
+    messages, cur_text, cur_rows = [], head, []
+    for r in items:
+        block = f"\n\n{r['text_html']}"
+        if len(cur_text) + len(block) > DIGEST_LIMIT and cur_rows:
+            messages.append((cur_text, cur_rows))
+            cur_text, cur_rows = "🏭 <b>Техоперации за день (продолжение)</b>", []
+        cur_text += block
+        cur_rows.append(_buttons(str(r["processing_id"]), prefix=f"№{r['name']} "))
+    messages.append((cur_text, cur_rows))
+
+    for text, rows in messages:
+        await app.bot.send_message(chat_id=int(owner), text=text, parse_mode="HTML",
+                                   reply_markup=InlineKeyboardMarkup(rows))
+    with _db().cursor() as cur:
+        cur.execute("update production.processing_svetofor_digest set sent_at=now() "
+                    "where processing_id = any(%s::uuid[])",
+                    ([str(r["processing_id"]) for r in items],))
+    logger.info(f"svetofor digest: {len(items)} операций, {len(messages)} сообщ.")

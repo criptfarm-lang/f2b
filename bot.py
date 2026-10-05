@@ -7594,6 +7594,22 @@ def main():
 
     app.job_queue.run_repeating(_processing_svetofor_wrapper, interval=1800, first=60)
 
+    # Дневная сводка техопераций собственнику – 18:00 МСК = 15:00 UTC
+    # (05.10.2026, опись сообщений бота, п. 4; вместо карточки на каждую операцию).
+    from processing_svetofor import digest_job as _processing_svetofor_digest
+    from datetime import time as _svf_time, timezone as _svf_tz
+
+    async def _processing_svetofor_digest_wrapper(context):
+        try:
+            await _processing_svetofor_digest(app)
+        except Exception as e:
+            logger.error(f"processing_svetofor digest: {e}", exc_info=True)
+
+    app.job_queue.run_daily(
+        _processing_svetofor_digest_wrapper,
+        time=_svf_time(hour=15, minute=0, tzinfo=_svf_tz.utc),
+    )
+
     # ────────────────────────────────────────────────────────────────────
     # Светофор Заказа поставщику — polling каждые 10 мин (webhook по
     # purchaseorder МС не шлёт). План: 2026-07-09-светофор-заказа-поставщику.
