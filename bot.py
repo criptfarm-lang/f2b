@@ -7911,6 +7911,10 @@ def main():
                 save_signals(db, signals)
             except Exception as e:
                 logger.warning(f"chat_digest job: save_signals: {e}")
+            # 05.10.2026: без сигналов не пишем (опись сообщений, п. 9).
+            if not signals:
+                logger.info("chat_digest job: сигналов нет, сообщение не шлём")
+                return
             text = render_digest(signals, "за сутки")
             # доставка Виктору (чанкинг по лимиту Telegram)
             limit = 3800
@@ -7942,7 +7946,9 @@ def main():
 
     async def _ms_task_pings_job(context):
         try:
-            stats = await _ms_task_pings_poll(app, owner_chat_id=OWNER_CHAT_ID)
+            # 05.10.2026: копия «затянувшихся просрочек» собственнику выключена
+            # (опись сообщений, п. 10) – исполнители получают свои списки сами.
+            stats = await _ms_task_pings_poll(app, owner_chat_id=None)
             if stats:
                 logger.info(f"ms_task_pings job: {stats}")
         except Exception as e:

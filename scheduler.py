@@ -133,14 +133,16 @@ def setup_scheduler(app: Application, db):
         misfire_grace_time=3600, coalesce=True,
     )
 
-    # 15:05 МСК — пинг собственнику по необработанным после дедлайна 15:00 (Фаза 4).
-    scheduler.add_job(
-        _pdz_run_and_record,
-        CronTrigger(hour=15, minute=5, timezone=MSK),
-        args=["pdz_send_owner_pending_1505", pdz_send_owner_pending_job, app, db],
-        id="pdz_send_owner_pending_1505",
-        misfire_grace_time=3600, coalesce=True,
-    )
+    # 15:05 МСК — сводка «Просрочка на 16:00» собственнику. Выключена 05.10.2026
+    # по решению собственника (опись сообщений, п. 15); убрана и из catch-up ниже.
+    # Вернуть – раскомментировать здесь и в pdz_jobs.
+    # scheduler.add_job(
+    #     _pdz_run_and_record,
+    #     CronTrigger(hour=15, minute=5, timezone=MSK),
+    #     args=["pdz_send_owner_pending_1505", pdz_send_owner_pending_job, app, db],
+    #     id="pdz_send_owner_pending_1505",
+    #     misfire_grace_time=3600, coalesce=True,
+    # )
 
     # 13:05 МСК — регенерация HTML-отчёта «Дебиторка» (Фаза 5).
     # Идёт после 12:52 (эскалация) и 13:00 (дайджесты
@@ -183,13 +185,16 @@ def setup_scheduler(app: Application, db):
     # API копирует последнюю SENT прайс-кампанию, патчит PDF/href/дату/subject,
     # шлёт Виктору TG-сообщение с inline-кнопкой «Запланировать» которая идёт
     # в handle_dashamail_callback (bot.py).
-    scheduler.add_job(
-        dashamail_weekly_send_job,
-        CronTrigger(day_of_week='mon', hour=9, minute=0, timezone=MSK),
-        args=[app, db],
-        id="dashamail_weekly_send_mon_09",
-        misfire_grace_time=3600, coalesce=True,
-    )
+    # Выключено 05.10.2026 по решению собственника (опись сообщений, п. 20):
+    # email-рассылка прайса остановлена с 13.08, сообщение в понедельник лишнее.
+    # Вернуть – раскомментировать.
+    # scheduler.add_job(
+    #     dashamail_weekly_send_job,
+    #     CronTrigger(day_of_week='mon', hour=9, minute=0, timezone=MSK),
+    #     args=[app, db],
+    #     id="dashamail_weekly_send_mon_09",
+    #     misfire_grace_time=3600, coalesce=True,
+    # )
 
     # ПН 09:30 МСК — еженедельная сводка по рекламе Я.Директ в ЛС собственнику.
     # План: 2026-08-10-еженедельная-сводка-директа-в-боте.md, Фаза 4.
@@ -329,10 +334,9 @@ async def fishki_reminder_job(app: Application, db) -> dict:
     for buyer in ("belyakova", "kristina"):
         await _send(buyer, ASSIGNEE_TG.get(buyer), text_buyers)
 
-    # Собственник + партнёр (логистика) — тот же текст без дашборда. id из env.
-    _owner = os.getenv("OWNER_CHAT_ID")
+    # Партнёр (логистика) — тот же текст без дашборда. id из env.
+    # Собственнику не шлём с 05.10.2026 (опись сообщений, п. 25).
     _partner = os.getenv("PARTNER_CHAT_ID")
-    await _send("viktor", int(_owner) if _owner else None, text_buyers)
     await _send("malanchuk", int(_partner) if _partner else None, text_buyers)
 
     logger.info(f"fishki_reminder_job завершена: {report}")
@@ -569,7 +573,7 @@ async def pdz_catch_up_missed_jobs(app: Application, db):
     # пропадали. См. retro 2026-06-04.
     pdz_jobs = [
         ("pdz_send_digests_1300",        13,  0, pdz_send_digests_job),
-        ("pdz_send_owner_pending_1505",  15,  5, pdz_send_owner_pending_job),
+        # ("pdz_send_owner_pending_1505",  15,  5, pdz_send_owner_pending_job),  # выкл 05.10.2026
         ("pdz_snapshot_1245",            12, 45, pdz_take_snapshot_job),
         ("pdz_snapshot_1250",            12, 50, pdz_take_snapshot_job),
         ("pdz_process_events_1252",      12, 52, pdz_process_events_job),
@@ -735,7 +739,11 @@ async def pdz_process_events_job(app: Application, db):
         initial_changes = await audit_ppm_initial_changes(today_rows, yesterday_rows)
         logger.info(f"pdz_process_events_job: ppm_initial изменений: {len(initial_changes)}")
 
-        if initial_changes:
+        # Алерт собственнику «Изменена ИСХОДНАЯ дата оплаты» выключен 05.10.2026
+        # по решению собственника (разбор потока сообщений бота, опись
+        # tasks/2026-10-05-опись-сообщений-бота-собственнику.md, п. 12).
+        # Аудит считается и пишется в лог; вернуть пуш – убрать `False and`.
+        if False and initial_changes:
             owner_raw = os.getenv("OWNER_CHAT_ID")
             if not owner_raw:
                 logger.warning("pdz_process_events_job: OWNER_CHAT_ID не задан, алерты не отправлены")
@@ -995,7 +1003,9 @@ async def _pdz_escalate_by_payment_gap(app: Application, db, today_rows: list) -
                 summary["errors"].append(f"prepay:{aid}:{e}")
 
     # ── Одно сводное сообщение собственнику по всем новым автостопам ────
-    if owner_id and (stop_alerts or prepay_alerts):
+    # Выключено 05.10.2026 по решению собственника (опись сообщений, п. 13):
+    # сам автостоп работает, сообщение не шлём. Вернуть – убрать `False and`.
+    if False and owner_id and (stop_alerts or prepay_alerts):
         parts: list = ["🚫 *Автостоп по ПДЗ*"]
         if prepay_alerts:
             parts.append(f"\n*Только предоплата* ({len(prepay_alerts)}):")
@@ -1351,15 +1361,9 @@ async def pdz_generate_html_job(app: Application, db) -> dict:
     dashboard_base = os.getenv("DASHBOARD_URL", "https://f2b-fishki-victor03.amvera.io").rstrip("/")
     url = f"{dashboard_base}/dashboard?tab=pdz"
 
-    try:
-        await app.bot.send_message(
-            chat_id=owner_id,
-            text=f"📊 Дебиторка обновлена: {url}",
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        logger.error(f"pdz_generate_html_job: send_message: {e}")
-        return {"status": "error_send", "error": str(e), "url": url}
+    # Пуш «📊 Дебиторка обновлена: <ссылка>» собственнику выключен 05.10.2026
+    # (опись сообщений, п. 14): действия не требует, дашборд и так обновлён.
+    # Алерт при падении рендера выше оставлен.
 
     logger.info(
         f"pdz_generate_html_job: html={len(html_text)} симв, url={url}"

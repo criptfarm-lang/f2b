@@ -261,7 +261,8 @@ def _tomorrow_noon() -> datetime:
 async def _alert_owner_once(bot, key: str, text: str) -> None:
     if _q("insert into public.fishki_prize_alerts(key) values (%s) on conflict do nothing returning key", (key,)) is None:
         return
-    owner_chat = int(os.getenv("OWNER_CHAT_ID", "0") or 0)
+    # 05.10.2026: из лички собственника – в группу «F2B PRO» (опись сообщений, п. 35).
+    owner_chat = int(os.getenv("FISHKI_PRIZE_ALERT_CHAT_ID", "-4824850517"))
     try:
         await bot.send_message(chat_id=owner_chat, text=text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:

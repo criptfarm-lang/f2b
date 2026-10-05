@@ -254,7 +254,7 @@ async def _amend_order_alerts(bot, req: dict, price: float) -> None:
         return
     from moysklad import MS_BASE, compute_price_color
     from notifier import _fmt_money
-    from bot import _edit_owner_messages, _approval_kb, _notify_owners
+    from bot import _edit_owner_messages, _approval_kb
     for a in alerts:
         text = a.get("alert_text") or ""
         if not text or f"(№{req['id']})" in text:
@@ -282,12 +282,9 @@ async def _amend_order_alerts(bot, req: dict, price: float) -> None:
             continue
         _one("UPDATE pending_approval_alerts SET alert_text=%s WHERE id=%s", (new_text, a["id"]))
         logger.info("price request %s: светофор заказа %s дополнен", req["id"], a["order_name"])
-        try:
-            await _notify_owners(bot, a, f"✅ Заказ {a['order_name']}: цена {_rub(price)} ₽ по позиции "
-                                         f"{_sku(req)} согласована в дашборде (№{req['id']}).")
-        except Exception as e:
-            logger.warning("price request %s: уведомление по заказу %s не ушло (%r)",
-                           req["id"], a["order_name"], e)
+        # Отдельное сообщение «✅ цена согласована в дашборде» согласующим
+        # выключено 05.10.2026 (опись сообщений, п. 31): светофор выше уже
+        # дополнен строкой о согласовании, повтор не нужен.
         return      # заказ один – дальше не ищем
 
 

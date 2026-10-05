@@ -2308,6 +2308,15 @@ def _owner_id() -> int:
     return int(os.environ["OWNER_CHAT_ID"])
 
 
+def _supervisor_id() -> int:
+    """Кому идут карточки без менеджера и служебные уведомления агента.
+
+    С 05.10.2026 – Руслан Белов, а не собственник (опись сообщений бота, п. 8).
+    Собственник по-прежнему может нажимать кнопки любой карточки.
+    """
+    return int(os.getenv("SALES_DIALOG_SUPERVISOR_CHAT_ID", "555437878"))
+
+
 def _card_text(db, msg: dict) -> str:
     lead = db._fetchone("""SELECT lead_name, contact_name, chat_type, chat_id FROM sales_dialog_leads
                            WHERE campaign=%s AND lead_id=%s""", (msg["campaign"], msg["lead_id"]))
@@ -2369,8 +2378,8 @@ def card_recipient(db, msg: dict) -> tuple[int, int | None]:
     chat = MANAGER_TG.get(amo) if amo else None
     if not chat:
         if amo:
-            logger.warning("sales_dialog: Telegram менеджера %s неизвестен, карточка собственнику", amo)
-        return _owner_id(), None
+            logger.warning("sales_dialog: Telegram менеджера %s неизвестен, карточка руководителю агента", amo)
+        return _supervisor_id(), None
     return chat, amo
 
 
@@ -2492,7 +2501,7 @@ def newer_inbound(db, msg: dict) -> dict | None:
 
 async def notify_owner(app, text: str) -> None:
     try:
-        await app.bot.send_message(_owner_id(), text)
+        await app.bot.send_message(_supervisor_id(), text)
     except Exception as e:
         logger.warning("sales_dialog: уведомление не ушло: %s", e)
 
@@ -2571,7 +2580,7 @@ def register(app, db) -> None:
         # по своей партии. Чужую карточку нажать нельзя.
         card = db._fetchone("SELECT assignee_amo_id FROM sales_dialog_messages WHERE id=%s",
                             (row_id,)) or {}
-        allowed = {_owner_id()}
+        allowed = {_owner_id(), _supervisor_id()}
         card_amo = card.get("assignee_amo_id")
         if card_amo and MANAGER_TG.get(card_amo):
             allowed.add(MANAGER_TG[card_amo])
@@ -2641,7 +2650,7 @@ def register(app, db) -> None:
                                   WHERE tg_message_id=%s""", (reply_to.message_id,))
             # Правит тот, кому карточка адресована: у менеджеров партии свои.
             amo = (row or {}).get("assignee_amo_id")
-            mine = who == _owner_id() or (bool(amo) and MANAGER_TG.get(amo) == who)
+            mine = who in (_owner_id(), _supervisor_id()) or (bool(amo) and MANAGER_TG.get(amo) == who)
             row_id = (row or {}).get("id") if mine else None
         if not row_id:
             pending = context.user_data.get("sd_edit_row")
@@ -2671,4 +2680,4 @@ def register(app, db) -> None:
     # Правку пишет тот, кому пришла карточка: собственник или менеджер партии.
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND
-        & filters.User([_owner_id(), *MANAGER_TG.values()]), on_edit_reply), group=-1)
+        & filters.User([_owner_id(), _supervisor_id(), *MANAGER_TG.values()]), on_edit_reply), group=-1)

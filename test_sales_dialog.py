@@ -669,12 +669,14 @@ def test_card_goes_to_assigned_manager():
     assert chat == sales_dialog.MANAGER_TG[13665786] and amo == 13665786
 
 
-def test_card_without_assignee_goes_to_owner(monkeypatch):
+def test_card_without_assignee_goes_to_supervisor(monkeypatch):
+    # С 05.10.2026 карточка без менеджера идёт Белову, а не собственнику.
     from sales_dialog import card_recipient
     monkeypatch.setenv("OWNER_CHAT_ID", "777")
+    monkeypatch.delenv("SALES_DIALOG_SUPERVISOR_CHAT_ID", raising=False)
     db = FakeDB({"lead": {"assignee_amo_id": None}})
     chat, amo = card_recipient(db, _msg(assignee_amo_id=None))
-    assert chat == 777 and amo is None
+    assert chat == 555437878 and amo is None
 
 
 def test_progress_line_counts_done(monkeypatch):
