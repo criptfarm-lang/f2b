@@ -56,6 +56,10 @@ def _owner_chat_id() -> int:
     return int(os.getenv("OWNER_CHAT_ID", "0") or 0)
 
 
+def _partner_chat_id() -> int:
+    return int(os.getenv("PARTNER_CHAT_ID", "772630562") or 0)  # Маланчук
+
+
 # Логисты (равный доступ + рассылки): 8267564735 Белякова,
 # 1296942948 Боева А. (с 09.09.2026 — забирает логистику).
 # Петровский В. снят с логистики 07.09.2026 — id убран из дефолта.
@@ -1259,7 +1263,7 @@ async def _alert_claim(context, row):
             f"Описание: {row.get('claim_text') or '—'}")
     if row.get("manager_tag"):
         text += f"\nМенеджер: {row.get('manager_tag')}"
-    recipients = [*_logist_chat_ids(), _owner_chat_id(), mgr_chat]
+    recipients = [*_logist_chat_ids(), _partner_chat_id(), mgr_chat]
     await _send_alert(context, recipients, text, photo_file_id=row.get("claim_photo_file_id"))
 
 

@@ -376,7 +376,7 @@ async def _idle_alert(bot, unit_name, info):
             f"Стоит на месте ~{info['idle_min']} мин (с {since}) — не база и не адрес клиента.\n"
             f"Точка: {info['lat']:.4f},{info['lon']:.4f}\n{link}")
     seen = set()
-    for cid in [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()]:
+    for cid in [*_logist_chat_ids(), _partner_chat_id()]:
         if not cid or cid in seen:
             continue
         seen.add(cid)
@@ -396,7 +396,7 @@ async def _route_end_alert(bot, unit_name, info, n_open=0):
             f"{open_line}"
             f"Точка: {info['lat']:.4f},{info['lon']:.4f}\n{link}")
     seen = set()
-    for cid in [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()]:
+    for cid in [*_logist_chat_ids(), _partner_chat_id()]:
         if not cid or cid in seen:
             continue
         seen.add(cid)
@@ -407,10 +407,10 @@ async def _route_end_alert(bot, unit_name, info, n_open=0):
 
 
 def _unload_recipients() -> list:
-    """Контролёры выгрузки: Саша(Белякова)+Виктор+Александр(Маланчук)
-    = owner + логисты + партнёр, с дедупом (Белякова уже среди логистов)."""
+    """Контролёры выгрузки: логисты + Александр(Маланчук), с дедупом.
+    Собственник логистические алерты не получает (решение 05.10.2026)."""
     seen = []
-    for cid in [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()]:
+    for cid in [*_logist_chat_ids(), _partner_chat_id()]:
         if cid and cid not in seen:
             seen.append(cid)
     return seen
@@ -803,14 +803,14 @@ async def run_check(db, bot=None, preview=False) -> list:
                                    demand_id=d["demand_id"], unit_id=uid)
 
             # ── Факт: окно приёмки ПРОШЛО, точка не сдана ──
-            # Владелец + логисты + Маланчук + ответственный менеджер клиента (чтобы менеджер
+            # Логисты + Маланчук + ответственный менеджер клиента (чтобы менеджер
             # сразу позвонил). Отдельный дедуп (fact_alerted) — НЕ глушится ранним прогнозом.
             if fact_misses:
                 lines.append(f"{name}: окно прошло, не сдано — точек: {len(fact_misses)}")
                 if bot and not preview:
                     for d in fact_misses:
                         _tag, mgr = _manager_chat(d["agent_tags"])
-                        recips = [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()]
+                        recips = [*_logist_chat_ids(), _partner_chat_id()]
                         if mgr:
                             recips.append(mgr)
                         await _window_passed_alert(bot, name, d["s"], now_ts, recips)
@@ -975,7 +975,7 @@ async def _write_fail_alert(bot, unit_name, order_no, client, cur, target, has_m
     text = (f"🛑 Статус в МойСклад НЕ записан\n{unit_name} №{order_no} {client or ''}\n"
             f"{cur} → {target}: {reason}.\nПроверьте отгрузку вручную.")
     seen = set()
-    for cid in [_owner_chat_id(), *_logist_chat_ids()]:
+    for cid in [*_logist_chat_ids(), _partner_chat_id()]:
         if not cid or cid in seen:
             continue
         seen.add(cid)
@@ -998,7 +998,7 @@ async def _lag_alert(bot, unit_name, lag_min, behind, now_ts):
             f"Даже с плавающими окнами день под угрозой — все точки можно не успеть.\n"
             f"Позади плана ({len(behind)}):\n{rows}")
     seen = set()
-    for cid in [_owner_chat_id(), *_logist_chat_ids(), _partner_chat_id()]:
+    for cid in [*_logist_chat_ids(), _partner_chat_id()]:
         if not cid or cid in seen:
             continue
         seen.add(cid)
