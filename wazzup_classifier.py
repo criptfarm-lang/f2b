@@ -355,7 +355,6 @@ async def _send_request_alert(
     kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ В работу", callback_data=f"wzc:ok:{mid}"),
-            InlineKeyboardButton("🔎 Контроль", callback_data=f"wzc:ctl:{mid}"),
         ],
         [
             InlineKeyboardButton("🐟 Наш ас-т", callback_data=f"wzc:our:{mid}"),
@@ -519,7 +518,7 @@ async def run_classification_batch(db, force: bool = False, bot_app=None) -> dic
                 # («запросы по номенклатуре больше мне в личку не отправляй»).
                 # Заявка по-прежнему пишется в procurement.assortment_requests
                 # и видна в дашборде закупок — теряется только триаж кнопками
-                # «В работу / Контроль / Наш ас-т / Ложный» из TG.
+                # «В работу / Наш ас-т / Ложный» из TG.
                 # Вернуть = раскомментировать вызов ниже (получатель в
                 # _send_request_alert — OWNER_CHAT_ID; чтобы слать закупщику,
                 # менять там же).

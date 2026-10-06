@@ -3571,55 +3571,6 @@ async def cmd_pdz_nopay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             part, parse_mode="Markdown", disable_web_page_preview=True
         )
 
-async def cmd_assortment_hits(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """`/assortment_hits [YYYY-MM]` — сверка «Наш ас-т» за месяц.
-
-    По нажатиям кнопки «🐟 Наш ас-т» проверяет: отгрузили ли клиенту
-    запрошенную позицию после нажатия (amoCRM компания → ИНН → отгрузки МС).
-    Без аргумента — текущий месяц по сегодня. Доступ — только собственник.
-    План 2026-07-01-кнопка-наш-ас-т-запрос-номенклатуры.md (Фаза B).
-    """
-    user = update.effective_user
-    if not user or user.id != OWNER_CHAT_ID:
-        return
-    if not update.message:
-        return
-
-    from datetime import date as _date
-    import calendar as _cal
-    import assortment_hits
-
-    arg = (context.args[0].strip() if context.args else "")
-    today = _date.today()
-    try:
-        if arg:
-            y, m = arg.split("-")
-            y, m = int(y), int(m)
-        else:
-            y, m = today.year, today.month
-        period_from = _date(y, m, 1)
-        # period_to = конец месяца всегда (стабильный ключ upsert; МС вернёт
-        # отгрузки только по сегодня, будущий верхний предел безвреден).
-        period_to = _date(y, m, _cal.monthrange(y, m)[1])
-    except Exception:
-        await update.message.reply_text("Формат: /assortment_hits 2026-06")
-        return
-
-    await update.message.reply_text("⏳ Считаю сверку «Наш ас-т»…")
-    try:
-        results = await assortment_hits.compute_assortment_hits(db, period_from, period_to)
-    except Exception as e:
-        logger.error(f"cmd_assortment_hits: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка сверки: {type(e).__name__}: {e}")
-        return
-
-    text = assortment_hits.format_hits_report(results, period_from, period_to)
-    for i in range(0, len(text), 3800):
-        await update.message.reply_text(
-            text[i:i + 3800], parse_mode="Markdown", disable_web_page_preview=True
-        )
-
-
 async def cmd_snimi_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """`/snimi_stop <agent_id | часть_имени>` — снять стоп-флаг (Фаза 6).
 
@@ -7078,44 +7029,9 @@ def main():
         except ValueError:
             return
         if action == "ctl":
-            # «🔎 Контроль» = наш ассортимент, берём на контроль отгрузки.
-            # Помечаем строку статусом our_assortment; в конце месяца пайплайн
-            # сверки (compute_assortment_hits) проверит, отгрузили ли клиенту
-            # запрошенную позицию после нажатия. Результат — на вкладке
-            # «Контроль» в дашборде закупок. См. план
-            # plans/2026-07-01-кнопка-наш-ас-т-запрос-номенклатуры.md.
-            ar = db._fetchone(
-                """SELECT status, converted_request_id
-                   FROM procurement.assortment_requests
-                   WHERE wazzup_message_id = %s""",
-                (message_id,),
-            )
-            if ar and ar["status"] == "converted":
-                await q.edit_message_text(
-                    q.message.text
-                    + f"\n\n📋 Уже создана заявка #{ar['converted_request_id']} — «Контроль» не применён.",
-                    parse_mode=None,
-                )
-                return
-            db._execute(
-                """UPDATE procurement.assortment_requests
-                   SET status='our_assortment', status_changed_at=NOW(),
-                       status_changed_by=%s
-                   WHERE wazzup_message_id = %s""",
-                (q.from_user.full_name or "owner", message_id),
-            )
-            # Классификатор сработал верно (реальный запрос по номенклатуре)
-            # → feedback='confirmed' для re-train.
-            db._execute(
-                """UPDATE wazzup_classifications
-                   SET feedback = 'confirmed'
-                   WHERE message_id = %s""",
-                (message_id,),
-            )
-            await q.edit_message_text(
-                q.message.text + "\n\n🔎 Взято на контроль — сверим отгрузку.",
-                parse_mode=None,
-            )
+            # «🔎 Контроль» отключён 06.10.2026 (собственник: вкладка «Контроль» больше
+            # не нужна). Кнопка осталась только на старых карточках в чате.
+            await q.edit_message_text(q.message.text + "\n\n🔎 Контроль отключён.", parse_mode=None)
             return
         if action == "our":
             # «🐟 Наш ас-т» = это наш ассортимент, ничего делать не нужно —
@@ -7276,7 +7192,6 @@ def main():
 
     app.add_handler(CallbackQueryHandler(handle_wzc_callback, pattern="^wzc:"))
     # Сверка «Наш ас-т» за месяц (только собственник) — Фаза B плана 2026-07-01.
-    app.add_handler(CommandHandler("assortment_hits", cmd_assortment_hits))
 
     # ─── DashaMail weekly: «Запланировать» из cron-уведомления ──────────────
     async def handle_dashamail_callback(update, context):
@@ -8054,34 +7969,6 @@ def main():
 
     app.job_queue.run_repeating(_wazzup_freshness_check, interval=3600, first=600)
 
-    # ────────────────────────────────────────────────────────────────────
-    # Авто-пересчёт «Контроль» (assortment hits). Кнопка «🔎 Контроль» в
-    # карточке запроса пишет status='our_assortment', но вкладку «Контроль»
-    # в дашборде закупок наполняет только пересчёт (compute_assortment_hits).
-    # Раньше он был только ручной командой /assortment_hits, которую по факту
-    # не запускали → вкладка вечно «нет данных» несмотря на нажатия.
-    # Теперь считаем автоматически текущий месяц: first=120 (сид сразу после
-    # деплоя) + каждые 3 часа (отгрузки клиенту появляются в течение дня).
-    # План 2026-07-01-кнопка-наш-ас-т-запрос-номенклатуры.md («осталось: cron»).
-    # ────────────────────────────────────────────────────────────────────
-    async def _assortment_hits_recompute(context):
-        from datetime import date as _date
-        import calendar as _cal
-        import assortment_hits
-        try:
-            today = _date.today()
-            period_from = _date(today.year, today.month, 1)
-            period_to = _date(today.year, today.month,
-                              _cal.monthrange(today.year, today.month)[1])
-            res = await assortment_hits.compute_assortment_hits(
-                db, period_from, period_to)
-            logger.info(f"assortment_hits recompute: {len(res)} rows "
-                        f"for {period_from:%Y-%m}")
-        except Exception as e:
-            logger.error(f"_assortment_hits_recompute: {e}", exc_info=True)
-
-    app.job_queue.run_repeating(
-        _assortment_hits_recompute, interval=3 * 3600, first=120)
 
     # Запускаем webhook-сервер и polling параллельно
     import aiohttp.web as web

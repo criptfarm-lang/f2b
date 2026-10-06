@@ -683,35 +683,8 @@ class Database:
                 days INT,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )""",
-            # ── Сверка «Наш ас-т» (план 2026-07-01-кнопка-наш-ас-т, Фаза B) ──
-            # Результаты: отгрузили ли клиенту запрошенную позицию после нажатия
-            # кнопки «🐟 Наш ас-т». Считает бот, вкладка в дашборде закупок читает.
-            # Схема procurement + assortment_requests уже созданы .sql-миграцией.
-            """CREATE TABLE IF NOT EXISTS procurement.assortment_hit_results (
-                id                    BIGSERIAL PRIMARY KEY,
-                assortment_request_id BIGINT NOT NULL
-                    REFERENCES procurement.assortment_requests(id) ON DELETE CASCADE,
-                contact_name          TEXT,
-                species_normalized    TEXT,
-                sku_or_description     TEXT,
-                clicked_at            TIMESTAMPTZ,
-                amo_company_name      TEXT,
-                inn                   TEXT,
-                ms_counterparty       TEXT,
-                match_confidence      TEXT NOT NULL DEFAULT 'unmatched',
-                shipped               BOOLEAN NOT NULL DEFAULT FALSE,
-                shipped_qty           NUMERIC,
-                shipped_sum           NUMERIC,
-                first_shipment_date   DATE,
-                amocrm_contact_id     BIGINT,
-                period_from           DATE NOT NULL,
-                period_to             DATE NOT NULL,
-                computed_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (assortment_request_id, period_from, period_to)
-            )""",
-            "CREATE INDEX IF NOT EXISTS idx_assortment_hit_results_period ON procurement.assortment_hit_results (period_from, period_to, computed_at DESC)",
-            # ссылка на карточку контакта amoCRM (диалог) — добавлено 2026-07-08
-            "ALTER TABLE procurement.assortment_hit_results ADD COLUMN IF NOT EXISTS amocrm_contact_id BIGINT",
+            # Сверка «Контроль» (procurement.assortment_hit_results) снята 06.10.2026 –
+            # таблица в базе осталась с историей, бот её больше не создаёт и не пополняет.
             # Лист контроля дебиторки (план 2026-09-09). Карточки МС, по которым
             # собственник держит руку на пульсе: метка в светофоре согласований +
             # ежедневная сводка 16:00. group_key = ИНН — несколько карточек одного
