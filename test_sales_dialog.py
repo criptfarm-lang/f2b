@@ -284,6 +284,8 @@ class FakeDB:
         self.executed = []
 
     def _fetchone(self, sql, params=None):
+        if "d.sent_at IS NOT NULL" in sql:
+            return self.rows.get("manual")
         if "sales_dialog_leads" in sql:
             return self.rows.get("lead")
         if "wazzup_messages" in sql:
@@ -1173,3 +1175,64 @@ def test_bare_no_is_soft_refusal():
     assert refusal_kind("Пока не нужно, спасибо") == "soft"
     assert refusal_kind("нет в наличии форели?") is None
     assert refusal_kind("а с/с вообще не используем") is None   # отказ от формата – не отказ
+
+
+# ── менеджер пишет сам – агент уходит (06.10.2026, Карина и «Николай 23 век») ──
+def test_draft_not_sent_if_manager_wrote_meanwhile():
+    """Пока карточка ждала, менеджер написал клиенту руками – не отправляем, лид снимаем."""
+    db = FakeDB({"msg": _msg(), "lead": {"all_chat_ids": ["1"], "chat_id": "1"}, "fresh": None,
+                 "manual": {"text": "У вас новый проект?"}})
+    sent = {}
+
+    async def fake_deliver(db_, session, msg, text):
+        sent["text"] = text
+        return True, "ok"
+
+    orig = sales_dialog._deliver
+    sales_dialog._deliver = fake_deliver
+    try:
+        ok, info = asyncio.run(sales_dialog._do_send(db, 7, "текст"))
+    finally:
+        sales_dialog._deliver = orig
+    assert not ok and "менеджер уже пишет" in info and not sent
+    sqls = " ".join(x[0] for x in db.executed)
+    assert "status='handed'" in sqls and "verdict='stale'" in sqls
+
+
+def test_newer_open_lead_found(monkeypatch):
+    """Новая открытая сделка на контакте у живого менеджера – агенту туда нельзя."""
+    from datetime import datetime, timezone
+
+    async def fake_get(session, path, params=None):
+        return {"_embedded": {"leads": [{"id": 43522723}, {"id": 44791145}]}}
+
+    async def fake_lead(session, lid):
+        return {"id": lid, "status_id": 1, "responsible_user_id": 12625622,
+                "created_at": int(datetime(2026, 10, 6, tzinfo=timezone.utc).timestamp())}
+
+    monkeypatch.setattr(sales_dialog, "_amo_get", fake_get)
+    monkeypatch.setattr(sales_dialog, "_amo_lead", fake_lead)
+    db = FakeDB({"lead": {"created_at": datetime(2026, 9, 25, tzinfo=timezone.utc)}})
+    row = {"campaign": "c", "lead_id": 43522723, "contact_id": 71194697}
+    other = asyncio.run(sales_dialog.newer_open_lead(None, db, row))
+    assert other and other["id"] == 44791145
+
+
+def test_newer_open_lead_ignores_closed_and_old(monkeypatch):
+    from datetime import datetime, timezone
+
+    async def fake_get(session, path, params=None):
+        return {"_embedded": {"leads": [{"id": 1}, {"id": 2}]}}
+
+    async def fake_lead(session, lid):
+        if lid == 1:   # закрыта
+            return {"id": 1, "status_id": 143, "responsible_user_id": 5,
+                    "created_at": int(datetime(2026, 10, 6, tzinfo=timezone.utc).timestamp())}
+        return {"id": 2, "status_id": 1, "responsible_user_id": 5,   # старше пула
+                "created_at": int(datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp())}
+
+    monkeypatch.setattr(sales_dialog, "_amo_get", fake_get)
+    monkeypatch.setattr(sales_dialog, "_amo_lead", fake_lead)
+    db = FakeDB({"lead": {"created_at": datetime(2026, 9, 25, tzinfo=timezone.utc)}})
+    row = {"campaign": "c", "lead_id": 3, "contact_id": 9}
+    assert asyncio.run(sales_dialog.newer_open_lead(None, db, row)) is None

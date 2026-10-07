@@ -202,6 +202,10 @@ def ensure_tables(db) -> None:
                    ADD COLUMN IF NOT EXISTS ping_count INT NOT NULL DEFAULT 0""")
     db._execute("""ALTER TABLE sales_dialog_messages
                    ADD COLUMN IF NOT EXISTS pinged_at TIMESTAMPTZ""")
+    # Кто нажал кнопку по карточке (Telegram id): 06.10.2026 разбирали, кто
+    # отправил ответ агента поверх диалога Карины, – в базе этого не было.
+    db._execute("""ALTER TABLE sales_dialog_messages
+                   ADD COLUMN IF NOT EXISTS decided_by BIGINT""")
     # Телефон из заявки: у трети сайт-лидов чата в мессенджере нет, и первое
     # сообщение уходит в Telegram по номеру (проверено 29.09.2026).
     db._execute("""ALTER TABLE sales_dialog_leads
@@ -1934,6 +1938,11 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     # Протухшие карточки гасим до отбора: иначе одна неразобранная блокирует
     # очередь до конца дня (25.09.2026 так встали все партии после 11:28).
     await expire_stale(app, db, campaign)
+    # Человек сам написал в чат лида – агент из диалога уходит навсегда, до
+    # отбора очереди: иначе ответ клиента менеджеру подхватит `_pending_inbound`.
+    for t in _manual_takeovers(db, campaign):
+        release_to_human(db, campaign, t["lead_id"],
+                         f"менеджер пишет клиенту сам ({t['sent_at']:%d.%m %H:%M} UTC)")
     await nudge(app, db, campaign, cfg, now)
     await daily_digest(app, db, campaign, cfg, now)
 
@@ -2244,6 +2253,12 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
                 await notify_owner(app, f"{row.get('lead_name') or row['lead_id']} · сделка {row['lead_id']}\n"
                                         f"Клиент ответил, пока черновик ждал: «{(row.get('inbound_text') or '')[:150]}»\n"
                                         f"Прежний черновик снят, готовлю новый.")
+    other = await newer_open_lead(session, db, row)
+    if other:
+        release_to_human(db, campaign, row["lead_id"],
+                         f"у контакта новая открытая сделка {other.get('id')} "
+                         f"(ответственный {other.get('responsible_user_id')})")
+        return
     ctx = await build_context(db, session, row)
     draft = await generate_draft(ctx, db)
     if not draft:
@@ -2499,6 +2514,89 @@ def newer_inbound(db, msg: dict) -> dict | None:
                            ORDER BY sent_at DESC LIMIT 1""", (list(chats), msg["created_at"]))
 
 
+# Эхо собственной отправки агента приходит из Wazzup через доли секунды; всё
+# исходящее дальше этого окна от отправок агента написал человек.
+OWN_ECHO_SEC = 300
+
+
+def manual_outbound(db, campaign: str, lead_id: int, since) -> dict | None:
+    """Последнее исходящее в чатах лида после `since`, которое отправил не агент.
+
+    Автора исходящего вебхук Wazzup не сохраняет (`manager_name` пуст всегда),
+    поэтому своё узнаём по журналу отправок агента, остальное – ручное.
+    06.10.2026 Карина написала «Николаю 23 век» по новой сделке, клиент ответил
+    «Здравствуйте», и агент из партии Коликова ответил поверх неё.
+    """
+    return db._fetchone("""
+        SELECT w.text, w.sent_at FROM sales_dialog_leads l
+        CROSS JOIN LATERAL (SELECT coalesce(l.all_chat_ids, ARRAY[l.chat_id]) AS ids) c
+        JOIN wazzup_messages w ON w.chat_id = ANY(c.ids) AND w.is_outbound
+        WHERE l.campaign = %s AND l.lead_id = %s
+          AND w.sent_at AT TIME ZONE 'UTC' > %s
+          AND NOT EXISTS (
+              SELECT 1 FROM sales_dialog_messages d
+              WHERE d.lead_id = l.lead_id AND d.sent_at IS NOT NULL
+                AND abs(extract(epoch FROM d.sent_at - w.sent_at AT TIME ZONE 'UTC')) < %s)
+        ORDER BY w.sent_at DESC LIMIT 1""", (campaign, lead_id, since, OWN_ECHO_SEC))
+
+
+def _manual_takeovers(db, campaign: str) -> list:
+    """Активные лиды агента, в чат которых после попадания в пул писал человек."""
+    return db._fetchall("""
+        SELECT l.lead_id, l.lead_name, l.contact_name, m.text, m.sent_at
+        FROM sales_dialog_leads l
+        CROSS JOIN LATERAL (SELECT coalesce(l.all_chat_ids, ARRAY[l.chat_id]) AS ids) c
+        JOIN LATERAL (
+            SELECT w.text, w.sent_at FROM wazzup_messages w
+            WHERE w.chat_id = ANY(c.ids) AND w.is_outbound
+              AND w.sent_at AT TIME ZONE 'UTC' > l.created_at
+              AND NOT EXISTS (
+                  SELECT 1 FROM sales_dialog_messages d
+                  WHERE d.lead_id = l.lead_id AND d.sent_at IS NOT NULL
+                    AND abs(extract(epoch FROM d.sent_at - w.sent_at AT TIME ZONE 'UTC')) < %s)
+            ORDER BY w.sent_at DESC LIMIT 1
+        ) m ON true
+        WHERE l.campaign = %s AND l.status = 'active'""", (OWN_ECHO_SEC, campaign))
+
+
+def release_to_human(db, campaign: str, lead_id: int, why: str) -> None:
+    """Агент уходит из диалога насовсем: лид `handed`, висящие черновики сняты.
+
+    Ответственного в amoCRM не трогаем – человек, который пишет клиенту, уже есть.
+    """
+    db._execute("""UPDATE sales_dialog_leads SET status='handed',
+                          note = coalesce(note, '') || ' | ' || %s
+                   WHERE campaign=%s AND lead_id=%s AND status='active'""",
+                (why, campaign, lead_id))
+    db._execute("""UPDATE sales_dialog_messages SET verdict='stale'
+                   WHERE campaign=%s AND lead_id=%s AND verdict IN ('draft','edited')""",
+                (campaign, lead_id))
+    logger.info("sales_dialog: lead=%s отдан человеку: %s", lead_id, why)
+
+
+async def newer_open_lead(session, db, row: dict) -> dict | None:
+    """Открытая сделка на том же контакте, заведённая после попадания лида в пул.
+
+    Значит, клиента ведёт менеджер по новой сделке, и агенту там делать нечего.
+    """
+    cid = row.get("contact_id")
+    lead = db._fetchone("""SELECT created_at FROM sales_dialog_leads
+                           WHERE campaign=%s AND lead_id=%s""", (row["campaign"], row["lead_id"]))
+    if not cid or not lead:
+        return None
+    contact = await _amo_get(session, f"/contacts/{cid}", {"with": "leads"})
+    ids = sorted({x.get("id") for x in ((contact.get("_embedded") or {}).get("leads") or [])
+                  if x.get("id") and x.get("id") != row["lead_id"]}, reverse=True)
+    since = lead["created_at"].timestamp()
+    for lid in ids[:3]:
+        other = await _amo_lead(session, lid)
+        if (other and other.get("status_id") not in (142, 143)
+                and (other.get("created_at") or 0) > since
+                and other.get("responsible_user_id") != AGENT_AMO_USER):
+            return other
+    return None
+
+
 async def notify_owner(app, text: str) -> None:
     try:
         await app.bot.send_message(_supervisor_id(), text)
@@ -2534,6 +2632,12 @@ async def _do_send(db, row_id: int, text: str) -> tuple[bool, str]:
                              AT TIME ZONE 'Europe/Moscow'""", ("silent:%", "first:%", ch))
         if (sent_today or {}).get("n", 0) >= int((policy.get("limits") or {}).get(ch, 0)):
             return False, f"дневной лимит сообщений первым в {ch} исчерпан"
+    human = manual_outbound(db, msg["campaign"], msg["lead_id"], msg["created_at"])
+    if human:
+        release_to_human(db, msg["campaign"], msg["lead_id"],
+                         "менеджер написал клиенту сам, пока карточка ждала")
+        return False, ("менеджер уже пишет клиенту сам: «" + (human.get("text") or "")[:120]
+                       + "» – агент из диалога вышел")
     fresh = newer_inbound(db, msg)
     if fresh:
         db._execute("UPDATE sales_dialog_messages SET verdict='stale' WHERE id=%s", (row_id,))
@@ -2588,6 +2692,8 @@ def register(app, db) -> None:
             await q.answer("Эта карточка не твоя.", show_alert=True)
             return
         base = (q.message.text or "").split("\n\n[")[0]
+        db._execute("UPDATE sales_dialog_messages SET decided_by=%s WHERE id=%s",
+                    (q.from_user.id, row_id))
 
         if action == "skip":
             db._execute("UPDATE sales_dialog_messages SET verdict='skipped' WHERE id=%s", (row_id,))
@@ -2664,8 +2770,8 @@ def register(app, db) -> None:
             return
         context.user_data.pop("sd_edit_row", None)
         text = strip_card_header(update.effective_message.text or "")
-        db._execute("UPDATE sales_dialog_messages SET verdict='edited', final_text=%s WHERE id=%s",
-                    (text, row_id))
+        db._execute("""UPDATE sales_dialog_messages SET verdict='edited', final_text=%s, decided_by=%s
+                       WHERE id=%s""", (text, who, row_id))
         ok, info = await _do_send(db, row_id, text)
         if not ok:
             info += await _after_send_failure(app, db, row_id, info)

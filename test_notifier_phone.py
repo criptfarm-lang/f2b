@@ -43,3 +43,10 @@ def test_value_untouched(raw):
 
 def test_whitespace_stripped():
     assert _normalize_phone("  79263338420  ") == "79263338420"
+
+
+def test_max_paused_two_weeks():
+    """MAX для фишек на паузе по 21.10.2026 включительно (собственник 07.10.2026)."""
+    from notifier import max_paused
+    assert max_paused("2026-10-07") and max_paused("2026-10-21")
+    assert not max_paused("2026-10-22")

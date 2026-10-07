@@ -41,6 +41,18 @@ CHANNEL_TELEGRAM = "ddd24a95-9304-4098-a320-3e47fcd1020a"
 CHANNEL_WHATSAPP = "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03"
 CHANNEL_MAX      = "1d5bc70a-7ca6-4895-8d1f-9690cf448214"
 
+# MAX заблокировали за спам (30.09 и снова 06.10.2026). Собственник 07.10.2026:
+# фишки в MAX две недели не шлём, только Telegram и WhatsApp. Включительно.
+MAX_PAUSED_UNTIL = "2026-10-21"
+
+
+def max_paused(today: str | None = None) -> bool:
+    if today is None:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
+    return today <= MAX_PAUSED_UNTIL
+
 
 MONTHS_RU = [
     "января", "февраля", "марта", "апреля", "мая", "июня",
@@ -342,7 +354,9 @@ async def _get_contacts_from_ms(agent_id: str, headers: dict) -> list[dict]:
         contacts = []
         if telegram_id:
             contacts.append({"chat_id": telegram_id, "chat_type": "telegram", "channel_id": CHANNEL_TELEGRAM})
-        if max_id:
+        if max_id and max_paused():
+            logger.info(f"notifier: MAX на паузе до {MAX_PAUSED_UNTIL}, канал пропущен")
+        elif max_id:
             contacts.append({"chat_id": max_id, "chat_type": "max", "channel_id": CHANNEL_MAX})
         if whatsapp_id:
             contacts.append({"chat_id": whatsapp_id, "chat_type": "whatsapp", "channel_id": CHANNEL_WHATSAPP})
