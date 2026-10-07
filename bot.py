@@ -7196,6 +7196,13 @@ def main():
         protocol_approval.register(app, db)
     except Exception as e:
         logger.exception(f"protocol_approval.register упал: {e}")
+    # Уборка (07.10.2026): нажал кнопку в личке собственника, обработчик снял
+    # кнопки – сообщение удаляется, висят только необработанные.
+    try:
+        import button_cleanup
+        button_cleanup.register(app, OWNER_CHAT_ID)
+    except Exception as e:
+        logger.exception(f"button_cleanup.register упал: {e}")
     # Накопитель доработок (07.10.2026): «ДОРАБОТКА …» от собственника в личке →
     # таблица dev_backlog, разбирает сессия Claude (скилл f2b-dorabotka).
     try:
