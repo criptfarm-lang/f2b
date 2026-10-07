@@ -2544,77 +2544,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = text[:3900] + "\n\n_...уточни запрос_"
         await message.reply_text(text, parse_mode="Markdown")
 
-    elif action == "broadcast":
-        product = params.get("product", "")
-        broadcast_text = params.get("message", "")
-        manager_filter = params.get("manager", "")
-
-        if not product or not broadcast_text:
-            await message.reply_text("❌ Не указан товар или текст сообщения.")
-            return
-
-        await message.reply_chat_action("typing")
-        period_days = params.get("period_days", 180)
-        await message.reply_text(
-            f"🔍 Ищу клиентов которые покупали *{product}* за последние {period_days} дней...",
-            parse_mode="Markdown"
-        )
-
-        # 1. Находим покупателей через МойСклад
-        from moysklad import get_buyers_by_product, get_counterparty_phones
-        result = await get_buyers_by_product(product, period_days=period_days)
-        buyers = result.get("buyers", []) if isinstance(result, dict) else result
-        found_name = result.get("product_name", product) if isinstance(result, dict) else product
-
-        if not buyers:
-            await message.reply_text(f"❌ Не найдено покупателей *{found_name}* за последние {period_days} дней.", parse_mode="Markdown")
-            return
-
-        await message.reply_text(f"📋 Найдено {len(buyers)} покупателей. Получаю телефоны...", parse_mode="Markdown")
-
-        # 2. Получаем телефоны из МойСклад
-        contacts = await get_counterparty_phones(buyers)
-        with_phone = [c for c in contacts if c.get("phone")]
-        no_phone = [c for c in contacts if not c.get("phone")]
-
-        if not with_phone:
-            await message.reply_text("❌ Ни у одного клиента нет телефона в МойСклад.")
-            return
-
-        # 3. Показываем список и просим подтверждение
-        duration_min = len(with_phone)
-        names_preview = "\n".join(f"• {c['name']} ({c['phone']})" for c in with_phone[:10])
-        if len(with_phone) > 10:
-            names_preview += f"\n_...и ещё {len(with_phone) - 10}_"
-
-        no_phone_note = f"\n⚠️ Без телефона ({len(no_phone)}): {', '.join(c['name'] for c in no_phone[:5])}" if no_phone else ""
-
-        confirm_text = (
-            f"📣 *Рассылка готова*\n\n"
-            f"*Товар:* {found_name}\n"
-            f"*Текст:* _{broadcast_text}_\n\n"
-            f"*Получатели ({len(with_phone)}):*\n{names_preview}{no_phone_note}\n\n"
-            f"⏱ Рассылка займёт ~{duration_min} мин (1 сообщение в минуту)\n\n"
-            f"Для подтверждения напиши: *да, рассылай*"
-        )
-        await message.reply_text(confirm_text, parse_mode="Markdown")
-
-        # Сохраняем и показываем кнопку подтверждения
-        import uuid as _uuid
-        broadcast_key = str(_uuid.uuid4())[:8]
-        _pending_sends[f"broadcast_{broadcast_key}"] = {
-            "contacts": with_phone,
-            "text": broadcast_text,
-            "product": found_name,
-            "is_broadcast": True,
-        }
-
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Начать рассылку", callback_data=f"send_confirm|broadcast_{broadcast_key}"),
-            InlineKeyboardButton("❌ Отменить", callback_data=f"send_cancel|broadcast_{broadcast_key}"),
-        ]])
-        await message.reply_text(confirm_text, parse_mode="Markdown", reply_markup=keyboard)
-
     elif action == "find_contact":
         contact_query = params.get("query", "")
         contacts = db.search_contacts(contact_query)
@@ -3027,54 +2956,6 @@ async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         {"id": "1d5bc70a-7ca6-4895-8d1f-9690cf448214", "type": "max"},
         {"id": "ddd24a95-9304-4098-a320-3e47fcd1020a", "type": "telegram"},
     ]
-
-    # Рассылка (несколько клиентов)
-    if pending.get("is_broadcast"):
-        contacts = pending["contacts"]
-        product = pending["product"]
-        broadcast_text = pending["text"]
-        count = len(contacts)
-        await query.message.edit_text(
-            f"🚀 Начинаю рассылку по *{product}*\n📨 {count} получателей · ~{count} мин",
-            parse_mode="Markdown"
-        )
-
-        async def run_wazzup_broadcast():
-            sent, failed = 0, 0
-            async with aiohttp.ClientSession() as session:
-                for c in contacts:
-                    phone = c.get("phone", "")
-                    if not phone:
-                        failed += 1
-                        continue
-                    try:
-                        async with session.post(
-                            "https://api.wazzup24.com/v3/message",
-                            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                            json={
-                                "channelId": channel_id,
-                                "chatType": c.get("chat_type", "whatsapp"),
-                                "chatId": phone,
-                                "crmMessageId": str(_uuid.uuid4()),
-                                "text": broadcast_text,
-                            }
-                        ) as resp:
-                            if resp.status in (200, 201):
-                                sent += 1
-                            else:
-                                failed += 1
-                    except Exception:
-                        failed += 1
-                    await asyncio.sleep(60)
-
-            result_text = f"✅ *Рассылка завершена!*\n📨 Отправлено: {sent}/{count}\n"
-            if failed:
-                result_text += f"❌ Не отправлено: {failed}\n"
-            group_chat_id = int(os.getenv("GROUP_CHAT_ID", "0"))
-            await context.bot.send_message(chat_id=group_chat_id or query.message.chat_id, text=result_text, parse_mode="Markdown")
-
-        asyncio.create_task(run_wazzup_broadcast())
-        return
 
     try:
         async with aiohttp.ClientSession() as session:
