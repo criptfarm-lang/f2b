@@ -2248,6 +2248,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "whatsapp": "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03",
         }
         PRIORITY = ["telegram", "tgapi", "max", "whatsapp"]
+        from notifier import max_paused
+        if max_paused():   # MAX заблокировали за спам, рассылки туда выключены
+            PRIORITY.remove("max")
 
         # Ищем известные каналы клиента из вебхуков — по имени или телефону
         known = db.get_wazzup_contacts(cp_name)

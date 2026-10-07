@@ -274,7 +274,10 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     if sent_today >= cfg.get("daily_cap", 25):
         return
 
-    paused = cfg.get("paused_channels", [])
+    paused = list(cfg.get("paused_channels", []))
+    from notifier import max_paused
+    if max_paused() and "max" not in paused:   # MAX заблокировали за спам
+        paused.append("max")
     templates = db._fetchall("SELECT block, template FROM reactivation_texts WHERE campaign=%s ORDER BY block",
                              (campaign,))
     if not templates:

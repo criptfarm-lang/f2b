@@ -2623,6 +2623,9 @@ async def _do_send(db, row_id: int, text: str) -> tuple[bool, str]:
     if is_initiative(msg):
         policy = channel_policy(db)
         ch = row_channel(msg)
+        from notifier import max_paused, MAX_PAUSED_UNTIL
+        if ch == "max" and max_paused():
+            return False, f"первым в MAX не пишем до {MAX_PAUSED_UNTIL}: канал блокировали за спам"
         if ch in (policy.get("paused") or {}):
             return False, f"инициатива в {ch} на паузе: {policy['paused'][ch]}"
         sent_today = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages
