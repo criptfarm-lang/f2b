@@ -4927,7 +4927,8 @@ async def _notify_owners(bot, alert_row: dict, text: str):
     for chat_id, message_id in msgs:
         try:
             await bot.send_message(chat_id=chat_id, text=text,
-                                   reply_to_message_id=message_id)
+                                   reply_to_message_id=message_id,
+                                   allow_sending_without_reply=True)
         except Exception as e:
             logger.warning(f"approval: уведомление {chat_id} → {e}")
 
@@ -5072,7 +5073,14 @@ async def _handle_buyer_approval(query, context, alert_id: int):
     if res == "fail":
         text = new_base + tail
         db.set_approval_alert_text(alert_id, text)
-        await _edit_owner_messages(context.bot, row, text, _approval_kb(alert_id))
+        if not await _edit_owner_messages(context.bot, row, text, _approval_kb(alert_id)):
+            # Сообщение в личке собственника уже удалено после его «да» – шлём заново с кнопками.
+            try:
+                await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=text,
+                                               parse_mode="Markdown",
+                                               reply_markup=_approval_kb(alert_id))
+            except Exception as e:
+                logger.warning(f"appr_buyer: переотправка светофора → {e}")
         await _notify_owners(context.bot, row,
             f"❌ {ATTRACTED_APPROVER_DONE} привлечённые по заказу {order_name}, но статус "
             f"в МС сменить не удалось – нажмите «Согласовано» ещё раз")
@@ -5185,6 +5193,13 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
                     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
                 except Exception as e:
                     logger.warning(f"appr_confirm: правка ожидания → {e}")
+            # Свою часть собственник отработал – в его личке сообщение убираем
+            # (07.10.2026), итог по Кристине придёт отдельным ответом.
+            if query.message.chat.id == OWNER_CHAT_ID:
+                try:
+                    await query.message.delete()
+                except Exception as e:
+                    logger.warning(f"appr_confirm: удаление в личке → {e}")
             return
         # Закупщик уже согласовал – оба «да», меняем статус.
         await _finalize_two_step(query, context, alert_id, row)
