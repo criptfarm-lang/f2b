@@ -7312,6 +7312,13 @@ def main():
         protocol_approval.register(app, db)
     except Exception as e:
         logger.exception(f"protocol_approval.register упал: {e}")
+    # Накопитель доработок (07.10.2026): «ДОРАБОТКА …» от собственника в личке →
+    # таблица dev_backlog, разбирает сессия Claude (скилл f2b-dorabotka).
+    try:
+        import dev_backlog
+        dev_backlog.register(app, db, OWNER_CHAT_ID)
+    except Exception as e:
+        logger.exception(f"dev_backlog.register упал: {e}")
     # Сторис-студия: фото/видео собственника в личке → очередь сторис (ДО catch-all
     # handle_message). Включается ключом bot_settings.stories_studio_enabled = '1'.
     # План: 2026-09-22-сторис-студия-в-боте (репо «второй мозг»).
@@ -8503,6 +8510,13 @@ def main():
         web_app.router.add_get("/market-intel/unprocessed", handle_market_intel_unprocessed)
         web_app.router.add_post("/market-intel/processed", handle_market_intel_processed)
         web_app.router.add_post("/market-intel/alert", handle_market_intel_alert)
+
+        # Накопитель доработок: очередь «ДОРАБОТКА» для скилла f2b-dorabotka.
+        try:
+            import dev_backlog
+            dev_backlog.add_routes(web_app, db, app.bot, market_intel_token)
+        except Exception as e:
+            logger.exception(f"dev_backlog.add_routes упал: {e}")
 
         # ─── Internal notify_manager (procurement webapp → бот) ───────────────
         # План: F2B второй мозг/plans/2026-05-28-дашборд-закупщика-с-матчером.md, Фаза 4.
