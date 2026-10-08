@@ -8907,6 +8907,64 @@ async def _find_ppm_change_author(session, order_id: str, current_date):
     return "unknown", None
 
 
+async def _ppm_follow_delivery_move(session, db, order, agent_id, current_date,
+                                    last_entry, base_dt, delay, expected_dt):
+    """Бот поставил дату оплаты, потом перенесли отгрузку — пересчитываем.
+
+    Решено 08.10.2026 (заказ 04519: бот поставил 20.10 от отгрузки 06.10,
+    отгрузку перенесли на 08.10, по договору стало 22.10). Пересчёт только
+    если последняя запись журнала — автоподстановка бота с этой же датой
+    (ручную правку менеджера не трогаем) и сдвинулась именно отгрузка:
+    база, от которой бот считал (дата − отсрочка из записи), ≠ текущей.
+    Смена «Дней отсрочки» у клиента по-прежнему не пересчитывает.
+    """
+    import re
+    from datetime import timedelta
+    from moysklad import (MS_BASE, get_headers, _PPM_INITIAL_ATTR_NAME,
+                          _autofill_get_attr_meta, _autofill_fmt_ms_dt)
+
+    if not last_entry or "autofill" not in (last_entry.get("source") or ""):
+        return
+    if last_entry.get("new_date") != current_date:
+        return
+    m = re.search(r"delay=(\d+)", last_entry.get("changed_by") or "")
+    if not m:
+        return
+    old_base = current_date - timedelta(days=int(m.group(1)))
+    if old_base == base_dt.date() or expected_dt.date() == current_date:
+        return
+
+    order_id_v = order.get("id")
+    meta = await _autofill_get_attr_meta(session, "customerorder", _PPM_INITIAL_ATTR_NAME)
+    if not meta:
+        return
+    value = _autofill_fmt_ms_dt(expected_dt)
+    db.mark_bot_self_write(order_id_v, "ppm_initial", value)
+    headers = dict(get_headers())
+    headers["X-Lognex-WebHook-Disable"] = "1"
+    body = {"attributes": [{
+        "meta": {
+            "href": f"{MS_BASE}/entity/customerorder/metadata/attributes/{meta.get('id')}",
+            "type": "attributemetadata", "mediaType": "application/json",
+        },
+        "value": value,
+    }]}
+    async with session.put(f"{MS_BASE}/entity/customerorder/{order_id_v}",
+                           headers=headers, json=body) as resp:
+        if resp.status not in (200, 201):
+            logger.error(f"ppm follow delivery {order_id_v}: {resp.status} {(await resp.text())[:200]}")
+            return
+    db.log_payment_planned_audit(
+        order_id=order_id_v, order_name=order.get("name"),
+        agent_id=agent_id, agent_name=((order.get("agent") or {}).get("name") or ""),
+        old_date=current_date, new_date=expected_dt.date(),
+        expected_date=expected_dt.date(),
+        changed_by=f"bot:autofill(delay={delay})",
+        source="webhook_autofill_delivery_move",
+    )
+    logger.info(f"ppm {order.get('name')}: {current_date} → {expected_dt.date()} (отгрузка перенесена с {old_base})")
+
+
 async def check_payment_planned_audit(order_href: str, bot, db):
     """Проверяет «Дату планируемой оплаты» после UPDATE-webhook'а.
 
@@ -9040,6 +9098,10 @@ async def check_payment_planned_audit(order_href: str, bot, db):
         if current_date_cmp is not None:
             try:
                 if db.was_payment_planned_set_by_bot(order_id_v, current_date_cmp):
+                    await _ppm_follow_delivery_move(
+                        session, db, order, agent_id, current_date_cmp,
+                        last_entry, base_dt, delay, expected_dt,
+                    )
                     return
             except Exception as ex:
                 logger.warning(f"was_payment_planned_set_by_bot({order_id_v}): {ex}")
