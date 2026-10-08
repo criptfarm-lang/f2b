@@ -8949,11 +8949,15 @@ async def check_payment_planned_audit(order_href: str, bot, db):
         # по этому order_id — менеджер когда-то поставил дату руками, и сверять
         # её с расчётной по сегодняшней отсрочке бессмысленно. Поймали на
         # ООО Фелиса (заказ от апреля).
+        # База недоступна — молчим: без неё не работает ни дедуп, ни «это бот
+        # сам ставил», и каждое сохранение заказа даёт алерт. 08.10.2026 при
+        # перезапуске PostgreSQL Amvera заказ 04519 прислал 4 одинаковых.
         try:
             if not db.has_bot_autofill_for_order(order_id_v):
                 return
         except Exception as ex:
-            logger.warning(f"has_bot_autofill_for_order({order_id_v}): {ex}")
+            logger.warning(f"has_bot_autofill_for_order({order_id_v}): {ex} — алерт пропущен")
+            return
 
         # Слой 1: если это наш самопатч — гасим без алерта
         try:
