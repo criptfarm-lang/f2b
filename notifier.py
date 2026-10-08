@@ -1738,6 +1738,46 @@ def _build_approval_text(
     return header + "\n".join(lines)
 
 
+def build_manager_fix_text(
+    order_name: str, client_name: str,
+    contract: dict, overdue: dict, contacts: dict,
+    upd_debt: dict, site: dict, address: dict,
+) -> str | None:
+    """Менеджеру – что исправить по красным пунктам светофора (решение 08.10.2026).
+    Только 🔴 из шести пунктов: Договор, Просрочка, Контакты, Долг по УПД, Сайт,
+    Адрес. Жёлтое («не проверено») не шлём – это сбой проверки, не ошибка менеджера.
+    Нет красных – None, сообщение не уходит. Текст без Markdown: имена клиентов и
+    адреса бывают с _ и *, которые ломают разметку."""
+    fixes = []
+    if contract.get("color") == "red":
+        fixes.append("Договор не подписан – подпишите договор с клиентом и поставьте "
+                     "галочку «Договор подписан» в карточке контрагента МС.")
+    if overdue.get("color") == "red":
+        fixes.append(f"Просрочка {overdue.get('days', 0)} дн / "
+                     f"{_fmt_money(overdue.get('debt', 0))} ₽ – добейтесь оплаты "
+                     f"просроченного долга до отгрузки.")
+    if contacts.get("color") == "red":
+        fixes.append("Контакты – заполните в карточке контрагента Max (телефон, 11 цифр) "
+                     "или Telegram (@ник).")
+    if upd_debt.get("color") == "red":
+        n = upd_debt.get("count", 0)
+        word = "отгрузке" if n == 1 else "отгрузкам"
+        fixes.append(f"Долг по УПД – верните подписанные УПД по {n} {word}.")
+    if site.get("color") == "red":
+        fixes.append("Сайт – заполните поле «Сайт» в карточке контрагента.")
+    if address.get("color") == "red":
+        if address.get("addr"):
+            fixes.append("Адрес – в «Адресе доставки» заказа оставьте только адрес, "
+                         "телефоны и заметки перенесите в комментарий.")
+        else:
+            fixes.append("Адрес – заполните «Адрес доставки» в заказе.")
+    if not fixes:
+        return None
+    body = "\n".join(f"{i}. {f}" for i, f in enumerate(fixes, 1))
+    return (f"Заказ {order_name} · {client_name} – на согласовании.\n"
+            f"Надо исправить:\n{body}")
+
+
 def approval_keyboard(alert_id: int, with_ok: bool = True):
     """Кнопки светофора. with_ok=False – собственник уже согласовал, ждём закупщика
     (отклонить при этом всё ещё можно)."""
@@ -2033,6 +2073,20 @@ async def check_approval_needed(order_href: str, bot, db):
                 db.set_approval_owner_messages(alert_id, owner_msgs)
             except Exception as e:
                 logger.warning(f"check_approval_needed: owner_messages {alert_id} → {e}")
+
+        # 9. Параллельно менеджеру – что исправить по красным пунктам. Повтор
+        # гасит тот же дедуп alert_id выше: одно сообщение на заход заказа.
+        fix_text = build_manager_fix_text(
+            order_name, agent_name, contract, overdue, contacts,
+            upd_debt, site, address)
+        if fix_text and mgr_user_id:
+            try:
+                await bot.send_message(chat_id=mgr_user_id, text=fix_text)
+                logger.info(f"check_approval_needed: {order_name} – что исправить → "
+                            f"менеджеру {manager_name} ({mgr_user_id})")
+            except Exception as e:
+                logger.warning(f"check_approval_needed: менеджеру {mgr_user_id} "
+                               f"не ушло ({e})")
 
     except Exception as e:
         logger.error(f"notifier.check_approval_needed: {e}", exc_info=True)
