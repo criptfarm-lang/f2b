@@ -7420,23 +7420,10 @@ def main():
         except Exception as e:
             logger.error(f"processing_svetofor job wrapper: {e}", exc_info=True)
 
-    app.job_queue.run_repeating(_processing_svetofor_wrapper, interval=1800, first=60)
+    # 08.10.2026: 5 мин вместо 30 – карточки собственнику в реальном времени.
+    app.job_queue.run_repeating(_processing_svetofor_wrapper, interval=300, first=60)
 
-    # Дневная сводка техопераций собственнику – 18:00 МСК = 15:00 UTC
-    # (05.10.2026, опись сообщений бота, п. 4; вместо карточки на каждую операцию).
-    from processing_svetofor import digest_job as _processing_svetofor_digest
     from datetime import time as _svf_time, timezone as _svf_tz
-
-    async def _processing_svetofor_digest_wrapper(context):
-        try:
-            await _processing_svetofor_digest(app)
-        except Exception as e:
-            logger.error(f"processing_svetofor digest: {e}", exc_info=True)
-
-    app.job_queue.run_daily(
-        _processing_svetofor_digest_wrapper,
-        time=_svf_time(hour=15, minute=0, tzinfo=_svf_tz.utc),
-    )
 
     # Проблемные выпуски Маланчуку («Проверить выход» + «Разобраться») – ПН–ПТ
     # 10:00 МСК = 07:00 UTC (08.10.2026). PTB ≥20: days 0=ВС … 6=СБ.

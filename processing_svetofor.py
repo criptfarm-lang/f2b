@@ -6,10 +6,12 @@ plans/2026-07-03-светофор-техопераций-эф.md — Фаза 2 
 оценку себестоимости (₽/кг) и выхода (%) относительно нормы — медианы по проверенным
 операциям того же SKU+типа сырья (view production.processing_stats).
 
-Триггеры (polling каждые 30 мин, вебхука у МС нет):
+Триггеры (polling каждые 5 мин, вебхука у МС нет):
   - новая техоперация (нет в логе отправок);
   - state операции стал «Анализ сделан» (повторный светофор).
   - state стал «Проверить выход» → карточка Маланчуку (vy_notify, 08.10.2026).
+Собственнику – сразу с кнопками, только выход 🟢/🟡 (красные и без нормы не шлём);
+Маланчуку – каждая карточка, без кнопок.
 ПН–ПТ 10:00 МСК – список «Проверить выход» + «Разобраться» Маланчуку (problems_job).
 
 Себестоимость — через ОБОРОТ /report/turnover/all (FIFO-выбытие), НЕ через остатки
@@ -371,6 +373,7 @@ def render(snap: dict) -> tuple[str, str | None]:
 
     c_cost = _color_cost(cost, med_cost)
     c_yld = _color_yield(yld, med_yld)
+    snap["yield_color"] = c_yld   # фильтр карточки собственнику (только 🟢/🟡 по выходу)
     sku_name = snap["out_sku_name"] or ""   # полное имя готовой продукции, без обрезки по запятой
     moment = datetime.strptime(snap["moment"], "%Y-%m-%d %H:%M:%S.%f").strftime("%d.%m")
 
@@ -550,14 +553,20 @@ async def handle_svetofor_callback(update, context):
 
 # ── детект + отправка ────────────────────────────────────────────────────────
 def _recipients() -> list[int]:
-    """Кому карточка уходит сразу. Собственнику – только в дневной сводке
-    (05.10.2026, опись сообщений бота, п. 4)."""
+    """Кому карточка уходит сразу без фильтра (Маланчук, без кнопок)."""
     ids = []
     for env in ("PARTNER_CHAT_ID",):
         v = (os.getenv(env) or "").strip()
         if v.lstrip("-").isdigit():
             ids.append(int(v))
     return ids
+
+
+# Собственнику – сразу, с кнопками, но только если ВЫХОД нормирован и 🟢/🟡;
+# 🔴 и ⚪ (нет нормы / н/д) не шлём, себестоимость не смотрим (08.10.2026,
+# вместо дневной сводки 18:00).
+OWNER_YIELD_COLORS = ("🟢", "🟡")
+DIGEST_LIMIT = 3800      # лимит длины сообщения списка проблем (problems_job)
 
 
 def _log_get_all() -> dict[str, dict]:
@@ -618,6 +627,7 @@ async def poll_job(app, db=None):
         return
 
     recipients = _recipients()
+    owner = (os.getenv("OWNER_CHAT_ID") or "").strip()
     sent = 0
     for r in rows:
         pid = r["id"]
@@ -638,7 +648,9 @@ async def poll_job(app, db=None):
             text, parse_mode = render(snap)
             for chat_id in recipients:
                 await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
-            _digest_enqueue(pid, r.get("name"), text, parse_mode)
+            if owner.isdigit() and snap.get("yield_color") in OWNER_YIELD_COLORS:
+                await app.bot.send_message(chat_id=int(owner), text=text, parse_mode=parse_mode,
+                                           reply_markup=keyboard(pid))
             _log_upsert(pid, r.get("name"), state, analiz=(state == ANALIZ_STATE))
             sent += 1
             logger.info(f"svetofor: №{r.get('name')} [{reason}] отправлен ({len(recipients)} получат.)")
@@ -651,65 +663,6 @@ async def poll_job(app, db=None):
         await vy_notify(app)
     except Exception as e:  # noqa: BLE001
         logger.error(f"svetofor vy_notify: {e}")
-
-
-# ── Дневная сводка собственнику ──────────────────────────────────────────────
-DIGEST_HOUR_MSK = 18
-DIGEST_LIMIT = 3800
-_COLOR_RANK = {"🔴": 0, "🟡": 1, "⚪": 2, "🟢": 3}
-
-
-def _digest_enqueue(pid, name, text, parse_mode):
-    text_html = text if parse_mode == "HTML" else html.escape(text, quote=False)
-    color = text[:1] if text[:1] in _COLOR_RANK else "⚪"
-    with _db().cursor() as cur:
-        cur.execute("""
-            insert into production.processing_svetofor_digest
-              (processing_id, name, color, text_html, queued_at, sent_at)
-            values (%s, %s, %s, %s, now(), null)
-            on conflict (processing_id) do update set
-              name=excluded.name, color=excluded.color, text_html=excluded.text_html,
-              queued_at=now(), sent_at=null
-        """, (pid, name, color, text_html))
-
-
-async def digest_job(app):
-    """Раз в день: все накопленные карточки одним сообщением, красные сверху.
-    Под каждой операцией – строка кнопок. Пустой день – тишина."""
-    owner = (os.getenv("OWNER_CHAT_ID") or "").strip()
-    if not owner.isdigit():
-        return
-    with _db().cursor() as cur:
-        cur.execute("""select processing_id, name, color, text_html
-                       from production.processing_svetofor_digest
-                       where sent_at is null order by queued_at""")
-        items = cur.fetchall()
-    if not items:
-        return
-    items.sort(key=lambda r: _COLOR_RANK.get(r["color"], 2))
-    counts = {c: sum(1 for r in items if r["color"] == c) for c in ("🔴", "🟡", "🟢", "⚪")}
-    head = (f"🏭 <b>Техоперации за день – {len(items)}</b>  "
-            + " ".join(f"{c}{n}" for c, n in counts.items() if n))
-
-    # Делим на сообщения по лимиту; кнопки – только у операций этого сообщения.
-    messages, cur_text, cur_rows = [], head, []
-    for r in items:
-        block = f"\n\n{r['text_html']}"
-        if len(cur_text) + len(block) > DIGEST_LIMIT and cur_rows:
-            messages.append((cur_text, cur_rows))
-            cur_text, cur_rows = "🏭 <b>Техоперации за день (продолжение)</b>", []
-        cur_text += block
-        cur_rows.append(_buttons(str(r["processing_id"]), prefix=f"№{r['name']} "))
-    messages.append((cur_text, cur_rows))
-
-    for text, rows in messages:
-        await app.bot.send_message(chat_id=int(owner), text=text, parse_mode="HTML",
-                                   reply_markup=InlineKeyboardMarkup(rows))
-    with _db().cursor() as cur:
-        cur.execute("update production.processing_svetofor_digest set sent_at=now() "
-                    "where processing_id = any(%s::uuid[])",
-                    ([str(r["processing_id"]) for r in items],))
-    logger.info(f"svetofor digest: {len(items)} операций, {len(messages)} сообщ.")
 
 
 # ── «Проверить выход» → Маланчуку (08.10.2026) ───────────────────────────────
