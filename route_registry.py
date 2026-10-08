@@ -242,6 +242,21 @@ async def _merge_manual(routes: dict, wialon_ok: bool) -> dict:
     return routes
 
 
+async def fetch_routes_checked():
+    """(routes, order_routes, wialon_ok) — как fetch_routes(with_meta=True), плюс признак,
+    ответила ли Логистика. Нужен странице водителя: пустой маршрут при недоступной
+    Логистике — это сбой связи, а не «маршрут не построен» (08.10.2026 водитель Porter
+    увидел 0 точек при подтверждённом маршруте из 6)."""
+    try:
+        routes, order_routes = await _fetch_routes_wialon()
+        wialon_ok = True
+    except Exception as e:
+        logger.warning("fetch_routes: Логистика недоступна (%s) — беру ручную раскладку", e)
+        routes, order_routes, wialon_ok = {uid: [] for uid in UNITS}, {}, False
+    routes = await _merge_manual(routes, wialon_ok)
+    return routes, order_routes, wialon_ok
+
+
 async def fetch_routes(with_meta: bool = False):
     """Возвращает {unit_id: [stop,...]} по машинам, точки отсортированы по порядку выгрузки.
     stop = {seq, vt, tf, tt, client, address, phone, order_no, oid, ...}.
@@ -250,13 +265,7 @@ async def fetch_routes(with_meta: bool = False):
     Источник — Wialon Logistics; когда она недоступна (с 08.09.2026 провайдер отдаёт
     ACCESS_DENIED_BY_SITENAME), берём аварийную раскладку логиста из manual_route,
     иначе водители остаются без реестра, а отгрузки — без статусов."""
-    try:
-        routes, order_routes = await _fetch_routes_wialon()
-        wialon_ok = True
-    except Exception as e:
-        logger.warning("fetch_routes: Логистика недоступна (%s) — беру ручную раскладку", e)
-        routes, order_routes, wialon_ok = {uid: [] for uid in UNITS}, {}, False
-    routes = await _merge_manual(routes, wialon_ok)
+    routes, order_routes, _ = await fetch_routes_checked()
     if with_meta:
         return routes, order_routes
     return routes

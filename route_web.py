@@ -185,11 +185,19 @@ _ROUTE_TTL = 90     # сек: снимок свежий — отдаём как 
 _COLD_WAIT = 25     # сек: сколько ждём ПЕРВОЕ построение, если снимка ещё нет вообще
 
 
+class LogisticsUnavailable(Exception):
+    """Логистика (Wialon) не ответила, и ручная раскладка по машине пуста."""
+
+
 async def _build_route_data(uid: int, target: date):
     """Тяжёлый живой фетч Wialon + МойСклад. Горячий путь HTTP-запроса его НЕ ждёт
     (кроме самого первого раза) — см. `_route_data`."""
-    routes, order_routes = await rr.fetch_routes(with_meta=True)
+    routes, order_routes, wialon_ok = await rr.fetch_routes_checked()
     stops = [s for s in (routes.get(uid) or []) if rd._stop_on_date(s, target)]
+    if not stops and not wialon_ok:
+        # Пустоту при упавшей Логистике в снимок не кладём: прежний снимок (если был)
+        # продолжит отдаваться, а без него водитель увидит «Логистика не ответила».
+        raise LogisticsUnavailable("Логистика не ответила, точек по машине нет")
     # names — чтобы заборы (заказы поставщику) матчились ещё и по названию поставщика,
     # а не только по номеру ЗП: иначе точка забора приезжает в веб как обычная доставка.
     ms_extra = await rr._ms_extra_by_order(
@@ -246,6 +254,8 @@ async def _route_data(uid: int, target: date):
     await asyncio.wait([task], timeout=_COLD_WAIT)
     hit = _ROUTE_CACHE.get(key)
     if not hit:
+        if task.done() and isinstance(task.exception(), LogisticsUnavailable):
+            raise task.exception()
         raise TimeoutError("снимок маршрута ещё не готов")
     return hit[1], hit[2], hit[3], time.monotonic() - hit[0]
 
@@ -549,6 +559,21 @@ def _wrap(title: str, inner: str) -> str:
 
 # ─── aiohttp-хендлер ─────────────────────────────────────────────────────────
 
+def _logistics_down_page() -> web.Response:
+    """Логистика не ответила — честно говорим водителю и сами перезагружаемся через 30 с."""
+    return web.Response(
+        text="<!doctype html><html lang='ru'><head><meta charset='utf-8'>"
+             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+             "<meta http-equiv='refresh' content='30'><title>Логистика не ответила</title>"
+             "<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f2f4f7;"
+             "color:#334;margin:0;padding:48px 24px;text-align:center}"
+             "h2{font-size:19px;margin:0 0 8px}p{font-size:15px;color:#667}</style></head>"
+             "<body><h2>Логистика не ответила</h2>"
+             "<p>Маршрут сейчас не загрузить. Страница обновится сама через 30 секунд, "
+             "или обнови её через минуту.</p></body></html>",
+        content_type="text/html", charset="utf-8")
+
+
 def _waiting_page() -> web.Response:
     """Маршрут ещё строится (холодный старт + тормоза МС) — страница сама перезагрузится."""
     return web.Response(
@@ -586,6 +611,9 @@ async def handle(request, db, bot) -> web.Response:
         html_text = await render_page(uid, target, db, bot)
         logger.info("route_web: страница uid=%s отдана за %.1f с", uid, time.monotonic() - t0)
         return web.Response(text=html_text, content_type="text/html", charset="utf-8")
+    except LogisticsUnavailable:
+        logger.warning("route_web: Логистика не ответила, снимка uid=%s нет — отдаю страницу «не ответила»", uid)
+        return _logistics_down_page()
     except TimeoutError:
         # Снимка ещё нет, а построение упёрлось в тормоза МС/Wialon. Отдаём лёгкую
         # страницу с авто-перезагрузкой — водитель не смотрит в «вечную загрузку».
