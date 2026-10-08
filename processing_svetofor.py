@@ -9,6 +9,8 @@ plans/2026-07-03-светофор-техопераций-эф.md — Фаза 2 
 Триггеры (polling каждые 30 мин, вебхука у МС нет):
   - новая техоперация (нет в логе отправок);
   - state операции стал «Анализ сделан» (повторный светофор).
+  - state стал «Проверить выход» → карточка Маланчуку (vy_notify, 08.10.2026).
+ПН–ПТ 10:00 МСК – список «Проверить выход» + «Разобраться» Маланчуку (problems_job).
 
 Себестоимость — через ОБОРОТ /report/turnover/all (FIFO-выбытие), НЕ через остатки
 (остатки дают 0 для партии, списанной в ноль). Кеш карты {товар→₽/ед} по дню.
@@ -53,6 +55,8 @@ TOL = 0.02              # ±2% от медианы — жёлтая зона
 COST_FLOOR = 200        # ₽/кг: ниже — битая себест. выбытия (near-zero партия)
 YIELD_MIN, YIELD_MAX = 30, 120  # % выхода вне диапазона — мусор состава
 ANALIZ_STATE = "Анализ сделан"
+VY_STATE = "Проверить выход"
+RZ_STATE = "Разобраться"
 POLL_DAYS = 7
 
 LOG_DDL = """
@@ -76,6 +80,10 @@ create table if not exists production.processing_svetofor_digest (
     sent_at        timestamptz
 );
 """
+# Уведомление Маланчуку при переводе операции в «Проверить выход» (08.10.2026).
+# vy_sent_at – когда ушло; сбрасывается, когда операция ушла из статуса.
+VY_COL = "vy_sent_at"
+_vy_seed = False   # колонку только что добавили – текущие «Проверить выход» не рассылаем
 
 
 # ── DB (свой коннект, autocommit) ──────────────────────────────────────────
@@ -83,7 +91,7 @@ _conn = None
 
 
 def _db():
-    global _conn
+    global _conn, _vy_seed
     if _conn is None or _conn.closed:
         _conn = psycopg2.connect(os.environ["DATABASE_URL"],
                                  cursor_factory=psycopg2.extras.RealDictCursor,
@@ -92,6 +100,14 @@ def _db():
         _conn.autocommit = True
         with _conn.cursor() as cur:
             cur.execute(LOG_DDL)
+            cur.execute("""select 1 from information_schema.columns
+                           where table_schema='production'
+                             and table_name='processing_svetofor_log' and column_name=%s""",
+                        (VY_COL,))
+            if cur.fetchone() is None:
+                cur.execute(f"alter table production.processing_svetofor_log "
+                            f"add column if not exists {VY_COL} timestamptz")
+                _vy_seed = True
     return _conn
 
 
@@ -222,7 +238,9 @@ async def _card_prices(sku_code: str | None) -> dict[str, float]:
     return out
 
 
-async def compute(pid: str, name: str, moment: str, state: str | None) -> dict | None:
+async def compute(pid: str, name: str, moment: str, state: str | None,
+                  light: bool = False) -> dict | None:
+    """light=True – только выход (без оборота дня и цен карточки): для списков."""
     prods = await _positions(pid, "products", expand="assortment.uom")
     if not prods:
         return None
@@ -275,6 +293,10 @@ async def compute(pid: str, name: str, moment: str, state: str | None) -> dict |
         fish_name = max(all_raw, key=lambda t: t[1])[0]  # тип нормы — по доминирующей строке
         fish_type = _classify_fish(fish_name) or "СЫРЬЁ"
         yield_pct = round(main_kg / fish_qty * 100, 2) if (fish_qty and main_kg) else None
+
+    if light:
+        return {"name": name, "moment": moment, "out_sku_code": out_sku_code,
+                "out_sku_name": out_sku_name, "fish_type": fish_type, "yield_pct": yield_pct}
 
     perunit = await _day_turnover(moment[:10])
     cost_total, missing = 0.0, 0
@@ -625,6 +647,11 @@ async def poll_job(app, db=None):
     if sent:
         logger.info(f"svetofor poll: отправлено {sent}")
 
+    try:
+        await vy_notify(app)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"svetofor vy_notify: {e}")
+
 
 # ── Дневная сводка собственнику ──────────────────────────────────────────────
 DIGEST_HOUR_MSK = 18
@@ -683,3 +710,149 @@ async def digest_job(app):
                     "where processing_id = any(%s::uuid[])",
                     ([str(r["processing_id"]) for r in items],))
     logger.info(f"svetofor digest: {len(items)} операций, {len(messages)} сообщ.")
+
+
+# ── «Проверить выход» → Маланчуку (08.10.2026) ───────────────────────────────
+async def _fetch_by_states(names: list[str]) -> list[dict]:
+    """Все техоперации в данных статусах – за любую дату (статус ставят и на старые)."""
+    meta = await _states_meta()
+    rows = []
+    for nm in names:
+        href = meta.get(nm)
+        if not href:
+            raise RuntimeError(f"нет state '{nm}' в метаданных processing")
+        offset = 0
+        while True:
+            d = await _ms_get("/entity/processing", {
+                "limit": 100, "offset": offset, "order": "moment,desc",
+                "expand": "state", "filter": f"state={href}",
+            })
+            chunk = d.get("rows") or []
+            rows.extend(chunk)
+            if len(chunk) < 100:
+                break
+            offset += 100
+    return rows
+
+
+def _ms_link(r: dict) -> str:
+    url = (r.get("meta") or {}).get("uuidHref")
+    num = html.escape(f"№{r.get('name')}", quote=False)
+    return f'<a href="{html.escape(url)}">{num}</a>' if url else num
+
+
+async def vy_notify(app):
+    """Операция перешла в «Проверить выход» → карточка Маланчуку (PARTNER_CHAT_ID).
+    Одно уведомление на заход в статус; ушла из статуса и вернулась – уведомим снова."""
+    global _vy_seed
+    partner = (os.getenv("PARTNER_CHAT_ID") or "").strip()
+    if not partner.lstrip("-").isdigit():
+        return
+    rows = await _fetch_by_states([VY_STATE])
+    ids = [r["id"] for r in rows]
+    with _db().cursor() as cur:
+        # вышли из статуса – сброс, чтобы повторный заход снова дал уведомление
+        cur.execute(f"""update production.processing_svetofor_log set {VY_COL}=null
+                        where {VY_COL} is not null and not (processing_id = any(%s::uuid[]))""",
+                    (ids,))
+        cur.execute(f"""select processing_id from production.processing_svetofor_log
+                        where {VY_COL} is not null""")
+        done = {str(x["processing_id"]) for x in cur.fetchall()}
+
+    def _mark(r):
+        with _db().cursor() as cur:
+            cur.execute(f"""
+                insert into production.processing_svetofor_log
+                  (processing_id, name, last_state, {VY_COL}, updated_at)
+                values (%s, %s, %s, now(), now())
+                on conflict (processing_id) do update set
+                  {VY_COL}=now(), last_state=excluded.last_state, updated_at=now()
+            """, (r["id"], r.get("name"), VY_STATE))
+
+    if _vy_seed:
+        for r in rows:
+            _mark(r)
+        _vy_seed = False
+        logger.info(f"svetofor vy: сид – {len(rows)} операций уже в статусе, без рассылки")
+        return
+
+    for r in rows:
+        if r["id"] in done:
+            continue
+        try:
+            snap = await compute(r["id"], r.get("name"), r["moment"], VY_STATE)
+            head = f"🔎 {_ms_link(r)} переведена в «{VY_STATE}» – посмотри, пожалуйста"
+            if snap is None:
+                text = head
+            else:
+                snap["comment"] = r.get("description")
+                card, mode = render(snap)
+                if mode != "HTML":
+                    card = html.escape(card, quote=False)
+                text = f"{head}\n\n{card}"
+            await app.bot.send_message(chat_id=int(partner), text=text, parse_mode="HTML",
+                                       disable_web_page_preview=True)
+            _mark(r)
+            logger.info(f"svetofor vy: №{r.get('name')} → Маланчуку")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"svetofor vy: №{r.get('name')} ошибка: {e}")
+
+
+# ── Список проблемных выпусков Маланчуку, ПН–ПТ 10:00 МСК (08.10.2026) ──────
+PROBLEM_STATES = (VY_STATE, RZ_STATE)
+
+
+async def problems_job(app):
+    """Все операции в «Проверить выход» и «Разобраться»: выход vs норма, возраст,
+    комментарий. Пусто – тишина."""
+    partner = (os.getenv("PARTNER_CHAT_ID") or "").strip()
+    if not partner.lstrip("-").isdigit():
+        return
+    rows = await _fetch_by_states(list(PROBLEM_STATES))
+    if not rows:
+        return
+    today = datetime.now().date()
+    out = []   # строки сообщения; "" – пустая строка между статусами
+    for st in PROBLEM_STATES:
+        part = [r for r in rows if (r.get("state") or {}).get("name") == st]
+        if not part:
+            continue
+        part.sort(key=lambda r: r["moment"])   # самые старые сверху
+        out += ["", f"<b>{html.escape(st)} – {len(part)}</b>"]
+        for r in part:
+            d = datetime.strptime(r["moment"][:10], "%Y-%m-%d").date()
+            age = (today - d).days
+            try:
+                snap = await compute(r["id"], r.get("name"), r["moment"], st, light=True)
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"svetofor problems: №{r.get('name')} ошибка: {e}")
+                snap = None
+            prod, yld = "", "выход н/д"
+            if snap:
+                prod = f"{snap['out_sku_code'] or ''} {snap['out_sku_name'] or ''}".strip()
+                y = snap["yield_pct"]
+                if y is not None:
+                    norm = _norm_row(snap["out_sku_code"], snap["fish_type"])
+                    med = (float(norm["med_yield_pct"])
+                           if norm and norm["med_yield_pct"] is not None else None)
+                    yld = (f"выход {y:.1f}% {_color_yield(y, med)} {_pct(y, med):+.1f}% к норме {med:.1f}%"
+                           if med else f"выход {y:.1f}%, нормы нет")
+            line = (f"{_ms_link(r)} от {d:%d.%m} ({age} дн.) · "
+                    f"{html.escape(prod, quote=False)} · {yld}")
+            comment = (r.get("description") or "").strip().replace("\n", " ")
+            if comment:
+                if len(comment) > 120:
+                    comment = comment[:120] + "…"
+                line += f"\n   <i>{html.escape(comment, quote=False)}</i>"
+            out.append(line)
+
+    text = f"🏭 <b>Проблемные выпуски – {len(rows)}</b>"
+    for line in out:
+        if len(text) + len(line) + 1 > DIGEST_LIMIT:
+            await app.bot.send_message(chat_id=int(partner), text=text, parse_mode="HTML",
+                                       disable_web_page_preview=True)
+            text = "🏭 <b>Проблемные выпуски (продолжение)</b>"
+        text += f"\n{line}"
+    await app.bot.send_message(chat_id=int(partner), text=text, parse_mode="HTML",
+                               disable_web_page_preview=True)
+    logger.info(f"svetofor problems: {len(rows)} операций → Маланчуку")

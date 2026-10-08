@@ -7438,6 +7438,22 @@ def main():
         time=_svf_time(hour=15, minute=0, tzinfo=_svf_tz.utc),
     )
 
+    # Проблемные выпуски Маланчуку («Проверить выход» + «Разобраться») – ПН–ПТ
+    # 10:00 МСК = 07:00 UTC (08.10.2026). PTB ≥20: days 0=ВС … 6=СБ.
+    from processing_svetofor import problems_job as _processing_svetofor_problems
+
+    async def _processing_svetofor_problems_wrapper(context):
+        try:
+            await _processing_svetofor_problems(app)
+        except Exception as e:
+            logger.error(f"processing_svetofor problems: {e}", exc_info=True)
+
+    app.job_queue.run_daily(
+        _processing_svetofor_problems_wrapper,
+        time=_svf_time(hour=7, minute=0, tzinfo=_svf_tz.utc),
+        days=(1, 2, 3, 4, 5),
+    )
+
     # ────────────────────────────────────────────────────────────────────
     # Светофор Заказа поставщику — polling каждые 10 мин (webhook по
     # purchaseorder МС не шлёт). План: 2026-07-09-светофор-заказа-поставщику.
