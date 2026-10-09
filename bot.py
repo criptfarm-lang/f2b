@@ -8100,6 +8100,14 @@ def main():
                 )
                 if ok:
                     saved += 1
+                    if not is_outbound:
+                        # сообщение по акции со страницы офера → тег на сделку в amoCRM
+                        try:
+                            import promo_offers
+                            promo_offers.on_message(db, chat_type, chat_id_val, contact_name,
+                                                    text, msg.get("messageId", ""))
+                        except Exception as _pe:
+                            logger.error(f"promo_offers: {_pe}")
             logger.info(f"Wazzup webhook: получено {len(messages)} сообщений, сохранено {saved}")
             return web.Response(text="ok")
         except Exception as e:
