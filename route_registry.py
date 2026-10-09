@@ -254,7 +254,42 @@ async def fetch_routes_checked():
         logger.warning("fetch_routes: Логистика недоступна (%s) — беру ручную раскладку", e)
         routes, order_routes, wialon_ok = {uid: [] for uid in UNITS}, {}, False
     routes = await _merge_manual(routes, wialon_ok)
+    await _apply_address_moves(routes)
     return routes, order_routes, wialon_ok
+
+
+async def _apply_address_moves(routes: dict) -> None:
+    """Адрес заказа поменяли в МойСклад, когда заявка уже стояла в маршруте: Wialon её
+    не правит, водитель ехал по старому адресу (заказ 04572, 09.10.2026: в маршруте
+    Гостиничный, на коробке – Бехтерева). Мост пишет такие заказы в address_moves –
+    подставляем новый адрес и точку (страница водителя, реестр, ссылка маршрута) и
+    помечаем точку addr_changed_from, чтобы водитель увидел, что адрес сменился."""
+    try:
+        import manual_route
+        if manual_route._DB is None:
+            return
+        rows = await asyncio.to_thread(
+            manual_route._DB._fetchall,
+            "SELECT ms_order_name, deliv_date, old_address, new_address, lat, lon "
+            "FROM address_moves WHERE deliv_date >= CURRENT_DATE - 1")
+    except Exception as e:
+        logger.warning("fetch_routes: address_moves недоступна: %s", e)
+        return
+    moves = {(r["ms_order_name"], r["deliv_date"]): r for r in rows or []}
+    if not moves:
+        return
+    for v in routes.values():
+        for s in v:
+            if not s.get("has_cid"):
+                continue  # ручную точку логист ведёт сам
+            m = next((moves[(s.get("order_no"), d)] for d in stop_days(s)
+                      if (s.get("order_no"), d) in moves), None)
+            if not m:
+                continue
+            s["addr_changed_from"] = s.get("address") or m.get("old_address") or ""
+            s["address"] = m["new_address"]
+            if m.get("lat") and m.get("lon"):
+                s["lat"], s["lon"] = m["lat"], m["lon"]
 
 
 async def fetch_routes(with_meta: bool = False):
@@ -909,6 +944,9 @@ def _build_registry_pdf(routes, ms_extra, date_str, date_iso=None) -> bytes:
                 info += ("<font size=10 color='#e65100'><b>➤➤ ЗАБОР ТОВАРА ◀</b></font>"
                          "<font size=7 color='#e65100'> · заказ поставщику, не доставка</font><br/>")
             info += f"<b>{client[:40]}</b> (№{s['order_no']})<br/>{address[:70]}"
+            if s.get("addr_changed_from") and not is_pickup:
+                info += ("<br/><font size=7 color='#c62828'><b>⚠ АДРЕС ИЗМЕНЁН</b> · в маршруте было: "
+                         f"{s['addr_changed_from'][:60]}</font>")
             resp = ex.get("manager") or ""
             if is_pickup:
                 # Ответственный за забор = закупщик (автор ЗП). Плюс водитель по доверенности, если есть.

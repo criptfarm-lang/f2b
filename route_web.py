@@ -146,6 +146,8 @@ body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f
 .tag-pickup{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:6px;
   background:#f59e0b;color:#fff;font-size:11px;font-weight:700;vertical-align:middle}
 .pt .meta.sample{color:#b45309;font-weight:600}
+/* Адрес сменили в МС после сборки маршрута – водитель едет по новому (кейс 04572). */
+.addr-moved{margin:4px 0;padding:6px 8px;border-radius:8px;background:#fdecea;color:#c62828;font-size:13px;font-weight:600}
 /* Подсветка точки, на которую привёл QR из реестра (якорь #o<№ документа>).
    scroll-margin — чтобы карточка не прилипала к верхней кромке экрана. */
 .pt:target{box-shadow:0 0 0 3px #f59e0b,0 1px 3px rgba(0,0,0,.06);scroll-margin-top:12px}
@@ -401,6 +403,9 @@ async def render_page(uid: int, target: date, db, bot) -> str:
                     f"<span class='win'>🕒 {_e(plan)} · {_e(win)}</span></div>")
         if address:
             rows.append(f"<div class='row'>📍 <a href='{_maps_link(address)}' target='_blank'>{_e(address)}</a></div>")
+        if s.get("addr_changed_from") and not is_pickup:
+            rows.append(f"<div class='addr-moved'>⚠ Адрес изменён менеджером. В маршруте было: "
+                        f"{_e(s['addr_changed_from'])}</div>")
         # Телефон приёмки — из Комментария заказа (менеджеры вписывают контакт туда),
         # карточку контрагента больше не читаем. Номер из комментария делаем кликабельным.
         tels = _phones_from_text(comment)
