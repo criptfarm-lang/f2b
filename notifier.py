@@ -14,6 +14,8 @@ import os
 logger = logging.getLogger(__name__)
 
 QUIZ_BASE_URL = os.getenv("QUIZ_BASE_URL", "")
+# Адрес FISHек для ссылок клиентам; по умолчанию тот же, что для API (на резерве они разные).
+QUIZ_PUBLIC_URL = (os.getenv("QUIZ_PUBLIC_URL") or QUIZ_BASE_URL).rstrip("/")
 
 MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
 # Заказ отклонён на согласовании, менеджеру нужно его доработать. С 28.09.2026 два
@@ -473,7 +475,7 @@ async def _send_fishki_mailing(order: dict, db) -> tuple[bool, str]:
     if QUIZ_BASE_URL:
         import urllib.parse, hashlib, aiohttp as _ah
         short_code = hashlib.md5(f"{order_id}{agent_id}".encode()).hexdigest()[:8]
-        quiz_url = f"{QUIZ_BASE_URL}/q/{short_code}"
+        quiz_url = f"{QUIZ_PUBLIC_URL}/q/{short_code}"
         try:
             async with _ah.ClientSession() as _qs:
                 await _qs.post(
@@ -488,7 +490,7 @@ async def _send_fishki_mailing(order: dict, db) -> tuple[bool, str]:
                 )
         except Exception as _e:
             quiz_url = (
-                f"{QUIZ_BASE_URL}"
+                f"{QUIZ_PUBLIC_URL}"
                 f"/?order={order_id}"
                 f"&client_id={agent_id}"
                 f"&amount={int(order_sum)}"

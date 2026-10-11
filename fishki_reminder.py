@@ -18,6 +18,7 @@ import aiohttp
 from notifier import (
     WAZZUP_API_URL,
     QUIZ_BASE_URL,
+    QUIZ_PUBLIC_URL,
     MS_BASE,
     _get_contact_from_ms,
 )
@@ -35,7 +36,7 @@ STOP_EVENT = asyncio.Event()
 
 def _make_short_url(order_id: str, agent_id: str) -> str:
     short_code = hashlib.md5(f"{order_id}{agent_id}".encode()).hexdigest()[:8]
-    return f"{QUIZ_BASE_URL}/q/{short_code}"
+    return f"{QUIZ_PUBLIC_URL}/q/{short_code}"
 
 
 def _plural_days(n: int) -> str:
