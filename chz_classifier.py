@@ -5,7 +5,9 @@
 В МойСкладе признаков маркировки нет (trackingType, GTIN, ТН ВЭД на 12.10.2026 пустые
 почти у всех товаров), поэтому группу определяем по названию и папке:
   1) правила (_RULES) — покрывают весь текущий ассортимент;
-  2) что правила не узнали — Claude Haiku, ответ строго одним ключом из CHZ_GROUPS;
+  2) что правила не узнали — классификатор ТН ВЭД: Claude Haiku определяет код ТН ВЭД
+     и признаки товара (масса, тара, стерилизация), группу вычисляет chz_tnved по
+     перечням кодов из постановлений, а не модель (решение собственника 12.10.2026);
   3) результат кэшируется в public.chz_product_class по товару + названию.
 
 Справочник групп (договор с ЧЗ есть/нет, статус) живёт в БД — public.chz_groups.
@@ -23,6 +25,8 @@ from datetime import date
 
 import aiohttp
 
+import chz_tnved
+
 logger = logging.getLogger(__name__)
 
 # status: mandatory — обязательна для опта сейчас; upcoming — станет обязательной
@@ -32,22 +36,28 @@ CHZ_GROUPS: dict[str, dict] = {
                 "mandatory_from": None, "has_contract": True, "act": "ПП 2099"},
     "oil":     {"title": "Растительные масла", "status": "mandatory",
                 "mandatory_from": None, "has_contract": False, "act": "ПП 676"},
-    "sauce":   {"title": "Бакалея: соусы и специи", "status": "mandatory",
+    "sauce":   {"title": "Бакалея: соусы, специи, уксусы, снеки", "status": "mandatory",
                 "mandatory_from": None, "has_contract": True, "act": "ПП 1682"},
-    "grain":   {"title": "Бакалея: крупы, макароны, мёд", "status": "upcoming",
-                "mandatory_from": date(2026, 12, 1), "has_contract": True,
+    # Нанесение кодов: макароны и мёд с 01.09.2026, крупы и рис с 01.12.2026;
+    # для опта (ЭДО) — с 01.11.2027.
+    "grain":   {"title": "Бакалея: крупы, рис, макароны, мёд, водоросли", "status": "upcoming",
+                "mandatory_from": date(2027, 11, 1), "has_contract": True,
                 "act": "ПП 1682 в ред. ПП 186"},
     "canned":  {"title": "Консервы", "status": "mandatory",
                 "mandatory_from": None, "has_contract": False, "act": "ПП 677"},
     "water":   {"title": "Упакованная вода", "status": "mandatory",
                 "mandatory_from": None, "has_contract": False, "act": "ПП 841"},
+    "drinks":  {"title": "Безалкогольные напитки и соки", "status": "mandatory",
+                "mandatory_from": None, "has_contract": False, "act": "ПП 887"},
+    "beer":    {"title": "Пиво и слабоалкогольные напитки", "status": "mandatory",
+                "mandatory_from": None, "has_contract": False, "act": "ПП 2173"},
     "meat":    {"title": "Мясные изделия", "status": "upcoming",
                 "mandatory_from": date(2027, 6, 1), "has_contract": False, "act": "ПП 205"},
     "frozen":  {"title": "Заморозка и полуфабрикаты", "status": "experiment",
                 "mandatory_from": date(2027, 3, 1), "has_contract": False,
                 "act": "ПП 1823 в ред. ПП 1099"},
-    # Модель считает, что товар маркируется, но не в группах выше — проверяет Малышкин.
-    "unknown": {"title": "Возможно маркируется, группа не определена", "status": "mandatory",
+    # Код ТН ВЭД определить не удалось — считаем маркируемым, пока не выяснено.
+    "unknown": {"title": "Код ТН ВЭД не определён", "status": "mandatory",
                 "mandatory_from": None, "has_contract": False, "act": ""},
     "none":    {"title": "Не маркируется", "status": "none",
                 "mandatory_from": None, "has_contract": True, "act": ""},
@@ -63,23 +73,34 @@ _FROZEN_PATHS = ("ПРИВЛЕЧЕННЫЕ ТОВАРЫ/Рыба", "ПРИВЛЕ
                  "ПРИВЛЕЧЕННЫЕ ТОВАРЫ/Полуфабрикаты", "ПРИВЛЕЧЕННЫЕ ТОВАРЫ/Мясо",
                  "ПРИВЛЕЧЕННЫЕ ТОВАРЫ/Икра")
 
-_FROZEN_RE = re.compile(r"с/м|з/м|заморож|мороже")
+_FROZEN_RE = re.compile(r"с/м|з/м|в/м|заморож|мороже")
 _SMALL_PACK_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:гр|г|мл)\b")
 
-# (ключ группы, регэксп по названию, исключения). Порядок важен: первое совпадение.
+# (ключ группы, регэксп по названию, исключения). Только однозначные случаи;
+# всё спорное (сыры с ЗМЖ, имбирь, водоросли, уксус, специи) идёт через ТН ВЭД.
+# Порядок важен: первое совпадение.
 _RULES: list[tuple[str, re.Pattern, re.Pattern | None]] = [
-    ("oil", re.compile(r"масло\s+(подсолн|растит|фритюр|оливк|кунжутн|рапс|кукуруз|соев|льнян)"
-                       r"|фритюрн|маргарин|спред"), None),
-    ("canned", re.compile(r"консерв|\bж/б\b|в собственном соку|шпрот|тушенк"), None),
+    ("oil", re.compile(r"масло\s+(подсолн|растит|фритюр|оливк|рапс|кукуруз|соев|льнян)|фритюрн"), None),
     ("water", re.compile(r"\bвода\b"), None),
-    ("dairy", re.compile(r"\bсыр(\b|ы\b|а\b|н|ом\b)|творож|сливк|сливочн|молок|молочн|сметан"
-                         r"|йогурт|кефир|маскарпоне|моцарел|пармез|филадельф|cream cheese"),
-     re.compile(r"кокос|сливочно-|в панировке")),
-    ("grain", re.compile(r"\bрис\b|рис для|крупа|гречк|пшено|булгур|кускус|киноа|макарон|спагетти"
-                         r"|лапша|\bмед\b|мёд|овсян|перлов"), None),
-    ("sauce", re.compile(r"(^|\s)соус(?!е)|майонез|кетчуп|горчиц|специ|приправ|перец\s+(черн|молот|красн)"
-                         r"|паприк|кориандр|васаби|карри|корица|куркум|паста\s+том\s*ям"), None),
-    ("meat", re.compile(r"колбас|сосиск|сардельк|ветчин|бекон|окорок|карбонад"), None),
+    ("grain", re.compile(r"\bрис\b|рис для|крупа|гречк|пшено|булгур|макарон|спагетти"), None),
+    ("sauce", re.compile(r"(^|\s)соус(?!е)|майонез|кетчуп"), None),
+]
+
+
+# Коды, сверенные по первоисточникам 12.10.2026 (разбор спорных позиций, см. план).
+# Модель на таких названиях путается от прогона к прогону — фиксируем код и признаки.
+# (регэксп по названию, код ТН ВЭД, признаки для chz_tnved.group_by_tnved)
+_KNOWN_TNVED: list[tuple[re.Pattern, str, dict]] = [
+    (re.compile(r"кокосов\w* молоко"), "2106909808", {"frozen": False}),  # решение ЕЭК № 171
+    (re.compile(r"со вкусом сыр|вкусом сыра"), "2106909808",
+     {"frozen": False, "milk_fat_replaced": True}),
+    (re.compile(r"кунжут"), "1207400000", {}),
+    (re.compile(r"панировочн|панко|panko"), "1905909000", {"breadcrumbs": True}),
+    (re.compile(r"уксус"), "2209009100", {}),
+    (re.compile(r"\bнори\b"), "1212210000", {}),
+    (re.compile(r"имбир\w* маринов"), "2001909709", {}),
+    (re.compile(r"паста\s+том\s*ям"), "2103909009", {}),
+    (re.compile(r"васаби"), "2103909009", {}),
 ]
 
 
@@ -112,6 +133,14 @@ def classify_by_rules(name: str, path: str) -> tuple[str, str] | None:
     # Масаго/тобико (икра летучей рыбы) в группу «икра» не входит, продаётся с/м.
     if re.search(r"масаго|тобико", n):
         return "frozen", "икра летучей рыбы, заморозка"
+    if "набор порционных образцов" in n:
+        return "none", "наш набор образцов, не товар поставщика"
+    for rx, code, flags in _KNOWN_TNVED:
+        if rx.search(n):
+            m = _SMALL_PACK_RE.search(n)
+            w = None if (not m or "кг" in n) else float(m.group(1).replace(",", "."))
+            key, why = chz_tnved.group_by_tnved(code, net_weight_g=w, **flags)
+            return key, why + " (код сверен вручную)"
     for key, rx, exclude in _RULES:
         if rx.search(n) and not (exclude and exclude.search(n)):
             if key == "sauce" and re.search(r"соус", n) and _small_sauce(n):
@@ -122,34 +151,32 @@ def classify_by_rules(name: str, path: str) -> tuple[str, str] | None:
     return None
 
 
-# ── Claude для того, что правила не узнали ───────────────────────────────────
+# ── классификатор ТН ВЭД для того, что правила не узнали ─────────────────────
 _LLM_MODEL = "claude-haiku-4-5-20251001"
-_LLM_PROMPT = """Ты помогаешь бухгалтерии оптовой компании (рыба и продукты для ресторанов, Россия, октябрь 2026).
-Определи, к какой товарной группе системы маркировки «Честный знак» относится товар.
-Группы (ответь ровно одним ключом):
-- dairy: молочная продукция, сыры, в т.ч. сырные продукты с заменителем молочного жира
-- oil: растительные масла и масложировая продукция
-- sauce: соусы (2103), специи и пряности (0904–0910)
-- grain: крупы, рис, макароны, лапша, мёд
-- canned: консервы (рыбные, мясные и т.п., в герметичной таре)
-- water: упакованная питьевая вода
-- meat: готовые мясные изделия (колбасы, сосиски, ветчина)
-- frozen: замороженная продукция и полуфабрикаты (рыба, морепродукты, мясо, овощи)
-- unknown: товар, вероятно, маркируется, но не входит ни в одну группу выше (напитки, пиво, табак, лекарства и т.п.)
-- none: не маркируется
-Если сомневаешься между none и группой – выбирай группу.
+_LLM_PROMPT = """Ты таможенный классификатор. Определи код ТН ВЭД ЕАЭС (10 знаков) для товара,
+который оптовая компания закупает у поставщика и перепродаёт ресторанам (Россия).
 Товар: «{name}»
 Папка в учётной системе: «{path}»
-Ответ – только JSON: {{"key": "<ключ>", "reason": "<до 12 слов>"}}"""
+Учитывай: продукты с заменителем молочного жира – не глава 04 (обычно 2106 или 1901);
+приправленные водоросли – глава 20; сушёные листы нори – 1212; маринованные овощи – 2001.
+Замороженный товар не бывает стерилизованным: hermetic_sterilized=false.
+Ответ – только JSON:
+{{"tnved": "<10 цифр>", "net_weight_g": <масса нетто одной упаковки в граммах или null>,
+  "hermetic_sterilized": <true если герметичная тара и продукт стерилизован/пастеризован, false если нет, null если неизвестно>,
+  "breadcrumbs": <true если это панировочные сухари>,
+  "milk_fat_replaced": <true если молочный жир заменён растительным>,
+  "frozen": <true если товар продаётся замороженным или это полуфабрикат>,
+  "reason": "<до 12 слов>"}}"""
 
 
 async def classify_by_llm(name: str, path: str) -> tuple[str, str]:
-    """Прямой HTTP к API (не SDK: на Amvera SDK заморожен на 0.40.0).
-    При сбое — «unknown»: пусть лучше посмотрит Малышкин, чем пропустим."""
+    """Код ТН ВЭД от модели → группа по перечням chz_tnved.
+    Прямой HTTP к API (не SDK: на Amvera SDK заморожен на 0.40.0).
+    При сбое — «unknown»: считаем маркируемым, пока не выяснено."""
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        return "unknown", "модель недоступна (нет ключа) – проверить вручную"
-    body = {"model": _LLM_MODEL, "max_tokens": 120,
+        return "unknown", "классификатор недоступен (нет ключа)"
+    body = {"model": _LLM_MODEL, "max_tokens": 200, "temperature": 0,
             "messages": [{"role": "user", "content": _LLM_PROMPT.format(name=name, path=path)}]}
     try:
         async with aiohttp.ClientSession() as s:
@@ -162,13 +189,18 @@ async def classify_by_llm(name: str, path: str) -> tuple[str, str]:
         text = next(b["text"] for b in data["content"] if b.get("type") == "text")
         m = re.search(r"\{.*\}", text, re.S)
         out = json.loads(m.group(0)) if m else {}
-        key = out.get("key")
-        if key not in CHZ_GROUPS:
-            return "unknown", f"модель ответила непонятно: {text[:60]}"
-        return key, "модель: " + (out.get("reason") or "")[:80]
     except Exception as e:
         logger.warning(f"chz_classifier: LLM fail for {name!r}: {e!r}")
-        return "unknown", "модель не ответила – проверить вручную"
+        return "unknown", "классификатор не ответил"
+    key, why = chz_tnved.group_by_tnved(
+        str(out.get("tnved") or ""),
+        net_weight_g=out.get("net_weight_g"),
+        hermetic_sterilized=out.get("hermetic_sterilized"),
+        breadcrumbs=bool(out.get("breadcrumbs")),
+        milk_fat_replaced=bool(out.get("milk_fat_replaced")),
+        frozen=out.get("frozen"),
+    )
+    return key, f"{why}; {(out.get('reason') or '')[:80]}"
 
 
 async def classify(name: str, path: str) -> tuple[str, str, str]:
