@@ -171,7 +171,10 @@ def add_routes(web_app, db, bot, token: str):
             data = await f.download_as_bytearray()
         except Exception as e:
             return web.Response(text=f"telegram: {e}", status=502)
-        ext = (f.file_path or "").rsplit(".", 1)[-1] if "." in (f.file_path or "") else "bin"
+        # file_path бывает полным адресом https://api.telegram.org/file/bot<TOKEN>/… – расширение
+        # берём только из имени файла, иначе в заголовок уходит кусок адреса с токеном бота.
+        name = (f.file_path or "").rsplit("/", 1)[-1]
+        ext = name.rsplit(".", 1)[-1] if "." in name else "bin"
         return web.Response(body=bytes(data), headers={"X-File-Ext": ext},
                             content_type="application/octet-stream")
 
