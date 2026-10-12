@@ -4559,7 +4559,11 @@ async def handle_doc_approval_callback(update: Update, context: ContextTypes.DEF
     Таблица documents в общей f2b-postgres. План: 2026-07-01-документы-договоры-и-telegram-согласование.md, Фаза 2.
     """
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except BadRequest as e:
+        # «Query is too old» (12.10.2026, резерв): нажатие дошло поздно – решение всё равно применяем
+        logger.warning("doc_approval: answer не прошёл (%s), продолжаю", e)
     data = query.data or ""
     try:
         action, sid = data.split(":", 1)
