@@ -169,6 +169,13 @@ _LLM_PROMPT = """Ты таможенный классификатор. Опре�
   "reason": "<до 12 слов>"}}"""
 
 
+def _anthropic_url() -> str:
+    """На резерве Timeweb Anthropic отвечает 403 – ходим через пересыльщик
+    (ANTHROPIC_BASE_URL, его же читает SDK); на Amvera переменной нет – напрямую."""
+    base = (os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
+    return f"{base}/v1/messages"
+
+
 async def classify_by_llm(name: str, path: str) -> tuple[str, str]:
     """Код ТН ВЭД от модели → группа по перечням chz_tnved.
     Прямой HTTP к API (не SDK: на Amvera SDK заморожен на 0.40.0).
@@ -180,7 +187,7 @@ async def classify_by_llm(name: str, path: str) -> tuple[str, str]:
             "messages": [{"role": "user", "content": _LLM_PROMPT.format(name=name, path=path)}]}
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post("https://api.anthropic.com/v1/messages", json=body,
+            async with s.post(_anthropic_url(), json=body,
                               headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
                               timeout=aiohttp.ClientTimeout(total=30)) as r:
                 data = await r.json()
