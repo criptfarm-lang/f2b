@@ -2201,109 +2201,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    elif action == "send_message_to_client":
-        client_query = params.get("client", "")
-        msg_text = params.get("message", "")
-
-        if not client_query:
-            await message.reply_text("❌ Укажи клиента.")
-            return
-
-        await message.reply_chat_action("typing")
-
-        # Находим контрагента в МойСклад
-        from moysklad import get_counterparty_phones
-        counterparties = await get_counterparty_balance(client_query)
-        if not counterparties:
-            await message.reply_text(f"❌ Клиент *{client_query}* не найден в МойСклад.", parse_mode="Markdown")
-            return
-
-        cp = counterparties[0]
-        cp_name = cp.get("name", client_query)
-
-        # Берём телефон
-        phones = await get_counterparty_phones([{"id": cp.get("id",""), "name": cp_name, "href": cp.get("href","")}])
-        phone = phones[0].get("phone") if phones else None
-
-        if not phone:
-            await message.reply_text(f"❌ У клиента *{cp_name}* нет телефона в МойСклад.", parse_mode="Markdown")
-            return
-
-        # Если текст не задан — формируем напоминание об оплате
-        if not msg_text:
-            balance = cp.get("balance", 0)
-            debt = abs(balance) if balance < 0 else 0
-            if debt > 0:
-                from moysklad import fmt_money
-                msg_text = f"Добрый день! Напоминаем о задолженности перед компанией F2B в размере {fmt_money(debt)}. Просьба произвести оплату. Спасибо!"
-            else:
-                await message.reply_text(f"❌ У *{cp_name}* нет долга. Укажи текст сообщения явно.", parse_mode="Markdown")
-                return
-
-        # Определяем каналы в порядке приоритета TG → Max → WhatsApp
-        CHANNEL_MAP = {
-            "telegram": "ddd24a95-9304-4098-a320-3e47fcd1020a",
-            "tgapi":    "ddd24a95-9304-4098-a320-3e47fcd1020a",
-            "max":      "1d5bc70a-7ca6-4895-8d1f-9690cf448214",
-            "whatsapp": "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03",
-        }
-        PRIORITY = ["telegram", "tgapi", "max", "whatsapp"]
-        from notifier import max_paused
-        if max_paused():   # MAX заблокировали за спам, рассылки туда выключены
-            PRIORITY.remove("max")
-
-        # Ищем известные каналы клиента из вебхуков — по имени или телефону
-        known = db.get_wazzup_contacts(cp_name)
-        # Также ищем по номеру телефона
-        if phone and not known:
-            known = db.get_wazzup_contacts(phone[-10:])  # последние 10 цифр
-        channels_to_try = []
-        for p in PRIORITY:
-            for k in known:
-                if k.get("chat_type") in (p,):
-                    channels_to_try.append({
-                        "channel_id": k["channel_id"],
-                        "chat_type": k["chat_type"],
-                        "chat_id": k["chat_id"],
-                    })
-                    break
-
-        # Fallback — WhatsApp по номеру телефона если нет известных каналов
-        if not any(c["chat_type"] in ("whatsapp",) for c in channels_to_try):
-            channels_to_try.append({
-                "channel_id": CHANNEL_MAP["whatsapp"],
-                "chat_type": "whatsapp",
-                "chat_id": phone,
-            })
-
-        # Показываем превью с кнопками — ждём подтверждения
-        import uuid as _uuid
-        msg_key = str(_uuid.uuid4())[:8]
-        _pending_sends[msg_key] = {
-            "channels": channels_to_try,
-            "name": cp_name,
-            "text": msg_text,
-        }
-
-        group_chat_id = get_group_chat_id()
-        target_chat = group_chat_id or chat_id
-
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Отправить", callback_data=f"send_confirm|{msg_key}"),
-            InlineKeyboardButton("❌ Отменить", callback_data=f"send_cancel|{msg_key}"),
-        ]])
-        await context.bot.send_message(
-            chat_id=target_chat,
-            text=(
-                f"📤 *Сообщение клиенту*\n\n"
-                f"👤 *{cp_name}*\n"
-                f"📱 {phone}\n\n"
-                f"💬 _{msg_text}_"
-            ),
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-
     elif action == "reconciliation":
         buyer_query = params.get("buyer", "")
         date_from = params.get("date_from", f"{datetime.now().year}-01-01")
@@ -2915,87 +2812,6 @@ async def cmd_add_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 results.append(f"❌ counterparty.UPDATE: {data}")
 
     await update.message.reply_text("Вебхуки МойСклад:\n" + "\n".join(results))
-
-# Хранилище ожидающих отправки сообщений — message_key → {phone, name, text, chat_type}
-_pending_sends: dict = {}
-
-async def handle_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатие кнопки Отправить / Отменить для сообщений клиентам."""
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    manager_ids = [int(x) for x in os.getenv("MANAGER_IDS", "").split(",") if x.strip()]
-    if user.id not in manager_ids:
-        await query.answer("⛔ Только для руководителей.", show_alert=True)
-        return
-
-    parts = query.data.split("|")
-    action = parts[0]
-    msg_key = parts[1] if len(parts) > 1 else ""
-
-    if action == "send_cancel":
-        _pending_sends.pop(msg_key, None)
-        await query.message.edit_text("❌ Отправка отменена.")
-        return
-
-    if action != "send_confirm":
-        return
-
-    pending = _pending_sends.pop(msg_key, None)
-    if not pending:
-        await query.message.edit_text("❌ Сообщение устарело — попробуй снова.")
-        return
-
-    api_key = os.getenv("WAZZUP_API_KEY", "")
-    import aiohttp, uuid as _uuid
-
-    # Каналы в порядке приоритета: WhatsApp → Max → Telegram
-    CHANNEL_PRIORITY = [
-        {"id": "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03", "type": "whatsapp"},
-        {"id": "1d5bc70a-7ca6-4895-8d1f-9690cf448214", "type": "max"},
-        {"id": "ddd24a95-9304-4098-a320-3e47fcd1020a", "type": "telegram"},
-    ]
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            sent_channel = None
-            last_error = ""
-            channels = pending.get("channels") or []
-            for ch in channels:
-                try:
-                    async with session.post(
-                        "https://api.wazzup24.com/v3/message",
-                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                        json={
-                            "channelId": ch["channel_id"],
-                            "chatType": ch["chat_type"],
-                            "chatId": ch["chat_id"],
-                            "crmMessageId": str(_uuid.uuid4()),
-                            "text": pending["text"],
-                        }
-                    ) as resp:
-                        if resp.status in (200, 201):
-                            sent_channel = ch["chat_type"]
-                            break
-                        else:
-                            body = await resp.text()
-                            last_error = f"{resp.status}: {body[:100]}"
-                            logger.warning(f"Wazzup {ch['chat_type']} failed: {last_error}")
-                except Exception as e:
-                    last_error = str(e)
-                    logger.warning(f"Wazzup {ch['chat_type']} exception: {e}")
-
-            if sent_channel:
-                await query.message.edit_text(
-                    f"✅ Сообщение отправлено *{pending['name']}* через {sent_channel}",
-                    parse_mode="Markdown"
-                )
-                logger.info(f"Wazzup: отправлено {pending['name']} ({pending['phone']}) через {sent_channel}")
-            else:
-                await query.message.edit_text(f"❌ Не удалось отправить ни через один канал.\nПоследняя ошибка: {last_error}")
-    except Exception as e:
-        await query.message.edit_text(f"❌ Ошибка: {e}")
 
 async def cmd_pdz_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Заглушка для всех старых команд по дебиторке (/pdz, /pdz_results, /pdz_test,
@@ -6921,7 +6737,6 @@ def main():
     # Ценовое согласование из дашборда менеджера (quiz-game) – светофор «ЗАПРОС ЦЕНЫ»
     from price_requests import handle_price_request_callback
     app.add_handler(CallbackQueryHandler(handle_price_request_callback, pattern="^preq_(ok|other):"))
-    app.add_handler(CallbackQueryHandler(handle_send_callback, pattern="^send_"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing|wazzup_later)"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
 
