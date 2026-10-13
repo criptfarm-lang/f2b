@@ -6436,7 +6436,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
                 pass  # если и это упало — сеть совсем легла, молча выходим
 
 
-TG_CONNECT_RETRIES = 3
+TG_CONNECT_RETRIES = 5
 
 
 class RetryingHTTPXRequest(HTTPXRequest):
@@ -6522,14 +6522,18 @@ def main():
         token=token,
         request=_tg_request(
             connection_pool_size=64,  # дефолт 1; апдейты + scheduler конкурируют за пул
-            connect_timeout=20.0,
+            # Резерв Timeweb, 13.10.2026: часть соединений к api.telegram.org не открывается
+            # вовсе (SYN без ответа). С 20 с на попытку ответ на кнопку опаздывал за 15 с
+            # окна Telegram («Query is too old», 31 раз за 11–12.10). Нормальное соединение
+            # открывается за 0,05 с – 4 с хватает с запасом, остальное добирают ретраи.
+            connect_timeout=4.0,
             read_timeout=20.0,
             write_timeout=30.0,       # send_document (PDF-реестры) — с запасом
             pool_timeout=10.0,        # дефолт 1с → PoolTimeout под нагрузкой
         ),
         get_updates_request=_tg_request(
             connection_pool_size=1,
-            connect_timeout=20.0,
+            connect_timeout=4.0,      # то же: долгий connect задерживал приход нажатий
             read_timeout=30.0,
         ),
     )
