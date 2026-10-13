@@ -103,7 +103,7 @@ CODE_VERSION = "antispam-3009"
 SETTINGS_PREFIX = "sales_dialog:"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
-ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/") + "/v1/messages"  # 11.10.2026: резерв ходит через пересыльщик
 ANTHROPIC_VERSION = "2023-06-01"
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 AMO_BASE = f"https://{os.getenv('AMO_SUBDOMAIN', 'victorfishtobiz')}.amocrm.ru/api/v4"
@@ -271,10 +271,11 @@ def workdays_ago(now: datetime, days: int) -> datetime:
 # `sales_dialog:_channels`, меняются без выкатки.
 CHANNELS_KEY = "_channels"
 DEFAULT_CHANNELS = {
-    "limits": {"telegram": 10, "max": 0, "whatsapp": 0},   # инициатив в день на канал
+    "limits": {"telegram": 10, "max": 5, "whatsapp": 0},   # инициатив в день на канал
     "window": [10, 17],                  # часы МСК, пн–пт
     "interval_min": [20, 45],            # случайная пауза между инициативами в канале
-    "first_touch_channels": ["telegram"],  # куда первым пишем новому сайт-лиду
+    "first_touch_channels": ["telegram", "max"],  # куда первым пишем новому сайт-лиду
+    "revive_channels": ["telegram"],     # где оживляем молчащий диалог (MAX – нет, 13.10.2026)
     "first_touch_max_days": 7,           # заявка старше – менеджеру, а не агенту
     "paused": {},                        # канал -> причина; снимает только собственник
     "next_at": {},                       # канал -> ISO-время, раньше которого не пишем
@@ -351,6 +352,9 @@ def initiative_block(row: dict, policy: dict, used: dict, now: datetime) -> str 
     nxt = (policy.get("next_at") or {}).get(ch)
     if nxt and now < datetime.fromisoformat(nxt):
         return f"пауза между сообщениями в {ch}"
+    revive = policy.get("revive_channels")
+    if row.get("source") == "silent" and revive is not None and ch not in revive:
+        return f"оживлять диалог в {ch} не пишем"
     if row.get("source") == "first":
         if ch not in (policy.get("first_touch_channels") or []):
             return f"первым в {ch} новому лиду не пишем"
@@ -2623,9 +2627,10 @@ async def _do_send(db, row_id: int, text: str) -> tuple[bool, str]:
     if is_initiative(msg):
         policy = channel_policy(db)
         ch = row_channel(msg)
-        from notifier import max_paused, MAX_PAUSED_UNTIL
-        if ch == "max" and max_paused():
-            return False, f"первым в MAX не пишем до {MAX_PAUSED_UNTIL}: канал блокировали за спам"
+        key = str(msg.get("inbound_message_id") or "")
+        revive = policy.get("revive_channels")
+        if key.startswith("silent:") and revive is not None and ch not in revive:
+            return False, f"оживлять диалог в {ch} не пишем"
         if ch in (policy.get("paused") or {}):
             return False, f"инициатива в {ch} на паузе: {policy['paused'][ch]}"
         sent_today = db._fetchone("""SELECT count(*) AS n FROM sales_dialog_messages

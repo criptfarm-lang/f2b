@@ -1089,7 +1089,7 @@ def test_note_initiative_sets_interval_within_bounds():
     note_initiative(db, channel_policy(db), "telegram", WED_11)
     nxt = datetime.fromisoformat(channel_policy(db)["next_at"]["telegram"])
     assert WED_11 + timedelta(minutes=20) <= nxt <= WED_11 + timedelta(minutes=45)
-    assert channel_policy(db)["limits"]["max"] == 0      # умолчания не затёрты
+    assert channel_policy(db)["limits"]["max"] == 5      # умолчания не затёрты
 
 
 # ── правки по разбору 23.09–02.10.2026 ───────────────────────────────────────
@@ -1236,3 +1236,14 @@ def test_newer_open_lead_ignores_closed_and_old(monkeypatch):
     db = FakeDB({"lead": {"created_at": datetime(2026, 9, 25, tzinfo=timezone.utc)}})
     row = {"campaign": "c", "lead_id": 3, "contact_id": 9}
     assert asyncio.run(sales_dialog.newer_open_lead(None, db, row)) is None
+
+
+def test_max_first_touch_allowed_revive_not():
+    # 13.10.2026: в MAX агент пишет первым только новому сайт-лиду, молчащих там не оживляет.
+    from sales_dialog import DEFAULT_CHANNELS, initiative_block
+    p = dict(DEFAULT_CHANNELS, next_at={})
+    first = _init_row("max", "first", taken_at_lead=None)
+    silent = _init_row("max", "silent")
+    assert initiative_block(first, p, {}, WED_11) is None
+    assert "оживлять" in initiative_block(silent, p, {}, WED_11)
+    assert "лимит" in initiative_block(first, p, {"max": 5}, WED_11)
