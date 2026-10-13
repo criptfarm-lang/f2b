@@ -44,8 +44,9 @@ CHANNEL_WHATSAPP = "e180aa1d-dc48-4d0a-bec3-fc0afc53cf03"
 CHANNEL_MAX      = "1d5bc70a-7ca6-4895-8d1f-9690cf448214"
 
 # MAX заблокировали за спам (30.09 и снова 06.10.2026). Собственник 07.10.2026:
-# фишки и любые рассылки в MAX не шлём, только Telegram и WhatsApp. Включительно.
-# Тот же выключатель читают bot.py (напоминание о долге), реактивация и агент.
+# рассылки в MAX не шлём, только Telegram и WhatsApp. Включительно.
+# Выключатель читают bot.py (напоминание о долге), реактивация и агент.
+# Фишки из-под паузы выведены 13.10.2026 (собственник: «включай рассылки фишки в макс»).
 MAX_PAUSED_UNTIL = "2026-10-21"
 
 
@@ -357,9 +358,9 @@ async def _get_contacts_from_ms(agent_id: str, headers: dict) -> list[dict]:
         contacts = []
         if telegram_id:
             contacts.append({"chat_id": telegram_id, "chat_type": "telegram", "channel_id": CHANNEL_TELEGRAM})
-        if max_id and max_paused():
-            logger.info(f"notifier: MAX на паузе до {MAX_PAUSED_UNTIL}, канал пропущен")
-        elif max_id:
+        # Фишки в MAX включены снова 13.10.2026 (собственник). Пауза MAX_PAUSED_UNTIL
+        # дальше действует только для долга, реактивации и первых сообщений агента.
+        if max_id:
             contacts.append({"chat_id": max_id, "chat_type": "max", "channel_id": CHANNEL_MAX})
         if whatsapp_id:
             contacts.append({"chat_id": whatsapp_id, "chat_type": "whatsapp", "channel_id": CHANNEL_WHATSAPP})
