@@ -486,7 +486,7 @@ import os
 
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/") + "/v1/messages"  # 11.10.2026: резерв ходит через пересыльщик
 ANTHROPIC_VERSION = "2023-06-01"
 MODEL = os.getenv("WEEKLY_MARKET_MODEL", "claude-opus-5")
 MAX_REPORT = 3500            # знаков видимого текста; лимит Telegram 4096
