@@ -41,6 +41,7 @@ from moysklad import (
     compute_supply_dates,
 )
 import supply_request_match as srm
+import chz_classifier as chz
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,18 @@ create table if not exists public.supply_svetofor_state (
     id        int primary key default 1,
     seeded_at timestamptz
 );
+-- Решение главбуха по ЧЗ на заказ (план 2026-10-12-чз-новый-товар-в-светофоре-закупки).
+-- status: pending — ждём; ok — согласовано; no — отказ; undelivered — запрос не дошёл.
+create table if not exists public.chz_decisions (
+    order_id    uuid primary key,
+    order_name  text,
+    sum_hash    bigint,
+    status      text not null,
+    positions   text,
+    asked_at    timestamptz default now(),
+    decided_at  timestamptz,
+    decided_by  bigint
+);
 """
 
 # ── DB (свой коннект, autocommit — как в processing_svetofor) ────────────────
@@ -79,6 +92,7 @@ def _db():
         _conn.autocommit = True
         with _conn.cursor() as cur:
             cur.execute(LOG_DDL)
+        chz.ensure_schema(_conn)
     return _conn
 
 
@@ -126,6 +140,89 @@ def _log_upsert(order_id: str, order_name: str, state: str, sum_hash: int):
 def _recipients() -> list[int]:
     v = (os.getenv("OWNER_CHAT_ID") or "").strip()
     return [int(v)] if v.lstrip("-").isdigit() else []
+
+
+def _accountant_chat_id() -> int | None:
+    """Главбух (Малышкин) — решения по ЧЗ. chat_id сверен отправкой 12.10.2026."""
+    v = (os.getenv("CHZ_ACCOUNTANT_CHAT_ID") or "96477973").strip()
+    return int(v) if v.isdigit() else None
+
+
+# ── ЧЗ: решение главбуха по заказу ────────────────────────────────────────────
+def _chz_get(order_id: str) -> dict | None:
+    with _db().cursor() as cur:
+        cur.execute("select * from public.chz_decisions where order_id=%s", (order_id,))
+        return cur.fetchone()
+
+
+def _chz_set(order_id: str, status: str, *, order_name: str | None = None,
+             sum_hash: int | None = None, positions: str | None = None,
+             decided_by: int | None = None):
+    with _db().cursor() as cur:
+        if decided_by is None:
+            # новый запрос (или повторный при изменении заказа) — сбрасываем прошлое решение
+            cur.execute("""
+                insert into public.chz_decisions (order_id, order_name, sum_hash, status, positions, asked_at)
+                values (%s, %s, %s, %s, %s, now())
+                on conflict (order_id) do update set order_name=excluded.order_name,
+                  sum_hash=excluded.sum_hash, status=excluded.status, positions=excluded.positions,
+                  asked_at=now(), decided_at=null, decided_by=null
+            """, (order_id, order_name, sum_hash, status, positions))
+        else:
+            cur.execute("""update public.chz_decisions set status=%s, decided_at=now(), decided_by=%s
+                           where order_id=%s""", (status, decided_by, order_id))
+
+
+def _fmt_date(d) -> str:
+    return d.strftime("%d.%m.%Y") if d else ""
+
+
+def _chz_eval(cls: dict, groups: dict, has_gtin: bool) -> dict | None:
+    """Блок «ЧЗ» по позиции: цвет, строка, нужен ли главбух. None — не маркируется."""
+    key = cls.get("key")
+    if not key or key == "none":
+        return None
+    g = groups.get(key) or chz.CHZ_GROUPS.get(key) or {}
+    title = g.get("title", key)
+    status = g.get("status")
+    contract = bool(g.get("has_contract"))
+    reason = cls.get("reason") or ""
+    conditional = "если тара герметичная" in reason
+    if status == "experiment":
+        return {"color": "white", "ask": False,
+                "line": f"   ЧЗ: ⚪ {title} – эксперимент, с {_fmt_date(g.get('mandatory_from'))} "
+                        f"возможно обязательна"}
+    if status == "upcoming":
+        c = "white" if contract else "yellow"
+        return {"color": c, "ask": False,
+                "line": f"   ЧЗ: {_icon(c)} {title} – для опта с {_fmt_date(g.get('mandatory_from'))}, "
+                        f"договор {'есть' if contract else 'НЕТ'}"}
+    if conditional:
+        return {"color": "red", "ask": True, "title": title,
+                "line": f"   ЧЗ: 🔴 {title}, если пастеризован в герметичной таре – "
+                        f"проверить по декларации, ждёт решения главбуха"}
+    if not contract:
+        return {"color": "red", "ask": True, "title": title,
+                "line": f"   ЧЗ: 🔴 {title} – договора с ЧЗ нет, ждёт решения главбуха"}
+    if not has_gtin:
+        return {"color": "yellow", "ask": False,
+                "line": f"   ЧЗ: 🟡 {title} – договор есть, в карточке нет GTIN"}
+    return {"color": "green", "ask": False, "line": f"   ЧЗ: 🟢 {title} – договор есть, GTIN есть"}
+
+
+async def _chz_blocks_safe(goods: list[dict]) -> dict[str, dict | None]:
+    """{pid: блок ЧЗ}. Сбой БД/классификатора — пустой словарь (блок не выводим,
+    светофор не ломаем), в логах предупреждение."""
+    out: dict[str, dict | None] = {}
+    try:
+        conn = _db()
+        groups = chz.load_groups(conn)
+        for g in goods:
+            cls = await chz.classify_cached(conn, g["pid"], g["name"], g.get("path") or "")
+            out[g["pid"]] = _chz_eval(cls, groups, g.get("gtin", False))
+    except Exception as e:
+        logger.warning(f"supply_svetofor: ЧЗ не посчитан: {e!r}")
+    return out
 
 
 # ── MS ─────────────────────────────────────────────────────────────────────
@@ -210,6 +307,7 @@ async def _compute_position_blocks(order: dict, requests: list[dict] | None = No
             "uom": ((a.get("uom") or {}).get("name") or ""),
             "qty": p.get("quantity") or 0,
             "price": (p.get("price", 0) or 0) / 100,
+            "gtin": any("gtin" in b for b in (a.get("barcodes") or [])),
         })
 
     async def _one(g):
@@ -244,6 +342,9 @@ async def _compute_position_blocks(order: dict, requests: list[dict] | None = No
     except asyncio.TimeoutError:
         logger.warning(f"supply_svetofor: timeout расчёта позиций для {order.get('name')}")
         results = []
+    chz_blocks = await _chz_blocks_safe(goods)
+    for r in results:
+        r["chz_block"] = chz_blocks.get(r["pid"])
     return results
 
 
@@ -284,7 +385,7 @@ def _build_supplier_card_lines(card: dict) -> list[str]:
 
 
 def _build_supply_alert_text(order: dict, pos_blocks: list[dict],
-                             card: dict, dates: dict) -> str:
+                             card: dict, dates: dict, chz_line: str = "") -> str:
     now_msk = datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M")
     order_name = order.get("name", "")
     agent = order.get("agent") or {}
@@ -299,6 +400,8 @@ def _build_supply_alert_text(order: dict, pos_blocks: list[dict],
     )
 
     lines = [""]
+    if chz_line:
+        lines.append(chz_line)
     # Даты
     lines.append(
         f"{_icon(dates['color'])} *Даты:* приёмка {dates['receipt_str']} → "
@@ -315,12 +418,17 @@ def _build_supply_alert_text(order: dict, pos_blocks: list[dict],
         lines.append("\n*Позиции:*")
         for b in pos_blocks[:_MAX_POS_SHOWN]:
             t = b["turn"]; pr = b["price_block"]; rq = b.get("req_block")
+            cz = b.get("chz_block")
             chilled = " ❄️" if is_chilled_position(b["name"]) else ""
             name = (b["name"] or "")[:52]
             pos_colors = [t["color"], pr["color"]]
             if rq:
                 pos_colors.append(rq["color"])
+            if cz:
+                pos_colors.append(cz["color"])
             lines.append(f"{_icon(_worst(pos_colors))} {name}{chilled} — {_fmt_qty(b['qty'])} кг")
+            if cz:
+                lines.append(cz["line"])
             # Заявка (только привлечённые товары)
             if rq:
                 lines.append(srm.format_line(rq, _icon))
@@ -388,6 +496,19 @@ async def handle_supply_approval_callback(update, context):
         await q.answer("Нет прав")
         return
 
+    # ЧЗ: пока главбух не решил (или отказал) — «Согласован» не выставляем.
+    try:
+        d = _chz_get(order_id)
+    except Exception as e:
+        logger.warning(f"supply_svetofor: chz_decisions недоступна: {e!r}")
+        d = None
+    if d and d["status"] == "pending":
+        await q.answer("Ждёт решения главбуха по Честному знаку", show_alert=True)
+        return
+    if d and d["status"] == "no":
+        await q.answer("Главбух отказал по Честному знаку – закупку не согласовать", show_alert=True)
+        return
+
     await q.answer("Отмечаю…")
     try:
         await _patch_supply_state(order_id, SUPPLY_STATE_AGREED)
@@ -402,6 +523,72 @@ async def handle_supply_approval_callback(update, context):
                 chat_id=q.message.chat_id,
                 text=f"⚠️ Светофор ЗП: не удалось выставить «Согласован» — {e}. "
                      f"Кнопка на месте, попробуй ещё раз.")
+        except Exception:
+            pass
+
+
+# ── ЧЗ: запрос главбуху и его кнопки ─────────────────────────────────────────
+def chz_keyboard(order_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Согласовано", callback_data=f"chz:ok:{order_id}"),
+        InlineKeyboardButton("❌ Отказ", callback_data=f"chz:no:{order_id}"),
+    ]])
+
+
+async def _ask_accountant(order: dict, asks: list[dict], app) -> bool:
+    """Шлёт главбуху запрос по ЧЗ. True — доставлено."""
+    chat_id = _accountant_chat_id()
+    if not chat_id:
+        return False
+    order_name = order.get("name", "")
+    agent_name = (order.get("agent") or {}).get("name", "—")
+    lines = [f"Честный знак: закупка маркируемого товара",
+             f"Заказ поставщику {order_name} · {agent_name}", ""]
+    for b in asks:
+        lines.append(f"• {b['name']} – {_fmt_qty(b['qty'])} {b.get('uom') or ''}".rstrip())
+        lines.append(b["chz_block"]["line"].replace("   ЧЗ: ", "  "))
+    lines += ["", "Закупку можно согласовать после вашего решения."]
+    try:
+        await app.bot.send_message(chat_id=chat_id, text="\n".join(lines),
+                                   reply_markup=chz_keyboard(order.get("id")))
+        return True
+    except Exception as e:
+        logger.error(f"supply_svetofor: запрос главбуху по {order_name} не доставлен: {e}")
+        return False
+
+
+async def handle_chz_callback(update, context):
+    """Кнопки главбуха «Согласовано»/«Отказ» (pattern ^chz:). Главбух или собственник."""
+    q = update.callback_query
+    try:
+        _, verdict, order_id = (q.data or "").split(":", 2)
+    except ValueError:
+        await q.answer()
+        return
+    uid = update.effective_user.id if update.effective_user else None
+    owner = (os.getenv("OWNER_CHAT_ID") or "").strip()
+    allowed = {_accountant_chat_id()} | ({int(owner)} if owner.isdigit() else set())
+    if uid not in allowed:
+        await q.answer("Нет прав")
+        return
+    await q.answer("Записываю…")
+    status = "ok" if verdict == "ok" else "no"
+    try:
+        _chz_set(order_id, status, decided_by=uid)
+        d = _chz_get(order_id) or {}
+        mark = "✅ Согласовано" if status == "ok" else "❌ Отказ"
+        await q.edit_message_text(f"{q.message.text or ''}\n\n→ {mark}", reply_markup=None)
+        if owner.isdigit() and uid != int(owner):
+            await context.bot.send_message(
+                chat_id=int(owner),
+                text=f"Честный знак, заказ поставщику {d.get('order_name', '')}: главбух – {mark}."
+                     + ("" if status == "ok" else " Закупку не согласовывать."))
+        logger.info(f"supply_svetofor: ЧЗ {order_id} → {status} ({uid})")
+    except Exception as e:
+        logger.error(f"supply_svetofor chz callback {order_id}: {e}")
+        try:
+            await context.bot.send_message(chat_id=q.message.chat_id,
+                                           text=f"⚠️ Не удалось записать решение по ЧЗ – {e}. Нажмите ещё раз.")
         except Exception:
             pass
 
@@ -421,7 +608,32 @@ async def check_supply_approval_needed(order: dict, app) -> bool:
     requests = _load_requests_safe()
     pos_blocks = await _compute_position_blocks(order, requests)
 
-    text = _build_supply_alert_text(order, pos_blocks, card, dates)
+    # ЧЗ: позиции, по которым нужен главбух → запрос ему, статус в chz_decisions.
+    chz_line = ""
+    asks = [b for b in pos_blocks if (b.get("chz_block") or {}).get("ask")]
+    if asks:
+        sum_hash = round((order.get("sum", 0) or 0) / 100)
+        names = "; ".join(b["name"] for b in asks)[:500]
+        delivered = await _ask_accountant(order, asks, app)
+        try:
+            _chz_set(order_id, "pending" if delivered else "undelivered",
+                     order_name=order_name, sum_hash=sum_hash, positions=names)
+        except Exception as e:
+            logger.warning(f"supply_svetofor: chz_decisions не записан: {e!r}")
+        chz_line = ("🔴 *ЧЗ:* маркируемый товар без договора – ждёт решения главбуха, "
+                    "«Согласован» заблокирован" if delivered else
+                    "🔴 *ЧЗ:* маркируемый товар без договора – запрос главбуху НЕ доставлен, "
+                    "решать вручную")
+    else:
+        # заказ пересогласовали без маркируемых позиций — старый запрос не должен блокировать
+        try:
+            with _db().cursor() as cur:
+                cur.execute("delete from public.chz_decisions where order_id=%s",
+                            (order_id,))
+        except Exception as e:
+            logger.warning(f"supply_svetofor: chz_decisions не очищен: {e!r}")
+
+    text = _build_supply_alert_text(order, pos_blocks, card, dates, chz_line)
 
     recipients = _recipients()
     if not recipients:

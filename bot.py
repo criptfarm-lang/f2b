@@ -6913,6 +6913,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_svetofor_callback, pattern="^svf:"))
     from supply_svetofor import handle_supply_approval_callback
     app.add_handler(CallbackQueryHandler(handle_supply_approval_callback, pattern="^sappr:"))
+    from supply_svetofor import handle_chz_callback
+    app.add_handler(CallbackQueryHandler(handle_chz_callback, pattern="^chz:"))
     app.add_handler(CallbackQueryHandler(handle_doc_approval_callback, pattern="^doc_(approve|reject):"))
     app.add_handler(CallbackQueryHandler(handle_claim_callback,
                                          pattern="^mclaim_(resolved|fix|finance|ack):"))
