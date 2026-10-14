@@ -135,6 +135,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ─── Ответ на нажатие кнопки не должен обрывать обработчик ──────────────────
+# query.answer() только убирает «часики» у кнопки. Когда Telegram отвечает
+# таймаутом или «Query is too old», исключение обрывало весь обработчик: статус
+# «Согласован» в МС не ставился, кнопка «не прожималась» (14.10.2026, ~40 обрывов
+# за 11–14.10). Глушим здесь – для всех кнопок бота сразу.
+from telegram import CallbackQuery as _CallbackQuery
+from telegram.error import TelegramError as _TelegramError
+_orig_cq_answer = _CallbackQuery.answer
+
+
+async def _safe_cq_answer(self, *args, **kwargs):
+    try:
+        return await _orig_cq_answer(self, *args, **kwargs)
+    except _TelegramError as e:
+        logger.warning(f"query.answer проигнорирован ({(self.data or '')[:40]}): {e}")
+        return False
+
+
+_CallbackQuery.answer = _safe_cq_answer
+
 # ─── Квиз — URL сервиса викторины ────────────────────────────────────────────
 QUIZ_BASE_URL = os.getenv("QUIZ_BASE_URL", "")  # https://викторина-xxxx.up.railway.app
 
@@ -4808,7 +4828,8 @@ async def _reject_order(query, context, alert_id: int, alert_data: dict, reason:
     except Exception as e:
         logger.warning(f"_reject_order: проверка статуса {order_id} → {e}")
     if not await set_order_state(order_id, state_id):
-        await query.answer("❌ Ошибка смены статуса в МС", show_alert=True)
+        await query.message.reply_text(
+            f"❌ Статус «Не согласован ({label})» в МС не поставился – нажмите ещё раз.")
         return
     db.close_approval_alert(alert_id, closed_by=user.id, comment=f"не согласован: {label}")
     base = (alert_data.get("alert_text") or "").split(_OWNER_WAIT_MARK)[0]
@@ -4921,7 +4942,8 @@ async def _finalize_two_step(query, context, alert_id: int, row: dict):
     user = query.from_user
     res, cur_state = await _agree_order_in_ms(row["order_id"])
     if res == "fail":
-        await query.answer("❌ Ошибка смены статуса в МС", show_alert=True)
+        await query.message.reply_text(
+            "❌ Статус «Согласован» в МС не поставился – нажмите «Согласовано» ещё раз.")
         return
     db.close_approval_alert(alert_id, closed_by=user.id)
     base = (row.get("alert_text") or "").split(_OWNER_WAIT_MARK)[0]
@@ -5034,10 +5056,14 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
             await query.answer("Уже согласовано ✓", show_alert=False)
             return
         if res == "fail":
-            await query.answer("❌ Ошибка смены статуса в МС", show_alert=True)
+            # Всплывашку уже не показать – на нажатие ответили в начале обработчика.
+            await query.message.reply_text(
+                f"❌ Статус «Согласован» в МС не поставился ({alert_data.get('order_name', '')}). "
+                f"Нажмите «Согласовано» ещё раз или поставьте вручную."
+            )
             return
         db.close_approval_alert(alert_id, closed_by=user.id)
-        tail = (f" · заказ уже «{cur_state}», статус в МС не меняли" if res == "ahead" else "")
+        tail =(f" · заказ уже «{cur_state}», статус в МС не меняли" if res == "ahead" else "")
         try:
             await query.edit_message_text(
                 query.message.text + f"\n\n✅ Согласовал: {user.full_name} в {_msk_hhmm()}{tail}",
