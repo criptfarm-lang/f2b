@@ -698,7 +698,7 @@ def test_persona_by_manager():
     from sales_dialog import persona_for
     assert persona_for(13665786)["first"] == "Денис"
     assert persona_for(11544494)["first"] == "Инесса"
-    assert persona_for(None)["first"] == "Инесса"          # карточка собственника
+    assert persona_for(None)["first"] == "Руслан"          # карточка руководителя агента
 
 
 def test_system_prompt_has_manager_name_and_gender():
