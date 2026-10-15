@@ -1525,6 +1525,7 @@ def _build_approval_text(
     credit: dict, contract: dict, overdue: dict, cashflow: dict, price: dict,
     site: dict, contacts: dict, upd_debt: dict = None,
     address: dict = None,
+    restaurant: dict = None,
     payment_planned_date: str = "",
     reliability: dict = None,
     control: dict = None,
@@ -1552,6 +1553,9 @@ def _build_approval_text(
     colors = [credit["color"], contract["color"], overdue["color"], cashflow["color"],
               price["color"], site["color"], contacts["color"], payment_color,
               upd_debt["color"], address["color"]]
+    # «Название ресторана» (15.10.2026): пустое → 🔴 и сводка не схлопывается.
+    if restaurant and not restaurant.get("skip"):
+        colors.append(restaurant["color"])
     # Надёжность контрагента (ЕГРЮЛ+финансы) — отдельная строка. unknown («не
     # проверено») не рушит all_green; yellow/red — рушат, чтобы строка показалась.
     rel_color, rel_line = (None, None)
@@ -1592,7 +1596,7 @@ def _build_approval_text(
             f"\n🟢 Все проверки ОК "
             f"(лимит {limit_pct}% · договор · ДДС {cashflow.get('n_days', 0)}д · "
             f"долг {_fmt_money(credit.get('current_debt', 0))} _на {sent_at}_ · "
-            f"УПД · сайт · контакты · адрес · цена{_dashboard_suffix(price)} · оплата {payment_planned_date}"
+            f"УПД · сайт · контакты · адрес{' · ресторан' if restaurant and not restaurant.get('skip') else ''} · цена{_dashboard_suffix(price)} · оплата {payment_planned_date}"
             f"{rel_suffix}{notary_suffix})\n"
         )
         return header + body
@@ -1708,6 +1712,13 @@ def _build_approval_text(
         else:
             lines.append(f"🔴 *Адрес:* {reason}")
 
+    # 6b. Название ресторана из карточки контрагента — для логиста и водителя
+    if restaurant and not restaurant.get("skip"):
+        if restaurant["color"] == "green":
+            lines.append(f"🟢 *Ресторан:* {_md(restaurant['value'][:60])}")
+        else:
+            lines.append("🔴 *Ресторан:* не заполнен")
+
     # 7. Цена — внизу, длинный список не мешает читать остальные строки
     items = price.get("items", [])
     if items:
@@ -1744,7 +1755,7 @@ def _build_approval_text(
 def build_manager_fix_text(
     order_name: str, client_name: str,
     contract: dict, overdue: dict, contacts: dict,
-    upd_debt: dict, site: dict, address: dict,
+    upd_debt: dict, site: dict, address: dict, restaurant: dict = None,
 ) -> str | None:
     """Менеджеру – что исправить по красным пунктам светофора (решение 08.10.2026).
     Только 🔴 из шести пунктов: Договор, Просрочка, Контакты, Долг по УПД, Сайт,
@@ -1768,6 +1779,9 @@ def build_manager_fix_text(
         fixes.append(f"Долг по УПД – верните подписанные УПД по {n} {word}.")
     if site.get("color") == "red":
         fixes.append("Сайт – заполните поле «Сайт» в карточке контрагента.")
+    if (restaurant or {}).get("color") == "red":
+        fixes.append("Ресторан – заполните поле «Название ресторана» в карточке "
+                     "контрагента, по нему логист и водитель находят точку.")
     if address.get("color") == "red":
         if address.get("addr"):
             fixes.append("Адрес – в «Адресе доставки» заказа оставьте только адрес, "
@@ -1811,7 +1825,7 @@ async def check_approval_needed(order_href: str, bot, db):
             compute_credit_color, compute_contract_color, compute_notary_color,
             compute_overdue_color, compute_cashflow_color,
             compute_price_color,
-            compute_site_color, compute_contacts_color,
+            compute_site_color, compute_contacts_color, compute_restaurant_color,
             compute_upd_debt_color, compute_address_color,
         )
 
@@ -1933,6 +1947,7 @@ async def check_approval_needed(order_href: str, bot, db):
         contract = compute_contract_color(cp_attrs)
         notary = compute_notary_color(cp_attrs)
         site = compute_site_color(cp_attrs)
+        restaurant = compute_restaurant_color(cp_attrs, agent_name)
         contacts = compute_contacts_color(cp_attrs)
         address = compute_address_color(order.get("shipmentAddress"))
 
@@ -1945,6 +1960,7 @@ async def check_approval_needed(order_href: str, bot, db):
             "cashflow": cashflow["color"],
             "price": price["color"],
             "site": site["color"],
+            "restaurant": restaurant["color"],
             "contacts": contacts["color"],
             "upd_debt": upd_debt["color"],
             "address": address["color"],
@@ -1971,7 +1987,7 @@ async def check_approval_needed(order_href: str, bot, db):
                 client_name=agent_name, manager_name=manager_name,
                 credit=credit, contract=contract, notary=notary, overdue=overdue, cashflow=cashflow,
                 price=price_block, site=site, contacts=contacts, upd_debt=upd_debt,
-                address=address,
+                address=address, restaurant=restaurant,
                 payment_planned_date=ppm_str,
                 reliability=reliability,
                 control=control,
@@ -2081,7 +2097,7 @@ async def check_approval_needed(order_href: str, bot, db):
         # гасит тот же дедуп alert_id выше: одно сообщение на заход заказа.
         fix_text = build_manager_fix_text(
             order_name, agent_name, contract, overdue, contacts,
-            upd_debt, site, address)
+            upd_debt, site, address, restaurant)
         if fix_text and mgr_user_id:
             try:
                 await bot.send_message(chat_id=mgr_user_id, text=fix_text)

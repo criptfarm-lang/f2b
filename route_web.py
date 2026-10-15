@@ -398,8 +398,11 @@ async def render_page(uid: int, target: date, db, bot) -> str:
 
         rows = []
         badge = "<span class='tag-pickup'>ЗАБОР</span>" if is_pickup else ""
+        rest = "" if is_pickup else (ex.get("restaurant") or "")
+        client = rr.split_restaurant(client, rest)
+        rest_html = f" <small style='font-weight:400;opacity:.75'>{_e(rest)}</small>" if rest else ""
         rows.append(f"<div class='top'><span class='num'>{i}.</span>"
-                    f"<span class='cli'>{_e(client)}{badge}</span>"
+                    f"<span class='cli'>{_e(client)}{rest_html}{badge}</span>"
                     f"<span class='win'>🕒 {_e(plan)} · {_e(win)}</span></div>")
         if address:
             rows.append(f"<div class='row'>📍 <a href='{_maps_link(address)}' target='_blank'>{_e(address)}</a></div>")

@@ -5853,6 +5853,25 @@ def compute_site_color(cp_attrs: dict) -> dict:
     return {"color": "red", "raw_value": raw}
 
 
+CP_ATTR_RESTAURANT = "Название ресторана"
+
+
+def compute_restaurant_color(cp_attrs: dict, agent_name: str = "") -> dict:
+    """Строка «Ресторан» светофора (собственник, 15.10.2026): доп.поле карточки
+    контрагента «Название ресторана» – по нему логист и водитель узнают точку, юрлицо
+    на вывеске не написано. Пусто → 🔴. Карточки «Розничный покупатель…» общие на
+    многих клиентов, заведения у них нет → skip (строку не показываем).
+    Возвращает {color, value, skip}."""
+    if (agent_name or "").startswith("Розничный покупатель"):
+        return {"color": "green", "value": "", "skip": True}
+    val = ""
+    for a in cp_attrs.get("_raw_attrs") or []:
+        if a.get("name") == CP_ATTR_RESTAURANT:
+            val = " ".join(str(a.get("value") or "").split())
+            break
+    return {"color": "green" if val else "red", "value": val, "skip": False}
+
+
 def _normalize_phone(raw: str) -> str:
     """+7 (926) 583-10-26 → 79265831026. Превращает префикс +7 в 7."""
     digits = re.sub(r"[^\d]", "", raw or "")

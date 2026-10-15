@@ -481,6 +481,11 @@ async def _ms_extra_by_order(order_numbers, names=None) -> dict:
         # Стандартное поле «Комментарий» заказа (description) — производственное (партии,
         # разделка, сроки), водителю не показываем.
         addr_comment = ((co.get("shipmentAddressFull") or {}).get("comment") or "").strip()
+        restaurant = ""
+        for a in agent.get("attributes") or []:
+            if a.get("name") == CP_ATTR_RESTAURANT:
+                restaurant = " ".join(str(a.get("value") or "").split())
+                break
         return {
             "places": places,
             "comment": addr_comment,
@@ -496,6 +501,8 @@ async def _ms_extra_by_order(order_numbers, names=None) -> dict:
             # Поручения водителю на точке (сырой текст доп.поля) — веб-чеклист делает
             # из них отдельные пункты-распоряжения (driver_checklist.driver_tasks).
             "checklist_raw": checklist_raw,
+            # «Название ресторана» из карточки контрагента — мельче рядом с юрлицом
+            "restaurant": restaurant,
             # Комментарий заказа (производственный) водителю не показываем — он нужен
             # только чтобы отличить приписку логиста в заявке от данных МС (manual_note).
             "descr": (co.get("description") or "").strip(),
@@ -745,6 +752,16 @@ ATTR_WINDOW_TO = "Окно доставки до (время)"
 # driver_checklist._CHECKLIST_ATTR_NAME — дублируем константу, а не импортируем,
 # чтобы не заводить циклический импорт (driver_checklist сам тянет route_registry).
 ATTR_DRIVER_CHECKLIST = "Чек-лист водителя"
+# Доп.поле КАРТОЧКИ КОНТРАГЕНТА — вывеска точки (собственник, 15.10.2026).
+CP_ATTR_RESTAURANT = "Название ресторана"
+
+
+def split_restaurant(client: str, restaurant: str) -> str:
+    """Имя заявки без « · вывеска»: мост с 15.10.2026 пишет в Логистику «юрлицо · вывеска»,
+    а реестр и страница водителя показывают вывеску отдельно и мельче."""
+    if restaurant and client.endswith(f" · {restaurant}"):
+        return client[: -len(restaurant) - 3]
+    return client
 
 import re as _re_rr
 
@@ -945,7 +962,12 @@ def _build_registry_pdf(routes, ms_extra, date_str, date_iso=None) -> bytes:
                 pickup_rows.append(idx)
                 info += ("<font size=10 color='#e65100'><b>➤➤ ЗАБОР ТОВАРА ◀</b></font>"
                          "<font size=7 color='#e65100'> · заказ поставщику, не доставка</font><br/>")
-            info += f"<b>{client[:40]}</b> (№{s['order_no']})<br/>{address[:70]}"
+            rest = "" if is_pickup else (ex.get("restaurant") or "")
+            client = split_restaurant(client, rest)
+            info += f"<b>{client[:40]}</b>"
+            if rest:
+                info += f" <font size=7 color='#444444'>{rest[:40]}</font>"
+            info += f" (№{s['order_no']})<br/>{address[:70]}"
             if s.get("addr_changed_from") and not is_pickup:
                 info += ("<br/><font size=7 color='#c62828'><b>⚠ АДРЕС ИЗМЕНЁН</b> · в маршруте было: "
                          f"{s['addr_changed_from'][:60]}</font>")
