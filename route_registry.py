@@ -795,7 +795,9 @@ def manual_note(note, ms_comment, descr="") -> str:
     for seg in _re_rr.split(r"\s*\|\s*|\s+·\s+", str(note)):
         seg = " ".join(str(seg).split())
         n = _norm_txt(seg)
-        if not n or n.startswith("мест:") or n.startswith("ещё тел.:"):
+        # «Чек-лист: …» — поле заказа «Чек-лист водителя», мост кладёт его с 15.10.2026;
+        # в реестре оно своей строкой, приписка логиста не оно.
+        if not n or n.startswith("мест:") or n.startswith("ещё тел.:") or n.startswith("чек-лист:"):
             continue
         w = _sig_words(seg)
         if not w:
@@ -973,6 +975,12 @@ def _build_registry_pdf(routes, ms_extra, date_str, date_iso=None) -> bytes:
                 # Лимит 300, чтобы не срезать длинные инструкции приёмки/номер. Paragraph переносит.
                 # Обрезаем ДО линкификации (иначе можно разрезать <a>-тег), все номера — кликабельные tel:.
                 info += f"<br/><font size=7 color='#888888'>{_linkify_phones(cm[:300])}</font>"
+            # Поле заказа «Чек-лист водителя» (пропуск, возврат, деньги) — до 15.10.2026 в
+            # реестр не попадало, логист его не видела (кейс 04734).
+            chk = " ".join((ex.get("checklist_raw") or "").split())
+            if chk and not is_pickup:
+                info += (f"<br/><font size=8 color='#c62828'><b>Чек-лист:</b> "
+                         f"{_linkify_phones(chk[:300])}</font>")
             # Приписка логиста в самой Логистике (пропуск, авианакладная, условия въезда) —
             # в МойСклад её нет, поэтому помечаем источник.
             mn = manual_note(s.get("note"), cm, ex.get("descr"))

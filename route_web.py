@@ -403,6 +403,12 @@ async def render_page(uid: int, target: date, db, bot) -> str:
                     f"<span class='win'>🕒 {_e(plan)} · {_e(win)}</span></div>")
         if address:
             rows.append(f"<div class='row'>📍 <a href='{_maps_link(address)}' target='_blank'>{_e(address)}</a></div>")
+        # Поручения из «Чек-листа водителя» — сразу под клиентом, а не только в форме
+        # сдачи внизу: «пропуск заказать за час» надо увидеть ДО приезда (кейс 04734).
+        chk = (ex.get("checklist_raw") or "").strip()
+        if chk and not is_done and not is_pickup:
+            chk_html = "<br>".join(_e(x.strip()) for x in chk.splitlines() if x.strip())
+            rows.append(f"<div class='addr-moved'>📋 Чек-лист: {chk_html}</div>")
         if s.get("addr_changed_from") and not is_pickup:
             rows.append(f"<div class='addr-moved'>⚠ Адрес изменён менеджером. В маршруте было: "
                         f"{_e(s['addr_changed_from'])}</div>")
