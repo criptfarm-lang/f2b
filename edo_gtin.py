@@ -234,15 +234,30 @@ async def run(write: bool = True) -> list[dict]:
     return log
 
 
-def missing_gtin_products() -> list[str]:
-    """Товары обязательных групп ЧЗ (по классификатору), у которых в карточке нет GTIN –
-    считаем по кэшу классификатора и последней записи GTIN; карточки читаются при отчёте."""
+async def missing_gtin_products(session) -> list[str]:
+    """Товары МС (не архив, не свои нужды) обязательных групп ЧЗ без штрихкода GTIN.
+    Группа – классификатор chz_classifier (кэш chz_product_class, новые товары
+    классифицируются при первом прогоне)."""
+    import chz_classifier as chz
     conn = _db()
-    with conn.cursor() as cur:
-        cur.execute("""select c.product_id, c.name from public.chz_product_class c
-                       join public.chz_groups g on g.key = c.group_key
-                       where g.status = 'mandatory' and c.group_key <> 'unknown'""")
-        return [(str(r["product_id"]), r["name"]) for r in cur.fetchall()]
+    chz.ensure_schema(conn)
+    groups = chz.load_groups(conn)
+    out, offset = [], 0
+    while True:
+        rows = (await _ms_get(session, "/entity/product", {"limit": 1000, "offset": offset})).get("rows", [])
+        for p in rows:
+            path = p.get("pathName") or ""
+            if p.get("archived") or path.startswith(_OWN_NEEDS):
+                continue
+            cls = await chz.classify_cached(conn, p["id"], p.get("name", ""), path)
+            if (groups.get(cls["key"]) or {}).get("status") != "mandatory" or cls["key"] == "unknown":
+                continue
+            if not any(b.get("gtin") for b in p.get("barcodes") or []):
+                out.append(f"{p.get('name')} ({(groups.get(cls['key']) or {}).get('title', cls['key'])})")
+        if len(rows) < 1000:
+            break
+        offset += 1000
+    return sorted(out)
 
 
 def _accountant_chat_id() -> int | None:
@@ -272,19 +287,11 @@ async def job(app, weekly_missing: bool = False):
             lines.append(f"• {x['line_name'][:60]} – GTIN {x['gtin']} (УПД {x['doc_number']} от "
                          f"{x['doc_date']:%d.%m.%Y}, {x['supplier']}): {x['reason']}")
     if weekly_missing:
-        miss = []
         async with aiohttp.ClientSession() as s:
-            from moysklad import MS_BASE
-            for pid, name in missing_gtin_products():
-                try:
-                    p = await _ms_get(s, f"{MS_BASE}/entity/product/{pid}")
-                except Exception:
-                    continue
-                if not p.get("archived") and not any(b.get("gtin") for b in p.get("barcodes") or []):
-                    miss.append(name)
+            miss = await missing_gtin_products(s)
         if miss:
-            lines += ["", "Маркируемые товары без GTIN в карточке (из УПД пока не пришёл):"]
-            lines += [f"• {n}" for n in sorted(miss)]
+            lines += ["", "Маркируемые товары без GTIN в карточке (из УПД пока не пришёл – внесите из ЛК ЧЗ):"]
+            lines += [f"• {n}" for n in miss]
     chat = _accountant_chat_id()
     if lines and chat:
         text = "\n".join(lines)
