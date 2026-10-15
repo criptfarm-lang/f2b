@@ -7478,6 +7478,29 @@ def main():
     app.job_queue.run_repeating(_fishki_review_ask_wrapper, interval=900, first=260)
 
     # ────────────────────────────────────────────────────────────────────
+    # ЭДО: неподписанные документы в Диадоке – синхронизация раз в 2 часа
+    # (строка «ЭДО» в светофоре заказа), сводка Рудневой по понедельникам 09:30 МСК.
+    # План: 2026-10-15-чз-эдо-неподписанные-документы.
+    # ────────────────────────────────────────────────────────────────────
+    import edo_unsigned as _edo
+
+    async def _edo_sync_wrapper(context):
+        await _edo.sync_job(app)
+
+    async def _edo_weekly_wrapper(context):
+        try:
+            await _edo.weekly_job(app)
+        except Exception as e:
+            logger.error(f"edo_unsigned weekly: {e}", exc_info=True)
+
+    app.job_queue.run_repeating(_edo_sync_wrapper, interval=7200, first=300)
+    app.job_queue.run_daily(
+        _edo_weekly_wrapper,
+        time=_fp_time(hour=6, minute=30, tzinfo=_fp_tz.utc),   # ПН 09:30 МСК
+        days=(1,),   # PTB: 0 = воскресенье, 1 = понедельник
+    )
+
+    # ────────────────────────────────────────────────────────────────────
     # Сторож «заказ ниже прайса без согласования» – добор каждые 30 мин
     # (вебхуки МС теряются). Первый прогон – тихая разметка текущих заказов.
     # План: 2026-09-22-сторож-заказ-ниже-прайса-без-согласования.

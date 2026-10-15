@@ -1531,6 +1531,7 @@ def _build_approval_text(
     control: dict = None,
     notary: dict = None,
     attracted_line: str = None,
+    edo: tuple = None,
 ) -> str:
     """
     Шаблон алерта. Порядок строк (по убыванию важности):
@@ -1563,6 +1564,10 @@ def _build_approval_text(
         from counterparty_svetofor import format_reliability_line
         rel_color, rel_line = format_reliability_line(reliability)
     all_green = all(c == "green" for c in colors) and rel_color not in ("yellow", "red")
+    # ЭДО (неподписанные документы в Диадоке) — отдельная строка, красная рушит сводку.
+    edo_color, edo_line, edo_chz = (tuple(edo) + (None,) * 3)[:3] if edo else (None, None, None)
+    if edo_color == "red":
+        all_green = False
     # Клиент из листа контроля виден ВСЕГДА: даже если все проверки зелёные,
     # схлопывать алерт в одну строку нельзя — метка ради этого и заводилась.
     if control:
@@ -1579,6 +1584,8 @@ def _build_approval_text(
     if control:
         note = (control.get("note") or "").strip()
         header += "⛔ *Клиент из листа контроля*" + (f" — {note}" if note else "") + "\n"
+    if edo_chz:
+        header += "⛔ *Честный знак клиенту с долгом по ЭДО*\n"
 
     if all_green:
         limit_pct = 0
@@ -1681,6 +1688,11 @@ def _build_approval_text(
         lines.append(f"🟡 *Долг по УПД:* не проверено")
     else:
         lines.append(f"🟢 *Долг по УПД:* нет")
+    if edo_line:
+        lines.append(edo_line)
+    if edo_chz:
+        shown = ", ".join(n[:40] for n in edo_chz[:5]) + (f" и ещё {len(edo_chz) - 5}" if len(edo_chz) > 5 else "")
+        lines.append(f"⛔ *ЧЗ в заказе:* {shown} – коды не перейдут клиенту, пока он не подпишет документы")
 
     # 5. Сайт
     if site["color"] == "green":
@@ -1879,6 +1891,23 @@ async def check_approval_needed(order_href: str, bot, db):
             except Exception as e:
                 logger.warning(f"check_approval_needed: надёжность {cp_inn} → {e}")
 
+        # 2a'. ЭДО: неподписанные документы клиента в Диадоке (снимок в БД, план
+        # 2026-10-15-чз-эдо-неподписанные-документы). Ошибка — строку не показываем.
+        edo = None
+        if cp_inn:
+            try:
+                from edo_unsigned import client_debt, format_line, chz_positions
+                edo = format_line(client_debt(cp_inn))
+                # долг по ЭДО + маркируемый товар в заказе → отдельная пометка
+                if edo[0] == "red":
+                    try:
+                        names = await asyncio.wait_for(chz_positions(order_href), timeout=25)
+                        edo = (*edo, names or None)
+                    except Exception as e:
+                        logger.warning(f"check_approval_needed: ЧЗ-позиции {order_name} → {e!r}")
+            except Exception as e:
+                logger.warning(f"check_approval_needed: ЭДО {cp_inn} → {e!r}")
+
         # 2b. Лист контроля дебиторки (план 2026-09-09) — одно чтение по PK.
         # Ошибка БД не должна ронять алерт: без метки он всё равно полезен.
         control = None
@@ -1966,6 +1995,8 @@ async def check_approval_needed(order_href: str, bot, db):
             "address": address["color"],
             "reliability": (reliability or {}).get("color", "unknown"),
             "attracted": "pending" if buyer_chat_id else "none",
+            "edo": (edo or (None, None))[0] or "none",
+            "edo_chz": "yes" if edo and len(edo) > 2 and edo[2] else "no",
         }
         # Дата планируемой оплаты — то что выставил webhook-autofill за 60с до
         # этого алерта. Берём из attributes заказа, форматируем DD.MM.YYYY.
@@ -1992,6 +2023,7 @@ async def check_approval_needed(order_href: str, bot, db):
                 reliability=reliability,
                 control=control,
                 attracted_line=attracted_line,
+                edo=edo,
             )
 
         alert_text = _render(
