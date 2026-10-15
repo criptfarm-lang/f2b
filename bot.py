@@ -7494,6 +7494,24 @@ def main():
             logger.error(f"edo_unsigned weekly: {e}", exc_info=True)
 
     app.job_queue.run_repeating(_edo_sync_wrapper, interval=7200, first=300)
+
+    # ЧЗ: GTIN из входящих УПД Диадока → штрихкод в карточке МС, 10:00 МСК ежедневно;
+    # по понедельникам главбуху ещё список маркируемых товаров без GTIN.
+    # План: 2026-10-15-чз-gtin-из-входящих-упд.
+    import edo_gtin as _edo_gtin
+
+    async def _edo_gtin_wrapper(context):
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        monday = _dt.now(_tz(_td(hours=3))).weekday() == 0
+        try:
+            await _edo_gtin.job(app, weekly_missing=monday)
+        except Exception as e:
+            logger.error(f"edo_gtin: {e}", exc_info=True)
+
+    app.job_queue.run_daily(
+        _edo_gtin_wrapper,
+        time=_fp_time(hour=7, minute=0, tzinfo=_fp_tz.utc),   # 10:00 МСК
+    )
     app.job_queue.run_daily(
         _edo_weekly_wrapper,
         time=_fp_time(hour=6, minute=30, tzinfo=_fp_tz.utc),   # ПН 09:30 МСК
