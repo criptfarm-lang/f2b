@@ -395,12 +395,16 @@ async def _call_claude(content, max_tokens: int = 8192, model: Optional[str] = N
     response = None
     for attempt in range(3):
         try:
-            response = await client.messages.create(
+            # Потоком: без него пересыльщик Railway рвёт долгий ответ («upstream error»),
+            # а Anthropic всё равно берёт деньги (PDF-прайсы падали так с 11.10.2026).
+            # max_retries=0 – повтор только наш, по 429, а не тройной платный повтор SDK.
+            async with client.with_options(max_retries=0).messages.stream(
                 model=used_model,
                 max_tokens=max_tokens,
                 system=_build_system_prompt(),
                 messages=[{"role": "user", "content": content}],
-            )
+            ) as stream:
+                response = await stream.get_final_message()
             break
         except Exception as e:
             err_msg = str(e)
@@ -803,6 +807,10 @@ def _insert_lots(db, lots: list[dict], supplier_id: str, msg_id: int,
     return inserted, skipped
 
 
+PDF_MAX_FAILS = 3
+_PDF_FAILS: dict[int, int] = {}   # счётчик неудач PDF по id сообщения (сбрасывается перезапуском)
+
+
 async def process_pending(db, limit: int = 20) -> dict:
     """Главная функция — обработать unprocessed сообщения."""
     pending = db.get_unprocessed_market_intel(limit=limit)
@@ -837,7 +845,13 @@ async def process_pending(db, limit: int = 20) -> dict:
                                                      original_filename=original_filename)
                 except Exception as e:
                     logger.exception(f"market_intel: msg {msg_id} PDF parse failed: {e!r}")
-                    # НЕ помечаем processed — попробуем на следующем тике (вдруг временный сбой).
+                    # НЕ помечаем processed — попробуем на следующем тике (вдруг временный сбой),
+                    # но не больше PDF_MAX_FAILS раз: каждая попытка платная (14.10.2026 один PDF
+                    # разбирался заново каждые 30 минут больше суток).
+                    _PDF_FAILS[msg_id] = _PDF_FAILS.get(msg_id, 0) + 1
+                    if _PDF_FAILS[msg_id] >= PDF_MAX_FAILS:
+                        logger.error(f"market_intel: msg {msg_id} PDF – {PDF_MAX_FAILS} неудачи подряд, больше не пробую")
+                        db.mark_market_intel_processed(msg_id)
                     stats["failed"] += 1
                     continue
             elif mt == "document" and msg.get("file_ext") in ("xls", "xlsx"):
