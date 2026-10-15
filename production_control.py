@@ -864,6 +864,12 @@ def schedule(app, db):
     """Джобы по окнам регламента. Времена в UTC, МСК = UTC+3."""
     from datetime import time as _time
 
+    # 15.10.2026 собственник отключил все три напоминания (09:00, 13:00, 17:00).
+    # Обработчик ответов (register) остаётся. Вернуть – QC_REMINDERS=1 в env.
+    if os.getenv("QC_REMINDERS", "0").strip() != "1":
+        logger.info("production_control: напоминания о замерах выключены (QC_REMINDERS!=1)")
+        return
+
     for w in WINDOWS:
         h, m = w["utc"]
         key = w["key"]
