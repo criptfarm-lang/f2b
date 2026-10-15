@@ -1457,6 +1457,13 @@ def _md(text: str) -> str:
     return text
 
 
+def _md_bold(text: str) -> str:
+    """Текст внутри *жирного* (Markdown v1): экранировать внутри сущности нельзя,
+    «*» закрывает жирный. Звёздочку меняем на похожий «∗» (клиент
+    «Розничный покупатель*** (Ирина)» 15.10.2026 сломал правку светофора)."""
+    return (text or "").replace("*", "∗")
+
+
 def _pcs(n: int) -> str:
     return "позиция" if n % 10 == 1 and n % 100 != 11 else \
         "позиции" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "позиций"
@@ -1493,7 +1500,7 @@ def build_attracted_buyer_text(order_name: str, client_name: str, manager_name: 
     client_type = (items[0].get("client_type") or "") if items else ""
     lines = [
         "🔔 *Согласование цены · привлечённые товары*",
-        f"*{_md(client_name)}* · заказ {_md(order_name)}" + (f" · {client_type}" if client_type else ""),
+        f"*{_md_bold(client_name)}* · заказ {_md(order_name)}" + (f" · {client_type}" if client_type else ""),
         f"👔 {_md(manager_name)} · 🕐 {sent_at}",
         "",
     ]
@@ -1577,7 +1584,7 @@ def _build_approval_text(
         all_green = False
 
     header = (
-        f"🔔 *{client_name}* · {_fmt_money(order_sum)} ₽\n"
+        f"🔔 *{_md_bold(client_name)}* · {_fmt_money(order_sum)} ₽\n"
         f"Заказ {order_name}\n"
         f"👔 {manager_name} · 🕐 {sent_at}\n"
     )

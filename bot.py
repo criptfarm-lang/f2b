@@ -4754,6 +4754,15 @@ async def _edit_owner_messages(bot, alert_row: dict, text: str, reply_markup=Non
             )
             done += 1
         except Exception as e:
+            if "parse entities" in str(e):
+                # Сломанная разметка не должна оставлять кнопки на месте – правим без неё.
+                try:
+                    await bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                                                text=text, reply_markup=reply_markup)
+                    done += 1
+                    continue
+                except Exception as e2:
+                    e = e2
             logger.warning(f"approval: правка сообщения {chat_id}/{message_id} → {e}")
     return done
 
@@ -4882,6 +4891,11 @@ async def _handle_buyer_approval(query, context, alert_id: int):
                                       parse_mode="Markdown")
     except Exception as e:
         logger.warning(f"appr_buyer: правка сообщения закупщика → {e}")
+        try:
+            # Без разметки, иначе кнопка «Согласовать» остаётся и кажется, что не сработала.
+            await query.edit_message_text(buyer_text + f"\n\n✅ Согласовано вами в {t}")
+        except Exception as e2:
+            logger.warning(f"appr_buyer: правка без разметки → {e2}")
 
     order_name = row.get("order_name") or ""
     client_name = row.get("client_name") or ""
