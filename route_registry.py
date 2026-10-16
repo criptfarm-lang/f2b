@@ -242,6 +242,113 @@ async def _merge_manual(routes: dict, wialon_ok: bool) -> dict:
     return routes
 
 
+# ─── Утверждённая раскладка «Развозки» (план 2026-10-16-логистика-всё-в-развозке) ──
+# На дату, где логист нажал «Утвердить» в «Развозке», раскладка берётся оттуда, а не
+# из Логистики: логист больше не повторяет её руками в Логистике. Заявки моста в
+# Логистике остаются – из них берём телефон, комментарий, точное окно и oid.
+
+def approved_plans(days) -> dict:
+    """{день: plan} – последняя утверждённая версия «Развозки» на каждый день.
+    Выключатель – env RAZVOZKA_SOURCE=1 (без него источник прежний – Логистика)."""
+    if os.getenv("RAZVOZKA_SOURCE") != "1":
+        return {}
+    try:
+        import manual_route
+        if manual_route._DB is None or not days:
+            return {}
+        rows = manual_route._DB._fetchall(
+            "SELECT DISTINCT ON (snap_date) snap_date, plan FROM ad_approved_plan "
+            "WHERE snap_date = ANY(%s) ORDER BY snap_date, approved_at DESC, id DESC",
+            (list(days),))
+    except Exception as e:
+        logger.warning("approved_plans: %s", e)
+        return {}
+    out = {}
+    for r in rows or []:
+        plan = r["plan"]
+        if isinstance(plan, str):
+            plan = json.loads(plan)
+        out[r["snap_date"]] = plan
+    return out
+
+
+def _approved_window_days():
+    today = datetime.now(_MSK).date()
+    return [today + timedelta(days=d) for d in (-1, 0, 1, 2)]
+
+
+def _hour_ts(day, h):
+    if h is None:
+        return None
+    hh = float(h)
+    dt = datetime(day.year, day.month, day.day, tzinfo=_MSK) + timedelta(hours=hh)
+    return int(dt.timestamp())
+
+
+def _match_wialon(st: dict, pool: list):
+    """Заявка моста в Логистике для точки «Развозки»: доставка – по № заказа,
+    забор – «ЗАБОР 00123» в «Развозке» против «ЗАБОР 00123: Поставщик» в Логистике."""
+    no = str(st.get("order_no") or "")
+    for s in pool:
+        n = str(s.get("order_no") or "")
+        if n == no or (no.startswith("ЗАБОР") and n.startswith(no + ":")):
+            return s
+    return None
+
+
+def apply_approved(routes: dict, plans: dict) -> dict:
+    """Заменить точки утверждённых дней точками «Развозки». Порядок – как утвердил
+    логист. Остальные дни не трогаем. Наёмная и нераспределённые в маршруты машин
+    не идут (как и раньше: в Логистике у них нет машины)."""
+    if not plans:
+        return routes
+    days = set(plans)
+    pool = [s for v in routes.values() for s in v]
+    out = {uid: [s for s in v if not (stop_days(s) & days)] for uid, v in routes.items()}
+    for day, plan in sorted(plans.items()):
+        for unit in plan.get("units") or []:
+            uid = unit.get("unit_id")
+            if uid not in UNITS:
+                continue
+            stops = sorted(unit.get("stops") or [], key=lambda s: s.get("seq") or 0)
+            for st in stops:
+                w = _match_wialon(st, [s for s in pool if day in stop_days(s)]) or {}
+                is_pickup = st.get("kind") == "pickup" or str(st.get("order_no") or "").startswith("ЗАБОР")
+                tf = w.get("tf") or _hour_ts(day, st.get("win_from"))
+                tt = w.get("tt") or _hour_ts(day, st.get("win_to"))
+                if not tf and not tt:
+                    tf = _hour_ts(day, 12)
+                out.setdefault(uid, []).append({
+                    "seq": None,
+                    "vt": None,  # плановое время по точкам – Ф2 (от выезда по дорогам)
+                    "tf": tf,
+                    "tt": tt,
+                    "client": w.get("client") if w.get("client") not in (None, "", "?") else (st.get("client") or "?"),
+                    "address": st.get("address") or w.get("address") or "",
+                    "phone": w.get("phone") or "",
+                    "order_no": w.get("order_no") or st.get("order_no"),
+                    "note": w.get("note") or "",
+                    "oid": w.get("oid"),
+                    "has_cid": True,  # гарды дублей ищут сирот без cid – эти не сироты
+                    "lat": st.get("lat") if st.get("lat") is not None else w.get("lat"),
+                    "lon": st.get("lon") if st.get("lon") is not None else w.get("lon"),
+                    "approved": True,
+                    **({"is_pickup": True} if is_pickup else {}),
+                })
+    # Порядок: точки неутверждённых дней – как были, утверждённые – в порядке логиста.
+    for uid, v in out.items():
+        for i, s in enumerate(v):
+            s["seq"] = i
+    logger.info("fetch_routes: раскладка «Развозки» на %s",
+                ", ".join(d.strftime("%d.%m") for d in sorted(days)))
+    return out
+
+
+async def overlay_approved(routes: dict) -> dict:
+    plans = await asyncio.to_thread(approved_plans, _approved_window_days())
+    return apply_approved(routes, plans)
+
+
 async def fetch_routes_checked():
     """(routes, order_routes, wialon_ok) — как fetch_routes(with_meta=True), плюс признак,
     ответила ли Логистика. Нужен странице водителя: пустой маршрут при недоступной
@@ -254,6 +361,7 @@ async def fetch_routes_checked():
         logger.warning("fetch_routes: Логистика недоступна (%s) — беру ручную раскладку", e)
         routes, order_routes, wialon_ok = {uid: [] for uid in UNITS}, {}, False
     routes = await _merge_manual(routes, wialon_ok)
+    routes = await overlay_approved(routes)
     await _apply_address_moves(routes)
     return routes, order_routes, wialon_ok
 

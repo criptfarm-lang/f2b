@@ -1028,7 +1028,8 @@ async def _fetch_routes_via(session, sid):
         })
     for uid in routes:
         routes[uid].sort(key=lambda s: (s["seq"] if s["seq"] is not None else 999))
-    return routes
+    # На дни, утверждённые в «Развозке», раскладка оттуда (в Логистике её больше не повторяют).
+    return await rr.overlay_approved(routes)
 
 
 async def _window_passed_alert(bot, unit_name, s, now_ts, recipients):

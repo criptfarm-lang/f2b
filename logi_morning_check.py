@@ -120,6 +120,21 @@ async def collect(target_date=None) -> dict:
             "address": p.get("a") or "",
             "has_cid": bool(p.get("cid")),
         })
+    # День утверждён в «Развозке»: машина назначена там, а не в Логистике. «Без машины»
+    # – только то, чего нет ни на машине, ни в наёмной утверждённой раскладки.
+    # № заявки забора в Логистике «ЗАБОР 00123: Поставщик», в «Развозке» – «ЗАБОР 00123».
+    plan = rr.approved_plans([day]).get(day)
+    if plan:
+        placed, assigned = set(), {}
+        for u in plan.get("units") or []:
+            for st in u.get("stops") or []:
+                placed.add(str(st.get("order_no") or ""))
+                if u.get("unit_id") in rr.UNITS:
+                    assigned[u["unit_id"]] = assigned.get(u["unit_id"], 0) + 1
+        for st in plan.get("hired") or []:
+            placed.add(str(st.get("order_no") or ""))
+        unassigned = [x for x in unassigned
+                      if str(x["order_no"]).split(":")[0] not in placed]
     unassigned.sort(key=lambda x: str(x["order_no"]))
     return {"unassigned": unassigned, "assigned": assigned}
 
