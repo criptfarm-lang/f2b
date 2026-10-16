@@ -208,6 +208,8 @@ class SkuRule:
     processing: tuple[str, ...] = ()     # пусто = любая разделка
     forms: tuple[str, ...] = ("сырьё",)
     raw_any: tuple[str, ...] = ()        # хоть одна подстрока в названии лота
+    raw_need: list = field(default_factory=list)   # группы подстрок: из каждой хоть одна
+    raw_none: tuple[str, ...] = ()       # ни одной из подстрок в названии и регионе лота
 
 
 def _sku_rule(name: str) -> SkuRule | None:
@@ -245,6 +247,18 @@ def _sku_rule(name: str) -> SkuRule | None:
         r.processing = ("Б/Г", "ПБГ")
     if " l1" in low:
         r.raw_any = ("l1", "l 1")
+    # 16.10.2026, Кристина: наш кальмар фас. по 1 кг сравнился с блоками и мешками,
+    # командорское филе – с гигантским из Перу. Фасовку, вид и очистку проверяем по тексту лота.
+    # Только кальмар: у угря, мидий, судака фасовка у поставщиков пишется как «в/у», «IQF».
+    if "кальмар" in species:
+        if "фас" in low:
+            r.raw_need.append(("фас", "коробочк", "пачк"))
+        if "командор" in low:
+            r.raw_none += ("гигант", "перу", "чили", "китай", "аргентин", "иллекс")
+        if "очищ" in low or "б/к" in low:
+            r.raw_none += ("хитин", "пласт", "неочищ")
+    if "гребешок" in species and "раковин" not in low:
+        r.raw_none += ("раковин",)
     return r
 
 
@@ -255,6 +269,8 @@ def _sku_lot_ok(lot: dict, r: SkuRule, use_sizes: bool) -> bool:
             and (not r.processing or lot["processing"] in r.processing)
             and (not r.forms or lot["form"] in r.forms)
             and (not r.raw_any or any(x in raw or x in (lot["weight_class"] or "").lower() for x in r.raw_any))
+            and all(any(x in raw for x in group) for group in r.raw_need)
+            and not any(x in f'{raw} {lot["region"] or ""}'.lower() for x in r.raw_none)
             and (not use_sizes or not r.sizes or r.sizes & _sizes(lot["weight_class"])))
 
 
