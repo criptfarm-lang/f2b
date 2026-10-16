@@ -773,31 +773,11 @@ async def _collect_and_send(context, target_date, to_chat):
             to_chat, f"На {date_str} маршрутов в Логистике нет (не построены).")
 
 
-async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждение → status=confirmed + пуш водителю (PDF + кнопки) + PDF в склад-группу."""
-    q = update.callback_query
-    await _safe_answer(q, "Отправляю…")
-    parts = q.data.split(":")  # rd:conf:<date>:<uid>
-    target_date = date.fromisoformat(parts[2])
-    uid = int(parts[3])
-    dstr = parts[2]
-    cached = _PKG_CACHE.get((dstr, uid))
-    if cached:
-        pkg, km = cached  # берём то, что логист только что видел при сборе — быстро, без перечита
-    else:
-        try:
-            routes, order_routes = await rr.fetch_routes(with_meta=True)
-            me = await context.bot.get_me()
-            pkg = await _unit_package(routes, uid, target_date, me.username)
-        except Exception as e:
-            logger.exception("cb_confirm fetch: %s", e)
-            await context.bot.send_message(q.from_user.id, "Не удалось перечитать маршрут Wialon для отправки.")
-            return
-        if not pkg:
-            await context.bot.send_message(q.from_user.id, f"Маршрут {rr.UNITS.get(uid)} пуст — отправлять нечего.")
-            return
-        km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in pkg["stops"]])
-
+async def confirm_unit(bot, target_date, uid, pkg, km):
+    """Ядро «Подтвердить»: status=confirmed, реестр в группу «Логистика», лист загрузки
+    в склад-группу. Возвращает (driver_note, sklad_note). Зовут кнопка «Подтвердить»
+    и отправка из «Развозки» (publish_pending)."""
+    dstr = target_date.isoformat()
     stops = pkg["stops"]
     date_str = target_date.strftime("%d.%m.%Y")
     unit_name = rr.UNITS.get(uid, str(uid))
@@ -843,7 +823,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 body = _h(f"Маршрут — {left} из {len(stops)} точек (порядок выгрузки).\n\n{note}\n\n"
                           f"👉 Чеклист машины: {_route_link(uid, dstr)}")
             ok, msg, how = await _send_pdf(
-                context.bot, logist_group, pkg["pdf"],
+                bot, logist_group, pkg["pdf"],
                 f"reestr_{uid}_{target_date.isoformat()}.pdf",
                 f"{head}\n\n{body}{_h(ya_block)}")
             if ok and msg is not None and _DB is not None:
@@ -863,7 +843,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sklad = _sklad_chat_id()
     if sklad:
         ok, _, how = await _send_pdf(
-            context.bot, sklad, pkg["pdf"],
+            bot, sklad, pkg["pdf"],
             f"reestr_{uid}_{target_date.isoformat()}.pdf",
             _sklad_caption(unit_name, date_str, note, _links_block(uid, stops, dstr), uid=uid),
             reply_markup=_sklad_kb(dstr, uid))
@@ -871,12 +851,96 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       else "склад ✓ (без PDF, Telegram лагает)" if ok
                       else "⚠️ склад НЕ доставлено")
 
+    return driver_note, sklad_note
+
+
+async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение → status=confirmed + пуш водителю (PDF + кнопки) + PDF в склад-группу."""
+    q = update.callback_query
+    await _safe_answer(q, "Отправляю…")
+    parts = q.data.split(":")  # rd:conf:<date>:<uid>
+    target_date = date.fromisoformat(parts[2])
+    uid = int(parts[3])
+    dstr = parts[2]
+    cached = _PKG_CACHE.get((dstr, uid))
+    if cached:
+        pkg, km = cached  # берём то, что логист только что видел при сборе — быстро, без перечита
+    else:
+        try:
+            routes, order_routes = await rr.fetch_routes(with_meta=True)
+            me = await context.bot.get_me()
+            pkg = await _unit_package(routes, uid, target_date, me.username)
+        except Exception as e:
+            logger.exception("cb_confirm fetch: %s", e)
+            await context.bot.send_message(q.from_user.id, "Не удалось перечитать маршрут Wialon для отправки.")
+            return
+        if not pkg:
+            await context.bot.send_message(q.from_user.id, f"Маршрут {rr.UNITS.get(uid)} пуст — отправлять нечего.")
+            return
+        km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in pkg["stops"]])
+
+    driver_note, sklad_note = await confirm_unit(context.bot, target_date, uid, pkg, km)
+
     try:
         await q.edit_message_caption(
             caption=(q.message.caption or "") + f"\n\n✅ Подтверждено → {driver_note}; {sklad_note}.",
             reply_markup=_route_kb(dstr, uid, 0, depart_hm(dstr, uid), confirmed=True))
     except Exception as e:
         logger.warning("cb_confirm edit: %s", e)
+
+
+# ─── Отправка из «Развозки» (план 2026-10-16-логистика-всё-в-развозке) ──────────
+# Логист нажал в «Развозке» «Утвердить и отправить» → строка в ad_publish_requests.
+# Раз в 30 с забираем её и делаем по каждой машине то же, что «Подтвердить»: реестр
+# в группу «Логистика», лист загрузки складу. Итог – логистам в личку.
+
+async def publish_pending(context: ContextTypes.DEFAULT_TYPE):
+    if _DB is None:
+        return
+    try:
+        rows = _DB._fetchall(
+            "UPDATE ad_publish_requests SET status='work', taken_at=now() "
+            "WHERE id IN (SELECT id FROM ad_publish_requests WHERE status='pending' "
+            "ORDER BY id LIMIT 3 FOR UPDATE SKIP LOCKED) "
+            "RETURNING id, snap_date, requested_by")
+    except Exception as e:
+        logger.warning("publish_pending: %s", e)
+        return
+    for r in rows or []:
+        target_date = r["snap_date"]
+        lines = []
+        try:
+            routes, order_routes = await rr.fetch_routes(with_meta=True)
+            me = await context.bot.get_me()
+            for uid in rr.UNITS:
+                pkg = await _unit_package(routes, uid, target_date, me.username)
+                if not pkg:
+                    continue
+                stops = pkg["stops"]
+                snap = [{"order_no": x["order_no"], "client": x.get("client"), "seq": x.get("seq"),
+                         "is_pickup": bool(x.get("is_pickup"))} for x in stops]
+                _upsert_draft(target_date, uid, pkg["driver_id"], snap)
+                km = rr.mileage_km(order_routes, uid, [x.get("oid") for x in stops])
+                _PKG_CACHE[(target_date.isoformat(), uid)] = (pkg, km)
+                dn, sn = await confirm_unit(context.bot, target_date, uid, pkg, km)
+                lines.append(f"{rr.unit_title(uid)} – {len(stops)} точек: {dn}; {sn}")
+            status = "done" if lines else "empty"
+            result = "\n".join(lines) or "маршрутов на дату нет"
+        except Exception as e:
+            logger.exception("publish_pending %s: %s", target_date, e)
+            status, result = "error", f"ошибка: {e}"
+        try:
+            _DB._execute("UPDATE ad_publish_requests SET status=%s, result=%s, done_at=now() WHERE id=%s",
+                         (status, result, r["id"]))
+        except Exception as e:
+            logger.warning("publish_pending mark %s: %s", r["id"], e)
+        text = (f"🚚 Реестры на {target_date.strftime('%d.%m')} из «Развозки» "
+                f"(утвердил(а) {r['requested_by']}):\n{result}")
+        for cid in _logist_chat_ids():
+            try:
+                await context.bot.send_message(cid, text)
+            except Exception as e:
+                logger.warning("publish_pending notify %s: %s", cid, e)
 
 
 async def cb_sklad_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -998,6 +1062,8 @@ def register(app: Application, db):
     app.add_handler(CallbackQueryHandler(cb_confirm, pattern=r"^rd:conf:"))
     app.add_handler(CallbackQueryHandler(cb_sklad_refresh, pattern=r"^rd:sklrf:"))
     app.add_handler(CallbackQueryHandler(cb_depart, pattern=r"^rd:dep:"))
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(publish_pending, interval=30, first=40, name="razvozka_publish")
     # ensure_schema — после хендлеров и best-effort: сбой БД на старте не должен ронять
     # register и глушить кнопки маршрута (та же защита, что в driver_checklist).
     try:
