@@ -274,7 +274,7 @@ def approved_plans(days) -> dict:
 
 def _approved_window_days():
     today = datetime.now(_MSK).date()
-    return [today + timedelta(days=d) for d in (-1, 0, 1, 2)]
+    return [today + timedelta(days=d) for d in (-1, 0, 1, 2, 3)]  # +3: в пятницу – понедельник
 
 
 def _hour_ts(day, h):

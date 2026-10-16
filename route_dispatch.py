@@ -420,12 +420,16 @@ async def cmd_routes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _allowed(user.id):
         await update.message.reply_text("⛔ Доступно логисту и владельцу.")
         return
-    kb = InlineKeyboardMarkup([[
+    row = [
         InlineKeyboardButton("Сегодня", callback_data="rd:col:0"),
         InlineKeyboardButton("Завтра", callback_data="rd:col:1"),
-    ]])
+    ]
+    wd = datetime.now(_MSK).weekday()
+    if wd in (4, 5):  # пт/сб – понедельник раскладывают заранее
+        row.append(InlineKeyboardButton("Понедельник", callback_data=f"rd:col:{7 - wd}"))
+    kb = InlineKeyboardMarkup([row])
     await update.message.reply_text(
-        "Собрать маршруты из Логистики на подтверждение — на какой день?",
+        "Собрать маршруты на подтверждение (из «Развозки», если день утверждён там) — на какой день?",
         reply_markup=kb)
 
 
