@@ -36,8 +36,9 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (Application, CommandHandler, MessageHandler, ContextTypes, filters,
+                          CallbackQueryHandler)
 
 from moysklad import MS_BASE, get_headers, PDZ_MANAGER_TG_IDS
 
@@ -58,6 +59,8 @@ HOME_POINTS = {
     26695: [(55.69762, 37.90345), (55.68441, 37.88906)],
 }
 R_HOME_M = 300
+DEPART_GRACE_MIN = 15   # Ф7: выезд позже плана меньше чем на 15 мин – не сигналим
+DEPART_STALE_H = 4      # сигнал о выезде – только в первые 4 ч после плана
 R_BASE_M = 500       # «В пути» — удаление транспорта на 500 м от склада (спека собственника)
 R_STOP_M = 300       # радиус «прибыл на точку»
 DELAY_BUFFER_MIN = 30
@@ -108,6 +111,55 @@ def _logist_chat_ids() -> list:
             except ValueError:
                 pass
     return out
+
+
+# Ф7 (решение собственника 16.10.2026): сигналы «не успеваем в окно» и «окно прошло»
+# получает только логист Боева А. (не Белякова, не партнёр, не менеджер).
+def _signal_chat_ids() -> list:
+    raw = os.getenv("RAZVOZKA_SIGNAL_CHAT_IDS") or "1296942948"
+    return [int(p) for p in raw.split(",") if p.strip().lstrip("-").isdigit()]
+
+
+def _warn_key(order_no) -> str:
+    """Ключ точки для «Клиент предупреждён»: № как есть, длинный – только номер документа
+    (callback_data Telegram ≤ 64 байт)."""
+    no = str(order_no or "")
+    if len(no.encode("utf-8")) <= 40:
+        return no
+    import re as _re
+    m = _re.search(r"\d{2,}", no)
+    return m.group(0) if m else no.encode("utf-8")[:40].decode("utf-8", "ignore")
+
+
+def _warn_kb(stops) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"✓ Клиент предупреждён: {(s.get('client') or '')[:22]} №{_warn_key(s['order_no'])[:12]}",
+                                  callback_data=f"dsw:{_warn_key(s['order_no'])}")] for s in stops[:8]]
+    return InlineKeyboardMarkup(rows)
+
+
+async def cb_client_warned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «Клиент предупреждён» под сигналом: по точке больше не тревожим (Ф7)."""
+    q = update.callback_query
+    uid = q.from_user.id
+    if uid not in set(_signal_chat_ids()) | set(_logist_chat_ids()) | {_owner_chat_id()}:
+        await q.answer("Нет доступа", show_alert=True)
+        return
+    key = q.data.split(":", 1)[1]
+    db = context.application.bot_data.get("db")
+    try:
+        _st_upsert(db, key, client_warned=True)
+    except Exception as e:
+        logger.warning("cb_client_warned %s: %s", key, e)
+        await q.answer("Не сохранилось, попробуйте ещё раз", show_alert=True)
+        return
+    _log_alert(db, "client_warned", order_no=key, detail=f"отметил {q.from_user.full_name}")
+    await q.answer(f"№{key}: клиент предупреждён, больше не тревожу")
+    try:
+        kb = q.message.reply_markup
+        left = [r for r in (kb.inline_keyboard if kb else []) if r[0].callback_data != q.data]
+        await q.edit_message_reply_markup(InlineKeyboardMarkup(left) if left else None)
+    except Exception as e:
+        logger.warning("cb_client_warned edit: %s", e)
 
 
 def _logist_chat_id() -> int:
@@ -194,6 +246,10 @@ def ensure_schema(db):
             PRIMARY KEY (unit_id, snap_date)
         )
     """)
+    # Ф7: фактический выезд по треку GPS (route_registry.fact_departure)
+    db._execute("ALTER TABLE unit_departure ADD COLUMN IF NOT EXISTS dep_fact TIMESTAMPTZ")
+    # Ф7: логист нажал «Клиент предупреждён» – по точке больше не тревожим
+    db._execute("ALTER TABLE route_status_state ADD COLUMN IF NOT EXISTS client_warned BOOLEAN DEFAULT FALSE")
 
 
 def _log_alert(db, kind, unit_id=None, unit_name=None, order_no=None, client=None, detail=None):
@@ -337,14 +393,16 @@ def _check_departure(db, uid, name, pos, stops, left_base, now_ts, preview):
             db._execute("INSERT INTO unit_departure (unit_id,snap_date) VALUES (%s,%s) "
                         "ON CONFLICT DO NOTHING", (uid, today))
         row = {}
-    first_out = row.get("first_out")
-    if left_base and not first_out and not preview:
-        db._execute("UPDATE unit_departure SET first_out=now() WHERE unit_id=%s AND snap_date=%s",
-                    (uid, today))
-        first_out = datetime.now(_MSK)
+    # Ф7: выезд – по треку GPS (dep_fact: побывала на складе и уехала). Прежний first_out
+    # (первая проверка, где машина «не на складе») врал для машины, ночующей не на складе.
+    row = db._fetchone("SELECT * FROM unit_departure WHERE unit_id=%s AND snap_date=%s",
+                       (uid, today)) or row
+    first_out = row.get("dep_fact")
     plan_hm = _dep_plan_hm(db, uid, today)
-    deadline = _dep_deadline_ts(now_ts, plan_hm)
-    if row.get("alerted") or now_ts < deadline:
+    # Ф7: выезд теперь точный (по треку) – допуск DEPART_GRACE_MIN, иначе «08:04 позже
+    # 08:00» каждое утро; и не будим вечером сигналом об утреннем выезде (DEPART_STALE_H).
+    deadline = _dep_deadline_ts(now_ts, plan_hm) + DEPART_GRACE_MIN * 60
+    if row.get("alerted") or now_ts < deadline or now_ts > deadline + DEPART_STALE_H * 3600:
         return None
     out_hm = first_out.astimezone(_MSK).strftime("%H:%M") if first_out else None
     if first_out and first_out.astimezone(_MSK).timestamp() <= deadline:
@@ -787,11 +845,15 @@ async def run_check(db, bot=None, preview=False) -> list:
             # По плану+отставанию не успеваем в окно, но окно ещё открыто. Логисты
             # переставляют точку в маршруте или предупреждают менеджера клиента о времени
             # прибытия. Одно сообщение на машину за прогон, дедуп на заказ (prognosis_alerted).
+            route_conflicts = [d for d in route_conflicts
+                               if not (_st_get(db, _warn_key(d["order_no"])) or {}).get("client_warned")]
+            fact_misses = [d for d in fact_misses
+                           if not (_st_get(db, _warn_key(d["order_no"])) or {}).get("client_warned")]
             if route_conflicts:
                 lines.append(f"{name}: нестыковка в маршруте (прогноз) — точек: {len(route_conflicts)}")
                 if bot and not preview:
                     await _route_conflict_alert(bot, name, [d["s"] for d in route_conflicts],
-                                                lag_sec, now_ts, _logist_chat_ids())
+                                                lag_sec, now_ts, _signal_chat_ids())
                     for d in route_conflicts:
                         _log_alert(db, "route_conflict", unit_id=uid, unit_name=name,
                                    order_no=d["order_no"], client=d["s"].get("client"),
@@ -809,11 +871,7 @@ async def run_check(db, bot=None, preview=False) -> list:
                 lines.append(f"{name}: окно прошло, не сдано — точек: {len(fact_misses)}")
                 if bot and not preview:
                     for d in fact_misses:
-                        _tag, mgr = _manager_chat(d["agent_tags"])
-                        recips = [*_logist_chat_ids(), _partner_chat_id()]
-                        if mgr:
-                            recips.append(mgr)
-                        await _window_passed_alert(bot, name, d["s"], now_ts, recips)
+                        await _window_passed_alert(bot, name, d["s"], now_ts, _signal_chat_ids())
                         _log_alert(db, "window_passed", unit_id=uid, unit_name=name,
                                    order_no=d["order_no"], client=d["s"].get("client"),
                                    detail="окно приёмки прошло, точка не сдана")
@@ -864,7 +922,11 @@ async def run_check(db, bot=None, preview=False) -> list:
             behind = risk.get("behind") or []
             # at_home: машина на ночёвке — день закончен, «не успеть» уже неактуально;
             # незакрытые точки покажет route_end-алерт ниже.
-            if not at_home and risk["lag_min"] >= LAG_ALERT_MIN and len(behind) >= LAG_ALERT_POINTS:
+            # Ф7: на дни из «Развозки» – только сигналы «не успеваем в окно» / «окно прошло»
+            # (собственник 16.10: сигнал, только если реально не успеваем), голое отставание молчит.
+            from_razvozka = any(x.get("approved") for x in stops)
+            if (not from_razvozka and not at_home and risk["lag_min"] >= LAG_ALERT_MIN
+                    and len(behind) >= LAG_ALERT_POINTS):
                 lines.append(f"{name}: ОТСТАВАНИЕ ~{risk['lag_min']} мин, точек позади плана: {len(behind)}")
                 if bot and not preview:
                     lkey = f"lag:{uid}:{datetime.now(_MSK).date().isoformat()}"
@@ -882,6 +944,8 @@ async def run_check(db, bot=None, preview=False) -> list:
                                                     for b in behind[:5]))
 
             # ── Поздний выезд со склада (план выезда машины, дефолт DEPART_DEADLINE_HM) ──
+            if stops:   # Ф7: фактический выезд по треку – в unit_departure.dep_fact
+                await rr.fact_departure(uid, datetime.fromtimestamp(now_ts, _MSK).date())
             dep = _check_departure(db, uid, name, pos, stops, left_base, now_ts, preview)
             if dep:
                 lines.append(dep["line"])
@@ -957,14 +1021,15 @@ async def _route_conflict_alert(bot, unit_name, stops, lag_sec, now_ts, recipien
     rows = "\n".join(line(s) for s in stops)
     text = (f"🗺 Нестыковка в маршруте — {unit_name}\n"
             f"Машина отстаёт ~{int(lag_sec / 60)} мин, по плану не успеваем в окно приёмки:\n{rows}\n"
-            f"Переставьте точку в маршруте или предупредите менеджера клиента о времени прибытия.")
+            f"Переставьте точку в маршруте или предупредите клиента о времени прибытия. "
+            f"Предупредили – нажмите кнопку, по точке больше не напишу.")
     seen = set()
     for cid in recipients:
         if not cid or cid in seen:
             continue
         seen.add(cid)
         try:
-            await bot.send_message(chat_id=cid, text=text)
+            await bot.send_message(chat_id=cid, text=text, reply_markup=_warn_kb(stops))
         except Exception as e:
             logger.warning("_route_conflict_alert → %s: %s", cid, e)
 
@@ -1050,7 +1115,7 @@ async def _window_passed_alert(bot, unit_name, s, now_ts, recipients):
             continue
         seen.add(cid)
         try:
-            await bot.send_message(chat_id=cid, text=text)
+            await bot.send_message(chat_id=cid, text=text, reply_markup=_warn_kb([s]))
         except Exception as e:
             logger.warning("_window_passed_alert → %s: %s", cid, e)
 
@@ -1110,6 +1175,7 @@ def register(app: Application, db):
     ensure_schema(db)
     app.bot_data.setdefault("db", db)
     app.add_handler(CommandHandler("statuses", cmd_statuses))
+    app.add_handler(CallbackQueryHandler(cb_client_warned, pattern=r"^dsw:"))
     app.add_handler(MessageHandler(filters.Regex(r"^/статусы(@\w+)?(\s|$)"), cmd_statuses))
     if app.job_queue:
         app.job_queue.run_repeating(_job, interval=JOB_INTERVAL_EVENING_SEC, first=90, name="delivery_statuses")

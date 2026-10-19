@@ -110,3 +110,21 @@ def test_taxi_not_in_driver_route():
     out = rr.apply_approved(_routes(), {D: plan})
     nos = [s["order_no"] for s in out[26209] if s.get("approved")]
     assert nos == ["04728"]
+
+
+def test_departure_from_track():
+    """Ф7: выезд – уход со склада после стоянки на нём, без возврата 15 мин."""
+    B = (55.633297, 38.104351)
+    far = (55.70, 37.90)
+    t = 1_000_000
+    home_then_base = [(t, *far), (t + 600, *B), (t + 1200, *B), (t + 1800, *far), (t + 2400, *far)]
+    assert rr.departure_from_track(home_then_base, B) == t + 1800     # ночёвка не у склада – не выезд
+    hop = [(t, *B), (t + 60, *far), (t + 300, *B), (t + 3000, *far), (t + 4000, *far)]
+    assert rr.departure_from_track(hop, B) == t + 3000                # вернулась через 4 мин – не выезд
+    assert rr.departure_from_track([(t, *far), (t + 60, *far)], B) is None   # на складе не была
+
+
+def test_warn_key_short():
+    import delivery_statuses as ds
+    assert ds._warn_key("04581") == "04581"
+    assert ds._warn_key("04581 (" + "очень длинная приписка логиста" * 2 + ")") == "04581"

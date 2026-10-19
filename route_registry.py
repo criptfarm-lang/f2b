@@ -422,22 +422,124 @@ def plan_times(stops, depart_ts, legs):
     return out
 
 
+# ─── Фактический выезд со склада по треку (Ф7) ──────────────────────────────
+# Машина побывала на складе (≤ DEP_R_M) и уехала минимум на DEP_STAY_MIN. Опрос «где
+# машина сейчас» для этого не годится: В970 ночует в Химках, и первая проверка дня
+# в 07:00 видела её «вне склада» – в unit_departure писалось 07:03 вместо 08:12.
+DEP_R_M = 500
+DEP_STAY_MIN = 15
+_DEP_TRIED: dict = {}
+
+
+def _dist_m(a, b) -> float:
+    import math
+    dlat = math.radians(a[0] - b[0])
+    dlon = math.radians(a[1] - b[1]) * math.cos(math.radians(a[0]))
+    return 6371000.0 * math.hypot(dlat, dlon)
+
+
+def departure_from_track(msgs, base=(55.633297, 38.104351)):
+    """Время выезда (unix) по сообщениям трека [(t, lat, lon), ...] по возрастанию t:
+    первый уход дальше DEP_R_M после стоянки на складе, без возврата DEP_STAY_MIN."""
+    seen, i, n = False, 0, len(msgs)
+    while i < n:
+        t, lat, lon = msgs[i]
+        if _dist_m((lat, lon), base) <= DEP_R_M:
+            seen = True
+        elif seen:
+            back = any(_dist_m((la, lo), base) <= DEP_R_M
+                       for tt, la, lo in msgs[i + 1:] if tt - t <= DEP_STAY_MIN * 60)
+            if not back:
+                return int(t)
+        i += 1
+    return None
+
+
+def _dep_fact_get(uid, day):
+    try:
+        import manual_route
+        r = manual_route._DB._fetchone(
+            "SELECT dep_fact FROM unit_departure WHERE unit_id=%s AND snap_date=%s", (uid, day))
+        return r["dep_fact"].timestamp() if r and r.get("dep_fact") else None
+    except Exception as e:
+        logger.warning("dep_fact get: %s", e)
+        return None
+
+
+def _dep_fact_set(uid, day, ts):
+    try:
+        import manual_route
+        manual_route._DB._execute(
+            "INSERT INTO unit_departure (unit_id, snap_date, dep_fact) VALUES (%s,%s,to_timestamp(%s)) "
+            "ON CONFLICT (unit_id, snap_date) DO UPDATE SET dep_fact=EXCLUDED.dep_fact", (uid, day, ts))
+    except Exception as e:
+        logger.warning("dep_fact set: %s", e)
+
+
+async def fact_departure(uid, day):
+    """Фактический выезд машины сегодня (unix) или None – ещё на складе / трека нет.
+    Найденный запоминаем в unit_departure.dep_fact; не найден – пробуем не чаще раза в 3 мин."""
+    if day != datetime.now(_MSK).date() or _DB_missing():
+        return None
+    ts = await asyncio.to_thread(_dep_fact_get, uid, day)
+    if ts:
+        return ts
+    if time.time() - _DEP_TRIED.get((uid, day), 0) < 180:
+        return None
+    _DEP_TRIED[(uid, day)] = time.time()
+    t0 = int(datetime(day.year, day.month, day.day, 4, tzinfo=_MSK).timestamp())
+    try:
+        async with aiohttp.ClientSession() as session:
+            login = await _wialon_call(session, "token/login", {"token": os.getenv("WIALON_TOKEN")})
+            sid = login.get("eid")
+            if not sid:
+                return None
+            r = await _wialon_call(session, "messages/load_interval",
+                                   {"itemId": uid, "timeFrom": t0, "timeTo": int(time.time()),
+                                    "flags": 1, "flagsMask": 65281, "loadCount": 20000}, sid)
+    except Exception as e:
+        logger.warning("fact_departure %s: %s", uid, e)
+        return None
+    msgs = [(m["t"], m["pos"]["y"], m["pos"]["x"]) for m in (r.get("messages") or []) if m.get("pos")]
+    ts = departure_from_track(msgs, BASE_ILINSKY)
+    if ts:
+        await asyncio.to_thread(_dep_fact_set, uid, day, ts)
+    return ts
+
+
+def _DB_missing() -> bool:
+    try:
+        import manual_route
+        return manual_route._DB is None
+    except Exception:
+        return True
+
+
 async def _fill_plan_times(routes: dict) -> None:
     import route_dispatch as rd
     for uid, stops in routes.items():
         days = sorted({s["plan_day"] for s in stops if s.get("plan_day")})
         for d in days:
             day_stops = [s for s in stops if s.get("plan_day") == d]
-            hm = await asyncio.to_thread(rd.plan_depart_hm, d, uid)
             day = datetime.fromisoformat(d)
-            hh, mm = (int(x) for x in hm.split(":"))
-            depart_ts = datetime(day.year, day.month, day.day, hh, mm, tzinfo=_MSK).timestamp()
+            # Ф7: машина уже уехала – время точек от фактического выезда, и только тогда
+            # включаем `vt` (от него сигналы «не успеваем в окно»). До выезда – от плана.
+            fact = await fact_departure(uid, day.date())
+            if fact:
+                depart_ts = fact
+            else:
+                hm = await asyncio.to_thread(rd.plan_depart_hm, d, uid)
+                hh, mm = (int(x) for x in hm.split(":"))
+                depart_ts = datetime(day.year, day.month, day.day, hh, mm, tzinfo=_MSK).timestamp()
             pts = [BASE_ILINSKY] + [g for g in map(_geo, day_stops) if g]
             legs = await _osrm_legs(pts)
             if legs is None:
                 continue
             for s, vt in zip(day_stops, plan_times(day_stops, depart_ts, legs)):
                 s["vt_plan"] = vt
+                if fact:
+                    s["vt"] = vt
+                    s["dep_fact"] = int(fact)
 
 
 async def fetch_routes_checked():
