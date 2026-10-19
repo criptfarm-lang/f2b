@@ -19,7 +19,7 @@ from datetime import datetime, date, timezone, timedelta
 
 import aiohttp
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                      InputFile)
+                      InputFile, InputMediaDocument)
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           CallbackQueryHandler, ContextTypes, filters)
 
@@ -398,6 +398,14 @@ async def cb_depart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     confirmed = "✅ Подтверждено" in (q.message.caption or "")
     day_off = (date.fromisoformat(dstr) - datetime.now(_MSK).date()).days
     try:
+        if confirmed:
+            _PKG_CACHE.pop((dstr, uid), None)
+        elif await _retime_card(q, dstr, uid, hm, confirmed):
+            return
+    except Exception as e:
+        logger.warning("cb_depart retime: %s", e)
+        _PKG_CACHE.pop((dstr, uid), None)  # «Подтвердить» соберёт заново с новым временем
+    try:
         await q.edit_message_reply_markup(reply_markup=_route_kb(dstr, uid, day_off, hm, confirmed))
     except Exception as e:
         logger.warning("cb_depart edit: %s", e)
@@ -725,6 +733,43 @@ async def mark_done_and_refresh(context, driver_chat_id, demand_id):
 _PKG_CACHE: dict = {}
 
 
+def _card_caption(uid, pkg, km, date_str) -> str:
+    """Подпись карточки маршрута логисту: объём + точки с плановым временем."""
+    stops = pkg["stops"]
+    note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
+    lines = [f"{i}. {'🔄 ЗАБОР: ' if s.get('is_pickup') else ''}"
+             f"{(s.get('client') or s.get('order_no') or '?')[:35]} ({rr._hm(s.get('vt') or s.get('vt_plan'))})"
+             for i, s in enumerate(stops, 1)]
+    # Имена клиентов идут в подпись как есть — экранируем (в них бывают * и _).
+    return (f"🚚 <b>{_h(rr.unit_title(uid))}</b>\n"
+            f"{_h(note)}\n"
+            f"Маршрут на {_h(date_str)} — {len(stops)} точек (порядок выгрузки):\n"
+            + _h("\n".join(lines)))[:1024]
+
+
+async def _retime_card(q, dstr, uid, hm, confirmed) -> bool:
+    """Выезд сменили → пересчитать плановое время точек «Развозки» и заменить реестр
+    в карточке. Пакет берём из кэша (рестарт бота → нет кэша → время пересчитается
+    при «Подтвердить»/«Пересобрать», там пакет собирается заново)."""
+    cached = _PKG_CACHE.get((dstr, uid))
+    if not cached or not any(s.get("plan_day") for s in cached[0]["stops"]):
+        _PKG_CACHE.pop((dstr, uid), None)
+        return False
+    pkg, km = cached
+    await rr._fill_plan_times({uid: pkg["stops"]})
+    target_date = date.fromisoformat(dstr)
+    pkg["pdf"] = await asyncio.to_thread(
+        rr._build_registry_pdf, {uid: pkg["stops"]}, pkg["ms_extra"],
+        target_date.strftime("%d.%m.%Y"), dstr)
+    day_off = (target_date - datetime.now(_MSK).date()).days
+    await q.edit_message_media(
+        InputMediaDocument(io.BytesIO(pkg["pdf"]), filename=f"reestr_{uid}_{dstr}.pdf",
+                           caption=_card_caption(uid, pkg, km, target_date.strftime("%d.%m.%Y")),
+                           parse_mode="HTML"),
+        reply_markup=_route_kb(dstr, uid, day_off, hm, confirmed))
+    return True
+
+
 async def _collect_and_send(context, target_date, to_chat):
     try:
         routes, order_routes = await rr.fetch_routes(with_meta=True)
@@ -754,15 +799,7 @@ async def _collect_and_send(context, target_date, to_chat):
 
         km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
         _PKG_CACHE[(dstr, uid)] = (pkg, km)  # чтобы «Подтвердить» не пересобирал всё заново
-        note = _volume_note(uid, stops, pkg["ms_extra"], km=km)
-        lines = [f"{i}. {'🔄 ЗАБОР: ' if s.get('is_pickup') else ''}"
-                 f"{(s.get('client') or s.get('order_no') or '?')[:35]} ({rr._hm(s.get('vt'))})"
-                 for i, s in enumerate(stops, 1)]
-        # Имена клиентов идут в подпись как есть — экранируем (в них бывают * и _).
-        caption = (f"🚚 <b>{_h(rr.unit_title(uid))}</b>\n"
-                   f"{_h(note)}\n"
-                   f"Маршрут на {_h(date_str)} — {len(stops)} точек (порядок выгрузки):\n"
-                   + _h("\n".join(lines)))
+        caption = _card_caption(uid, pkg, km, date_str)
         kb = _route_kb(dstr, uid, day_off, depart_hm(target_date, uid))
         await _send_pdf(context.bot, to_chat, pkg["pdf"],
                         f"reestr_{uid}_{target_date.isoformat()}.pdf",

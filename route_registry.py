@@ -333,6 +333,7 @@ def apply_approved(routes: dict, plans: dict) -> dict:
                     "lat": st.get("lat") if st.get("lat") is not None else w.get("lat"),
                     "lon": st.get("lon") if st.get("lon") is not None else w.get("lon"),
                     "approved": True,
+                    "plan_day": day.isoformat(),
                     **({"is_pickup": True} if is_pickup else {}),
                 })
     # Порядок: точки неутверждённых дней – как были, утверждённые – в порядке логиста.
@@ -346,7 +347,95 @@ def apply_approved(routes: dict, plans: dict) -> dict:
 
 async def overlay_approved(routes: dict) -> dict:
     plans = await asyncio.to_thread(approved_plans, _approved_window_days())
-    return apply_approved(routes, plans)
+    routes = apply_approved(routes, plans)
+    if plans:
+        try:
+            await _fill_plan_times(routes)
+        except Exception as e:
+            logger.warning("плановое время точек: %s", e)
+    return routes
+
+
+# ─── Плановое время точек от выезда (Ф2 плана 2026-10-16-логистика-всё-в-развозке) ──
+# Выезд – кнопка «Выезд ЧЧ:ММ» в «Маршрутах» (route_dispatch.depart_hm). Дальше та же
+# модель, что у «Развозки» (autodispatch/routing.py): плечи по дорогам OSRM × 1.21
+# (пробки), приехал раньше начала окна – ждёт, 8 мин на выгрузку. Пишем в `vt_plan`,
+# а не в `vt`: от `vt` считаются сигналы «отставание от графика» / «нестыковка», а они
+# до Ф7 (начало маршрута = фактический выезд по GPS) врут – Алёна на них жаловалась.
+TRAFFIC_FACTOR = 1.21
+SERVICE_MIN = 8.0
+_LEGS_CACHE: dict = {}
+
+
+async def _osrm_legs(pts):
+    """Длительности плеч (сек, без пробок) по дорогам между точками по порядку; None – нет связи."""
+    if len(pts) < 2:
+        return []
+    key = tuple(pts)
+    if key in _LEGS_CACHE:
+        return _LEGS_CACHE[key]
+    base = (os.getenv("OSRM_URL") or "").rstrip("/")
+    if not base:
+        return None
+    coords = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in pts)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{base}/route/v1/driving/{coords}",
+                                   params={"overview": "false"},
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json(content_type=None)
+        legs = [float(l.get("duration") or 0) for l in data["routes"][0]["legs"]]
+    except Exception as e:
+        logger.warning("OSRM: %s", e)
+        return None
+    if len(_LEGS_CACHE) > 500:
+        _LEGS_CACHE.clear()
+    _LEGS_CACHE[key] = legs
+    return legs
+
+
+def _geo(s):
+    lat, lon = s.get("lat"), s.get("lon")
+    if lat in (None, "", 0) or lon in (None, "", 0):
+        return None
+    return (round(float(lat), 6), round(float(lon), 6))
+
+
+def plan_times(stops, depart_ts, legs):
+    """Плановое время начала выгрузки каждой точки (unix) по порядку объезда.
+    legs – плечи (сек без пробок) база→1-я точка с координатами→следующая…;
+    у точки без координат времени нет (None), выгрузку всё равно учитываем."""
+    t = float(depart_ts)
+    out, li = [], 0
+    for s in stops:
+        if _geo(s) is None:
+            out.append(None)
+        else:
+            t += legs[li] * TRAFFIC_FACTOR
+            li += 1
+            if s.get("tf") and t < s["tf"]:
+                t = float(s["tf"])
+            out.append(int(t))
+        t += SERVICE_MIN * 60
+    return out
+
+
+async def _fill_plan_times(routes: dict) -> None:
+    import route_dispatch as rd
+    for uid, stops in routes.items():
+        days = sorted({s["plan_day"] for s in stops if s.get("plan_day")})
+        for d in days:
+            day_stops = [s for s in stops if s.get("plan_day") == d]
+            hm = await asyncio.to_thread(rd.depart_hm, d, uid)
+            day = datetime.fromisoformat(d)
+            hh, mm = (int(x) for x in hm.split(":"))
+            depart_ts = datetime(day.year, day.month, day.day, hh, mm, tzinfo=_MSK).timestamp()
+            pts = [BASE_ILINSKY] + [g for g in map(_geo, day_stops) if g]
+            legs = await _osrm_legs(pts)
+            if legs is None:
+                continue
+            for s, vt in zip(day_stops, plan_times(day_stops, depart_ts, legs)):
+                s["vt_plan"] = vt
 
 
 async def fetch_routes_checked():
@@ -1120,7 +1209,7 @@ def _build_registry_pdf(routes, ms_extra, date_str, date_iso=None) -> bytes:
             link = stop_url(uid, s["order_no"])
             rows.append([
                 Paragraph(str(idx), cell),
-                Paragraph(_hm(s["vt"]), cell),
+                Paragraph(_hm(s["vt"] or s.get("vt_plan")), cell),
                 Paragraph(_fmt_window(ex.get("win_from"), ex.get("win_to"), s["tf"], s["tt"]), cell),
                 Paragraph(info, cell),
                 Paragraph(wcell, cell),

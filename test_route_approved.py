@@ -71,3 +71,25 @@ def test_unmatched_stop_gets_window_from_hours():
 def test_no_plans_noop():
     r = _routes()
     assert rr.apply_approved(r, {}) is r
+
+
+def test_plan_times_from_departure():
+    """Выезд 08:00, плечи 20 и 10 мин без пробок (×1.21), окно второй точки с 09:00 – ждёт."""
+    dep = ts(8)
+    stops = [{"lat": 55.8, "lon": 37.5, "tf": ts(8)},
+             {"lat": 55.7, "lon": 37.6, "tf": ts(9)},
+             {"lat": None, "lon": None},
+             {"lat": 55.6, "lon": 37.7}]
+    out = rr.plan_times(stops, dep, [1200, 600, 300])
+    assert out[0] == dep + int(1200 * 1.21)                 # 08:24
+    assert out[1] == ts(9)                                   # приехал 08:39, ждёт окна
+    assert out[2] is None                                    # без координат – без времени
+    # после второй: 8 мин выгрузки, точка без гео тоже 8 мин, плечо 5 мин × 1.21
+    assert out[3] == ts(9) + 16 * 60 + int(300 * 1.21)
+
+
+def test_apply_approved_marks_plan_day():
+    out = rr.apply_approved(_routes(), {D: PLAN})
+    st = [s for s in out[26209] if s.get("approved")]
+    assert {s["plan_day"] for s in st} == {D.isoformat()}
+    assert all(s["vt"] is None for s in st)  # сигналы по `vt` до Ф7 не включаем

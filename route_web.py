@@ -388,7 +388,7 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         client = (ex.get("client") if is_pickup and ex.get("client") else s.get("client")) or order_no or "?"
         # Окно приёмки — из полей заказа МС «Окно доставки с/до (время)», фолбэк на заявку.
         win = rr._fmt_window(ex.get("win_from"), ex.get("win_to"), s.get("tf"), s.get("tt"))
-        plan = rr._hm(s.get("vt"))
+        plan = rr._hm(s.get("vt") or s.get("vt_plan"))
         address = (ex.get("address") if is_pickup and ex.get("address") else s.get("address")) or ""
         wt = rr._fmt_weight(ex.get("weight"))
         places = ex.get("places")
