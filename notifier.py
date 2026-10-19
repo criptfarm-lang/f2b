@@ -109,18 +109,27 @@ async def _load_order_positions(order_id: str, headers: dict) -> str:
             async with session.get(
                 f"{MS_BASE}/entity/customerorder/{order_id}/positions",
                 headers=headers,
-                params={"expand": "assortment", "limit": 100}
+                params={"expand": "assortment.uom,assortment.product.uom", "limit": 100}
             ) as r:
                 if r.status != 200:
                     return ""
                 data = await r.json()
                 lines = []
                 for pos in data.get("rows", []):
-                    name = pos.get("assortment", {}).get("name", "?")
-                    qty = int(pos.get("quantity", 0))
+                    a = pos.get("assortment", {}) or {}
+                    name = a.get("name", "?")
+                    qty = pos.get("quantity", 0) or 0
                     price = (pos.get("price", 0) or 0) / 100
                     total = qty * price
-                    lines.append(f"  • {name} — {qty} кг × {price:,.0f} руб/кг = {total:,.0f} руб.")
+                    # Единица из карточки товара (нарезки – шт, весовое – кг);
+                    # у варианта uom нет, берём у родительского товара.
+                    uom = a.get("uom") if isinstance(a.get("uom"), dict) else None
+                    if not uom:
+                        prod = a.get("product") if isinstance(a.get("product"), dict) else {}
+                        uom = prod.get("uom") if isinstance(prod.get("uom"), dict) else None
+                    unit = ((uom or {}).get("name") or "кг").strip()
+                    q_str = f"{qty:g}".replace(".", ",")
+                    lines.append(f"  • {name} — {q_str} {unit} × {price:,.0f} руб/{unit} = {total:,.0f} руб.")
                 return "\n".join(lines)
     except Exception as e:
         logger.warning(f"_load_order_positions: {e}")
