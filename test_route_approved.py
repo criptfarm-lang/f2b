@@ -93,3 +93,11 @@ def test_apply_approved_marks_plan_day():
     st = [s for s in out[26209] if s.get("approved")]
     assert {s["plan_day"] for s in st} == {D.isoformat()}
     assert all(s["vt"] is None for s in st)  # сигналы по `vt` до Ф7 не включаем
+
+
+def test_plan_times_uses_client_service_min():
+    dep = ts(8)
+    stops = [{"lat": 55.8, "lon": 37.5, "service_min": 30},
+             {"lat": 55.7, "lon": 37.6}]
+    out = rr.plan_times(stops, dep, [600, 600])
+    assert out[1] - out[0] == 30 * 60 + int(600 * 1.21)

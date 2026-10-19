@@ -334,6 +334,7 @@ def apply_approved(routes: dict, plans: dict) -> dict:
                     "lon": st.get("lon") if st.get("lon") is not None else w.get("lon"),
                     "approved": True,
                     "plan_day": day.isoformat(),
+                    "service_min": st.get("service_min"),  # Ф3: минут на точке по статистике клиента
                     **({"is_pickup": True} if is_pickup else {}),
                 })
     # Порядок: точки неутверждённых дней – как были, утверждённые – в порядке логиста.
@@ -359,7 +360,8 @@ async def overlay_approved(routes: dict) -> dict:
 # ─── Плановое время точек от выезда (Ф2 плана 2026-10-16-логистика-всё-в-развозке) ──
 # Выезд – кнопка «Выезд ЧЧ:ММ» в «Маршрутах» (route_dispatch.depart_hm). Дальше та же
 # модель, что у «Развозки» (autodispatch/routing.py): плечи по дорогам OSRM × 1.21
-# (пробки), приехал раньше начала окна – ждёт, 8 мин на выгрузку. Пишем в `vt_plan`,
+# (пробки), приехал раньше начала окна – ждёт, выгрузка – `service_min` точки из
+# «Развозки» (медиана стоянок клиента, Ф3), иначе 8 мин. Пишем в `vt_plan`,
 # а не в `vt`: от `vt` считаются сигналы «отставание от графика» / «нестыковка», а они
 # до Ф7 (начало маршрута = фактический выезд по GPS) врут – Алёна на них жаловалась.
 TRAFFIC_FACTOR = 1.21
@@ -416,7 +418,7 @@ def plan_times(stops, depart_ts, legs):
             if s.get("tf") and t < s["tf"]:
                 t = float(s["tf"])
             out.append(int(t))
-        t += SERVICE_MIN * 60
+        t += float(s.get("service_min") or SERVICE_MIN) * 60
     return out
 
 
