@@ -7124,6 +7124,11 @@ def main():
     except Exception as e:
         logger.exception(f"delivery_statuses.register упал: {e}")
     try:
+        import razvozka_evening
+        razvozka_evening.register(app, db)
+    except Exception as e:
+        logger.exception(f"razvozka_evening.register упал: {e}")
+    try:
         import logi_morning_check
         logi_morning_check.register(db)
     except Exception as e:
