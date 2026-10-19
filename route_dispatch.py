@@ -344,7 +344,19 @@ DEPART_DEFAULT_HM = os.getenv("DEPART_DEADLINE_HM", "09:00")
 DEPART_CHOICES = ("07:00", "08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00")
 
 
-def depart_hm(snap_date, unit_id) -> str:
+# Выезд для планового времени точек, когда логист его не выбрал: медиана фактического
+# выезда с базы (как START_HOUR «Развозки», 08:10). DEPART_DEFAULT_HM (09:00) – это
+# порог сигнала «машина не выехала», его не трогаем.
+PLAN_DEPART_DEFAULT_HM = "08:10"
+
+
+def plan_depart_hm(snap_date, unit_id) -> str:
+    """Выезд для расчёта времени точек: выбранный логистом, иначе 08:10."""
+    hm = depart_hm(snap_date, unit_id, default=None)
+    return hm or PLAN_DEPART_DEFAULT_HM
+
+
+def depart_hm(snap_date, unit_id, default=DEPART_DEFAULT_HM):
     """Плановое время выезда машины в день snap_date (или дефолт)."""
     if _DB is not None:
         try:
@@ -354,7 +366,7 @@ def depart_hm(snap_date, unit_id) -> str:
                 return r["depart_hm"]
         except Exception as e:
             logger.warning("depart_hm: %s", e)
-    return DEPART_DEFAULT_HM
+    return default
 
 
 def _depart_rows(dstr, uid, current) -> list:
@@ -853,7 +865,7 @@ async def confirm_unit(bot, target_date, uid, pkg, km):
             # в сыром order_no бывают заметки логиста, и счётчик закрытых врал.
             left = len([s for s in stops if _doc_no(s.get("order_no")) not in done_prev])
             head = (f"🚚 <b>{_h(rr.unit_title(uid))}</b>, {_h(date_str)}. "
-                    f"Выезд со склада: {_h(depart_hm(dstr, uid))}.")
+                    f"Выезд со склада: {_h(plan_depart_hm(dstr, uid) if any(s.get('plan_day') for s in stops) else depart_hm(dstr, uid))}.")
             if left == 0:
                 body = "Все точки уже закрыты. ✅"
             else:

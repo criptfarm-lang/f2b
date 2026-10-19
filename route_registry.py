@@ -426,7 +426,7 @@ async def _fill_plan_times(routes: dict) -> None:
         days = sorted({s["plan_day"] for s in stops if s.get("plan_day")})
         for d in days:
             day_stops = [s for s in stops if s.get("plan_day") == d]
-            hm = await asyncio.to_thread(rd.depart_hm, d, uid)
+            hm = await asyncio.to_thread(rd.plan_depart_hm, d, uid)
             day = datetime.fromisoformat(d)
             hh, mm = (int(x) for x in hm.split(":"))
             depart_ts = datetime(day.year, day.month, day.day, hh, mm, tzinfo=_MSK).timestamp()
