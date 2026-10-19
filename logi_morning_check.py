@@ -131,7 +131,7 @@ async def collect(target_date=None) -> dict:
                 placed.add(str(st.get("order_no") or ""))
                 if u.get("unit_id") in rr.UNITS:
                     assigned[u["unit_id"]] = assigned.get(u["unit_id"], 0) + 1
-        for st in plan.get("hired") or []:
+        for st in (plan.get("hired") or []) + (plan.get("taxi") or []):  # такси – Ф6
             placed.add(str(st.get("order_no") or ""))
         unassigned = [x for x in unassigned
                       if str(x["order_no"]).split(":")[0] not in placed]

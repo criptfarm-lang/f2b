@@ -101,3 +101,12 @@ def test_plan_times_uses_client_service_min():
              {"lat": 55.7, "lon": 37.6}]
     out = rr.plan_times(stops, dep, [600, 600])
     assert out[1] - out[0] == 30 * 60 + int(600 * 1.21)
+
+
+def test_taxi_not_in_driver_route():
+    """Ф6: заказ, отданный в такси, не попадает в маршрут машины."""
+    plan = {"units": [{"unit_id": 26209, "stops": [PLAN["units"][0]["stops"][0]]}],
+            "hired": [], "taxi": [PLAN["units"][0]["stops"][1]], "unassigned": []}
+    out = rr.apply_approved(_routes(), {D: plan})
+    nos = [s["order_no"] for s in out[26209] if s.get("approved")]
+    assert nos == ["04728"]

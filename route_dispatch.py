@@ -943,6 +943,60 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Раз в 30 с забираем её и делаем по каждой машине то же, что «Подтвердить»: реестр
 # в группу «Логистика», лист загрузки складу. Итог – логистам в личку.
 
+def _same_as_confirmed(target_date, uid, stops) -> bool:
+    """Маршрут машины уже подтверждён ровно с этими точками в этом порядке."""
+    if _DB is None:
+        return False
+    try:
+        r = _DB._fetchone("SELECT status, stops FROM route_dispatch WHERE snap_date=%s AND unit_id=%s",
+                          (target_date, uid))
+    except Exception as e:
+        logger.warning("_same_as_confirmed: %s", e)
+        return False
+    if not r or r.get("status") != "confirmed" or not r.get("stops"):
+        return False
+    prev = r["stops"] if isinstance(r["stops"], list) else json.loads(r["stops"])
+    return [_doc_no(x.get("order_no")) for x in prev] == [_doc_no(x.get("order_no")) for x in stops]
+
+
+async def status_pending(context: ContextTypes.DEFAULT_TYPE):
+    """Ф6: статусы заказов наёмной машины и такси, которые логист поставил кнопкой в
+    «Развозке» (ad_status_requests) → статус отгрузки в МС через delivery_statuses."""
+    if _DB is None:
+        return
+    try:
+        rows = _DB._fetchall(
+            "UPDATE ad_status_requests SET done_at=now(), result='в работе' "
+            "WHERE id IN (SELECT id FROM ad_status_requests WHERE done_at IS NULL "
+            "ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED) "
+            "RETURNING id, order_no, status, requested_by")
+    except Exception as e:
+        logger.warning("status_pending: %s", e)
+        return
+    if not rows:
+        return
+    import delivery_statuses as ds
+    async with aiohttp.ClientSession() as session:
+        for r in rows:
+            try:
+                info = await ds._ms_resolve(session, _doc_no(r["order_no"]))
+                if not info or not info.get("demand_id"):
+                    result = "ошибка: нет отгрузки в МойСклад"
+                elif await ds.write_ms_status(info["demand_id"], r["status"]):
+                    ds._st_upsert(_DB, r["order_no"], ms_status=r["status"], demand_id=info["demand_id"])
+                    result = "ок"
+                else:
+                    result = "ошибка: МойСклад не принял статус (или запись статусов выключена)"
+            except Exception as e:
+                logger.warning("status_pending %s: %s", r["order_no"], e)
+                result = f"ошибка: {e}"[:200]
+            try:
+                _DB._execute("UPDATE ad_status_requests SET result=%s, done_at=now() WHERE id=%s",
+                             (result, r["id"]))
+            except Exception as e:
+                logger.warning("status_pending mark %s: %s", r["id"], e)
+
+
 async def publish_pending(context: ContextTypes.DEFAULT_TYPE):
     if _DB is None:
         return
@@ -966,6 +1020,11 @@ async def publish_pending(context: ContextTypes.DEFAULT_TYPE):
                 if not pkg:
                     continue
                 stops = pkg["stops"]
+                # Ф6: корректировка после утверждения – машину без изменений не шлём повторно
+                # (водитель и склад не получают дубль реестра).
+                if _same_as_confirmed(target_date, uid, stops):
+                    lines.append(f"{rr.unit_title(uid)} – без изменений, реестр не переотправлял")
+                    continue
                 snap = [{"order_no": x["order_no"], "client": x.get("client"), "seq": x.get("seq"),
                          "is_pickup": bool(x.get("is_pickup"))} for x in stops]
                 _upsert_draft(target_date, uid, pkg["driver_id"], snap)
@@ -973,6 +1032,10 @@ async def publish_pending(context: ContextTypes.DEFAULT_TYPE):
                 _PKG_CACHE[(target_date.isoformat(), uid)] = (pkg, km)
                 dn, sn = await confirm_unit(context.bot, target_date, uid, pkg, km)
                 lines.append(f"{rr.unit_title(uid)} – {len(stops)} точек: {dn}; {sn}")
+            taxi = (rr.approved_plans([target_date]).get(target_date) or {}).get("taxi") or []
+            if taxi:
+                lines.append("В такси: " + "; ".join(
+                    f"{(t.get('restaurant') or t.get('client') or '')[:30]} №{t.get('order_no')}" for t in taxi))
             status = "done" if lines else "empty"
             result = "\n".join(lines) or "маршрутов на дату нет"
         except Exception as e:
@@ -1113,6 +1176,7 @@ def register(app: Application, db):
     app.add_handler(CallbackQueryHandler(cb_depart, pattern=r"^rd:dep:"))
     if app.job_queue is not None:
         app.job_queue.run_repeating(publish_pending, interval=30, first=40, name="razvozka_publish")
+        app.job_queue.run_repeating(status_pending, interval=30, first=50, name="razvozka_status")
     # ensure_schema — после хендлеров и best-effort: сбой БД на старте не должен ронять
     # register и глушить кнопки маршрута (та же защита, что в driver_checklist).
     try:
