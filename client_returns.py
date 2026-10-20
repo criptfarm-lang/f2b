@@ -276,10 +276,38 @@ async def cb_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning("client_returns decision → %s: %s", cid, e)
 
 
+async def job_remind(context: ContextTypes.DEFAULT_TYPE):
+    """Возврат без решения дольше 2 рабочих дней – напоминание менеджеру и Рудневой (раз в день, будни)."""
+    db = context.bot_data.get("db") or _DB
+    rows = db._fetchall("""
+        SELECT * FROM client_returns
+         WHERE decision IS NULL AND created_at >= now() - interval '30 days'
+           AND (SELECT count(*) FROM generate_series(created_at::date + 1, (now() AT TIME ZONE 'Europe/Moscow')::date, '1 day') d
+                 WHERE extract(isodow FROM d) < 6) > 2""")
+    if not rows:
+        return
+    import driver_checklist as dc
+    import edo_unsigned
+    for r in rows:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Вычерк из отгрузки", callback_data=f"cret:{r['id']}:strike")],
+                                   [InlineKeyboardButton("Официальный возврат", callback_data=f"cret:{r['id']}:official")]])
+        text = (f"⏰ Возврат без решения с {r['created_at'].astimezone(MSK):%d.%m}: {r.get('agent_name') or ''}, "
+                f"точка {r.get('order_no')}. Решите с клиентом – вычерк или официальный возврат.")
+        _, mchat = await dc._resolve_manager_chat(r["agent_id"]) if r.get("agent_id") else (None, None)
+        for cid in _recipients(mchat, edo_unsigned._rudneva_chat_id()):
+            try:
+                await context.bot.send_message(chat_id=cid, text=text, reply_markup=kb)
+            except Exception as e:
+                logger.warning("client_returns remind → %s: %s", cid, e)
+
+
 def register(app: Application, db) -> None:
     global _DB
     _DB = db
     app.add_handler(CallbackQueryHandler(cb_decision, pattern=r"^cret:\d+:(strike|official)$"))
+    # будни 10:00 МСК
+    from datetime import time as _t
+    app.job_queue.run_daily(job_remind, time=_t(10, 0, tzinfo=MSK), days=(1, 2, 3, 4, 5), name="client_returns_remind")
     try:
         ensure_schema(db)
     except Exception as e:
