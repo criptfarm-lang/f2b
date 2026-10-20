@@ -7060,6 +7060,11 @@ def main():
     try:
         import driver_checklist
         driver_checklist.register(app, db)
+        try:
+            import client_returns
+            client_returns.register(app, db)
+        except Exception as e:
+            logger.exception(f"client_returns.register упал: {e}")
     except Exception as e:
         logger.exception(f"driver_checklist.register упал: {e}")
     # Контроль производства: замеры температуры по расписанию в группе.
@@ -8220,6 +8225,14 @@ def main():
             return await route_web.handle_submit(request, db, app.bot)
         web_app.router.add_get("/route/{uid}/{date}", handle_route_page)
         web_app.router.add_post("/route/{uid}/{date}/submit", handle_route_submit)
+        # «Клиент вернул» на странице маршрута (план 2026-10-20-возвраты-гп)
+        async def handle_route_returns_get(request):
+            return await route_web.handle_returns_options(request, db, app.bot)
+        async def handle_route_returns_post(request):
+            return await route_web.handle_returns_submit(request, db, app.bot)
+        web_app.router.add_get("/route/{uid}/{date}/returns", handle_route_returns_get)
+        web_app.router.add_post("/route/{uid}/{date}/returns", handle_route_returns_post)
+        web_app.router.add_get("/route-static/zxing.min.js", route_web.handle_zxing)
 
         # Аварийная раскладка логиста, когда Логистика (Wialon) недоступна
         # (план 2026-09-09): страница со списком заказов дня → машина + порядок.

@@ -509,6 +509,14 @@ async def render_page(uid: int, target: date, db, bot) -> str:
                   "<button type='button' class='btn' onclick='sendSd(this.form)'>Отправить сдачу</button>"
                   "<div class='msg'></div></form>")
 
+        # «Клиент вернул» (план 2026-10-20-возвраты-гп): и до, и после сдачи – возврат бывает
+        # по прошлым накладным. Форма грузит накладные клиента по запросу, а не с маршрутом.
+        if not is_pickup and not is_manual:
+            rows.append(f"<div class='ret' data-uid='{uid}' data-date='{date_iso}' "
+                        f"data-order='{_e(order_no)}' data-token='{_e(token)}'>"
+                        "<button type='button' class='btn2' onclick='retOpen(this)'>↩️ Клиент вернул</button>"
+                        "<div class='retbox' hidden></div></div>")
+
         # id карточки = № документа: QR в PDF-реестре ведёт сюда якорем (#o<№>),
         # и точка подсвечивается рамкой — водителю видно, какую именно он сканировал.
         cards.append(f"<div class='{cls}' id='o{_e(rd._doc_no(order_no))}'>"
@@ -534,7 +542,25 @@ _FORM_CSS = (".sd{margin-top:10px;padding-top:10px;border-top:1px solid #eee}"
              # Неотвеченный пункт при попытке отправить сдачу.
              ".q.unans .qt{color:#b91c1c}"
              ".q.unans .opt{border-color:#b91c1c}"
-             ".msg{color:#b91c1c;font-size:14px;margin-top:6px}")
+             ".msg{color:#b91c1c;font-size:14px;margin-top:6px}"
+             # Возврат у клиента
+             ".ret{margin-top:10px}"
+             ".btn2{display:block;width:100%;padding:11px;border:1px solid #0d2b45;border-radius:10px;"
+             "background:#fff;color:#0d2b45;font-size:15px;font-weight:600;cursor:pointer}"
+             ".retbox{margin-top:8px;padding:10px;border:1px dashed #0d2b45;border-radius:10px;background:#f8fafc}"
+             ".retbox h4{margin:10px 0 6px;font-size:14px}"
+             ".retbox video{width:100%;max-height:220px;background:#000;border-radius:8px}"
+             ".rtabs{display:flex;gap:6px;margin:6px 0}"
+             ".rtabs button{flex:1;padding:8px;border:1px solid #d7dbe0;border-radius:8px;background:#fff;font-size:14px}"
+             ".rtabs button.on{background:#0d2b45;color:#fff;border-color:#0d2b45}"
+             ".rpos{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #e6e7ee;font-size:14px}"
+             ".rpos .nm{flex:1}.rpos small{color:#667}"
+             ".rpos button{border:1px solid #d7dbe0;border-radius:8px;background:#fff;padding:6px 10px;font-size:14px}"
+             ".rpos input{width:70px;padding:6px;font-size:15px;border:1px solid #d7dbe0;border-radius:8px;text-align:right}"
+             ".retbox select,.retbox textarea,.retbox .code{width:100%;box-sizing:border-box;padding:8px;font-size:15px;"
+             "border:1px solid #d7dbe0;border-radius:10px;margin:4px 0}"
+             ".rtoast{font-size:14px;color:#166534;min-height:18px;margin:4px 0}"
+             ".rtoast.err{color:#b91c1c}")
 
 _FORM_JS = (
     # Ни один пункт нельзя пропустить: раньше проверялся только «Итог сдачи», и поручения
@@ -575,13 +601,115 @@ _FORM_JS = (
     "var q=el.closest('.q');if(q)q.classList.remove('unans');});")
 
 
+# Форма «Клиент вернул». Скан – камерой (BarcodeDetector, иначе библиотека ZXing, как в ревизии
+# цеха) или вводом цифр штрихкода. Весовая этикетка «2…»: знаки 3–7 – код товара, 8–12 – граммы;
+# GS1-128 – GTIN и вес. Позиция ищется в накладной точки, потом в 3 прошлых накладных клиента.
+_RET_JS = r"""
+var RET={};
+function retEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function retUrl(w,path){return '/route/'+w.dataset.uid+'/'+w.dataset.date+'/returns'+(path||'')+'?t='+encodeURIComponent(w.dataset.token);}
+function retOpen(btn){var w=btn.closest('.ret'),box=w.querySelector('.retbox');
+  if(!box.hidden){box.hidden=true;retStop(w);return;}
+  box.hidden=false;if(RET[w.dataset.order]){return;}
+  box.innerHTML='Загружаю накладные клиента…';
+  fetch(retUrl(w)+'&order='+encodeURIComponent(w.dataset.order)).then(function(r){return r.json();}).then(function(d){
+    if(!d.ok){box.innerHTML='<div class="rtoast err">'+retEsc(d.msg||'Не загрузилось')+'</div>';return;}
+    RET[w.dataset.order]={d:d,items:[],tab:'today',last:{}};retDraw(w);
+  }).catch(function(e){box.innerHTML='<div class="rtoast err">Сбой: '+retEsc(e.message||e)+'</div>';});}
+function retDraw(w){var st=RET[w.dataset.order],d=st.d,box=w.querySelector('.retbox');
+  box.innerHTML='<h4>Наша продукция – сканируй этикетку</h4>'
+   +'<button type="button" class="btn2 rcam" onclick="retCam(this)">📷 Сканировать</button>'
+   +'<video class="rv" hidden playsinline muted></video>'
+   +'<input class="code" inputmode="numeric" placeholder="или цифры штрихкода" onkeydown="if(event.key===\'Enter\'){retCode(this.closest(\'.ret\'),this.value);this.value=\'\';}">'
+   +'<div class="rtoast"></div>'
+   +'<h4>Привлечённая – выбери из отгруженного</h4><div class="rdem"></div>'
+   +'<h4>Возвращают</h4><div class="ritems"></div>'
+   +'<h4>Причина</h4><select class="rreason"><option value="">– выбери –</option>'
+   +d.reasons.map(function(r){return '<option>'+retEsc(r)+'</option>';}).join('')+'</select>'
+   +'<textarea class="rcomm" placeholder="Комментарий: что не так"></textarea>'
+   +'<button type="button" class="btn" onclick="retSend(this.closest(\'.ret\'))">Оформить возврат</button><div class="msg"></div>';
+  retDem(w);retItems(w);}
+function retDem(w){var st=RET[w.dataset.order],d=st.d;
+  var dem=d.demands.filter(function(x){return st.tab==='today'?x.today:!x.today;});
+  var h='<div class="rtabs"><button type="button" class="'+(st.tab==='today'?'on':'')+'" onclick="retTab(this,\'today\')">Сегодня</button>'
+   +'<button type="button" class="'+(st.tab==='earlier'?'on':'')+'" onclick="retTab(this,\'earlier\')">Ранее (3 накладные)</button></div>';
+  if(!dem.length)h+='<div class="rpos"><small>'+(st.tab==='today'?'Сегодняшней накладной нет':'Прошлых накладных нет')+'</small></div>';
+  dem.forEach(function(dm){h+='<div class="rpos"><b>№'+retEsc(dm.name)+'</b><small>'+retEsc(dm.moment.split('-').reverse().join('.'))+'</small></div>';
+    dm.positions.forEach(function(p,i){h+='<div class="rpos"><span class="nm">'+retEsc(p.code)+' '+retEsc(p.name)+' <small>отгр. '+p.qty+' '+retEsc(p.uom)+'</small></span>'
+      +'<button type="button" onclick="retAdd(this.closest(\'.ret\'),\''+dm.id+'\','+i+',null,\'list\',\'\')">+</button></div>';});});
+  w.querySelector('.rdem').innerHTML=h;}
+function retItems(w){var st=RET[w.dataset.order],h='';
+  if(!st.items.length)h='<div class="rpos"><small>пока ничего</small></div>';
+  st.items.forEach(function(it,k){h+='<div class="rpos"><span class="nm">'+retEsc(it.code)+' '+retEsc(it.name)+' <small>накл. №'+retEsc(it.demand_name)+'</small></span>'
+    +'<input inputmode="decimal" value="'+it.qty+'" onchange="retQty(this.closest(\'.ret\'),'+k+',this.value)"><small>'+retEsc(it.uom)+'</small>'
+    +'<button type="button" onclick="retDel(this.closest(\'.ret\'),'+k+')">✕</button></div>';});
+  w.querySelector('.ritems').innerHTML=h;}
+function retTab(btn,t){var w=btn.closest('.ret');RET[w.dataset.order].tab=t;retDem(w);}
+function retToast(w,t,err){var e=w.querySelector('.rtoast');if(e){e.textContent=t;e.className='rtoast'+(err?' err':'');}}
+function retAdd(w,did,i,qty,src,raw){var st=RET[w.dataset.order];
+  var dm=st.d.demands.filter(function(x){return x.id===did;})[0],p=dm.positions[i];
+  var q=qty==null?(p.uom.indexOf('кг')===0?0:1):qty;
+  var ex=st.items.filter(function(x){return x.demand_id===did&&x.product_id===p.product_id;})[0];
+  if(ex&&src==='scan'){ex.qty=Math.round((ex.qty+q)*1000)/1000;ex.raw=(ex.raw?ex.raw+' ':'')+raw;}
+  else if(!ex){st.items.push({demand_id:did,demand_name:dm.name,product_id:p.product_id,type:p.type,code:p.code,name:p.name,qty:q,uom:p.uom,source:src,raw:raw||''});}
+  retItems(w);
+  if(src==='scan')retToast(w,'Добавлено: '+p.code+' '+p.name+' +'+q+' '+p.uom);
+  else if(!q){var ins=w.querySelectorAll('.ritems input');if(ins.length)ins[ins.length-1].focus();}}
+function retQty(w,k,v){RET[w.dataset.order].items[k].qty=parseFloat(String(v).replace(',','.'))||0;}
+function retDel(w,k){RET[w.dataset.order].items.splice(k,1);retItems(w);}
+function ean13ok(d){var s=0;for(var i=0;i<12;i++)s+=(+d[i])*(i%2?3:1);return (10-s%10)%10===+d[12];}
+function retParse(raw){var c=String(raw||'').trim();
+  if(/^2\d{12}$/.test(c)&&ean13ok(c)&&c.slice(2,7)!=='00000')return{code:c.slice(2,7),kg:parseInt(c.slice(7,12),10)/1000};
+  var t=c.replace(/^\]C1/,'').replace(/[()]/g,''),m=t.match(/01(\d{14})/),wt=t.match(/310(\d)(\d{6})/);
+  if(m)return{gtin:m[1],kg:wt?parseInt(wt[2],10)/Math.pow(10,+wt[1]):null};
+  if(/^\d{4,6}$/.test(c))return{code:c,kg:null};
+  return null;}
+function retCode(w,raw){var st=RET[w.dataset.order],now=Date.now();
+  if(st.last[raw]&&now-st.last[raw]<3000)return;st.last[raw]=now;
+  var l=retParse(raw);if(!l){retToast(w,'Штрихкод не распознан: '+raw,true);return;}
+  var hit=null;st.d.demands.some(function(dm){return dm.positions.some(function(p,i){
+    var ok=l.code?(p.code===l.code||p.code.replace(/^0+/,'')===l.code.replace(/^0+/,'')):(p.gtins||[]).indexOf(l.gtin)>=0;
+    if(ok){hit=[dm.id,i];}return ok;});});
+  if(!hit){retToast(w,'Этого товара нет в накладной и в 3 прошлых – выбери из списка или напиши в комментарий',true);return;}
+  retAdd(w,hit[0],hit[1],l.kg,'scan',raw);}
+function retStop(w){var v=w.querySelector('video.rv');if(w._rs){w._rs.getTracks().forEach(function(t){t.stop();});w._rs=null;}
+  if(w._rz){try{w._rz.reset();}catch(e){}w._rz=null;}w._scan=false;if(v)v.hidden=true;}
+function retLoadZx(cb){if(window.ZXing)return cb();var s=document.createElement('script');s.src='/route-static/zxing.min.js';s.onload=cb;
+  s.onerror=function(){cb('нет библиотеки');};document.head.appendChild(s);}
+function retCam(btn){var w=btn.closest('.ret'),v=w.querySelector('video.rv');
+  if(w._scan){retStop(w);btn.textContent='📷 Сканировать';return;}
+  btn.textContent='⏹ Остановить камеру';
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){retToast(w,'Браузер не даёт камеру – введи цифры штрихкода',true);return;}
+  var go=function(stream){w._rs=stream;w._scan=true;v.hidden=false;v.srcObject=stream;v.play().catch(function(){});
+    if('BarcodeDetector' in window){var det=new BarcodeDetector({formats:['ean_13','code_128']});
+      (function loop(){if(!w._scan)return;det.detect(v).then(function(cs){cs.forEach(function(c){retCode(w,c.rawValue);});}).catch(function(){}).then(function(){setTimeout(loop,200);});})();}
+    else retLoadZx(function(err){if(err){retToast(w,'Сканер не загрузился – введи цифры',true);return;}
+      var hints=new Map();hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,[ZXing.BarcodeFormat.EAN_13,ZXing.BarcodeFormat.CODE_128]);
+      w._rz=new ZXing.BrowserMultiFormatReader(hints,200);w._rz.decodeFromStream(stream,v,function(res){if(res)retCode(w,res.getText());});});};
+  navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false}).then(go)
+    .catch(function(e){retToast(w,'Камера не открылась: '+(e.name||e)+' – введи цифры штрихкода',true);});}
+function retSend(w){var st=RET[w.dataset.order],b0=w.querySelector('.retbox');var m=b0.querySelector('.msg');
+  st.reason=b0.querySelector('.rreason').value;st.comment=b0.querySelector('.rcomm').value;
+  if(!st.items.length){m.textContent='Добавь позицию – сканом или из списка';return;}
+  if(st.items.some(function(x){return !(x.qty>0);})){m.textContent='Укажи количество у каждой позиции';return;}
+  if(!st.reason){m.textContent='Выбери причину';return;}
+  var b=w.querySelector('.retbox .btn');b.disabled=true;b.textContent='Оформляю…';
+  fetch(retUrl(w),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order_no:w.dataset.order,
+    agent_id:st.d.agent_id,agent_name:st.d.agent_name,items:st.items,reason:st.reason,comment:st.comment||''})})
+   .then(function(r){return r.json();}).then(function(d){
+     if(d.ok){retStop(w);delete RET[w.dataset.order];w.querySelector('.retbox').innerHTML='<div class="done-badge">'+retEsc(d.msg)+'</div>';}
+     else{m.textContent=d.msg||'Ошибка';b.disabled=false;b.textContent='Оформить возврат';}})
+   .catch(function(e){m.textContent='Сбой: '+(e.message||e);b.disabled=false;b.textContent='Оформить возврат';});}
+"""
+
+
 def _wrap(title: str, inner: str) -> str:
     return (f"<!doctype html><html lang='ru'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
             f"<title>Маршрут {_e(title)}</title><style>{_PAGE_CSS}{_FORM_CSS}</style></head>"
             f"<body><div class='wrap'>{inner}"
             f"<div class='foot'>Сдача точки — прямо здесь. Обнови страницу, если логист поменял маршрут.</div>"
-            f"</div><script>{_FORM_JS}</script></body></html>")
+            f"</div><script>{_FORM_JS}{_RET_JS}</script></body></html>")
 
 
 # ─── aiohttp-хендлер ─────────────────────────────────────────────────────────
@@ -693,3 +821,49 @@ async def handle_submit(request, db, bot) -> web.Response:
     except Exception as e:
         logger.error("route_web.handle_submit: %s", e, exc_info=True)
         return web.json_response({"ok": False, "msg": "Ошибка сохранения, повтори"}, status=500)
+
+
+# ─── возврат у клиента (client_returns.py) ───────────────────────────────────
+
+def _check_link(request):
+    try:
+        uid = int(request.match_info["uid"])
+        date_str = request.match_info["date"]
+        day = date.fromisoformat(date_str)
+    except (ValueError, KeyError):
+        return None, None, web.json_response({"ok": False, "msg": "Некорректная ссылка"}, status=400)
+    if uid not in rr.UNITS or not verify_token(uid, date_str, request.query.get("t", "")):
+        return None, None, web.json_response({"ok": False, "msg": "Ссылка недействительна"}, status=403)
+    return uid, day, None
+
+
+async def handle_returns_options(request, db, bot) -> web.Response:
+    uid, day, err = _check_link(request)
+    if err:
+        return err
+    import client_returns
+    try:
+        return web.json_response(await client_returns.options(request.query.get("order", "")))
+    except Exception as e:
+        logger.error("returns options: %s", e, exc_info=True)
+        return web.json_response({"ok": False, "msg": "МойСклад не ответил, попробуй ещё раз"})
+
+
+async def handle_returns_submit(request, db, bot) -> web.Response:
+    uid, day, err = _check_link(request)
+    if err:
+        return err
+    import client_returns
+    try:
+        body = await request.json()
+        ok, msg = await client_returns.submit(db, bot, uid, day, str(body.get("order_no") or "").strip(), body)
+        return web.json_response({"ok": ok, "msg": msg})
+    except Exception as e:
+        logger.error("returns submit: %s", e, exc_info=True)
+        return web.json_response({"ok": False, "msg": "Ошибка сохранения, повтори"}, status=500)
+
+
+async def handle_zxing(request) -> web.Response:
+    import pathlib
+    return web.FileResponse(pathlib.Path(__file__).with_name("static") / "zxing.min.js",
+                            headers={"Cache-Control": "public, max-age=604800"})
