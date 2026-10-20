@@ -511,7 +511,9 @@ async def render_page(uid: int, target: date, db, bot) -> str:
 
         # «Клиент вернул» (план 2026-10-20-возвраты-гп): и до, и после сдачи – возврат бывает
         # по прошлым накладным. Форма грузит накладные клиента по запросу, а не с маршрутом.
-        if not is_pickup and not is_manual:
+        # Кнопка скрыта до обсуждения инструкции командой (собственник 20.10.2026):
+        # включить – RETURNS_FORM_ON=1 в env бота и перезапуск.
+        if not is_pickup and not is_manual and os.getenv("RETURNS_FORM_ON") == "1":
             rows.append(f"<div class='ret' data-uid='{uid}' data-date='{date_iso}' "
                         f"data-order='{_e(order_no)}' data-token='{_e(token)}'>"
                         "<button type='button' class='btn2' onclick='retOpen(this)'>↩️ Клиент вернул</button>"
@@ -853,6 +855,8 @@ async def handle_returns_submit(request, db, bot) -> web.Response:
     uid, day, err = _check_link(request)
     if err:
         return err
+    if os.getenv("RETURNS_FORM_ON") != "1":
+        return web.json_response({"ok": False, "msg": "Оформление возвратов пока выключено"}, status=403)
     import client_returns
     try:
         body = await request.json()
