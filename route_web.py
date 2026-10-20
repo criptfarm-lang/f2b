@@ -382,6 +382,10 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         # Забор товара: заказ поставщику с нашей машиной (is_pickup из МС) ЛИБО ручная
         # точка Логистики, названная «забрать …» (документа в МС у неё нет вообще).
         is_pickup = bool(ex.get("is_pickup")) or _looks_like_pickup(order_no, s.get("client"))
+        # Ручная точка Логистики без документа МС («Рыба на Анализы»): в поле № заказа нет
+        # номера — отгрузки быть не может, обычная сдача ответила бы «не отгружена» навсегда
+        # (кейс 20.10.2026). Закрывается своей формой: выполнил / проблема.
+        is_manual = not is_pickup and not rd._DOC_RE.search(order_no or "")
         cls = "pt" + (" done" if is_done else "") + (" pickup" if is_pickup else "")
 
         # Для забора имя = поставщик, адрес = «Адрес забора» из заказа поставщику (как в PDF-реестре).
@@ -435,7 +439,16 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         rows.append(f"<div class='meta'>№ заказа {_e(order_no)}</div>")
 
         if is_done:
-            rows.append(f"<div class='done-badge'>{'✅ Забрано' if is_pickup else '✅ Сдан'}</div>")
+            rows.append(f"<div class='done-badge'>{'✅ Забрано' if is_pickup else ('✅ Выполнено' if is_manual else '✅ Сдан')}</div>")
+        elif is_manual:
+            rows.append(
+                f"<form class='sd' data-uid='{uid}' data-date='{date_iso}' data-kind='manual' "
+                f"data-order='{_e(order_no)}' data-token='{_e(token)}'>"
+                + _q_block("📦 Итог по точке:", "accepted",
+                           [("ok", "Выполнил"), ("claim", "Проблема")])
+                + "<textarea name='claim_text' class='claim' placeholder='Что не так' hidden></textarea>"
+                  "<button type='button' class='btn' onclick='sendSd(this.form)'>Отправить</button>"
+                  "<div class='msg'></div></form>")
         elif is_pickup:
             # Забор: денег и «сдачи» нет — водитель забирает товар и документы у поставщика.
             rows.append(
@@ -535,11 +548,11 @@ _FORM_JS = (
     "q.scrollIntoView({block:'center',behavior:'smooth'});"
     "var t=q.querySelector('.qt');alert('Отметь пункт: '+((t&&t.textContent)||''));}return false;}}"
     "return true;}"
-    "function sendSd(f){var pk=f.dataset.kind==='pickup';"
+    "function sendSd(f){var kd=f.dataset.kind||'';var pk=(kd==='pickup'||kd==='manual');"
     "if(!needAll(f))return;"
     "var acc=(f.accepted&&f.accepted.value)||'';"
     "var body={order_no:f.dataset.order,items:{}};"
-    "if(pk){body.kind='pickup';body.title=(f.closest('.pt').querySelector('.cli')||{}).textContent||'';}"
+    "if(pk){body.kind=kd;body.title=(f.closest('.pt').querySelector('.cli')||{}).textContent||'';}"
     "new FormData(f).forEach(function(v,k){if(k.indexOf('item_')===0){body.items[k.slice(5)]=v;}else{body[k]=v;}});"
     "if(acc==='claim'&&!((body.claim_text||'').trim())){alert(pk?'Опиши, что не так':'Опиши претензию');return;}"
     "var url='/route/'+f.dataset.uid+'/'+f.dataset.date+'/submit?t='+encodeURIComponent(f.dataset.token);"
@@ -548,7 +561,7 @@ _FORM_JS = (
     "fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})"
     ".then(function(r){return r.text().then(function(txt){return{status:r.status,txt:txt};});})"
     ".then(function(res){var d=null;try{d=JSON.parse(res.txt);}catch(_){}"
-    "if(d&&d.ok){var c=f.closest('.pt');if(c)c.className='pt done'+(pk?' pickup':'');"
+    "if(d&&d.ok){var c=f.closest('.pt');if(c)c.className='pt done'+(kd==='pickup'?' pickup':'');"
     "f.outerHTML=\"<div class='done-badge'>\"+(d.msg||'✅ Закрыто')+\"</div>\";}"
     "else if(d){fail(d.msg||('Ошибка '+res.status));}"
     "else{fail('HTTP '+res.status+': '+((res.txt||'нет ответа').replace(/<[^>]*>/g,' ').trim().slice(0,140)));}})"
@@ -660,13 +673,14 @@ async def handle_submit(request, db, bot) -> web.Response:
         return web.json_response({"ok": False, "msg": "Не указана точка"}, status=400)
     try:
         import driver_checklist as dc
-        if (body.get("kind") or "") == "pickup":
-            # Забор: отгрузки в МС нет — своя ветка (гасим точку + уведомляем логистов).
+        kind = body.get("kind") or ""
+        if kind in ("pickup", "manual"):
+            # Забор и ручная точка: отгрузки в МС нет — своя ветка (гасим точку + уведомляем логистов).
             ok, msg = await dc.web_pickup_submit(
                 db, bot, uid, order_no,
                 doc=body.get("doc"), accepted=(body.get("accepted") or ""),
                 claim_text=body.get("claim_text") or "", title=(body.get("title") or "").strip(),
-                day=day)
+                day=day, kind=kind)
             return web.json_response({"ok": ok, "msg": msg})
         # day — дата ИЗ ССЫЛКИ, а не «сегодня»: сдача после полуночи должна гасить точку
         # своего маршрута, а не следующего дня.

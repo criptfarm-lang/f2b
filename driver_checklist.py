@@ -1494,7 +1494,8 @@ async def _web_alert_undone(bot, row):
             logger.warning("_web_alert_undone → %s: %s", cid, e)
 
 
-async def web_pickup_submit(db, bot, uid, order_no, *, doc, accepted, claim_text, title="", day=None):
+async def web_pickup_submit(db, bot, uid, order_no, *, doc, accepted, claim_text, title="", day=None,
+                            kind="pickup"):
     """Закрытие точки ЗАБОРА товара (заказ поставщику или ручная точка Логистики).
 
     У забора нет отгрузки в МС → резолвить demand и писать статус отгрузки нечего.
@@ -1511,7 +1512,12 @@ async def web_pickup_submit(db, bot, uid, order_no, *, doc, accepted, claim_text
 
     import route_registry as rr
     head = f"{title or doc_no} ({rr.UNITS.get(uid, uid)})"
-    if ok_taken:
+    if kind == "manual":
+        # Ручная точка Логистики без документа МС («Рыба на Анализы»): вопроса про документы нет.
+        text = (f"✅ Ручная точка выполнена — {head}" if ok_taken
+                else f"⚠️ Проблема на ручной точке — {head}\n"
+                     f"Коммент: {(claim_text or '').strip() or '—'}")
+    elif ok_taken:
         text = (f"📦 Забор выполнен — {head}\n"
                 f"№ {doc_no}\nДокументы: {'забрал' if doc == 'yes' else 'НЕ забрал'}")
     else:
@@ -1524,6 +1530,9 @@ async def web_pickup_submit(db, bot, uid, order_no, *, doc, accepted, claim_text
         except Exception as e:
             logger.warning("web_pickup_submit → %s: %s", cid, e)
 
+    if kind == "manual":
+        return True, ("✅ Точка выполнена, логист уведомлён." if ok_taken
+                      else "⚠️ Проблема зафиксирована, логист уведомлён.")
     return True, ("✅ Забор закрыт, логист уведомлён." if ok_taken
                   else "⚠️ Проблема зафиксирована, логист уведомлён.")
 
