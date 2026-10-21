@@ -51,7 +51,10 @@ AMO_BASE = f"https://{AMO_SUBDOMAIN}.amocrm.ru/api/v4"
 PIPELINE_ATTRACT = 10873622
 TAG_IDS = {782551: "сайт", 782507: "сайт заявка"}
 STATUS_WON, STATUS_LOST = 142, 143
-LEADS_WINDOW_DAYS = 13
+# С 29.09.2026 новые сайт-лиды агент «Эф» переносит в свою воронку, тег
+# «сайт» остаётся – считаем обе (план 2026-09-29, Фаза 4).
+PIPELINE_AGENT = 11331778
+PIPELINES = (PIPELINE_ATTRACT, PIPELINE_AGENT)
 RATE_DELAY = 0.2
 
 # Порог простоя лида до пинга менеджера, часы.
@@ -132,6 +135,10 @@ async def fetch_report_tsv(session: aiohttp.ClientSession, date_from: str,
                 await asyncio.sleep(5)
                 continue
             text = await resp.text()
+            # error_code 56: отчёты не чаще 1 раза в 10 секунд
+            if resp.status == 400 and '"56"' in text:
+                await asyncio.sleep(11)
+                continue
             if resp.status in (401, 403):
                 raise DirectError(
                     "Я.Директ не принял токен (HTTP %s). Нужен свежий "
@@ -295,24 +302,31 @@ def is_site_lead(lead: dict) -> bool:
 
 
 async def fetch_site_leads(session: aiohttp.ClientSession,
-                           days: int = LEADS_WINDOW_DAYS) -> dict:
+                           period: list[str]) -> dict:
+    """Сайт-лиды, созданные в те же дни, что и расход недели (period = [с, по])."""
     now = datetime.now(timezone.utc)
-    ts_from = int((now - timedelta(days=days)).timestamp())
+    d_from, d_to = (date.fromisoformat(x) for x in period)
+    ts_from = int(datetime.combine(d_from, datetime.min.time(), MSK).timestamp())
+    ts_to = int(datetime.combine(d_to + timedelta(days=1), datetime.min.time(),
+                                 MSK).timestamp()) - 1
 
     users_raw = await amo_get(session, "/users", {"limit": 250})
     users = {u["id"]: u["name"]
              for u in users_raw.get("_embedded", {}).get("users", [])}
 
-    st_raw = await amo_get(session, f"/leads/pipelines/{PIPELINE_ATTRACT}", {})
-    statuses = {s["id"]: s["name"]
-                for s in st_raw.get("_embedded", {}).get("statuses", [])}
+    statuses: dict[int, str] = {}
+    for pid in PIPELINES:
+        st_raw = await amo_get(session, f"/leads/pipelines/{pid}", {})
+        statuses.update({s["id"]: s["name"]
+                         for s in st_raw.get("_embedded", {}).get("statuses", [])})
 
     all_leads: list[dict] = []
     page = 1
     while True:
         d = await amo_get(session, "/leads", {
-            "filter[pipeline_id]": PIPELINE_ATTRACT,
+            "filter[pipeline_id][]": list(PIPELINES),
             "filter[created_at][from]": ts_from,
+            "filter[created_at][to]": ts_to,
             "limit": 250,
             "page": page,
         })
@@ -342,9 +356,12 @@ async def fetch_site_leads(session: aiohttp.ClientSession,
         by_resp[users.get(l["responsible_user_id"],
                           f"id={l['responsible_user_id']}")] += 1
 
+    agent = sum(1 for l in site if l.get("pipeline_id") == PIPELINE_AGENT)
+    # Зависшие – только у менеджеров: в воронке агента темп держит он сам.
     stale = []
     for l in site:
-        if l["status_id"] in (STATUS_WON, STATUS_LOST):
+        if (l["status_id"] in (STATUS_WON, STATUS_LOST)
+                or l.get("pipeline_id") == PIPELINE_AGENT):
             continue
         last_note = await fetch_last_note_ts(session, l["id"])
         await asyncio.sleep(RATE_DELAY)
@@ -365,9 +382,10 @@ async def fetch_site_leads(session: aiohttp.ClientSession,
     stale.sort(key=lambda x: -x["idle_hours"])
 
     return {
-        "days": days,
+        "period": period,
         "total_in_pipeline": len(all_leads),
         "total_site": len(site),
+        "agent": agent,
         "won": won,
         "lost": lost,
         "open": open_,
@@ -451,10 +469,6 @@ def block_recommendations(weekly: dict, leads: dict,
     if balance_info["days_left"] < 7:
         recs.append(f"Баланс кончается через "
                     f"{balance_info['days_left']:.0f} дн.")
-    if leads["total_site"] > 0 and leads["won"] == 0:
-        recs.append(f"0 продаж из {leads['total_site']} "
-                    f"{plural(leads['total_site'], 'заявки', 'заявок', 'заявок')} "
-                    f"за {leads['days']} дн.")
     if not recs:
         return ["Проблем нет."]
     return ["Главное:"] + [f"– {r}" for r in recs]
@@ -463,11 +477,13 @@ def block_recommendations(weekly: dict, leads: dict,
 def block_leads(leads: dict, weekly: dict) -> list[str]:
     """Заявки с сайта, продажи, зависшие — три числа и цена заявки."""
     total_cost = sum(b["current"]["cost"] for b in weekly["campaigns"].values())
+    conv = sum(b["current"]["conv"] for b in weekly["campaigns"].values())
     cpl = (f", по ~{rub(total_cost / leads['total_site'])}"
            if leads["total_site"] else "")
-    lines = [f"Заявки с сайта за {leads['days']} дн.: "
-             f"{leads['total_site']}{cpl} · продаж {leads['won']} · "
-             f"отказов {leads['lost']}"]
+    lines = [f"Заявки с сайта за ту же неделю: {leads['total_site']}{cpl} · "
+             f"в воронке агента {leads['agent']} · отказов {leads['lost']}",
+             f"Конверсий в Метрике: {conv} (повторная заявка с того же "
+             f"телефона новой сделки не создаёт)"]
 
     stale = leads["stale"]
     if stale:
@@ -490,7 +506,7 @@ async def build_report() -> str:
         # эффективности: сумма current-периода по обеим кампаниям / 7.
         avg_daily = sum(b["current"]["cost"]
                         for b in weekly["campaigns"].values()) / 7
-        leads = await fetch_site_leads(session)
+        leads = await fetch_site_leads(session, weekly["period_current"])
 
     bal_lines, bal_info = block_balance(bal, avg_daily)
     parts = [
