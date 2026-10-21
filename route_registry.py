@@ -296,6 +296,13 @@ def _match_wialon(st: dict, pool: list):
     return None
 
 
+FREE_PREFIX = "ТОЧКА "   # своя точка «Развозки» (autodispatch.live_pool.FREE_PREFIX)
+
+
+def is_free_point(order_no) -> bool:
+    return str(order_no or "").startswith(FREE_PREFIX)
+
+
 def apply_approved(routes: dict, plans: dict) -> dict:
     """Заменить точки утверждённых дней точками «Развозки». Порядок – как утвердил
     логист. Остальные дни не трогаем. Наёмная и нераспределённые в маршруты машин
@@ -313,7 +320,11 @@ def apply_approved(routes: dict, plans: dict) -> dict:
             stops = sorted(unit.get("stops") or [], key=lambda s: s.get("seq") or 0)
             for st in stops:
                 w = _match_wialon(st, [s for s in pool if day in stop_days(s)]) or {}
-                is_pickup = st.get("kind") == "pickup" or str(st.get("order_no") or "").startswith("ЗАБОР")
+                # Своя точка логиста («ТОЧКА 7», 21.10.2026): забор вне МойСклада – Керхер,
+                # спецодежда, склад в Химках. Что забрать – в комментарии точки «Развозки».
+                is_free = bool(st.get("free")) or is_free_point(st.get("order_no"))
+                is_pickup = (is_free or st.get("kind") == "pickup"
+                             or str(st.get("order_no") or "").startswith("ЗАБОР"))
                 tf = w.get("tf") or _hour_ts(day, st.get("win_from"))
                 tt = w.get("tt") or _hour_ts(day, st.get("win_to"))
                 if not tf and not tt:
@@ -327,7 +338,7 @@ def apply_approved(routes: dict, plans: dict) -> dict:
                     "address": st.get("address") or w.get("address") or "",
                     "phone": w.get("phone") or "",
                     "order_no": w.get("order_no") or st.get("order_no"),
-                    "note": w.get("note") or "",
+                    "note": w.get("note") or (st.get("comment") or "" if is_free else ""),
                     "oid": w.get("oid"),
                     "has_cid": True,  # гарды дублей ищут сирот без cid – эти не сироты
                     "lat": st.get("lat") if st.get("lat") is not None else w.get("lat"),
@@ -336,6 +347,7 @@ def apply_approved(routes: dict, plans: dict) -> dict:
                     "plan_day": day.isoformat(),
                     "service_min": st.get("service_min"),  # Ф3: минут на точке по статистике клиента
                     **({"is_pickup": True} if is_pickup else {}),
+                    **({"is_free": True} if is_free else {}),
                 })
     # Порядок: точки неутверждённых дней – как были, утверждённые – в порядке логиста.
     for uid, v in out.items():
@@ -1250,7 +1262,7 @@ def _build_registry_pdf(routes, ms_extra, date_str, date_iso=None) -> bytes:
         pickup_rows = []  # индексы строк-заборов → подсветим фон, чтобы кидалось в глаза
         for idx, s in enumerate(stops, 1):
             ex = ms_extra.get(s["order_no"], {})
-            is_pickup = ex.get("is_pickup")
+            is_pickup = ex.get("is_pickup") or s.get("is_pickup")
             places = ex.get("places")
             places = str(places) if places not in (None, "") else "—"
             wt = _fmt_weight(ex.get("weight"))
@@ -1262,7 +1274,9 @@ def _build_registry_pdf(routes, ms_extra, date_str, date_iso=None) -> bytes:
             if is_pickup:
                 pickup_rows.append(idx)
                 info += ("<font size=10 color='#e65100'><b>➤➤ ЗАБОР ТОВАРА ◀</b></font>"
-                         "<font size=7 color='#e65100'> · заказ поставщику, не доставка</font><br/>")
+                         "<font size=7 color='#e65100'> · "
+                         + ("своя точка, не доставка" if s.get("is_free") else "заказ поставщику, не доставка")
+                         + "</font><br/>")
             rest = "" if is_pickup else (ex.get("restaurant") or "")
             client = split_restaurant(client, rest)
             info += f"<b>{client[:40]}</b>"
@@ -1288,7 +1302,7 @@ def _build_registry_pdf(routes, ms_extra, date_str, date_iso=None) -> bytes:
             if meta_line:
                 info += f"<br/><font size=7 color='#444444'>{meta_line[:90]}</font>"
             # Комментарий под адресом доставки = контакт/условия приёмки (телефон, окно).
-            cm = (ex.get("comment") or "").replace("\n", " ")
+            cm = (ex.get("comment") or (s.get("note") if s.get("is_free") else "") or "").replace("\n", " ")
             # Телефон приёмки — из комментария, кликабельной tel:-ссылкой (звонок из PDF).
             tel = _phone_from_text(cm)
             if tel:
@@ -1346,7 +1360,7 @@ def _build_registry_pdf(routes, ms_extra, date_str, date_iso=None) -> bytes:
                 (f"{wt} кг" if wt else ""),
                 (f"{pl} мест" if pl not in (None, "") else ""),
             ) if x) if (wt or pl not in (None, "")) else ""
-            is_pickup = ex.get("is_pickup")
+            is_pickup = ex.get("is_pickup") or s.get("is_pickup")
             nm = (ex.get("client") if is_pickup and ex.get("client") else s["client"])[:38]
             tag = "➤ ЗАБОР: " if is_pickup else ""
             loading.append(f"{idx}. {tag}{nm} (№{s['order_no']}){bits}")

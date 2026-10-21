@@ -128,3 +128,18 @@ def test_warn_key_short():
     import delivery_statuses as ds
     assert ds._warn_key("04581") == "04581"
     assert ds._warn_key("04581 (" + "очень длинная приписка логиста" * 2 + ")") == "04581"
+
+
+def test_free_point_goes_to_route_as_pickup_with_note():
+    """Своя точка «Развозки» (21.10.2026): забор вне МС, что забрать – в заметке водителю."""
+    plan = {"units": [{"unit_id": 26209, "stops": [
+        {"seq": 1, "order_no": "ТОЧКА 7", "client": "ТОЧКА: Склад Химки", "free": True,
+         "address": "Химки, Рабочая 2А", "lat": 55.89, "lon": 37.43, "win_from": None,
+         "win_to": None, "kind": "pickup", "comment": "Забрать: паллеты; звонить Ивану"},
+    ]}], "hired": [], "unassigned": []}
+    out = rr.apply_approved(_routes(), {D: plan})
+    st = [s for s in out[26209] if s["order_no"] == "ТОЧКА 7"][0]
+    assert st["is_pickup"] and st["is_free"]
+    assert st["note"] == "Забрать: паллеты; звонить Ивану"
+    assert st["client"] == "ТОЧКА: Склад Химки" and st["address"] == "Химки, Рабочая 2А"
+    assert rr.is_free_point("ТОЧКА 12") and not rr.is_free_point("ЗАБОР 00123")

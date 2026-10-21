@@ -382,10 +382,15 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         # Забор товара: заказ поставщику с нашей машиной (is_pickup из МС) ЛИБО ручная
         # точка Логистики, названная «забрать …» (документа в МС у неё нет вообще).
         is_pickup = bool(ex.get("is_pickup")) or _looks_like_pickup(order_no, s.get("client"))
+        # Своя точка «Развозки» («ТОЧКА 7»): документа в МС нет – закрывается ручной формой
+        # «Выполнил / Проблема», а не забором с документами поставщика.
+        is_free = bool(s.get("is_free")) or rr.is_free_point(order_no)
+        if is_free:
+            is_pickup = False
         # Ручная точка Логистики без документа МС («Рыба на Анализы»): в поле № заказа нет
         # номера — отгрузки быть не может, обычная сдача ответила бы «не отгружена» навсегда
         # (кейс 20.10.2026). Закрывается своей формой: выполнил / проблема.
-        is_manual = not is_pickup and not rd._DOC_RE.search(order_no or "")
+        is_manual = is_free or (not is_pickup and not rd._DOC_RE.search(order_no or ""))
         cls = "pt" + (" done" if is_done else "") + (" pickup" if is_pickup else "")
 
         # Для забора имя = поставщик, адрес = «Адрес забора» из заказа поставщику (как в PDF-реестре).
