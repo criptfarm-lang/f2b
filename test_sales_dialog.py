@@ -1247,3 +1247,13 @@ def test_max_first_touch_allowed_revive_not():
     assert initiative_block(first, p, {}, WED_11) is None
     assert "оживлять" in initiative_block(silent, p, {}, WED_11)
     assert "лимит" in initiative_block(first, p, {"max": 5}, WED_11)
+
+
+def test_note_parallel_lead_once():
+    """Параллельная сделка менеджера помечается один раз – собственнику одна строка."""
+    db = FakeDB({"lead": {"note": "новый сайт-лид"}})
+    assert sales_dialog.note_parallel_lead(db, "site-leads-new", 1, {"id": 44839963})
+    assert "параллельная сделка 44839963" in db.executed[0][1][0]
+    db = FakeDB({"lead": {"note": "новый сайт-лид | параллельная сделка 44839963"}})
+    assert not sales_dialog.note_parallel_lead(db, "site-leads-new", 1, {"id": 44839963})
+    assert not db.executed

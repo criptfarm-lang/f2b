@@ -2258,12 +2258,21 @@ async def _handle_one(app, db, session, campaign: str, row: dict, cfg: dict) -> 
                 await notify_owner(app, f"{row.get('lead_name') or row['lead_id']} · сделка {row['lead_id']}\n"
                                         f"Клиент ответил, пока черновик ждал: «{(row.get('inbound_text') or '')[:150]}»\n"
                                         f"Прежний черновик снят, готовлю новый.")
+    # Параллельная сделка менеджера агента не выключает (собственник 21.10.2026:
+    # сайт-лиды ведёт агент) – уходим, только если человек написал клиенту в чат.
+    # Собственнику одна строка на каждую такую сделку.
     other = await newer_open_lead(session, db, row)
-    if other:
+    if other and not cfg.get("intake"):
         release_to_human(db, campaign, row["lead_id"],
                          f"у контакта новая открытая сделка {other.get('id')} "
                          f"(ответственный {other.get('responsible_user_id')})")
         return
+    if other and note_parallel_lead(db, campaign, row["lead_id"], other) and app:
+        await app.bot.send_message(
+            _owner_id(),
+            f"У контакта «{row.get('lead_name') or row['lead_id']}» менеджер "
+            f"(amo {other.get('responsible_user_id')}) завёл параллельную сделку "
+            f"{other.get('id')}, сайт-лид {row['lead_id']} ведёт агент.")
     ctx = await build_context(db, session, row)
     draft = await generate_draft(ctx, db)
     if not draft:
@@ -2577,6 +2586,18 @@ def release_to_human(db, campaign: str, lead_id: int, why: str) -> None:
                    WHERE campaign=%s AND lead_id=%s AND verdict IN ('draft','edited')""",
                 (campaign, lead_id))
     logger.info("sales_dialog: lead=%s отдан человеку: %s", lead_id, why)
+
+
+def note_parallel_lead(db, campaign: str, lead_id: int, other: dict) -> bool:
+    """Помечает параллельную сделку в заметке лида. True – встретили впервые."""
+    mark = f"параллельная сделка {other.get('id')}"
+    row = db._fetchone("SELECT note FROM sales_dialog_leads WHERE campaign=%s AND lead_id=%s",
+                       (campaign, lead_id))
+    if not row or mark in (row.get("note") or ""):
+        return False
+    db._execute("""UPDATE sales_dialog_leads SET note = coalesce(note, '') || ' | ' || %s
+                   WHERE campaign=%s AND lead_id=%s""", (mark, campaign, lead_id))
+    return True
 
 
 async def newer_open_lead(session, db, row: dict) -> dict | None:
