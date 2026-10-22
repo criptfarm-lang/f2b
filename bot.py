@@ -657,6 +657,30 @@ _user_awaiting: dict = {}  # user_id → "photo" | "contract" | "reconciliation"
 _draft_requests: dict = {}  # user_id → list[(ParsedRequest, assigned_to)]. Phase 3.2.
 _pending_price_comments: dict = {}  # manager_user_id → {alert_id, order_id, mgr_name, alert_type?, approver_chat_id?}
 _pending_approver_input: dict = {}  # approver_chat_id → {alert_id, order_name, client_name, manager_name, manager_user_id}
+_pending_patrol_comment: dict = {}  # owner_id → id кадра патруля, ждём текст поправки (22.10.2026)
+
+
+def _save_patrol_comment(patrol_id: int, comment: str) -> bool:
+    """Поправка собственника к разбору кадра патруля → production.cctv_feedback.
+
+    f2b-production подмешивает эти поправки в промпт следующих разборов (cctv_patrol.lessons).
+    """
+    row = db._fetchone(
+        "SELECT camera, zone, spec FROM production.cctv_patrol WHERE id = %s", (patrol_id,))
+    if not row:
+        return False
+    spec = row.get("spec") or []
+    if isinstance(spec, str):
+        import json
+        spec = json.loads(spec)
+    item = spec[0] if spec else {}
+    db._execute(
+        "INSERT INTO production.cctv_feedback (patrol_id, camera, zone, ref, seen, comment) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (patrol_id, row.get("camera"), row.get("zone"), item.get("ref"), item.get("seen"),
+         comment.strip()[:2000]))
+    return True
+
 
 async def handle_wazzup_ignore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Помечает контакт как 'не наш клиент' — больше не присылать уведомления."""
@@ -1488,6 +1512,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"фото от сотрудника сохранено: user={user.id}")
         await message.reply_text("Фото получено, спасибо.")
         return
+
+    # Поправка собственника к кадру патруля камер: после кнопки «Комментарий»
+    # или ответом (reply) на сам кадр (22.10.2026)
+    if user and user.id == OWNER_CHAT_ID and chat_id == user.id and text and not text.startswith("/"):
+        patrol_id = _pending_patrol_comment.pop(user.id, None)
+        reply = message.reply_to_message
+        if patrol_id is None and reply and reply.photo:
+            hit = db._fetchone(
+                "SELECT id FROM production.cctv_patrol WHERE owner_msg_id = %s", (reply.message_id,))
+            patrol_id = hit and hit["id"]
+        if patrol_id:
+            try:
+                ok = _save_patrol_comment(patrol_id, text)
+            except Exception as exc:
+                logger.exception("патруль: не записал комментарий")
+                await message.reply_text(f"Не записал комментарий: {exc}")
+                return
+            await message.reply_text(
+                "Записал. Учту в разборе со следующего обхода." if ok
+                else f"Кадр патруля {patrol_id} не нашёл, комментарий не записан.")
+            return
 
     # Обработка ожидаемого ввода из меню (фото / ПДЗ клиента)
     awaiting = _user_awaiting.get(user.id) if user else None
@@ -7028,6 +7073,21 @@ def main():
         await q.answer("Ничего не публикуем" if choice == 0 else f"Публикую пункт {choice}")
 
     app.add_handler(CallbackQueryHandler(handle_patrol_callback, pattern=r"^patrol:\d+:\d+$"))
+
+    async def handle_patrol_comment_callback(update, context):
+        """Кнопка «Комментарий» под кадром патруля: ждём от собственника текст поправки."""
+        q = update.callback_query
+        if not q.from_user or q.from_user.id != OWNER_CHAT_ID:
+            await q.answer("⛔ Только для руководителя.", show_alert=True)
+            return
+        pid = int(q.data.split(":", 1)[1])
+        _pending_patrol_comment[q.from_user.id] = pid
+        await q.answer()
+        await q.message.reply_text(
+            "Напишите одним сообщением, что агент определил не так и как надо было. "
+            "Учту в следующих разборах.")
+
+    app.add_handler(CallbackQueryHandler(handle_patrol_comment_callback, pattern=r"^patrolc:\d+$"))
 
     # ─── Алармы amoCRM ───────────────────────────────────────────────────────
     app.add_handler(CommandHandler("myamoid", leads_only(lambda u, c: cmd_myamoid(u, c, db))))
