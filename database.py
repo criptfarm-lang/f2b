@@ -1237,6 +1237,17 @@ class Database:
         self._save_pdz_escalation_done(data)
         return True
 
+    def reset_pdz_escalation_done(self, agent_id: str) -> bool:
+        """Сбрасывает отметки эскалаций клиента (долг погашен). True если было что сбросить."""
+        if not agent_id:
+            return False
+        data = self._get_pdz_escalation_done()
+        if agent_id not in data:
+            return False
+        data.pop(agent_id, None)
+        self._save_pdz_escalation_done(data)
+        return True
+
     # ─── Market Intel (канал «Мониторинг» — закупочные прайсы) ──────────────
     def save_market_intel_message(
         self,

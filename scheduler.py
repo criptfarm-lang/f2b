@@ -723,7 +723,8 @@ async def pdz_process_events_job(app: Application, db):
                 f"tasks_created={escalation_summary['tasks_created']}, "
                 f"stop_shipments={escalation_summary['stop_shipments']}, "
                 f"prepayment_only={escalation_summary['prepayment_only']}, "
-                f"skipped_done={escalation_summary['skipped_done']}"
+                f"skipped_done={escalation_summary['skipped_done']}, "
+                f"auto_lifted={escalation_summary.get('auto_lifted', 0)}"
             )
         except Exception as e:
             logger.error(f"pdz_process_events_job: escalation step failed: {e}", exc_info=True)
@@ -802,6 +803,10 @@ PDZ_ESC_STOP_OVERDUE_DAYS = 14      # стоп отгрузок
 PDZ_ESC_STOP_NOPAY_DAYS = 21
 PDZ_ESC_PREPAY_OVERDUE_DAYS = 30    # только предоплата
 PDZ_ESC_PREPAY_NOPAY_DAYS = 21
+# Долг меньше порога – не долг (22.10.2026: ИП Полякова с долгом 0,60 ₽
+# получила задачу «связаться по оплате», Абдужапаров с 107 ₽ – предоплату).
+# Ниже порога не эскалируем, а автостоп снимаем.
+PDZ_ESC_MIN_DEBT = 1000
 
 
 async def _pdz_escalate_by_payment_gap(app: Application, db, today_rows: list) -> dict:
@@ -851,6 +856,7 @@ async def _pdz_escalate_by_payment_gap(app: Application, db, today_rows: list) -
 
     # Шаг 1: собрать по клиенту максимальную глубину просрочки и сальдо.
     agents: dict = {}
+    balances: dict = {}
     for r in today_rows or []:
         aid = r.get("agent_id") or ""
         if not aid:
@@ -860,8 +866,11 @@ async def _pdz_escalate_by_payment_gap(app: Application, db, today_rows: list) -
             balance = float(bal_raw) if bal_raw is not None else None
         except Exception:
             balance = None
-        if balance is None or balance >= 0:
-            continue  # клиент не должен — не эскалируем
+        if balance is None:
+            continue
+        balances[aid] = balance
+        if balance > -PDZ_ESC_MIN_DEBT:
+            continue  # клиент не должен (или копейки) — не эскалируем
         try:
             total = float(r.get("total_sum") or 0)
             payed = float(r.get("payed_sum") or 0)
@@ -888,6 +897,29 @@ async def _pdz_escalate_by_payment_gap(app: Application, db, today_rows: list) -
         last = _to_date(last) if last else None
         a["days_no_pay"] = (today - last).days if last else PDZ_PAYMENT_WINDOW_DAYS
         a["last_payment_date"] = last
+
+    # Шаг 3: снять автостоп с тех, кто погасил долг (сальдо из сегодняшнего
+    # снимка выше -PDZ_ESC_MIN_DEBT). Только флаги, поставленные ботом; ручные
+    # не трогаем. Сбрасываем и отметки уровней, чтобы новый долг снова
+    # эскалировался. Клиента нет в снимке – данных нет, ничего не делаем.
+    summary["auto_lifted"] = 0
+    try:
+        for f in db.get_active_stop_flags() or []:
+            aid = f.get("agent_id") or ""
+            if f.get("set_by") != "auto" or aid not in balances:
+                continue
+            if balances[aid] <= -PDZ_ESC_MIN_DEBT:
+                continue
+            if db.remove_client_stop_flag(aid, removed_by="auto:debt_paid"):
+                db.reset_pdz_escalation_done(aid)
+                summary["auto_lifted"] += 1
+                logger.info(
+                    f"_pdz_escalate_by_payment_gap: автостоп снят – {f.get('agent_name')}"
+                    f" (сальдо {balances[aid]:.2f})"
+                )
+    except Exception as e:
+        logger.error(f"_pdz_escalate_by_payment_gap: автоснятие стопов: {e}")
+        summary["errors"].append(f"lift:{e}")
 
     owner_raw = os.getenv("OWNER_CHAT_ID")
     owner_id = int(owner_raw) if owner_raw else None
