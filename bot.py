@@ -1601,7 +1601,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # Ответ менеджера на алерт цены в личке — пересылаем Виктору
-    if user and chat_id == user.id and chat_id != OWNER_CHAT_ID and text:
+    # Согласующий — обычно сам собственник, поэтому этот шаг НЕ под гейтом
+    # «не владелец» ниже: иначе его комментарий падал в «только уведомления» (22.10.2026).
+    if user and chat_id == user.id and text:
 
         # 1. Approver написал текст комментария для менеджера (approval-алерт)
         if user.id in _pending_approver_input:
@@ -1658,6 +1660,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Напишите ему напрямую."
                 )
             return
+
+    if user and chat_id == user.id and chat_id != OWNER_CHAT_ID and text:
 
         # 2. Ответ на запрос комментария по цене (price_*) ИЛИ от менеджера на approval
         if user.id in _pending_price_comments:
