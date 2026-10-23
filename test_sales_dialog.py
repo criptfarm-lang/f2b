@@ -1257,3 +1257,49 @@ def test_note_parallel_lead_once():
     db = FakeDB({"lead": {"note": "новый сайт-лид | параллельная сделка 44839963"}})
     assert not sales_dialog.note_parallel_lead(db, "site-leads-new", 1, {"id": 44839963})
     assert not db.executed
+
+
+def test_work_minutes_counts_only_window():
+    """Ночная заявка: отсчёт с 9:00; пятничная вечерняя – с понедельника."""
+    cfg = {"start_hour": 9, "end_hour": 19}
+    night = datetime(2026, 10, 23, 2, 0, tzinfo=MSK)
+    assert sales_dialog.work_minutes(night, datetime(2026, 10, 23, 9, 20, tzinfo=MSK), cfg) == 20
+    fri = datetime(2026, 10, 23, 18, 50, tzinfo=MSK)
+    assert sales_dialog.work_minutes(fri, datetime(2026, 10, 26, 9, 15, tzinfo=MSK), cfg) == 25
+    utc = datetime(2026, 10, 23, 6, 28, tzinfo=timezone.utc)            # 09:28 МСК
+    assert sales_dialog.work_minutes(utc, datetime(2026, 10, 23, 9, 58, tzinfo=MSK), cfg) == 30
+
+
+def test_first_touch_watch_hands_overdue_lead(monkeypatch):
+    """Агент не написал свежей заявке за 30 минут – черновик снят, лид на звонок с задачей на час."""
+    executed, handed = [], []
+
+    class DB:
+        def _fetchall(self, sql, params=None):
+            return [{"campaign": "site-leads-new", "lead_id": 1, "lead_name": "ПТК",
+                     "created_at": datetime(2026, 10, 23, 6, 28, tzinfo=timezone.utc),
+                     "draft_text": None},
+                    {"campaign": "site-leads-new", "lead_id": 2, "lead_name": "свежий",
+                     "created_at": datetime(2026, 10, 23, 6, 50, tzinfo=timezone.utc),
+                     "draft_text": None}]
+
+        def _execute(self, sql, params=None):
+            executed.append((sql, params))
+
+    async def fake_hand(app, db, msg, task_text="", task_hours=3):
+        handed.append((msg["lead_id"], task_hours, task_text))
+        return "ok"
+
+    monkeypatch.setattr(sales_dialog, "hand_to_manager", fake_hand)
+    monkeypatch.setattr(sales_dialog, "_heartbeat", lambda *a, **k: None)
+    now = datetime(2026, 10, 23, 10, 0, tzinfo=MSK)
+    n = asyncio.run(sales_dialog.first_touch_watch(FakeApp(), DB(), "site-leads-new",
+                                                   {"first_touch": True}, now))
+    assert n == 1
+    assert handed[0][:2] == (1, 1) and "Позвонить" in handed[0][2]
+    assert any("verdict='handed'" in sql and params[1] == 1 for sql, params in executed)
+
+
+def test_first_touch_watch_off_without_first_touch():
+    assert asyncio.run(sales_dialog.first_touch_watch(FakeApp(), None, "x", {},
+                                                      datetime.now(MSK))) == 0

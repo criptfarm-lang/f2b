@@ -606,7 +606,8 @@ async def _amo_user_active(session: aiohttp.ClientSession, user_id: int) -> bool
 
 
 async def hand_to_manager(app, db, msg: dict,
-                          task_text: str = "Ответить клиенту: диалог передан от агента") -> str:
+                          task_text: str = "Ответить клиенту: диалог передан от агента",
+                          task_hours: int = 3) -> str:
     """Возврат раскачанного лида человеку: сделка, контакты, задача и сообщение в Telegram.
 
     Возвращаем тому менеджеру, который вёл лид до агента, — он помнит клиента и
@@ -636,7 +637,7 @@ async def hand_to_manager(app, db, msg: dict,
                                     [{"id": c, "responsible_user_id": target} for c in contacts])
             done.append("контакты переданы" if ok_c else "контакты передать не вышло")
 
-        till = int((datetime.now(MSK) + timedelta(hours=3)).timestamp())
+        till = int((datetime.now(MSK) + timedelta(hours=task_hours)).timestamp())
         ok_t = await _amo_write(session, "/tasks", [{
             "entity_id": lead_id, "entity_type": "leads", "responsible_user_id": target,
             "task_type_id": 1, "complete_till": till,
@@ -1940,6 +1941,8 @@ async def _tick_campaign(app, db, campaign: str) -> None:
     if not_before and now.date().isoformat() < not_before:
         return
 
+    # Свежая заявка не ждёт агента дольше получаса – иначе менеджеру на звонок.
+    await first_touch_watch(app, db, campaign, cfg, now)
     # Протухшие карточки гасим до отбора: иначе одна неразобранная блокирует
     # очередь до конца дня (25.09.2026 так встали все партии после 11:28).
     await expire_stale(app, db, campaign)
@@ -2013,6 +2016,81 @@ async def _tick_campaign(app, db, campaign: str) -> None:
             await _handle_one(app, db, session, campaign, row, cfg)
             if is_initiative(row):
                 note_initiative(db, channel_policy(db), row_channel(row), now)
+
+
+# Сторож первого касания (Поволжская ТК 23.10.2026: заявка в 09:28, первое
+# сообщение агент собрал в 11:12 – окно инициативы с 10:00 и антиспам-пауза
+# между сообщениями в Telegram, – одобрили в 11:53, номера в Telegram не
+# оказалось, и только тогда лид ушёл Белову на звонок со сроком +3 часа).
+FIRST_TOUCH_SLA_MIN = 30
+CALL_TASK_HOURS = 1
+
+
+def work_minutes(start: datetime, now: datetime, cfg: dict) -> float:
+    """Минуты рабочего окна кампании (будни, `start_hour`–`end_hour` МСК) между
+    `start` и `now`. Ночная заявка начинает отсчёт с утра, пятничная вечерняя –
+    с понедельника."""
+    start, now = start.astimezone(MSK), now.astimezone(MSK)
+    lo, hi = cfg.get("start_hour", 9), cfg.get("end_hour", 19)
+    total, day = 0.0, start.date()
+    while day <= now.date():
+        if day.weekday() < 5 or cfg.get("weekends"):
+            a = max(start, datetime(day.year, day.month, day.day, lo, tzinfo=MSK))
+            b = min(now, datetime(day.year, day.month, day.day, hi, tzinfo=MSK))
+            if b > a:
+                total += (b - a).total_seconds() / 60
+        day += timedelta(days=1)
+    return total
+
+
+def _overdue_first(db, campaign: str) -> list:
+    """Лиды кампании, которым агент так и не отправил первое сообщение.
+
+    Перенесённые партией (`activate_on`) не трогаем – это старые заявки, их
+    агент разбирает очередью. Отправка в процессе (`sending`) – тоже не трогаем.
+    """
+    return db._fetchall("""
+        SELECT l.campaign, l.lead_id, l.lead_name, l.created_at,
+               (SELECT d.draft_text FROM sales_dialog_messages d
+                WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
+                ORDER BY d.id DESC LIMIT 1) AS draft_text
+        FROM sales_dialog_leads l
+        WHERE l.campaign = %s AND l.status = 'active' AND l.activate_on IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM sales_dialog_messages d
+              WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
+                AND d.verdict IN ('sent', 'sending'))
+          AND NOT EXISTS (
+              SELECT 1 FROM wazzup_messages o
+              WHERE o.chat_id = ANY(coalesce(l.all_chat_ids, ARRAY[l.chat_id]))
+                AND o.is_outbound = true AND o.sent_at AT TIME ZONE 'UTC' > l.created_at)
+        ORDER BY l.id""", (campaign,))
+
+
+async def first_touch_watch(app, db, campaign: str, cfg: dict, now: datetime) -> int:
+    """Заявка с сайта, которой агент не написал за полчаса рабочего времени, –
+    сразу менеджеру на звонок (собственник 23.10.2026). Висящий черновик снимаем,
+    чтобы кнопка «Отправить» не ушла клиенту поверх звонка."""
+    if not cfg.get("first_touch") or not app:
+        return 0
+    n = 0
+    for r in _overdue_first(db, campaign):
+        if work_minutes(r["created_at"], now, cfg) < FIRST_TOUCH_SLA_MIN:
+            continue
+        db._execute("""UPDATE sales_dialog_messages SET verdict='handed'
+                       WHERE campaign=%s AND lead_id=%s AND verdict IN ('draft','edited')""",
+                    (campaign, r["lead_id"]))
+        db._execute("""UPDATE sales_dialog_leads SET status='handed',
+                              note = coalesce(note, '') || ' | ' || %s
+                       WHERE campaign=%s AND lead_id=%s AND status='active'""",
+                    (f"агент не написал за {FIRST_TOUCH_SLA_MIN} мин – на звонок",
+                     campaign, r["lead_id"]))
+        what = await hand_to_manager(app, db, dict(r), task_text=(
+            "Позвонить клиенту: заявка с сайта, агент не успел написать "
+            f"за {FIRST_TOUCH_SLA_MIN} минут"), task_hours=CALL_TASK_HOURS)
+        _heartbeat(db, f"{campaign}: лид {r['lead_id']} ушёл на звонок по сторожу: {what}")
+        n += 1
+    return n
 
 
 async def _tell(app, chat: int, text: str) -> None:
@@ -2507,7 +2585,7 @@ async def _after_send_failure(app, db, row_id: int, info: str) -> str:
                    WHERE campaign=%s AND lead_id=%s""", (msg["campaign"], msg["lead_id"]))
     what = await hand_to_manager(app, db, msg, task_text=(
         "Позвонить клиенту: заявка с сайта, чата в мессенджерах нет, "
-        "в Telegram по номеру не нашёлся"))
+        "в Telegram по номеру не нашёлся"), task_hours=CALL_TASK_HOURS)
     return f". Лид передан на звонок: {what}"
 
 
