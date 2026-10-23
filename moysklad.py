@@ -2424,6 +2424,113 @@ async def _overdue_by_demand_fifo(agent_id: str, today, delay: Optional[int] = N
     return (max_days, ov_amt, url, len(overdue))
 
 
+LATE_HISTORY_DAYS = 183      # история оплат в светофоре согласования – полгода
+LATE_HISTORY_THRESHOLD = 15  # просрочка сверх отсрочки по договору, дней
+LATE_HISTORY_LEAD_DAYS = 120 # отгрузки до окна – чтобы FIFO знал, что гасилось раньше
+
+
+def late_history_fifo(demands: list, credits: list, balance: float, delay: int, today,
+                      since, threshold: int = LATE_HISTORY_THRESHOLD) -> dict:
+    """Чистая FIFO-разноска для «были просрочки > threshold дн».
+
+    demands/credits – [(date, сумма ₽)], balance – сальдо МС (минус – клиент должен).
+    Погашения гасят отгрузки от старых к новым; то, что документами не объяснено
+    (долг до окна, зачёты), ставится в начало очереди, чтобы итог сходился с сальдо
+    (тот же приём, что pay_days в quiz-game/price_approval.py).
+    Считаются отгрузки со сроком (отгрузка + delay) в окне [since, today]:
+    оплачена позже срока более чем на threshold дн или не оплачена и срок прошёл
+    более чем на threshold дн.
+    """
+    from datetime import timedelta
+    demands = sorted((d, a) for d, a in demands if d and a and a > 0)
+    credits = sorted((d, a) for d, a in credits if d and a and a > 0)
+    calib = (sum(a for _, a in demands) - sum(a for _, a in credits)) - (-balance)
+    start = demands[0][0] if demands else today
+    if calib > 0:
+        credits = [(start, calib)] + credits
+    elif calib < 0:
+        demands = [(start - timedelta(days=1), -calib)] + demands
+
+    ci, c_left = 0, (credits[0][1] if credits else 0.0)
+    rows, carry = [], 0.0
+    for d_date, amt in demands:
+        # допуск на копеечную недоплату, иначе каждая следующая отгрузка
+        # сдвигается на платёж позже
+        tol = max(0.01 * amt, 50.0)
+        need, last_credit = amt + carry, None
+        while need > tol and ci < len(credits):
+            take = min(need, c_left)
+            need -= take
+            c_left -= take
+            last_credit = credits[ci][0]
+            if c_left <= 0.005:
+                ci += 1
+                c_left = credits[ci][1] if ci < len(credits) else 0.0
+        if need <= tol:
+            rows.append((d_date, amt, last_credit or d_date))
+            carry = need
+        else:
+            rows.append((d_date, amt, None))
+            carry = 0.0
+
+    count, max_days, last_due, total = 0, 0, None, 0.0
+    for d_date, amt, paid_on in rows:
+        due = d_date + timedelta(days=delay)
+        if due < since or due > today or amt <= 1:
+            continue
+        late = ((paid_on or today) - due).days
+        if late > threshold:
+            count += 1
+            total += amt
+            max_days = max(max_days, late)
+            last_due = max(last_due, due) if last_due else due
+    return {"count": count, "max_days": max_days, "last_due": last_due,
+            "sum": round(total, 2), "delay": delay}
+
+
+async def compute_late_history(agent_id: str, delay: int = 0, today=None) -> dict:
+    """Были ли у контрагента за LATE_HISTORY_DAYS просрочки оплат больше
+    LATE_HISTORY_THRESHOLD дн сверх отсрочки по договору (светофор согласования).
+    Ошибка МС – {"error": ...}, строку тогда не показываем."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo as _ZI
+    today = today or datetime.now(_ZI("Europe/Moscow")).date()
+    since = today - timedelta(days=LATE_HISTORY_DAYS)
+    load_from = since - timedelta(days=delay + LATE_HISTORY_LEAD_DAYS)
+    agent_href = f"{MS_BASE}/entity/counterparty/{agent_id}"
+    flt = f"agent={agent_href};applicable=true;moment>={load_from:%Y-%m-%d} 00:00:00"
+
+    async def _all(session, ent):
+        out, offset = [], 0
+        while True:
+            async with session.get(f"{MS_BASE}/entity/{ent}", headers=get_headers(),
+                                   params={"filter": flt, "limit": 1000, "offset": offset}) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"{ent} {r.status}")
+                rows = (await r.json()).get("rows", []) or []
+            out += [(_to_date(x.get("moment")), (x.get("sum", 0) or 0) / 100) for x in rows]
+            if len(rows) < 1000:
+                return out
+            offset += 1000
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.get(f"{MS_BASE}/report/counterparty/{agent_id}",
+                                   headers=get_headers()) as r:
+                if r.status != 200:
+                    return {"error": f"report {r.status}"}
+                balance = ((await r.json()).get("balance", 0) or 0) / 100
+            demands, *creds = await asyncio.gather(
+                _all(session, "demand"),
+                *(_all(session, e) for e in
+                  ("paymentin", "cashin", "salesreturn", "counterpartyadjustment")))
+    except Exception as e:
+        logger.warning(f"compute_late_history({agent_id[:8]}): {e!r}")
+        return {"error": repr(e)}
+    credits = [c for part in creds for c in part]
+    return late_history_fifo(demands, credits, balance, int(delay or 0), today, since)
+
+
 def _row_fifo(r: dict):
     """Достаёт результат demand-FIFO, сохранённый в строке снимка
     (pdz_take_snapshot), в формате `_overdue_by_demand_fifo`:

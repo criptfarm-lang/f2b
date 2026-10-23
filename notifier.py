@@ -1535,6 +1535,19 @@ def _dashboard_suffix(price: dict) -> str:
     return f" (согласовано в дашборде №{', №'.join(ids)})" if ids else ""
 
 
+def _late_history_line(lh: dict):
+    """Строка «были просрочки > 15 дн за полгода» (compute_late_history) или None."""
+    if not lh or lh.get("error") or not lh.get("count"):
+        return None
+    n = lh["count"]
+    word = "отгрузка" if n % 10 == 1 and n % 100 != 11 else (
+        "отгрузки" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "отгрузок")
+    last = lh.get("last_due")
+    last_s = f" · последняя со сроком {last:%d.%m}" if last else ""
+    return (f"⚠️ *Были просрочки >15 дн* за полгода: {n} {word} "
+            f"на {_fmt_money(lh.get('sum', 0))} ₽ · макс. {lh.get('max_days', 0)} дн{last_s}")
+
+
 def _build_approval_text(
     order_name: str, order_sum: float, state_name: str,
     client_name: str, manager_name: str,
@@ -1548,6 +1561,7 @@ def _build_approval_text(
     notary: dict = None,
     attracted_line: str = None,
     edo: tuple = None,
+    late_history: dict = None,
 ) -> str:
     """
     Шаблон алерта. Порядок строк (по убыванию важности):
@@ -1587,6 +1601,10 @@ def _build_approval_text(
     # Клиент из листа контроля виден ВСЕГДА: даже если все проверки зелёные,
     # схлопывать алерт в одну строку нельзя — метка ради этого и заводилась.
     if control:
+        all_green = False
+    # Были просрочки оплат > 15 дн за полгода — тоже видно всегда (решение 23.10.2026).
+    late_line = _late_history_line(late_history)
+    if late_line:
         all_green = False
     # Привлечённые ждут закупщика – это решение по заказу, сводка его бы спрятала.
     if attracted_line:
@@ -1679,6 +1697,8 @@ def _build_approval_text(
         )
     else:
         lines.append(f"🟢 *Просрочка:* нет")
+    if late_line:
+        lines.append(late_line)
 
     # 3a. Дата планируемой оплаты — то, что бот проставил автоматом
     # из План.даты отгрузки + дней отсрочки (план 2026-05-20-автоподстановка).
@@ -1855,6 +1875,7 @@ async def check_approval_needed(order_href: str, bot, db):
             compute_price_color,
             compute_site_color, compute_contacts_color, compute_restaurant_color,
             compute_upd_debt_color, compute_address_color,
+            compute_late_history,
         )
 
         # 1. Загружаем заказ с атрибутами и расширениями
@@ -1936,19 +1957,23 @@ async def check_approval_needed(order_href: str, bot, db):
 
         # 3. Параллельно: cashflow, overdue, price, upd_debt (+ timeout 20с с fallback)
         try:
-            cashflow, overdue, price, upd_debt = await asyncio.wait_for(
+            cashflow, overdue, price, upd_debt, late_history = await asyncio.wait_for(
                 asyncio.gather(
                     compute_cashflow_color(agent_id),
                     compute_overdue_color(agent_id),
                     compute_price_color(order_href),
                     compute_upd_debt_color(agent_id),
+                    compute_late_history(agent_id, int(cp_attrs.get("days_delay") or 0)),
                     return_exceptions=True,
                 ),
                 timeout=20.0,
             )
         except asyncio.TimeoutError:
             logger.warning(f"check_approval_needed: timeout для {order_name}")
-            cashflow = overdue = price = upd_debt = None
+            cashflow = overdue = price = upd_debt = late_history = None
+        if isinstance(late_history, Exception):
+            logger.warning(f"check_approval_needed: история просрочек → {late_history!r}")
+            late_history = None
 
         # Нормализуем результаты (Exception/None → yellow с пометкой)
         def _norm(v, default):
@@ -2013,6 +2038,7 @@ async def check_approval_needed(order_href: str, bot, db):
             "attracted": "pending" if buyer_chat_id else "none",
             "edo": (edo or (None, None))[0] or "none",
             "edo_chz": "yes" if edo and len(edo) > 2 and edo[2] else "no",
+            "late_history": (late_history or {}).get("count", 0) if not (late_history or {}).get("error") else "error",
         }
         # Дата планируемой оплаты — то что выставил webhook-autofill за 60с до
         # этого алерта. Берём из attributes заказа, форматируем DD.MM.YYYY.
@@ -2040,6 +2066,7 @@ async def check_approval_needed(order_href: str, bot, db):
                 control=control,
                 attracted_line=attracted_line,
                 edo=edo,
+                late_history=late_history,
             )
 
         alert_text = _render(
