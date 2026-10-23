@@ -235,7 +235,7 @@ async def _finalize(db, bot, rid, uid, order_no, items, reason, comment, agent_n
     for it in items:
         by_demand.setdefault(it["demand_id"], []).append(it)
     # Привлечённая по фото и сканы вне накладных: пустой черновик по накладной точки – позиции и
-    # накладную по фото уточняют менеджер и бухгалтер; с позициями он встанет в очередь цеха.
+    # накладную по фото уточняет менеджер клиента (собственник 23.10.2026); с позициями он встанет в очередь цеха.
     todo_note = ""
     if (loose or photos) and point_demand_id:
         todo_note = (note.replace(" Создано формой", " ПОЗИЦИИ УТОЧНИТЬ по фото этикеток в Telegram"
@@ -271,8 +271,9 @@ async def _finalize(db, bot, rid, uid, order_no, items, reason, comment, agent_n
         lines.append(f"Привлечённая: {len(photos)} фото этикеток – позиции определить по фото.")
     todo = [m for m in made if m.get("id") and m.get("todo")]
     if todo:
-        lines.append(f"В черновик возврата №{todo[0]['name']} (накладная {todo[0].get('demand_name')}) добавьте "
-                     "позиции по фото – с ними возврат встанет в очередь цеха.")
+        lines.append(f"Менеджер{' ' + mtag if mtag else ''}: добавь позиции по фото в черновик возврата "
+                     f"№{todo[0]['name']} (накладная {todo[0].get('demand_name')}) – с ними возврат встанет "
+                     "в очередь цеха.")
     docs = ", ".join(f"№{m['name']}" for m in made if m.get("id"))
     fails = [m for m in made if not m.get("id")]
     text = (f"↩️ Едет возврат\nКлиент: {agent_name}\nМашина {unit_name}, точка {order_no}\n"
