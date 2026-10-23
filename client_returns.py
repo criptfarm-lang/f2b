@@ -2,13 +2,17 @@
 
 Решения собственника 20.10.2026:
 - возврат бывает по прошлым накладным: нашу ГП водитель сканирует (весовая этикетка или этикетка
-  коробки), привлечённую выбирает из отгруженного – «сегодня» и «ранее» (последние 3 накладные);
+  коробки), накладную форма находит сама; привлечённую – фото этикетки, позиции и накладную по фото
+  определяют менеджер и бухгалтер (23.10.2026, после жалобы водителей: «как я должен знать, с какого
+  заказа этот возврат»). Скан, которого нет в последних накладных, тоже принимается – «накладную определить»;
 - форма создаёт в МС НЕпроведённый «Возврат покупателя» (разрешено собственником) на склад
   «Производство»: на Основной склад возврат не принимают, он сразу идёт в цех на анализ;
 - менеджеру клиента, логистам и Рудневой – «едет возврат»: решить с клиентом, это вычерк из
   отгрузки или официальный возврат с корректировочной. Вычерк делает Руднева.
 """
 import asyncio
+import base64
+import io
 import json
 import logging
 import os
@@ -16,7 +20,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
 from moysklad import MS_BASE, get_headers
@@ -26,6 +30,7 @@ MSK = timezone(timedelta(hours=3))
 
 STORE_PRODUCTION_ID = os.getenv("MOYSKLAD_STORE_PRODUCTION_ID") or "7f3534c1-9dca-11f0-0a80-0510000585d3"
 EARLIER_DEMANDS = 3
+MAX_PHOTOS = 10
 REASONS = ["брак или качество", "не заказывали", "пересорт", "срок годности", "другое"]
 DECISIONS = {"strike": "вычерк из отгрузки", "official": "официальный возврат с корректировочной"}
 _DB = None
@@ -50,6 +55,8 @@ def ensure_schema(db) -> None:
             decided_by   TEXT,
             decided_at   TIMESTAMPTZ
         )""")
+    db._execute("ALTER TABLE client_returns ADD COLUMN IF NOT EXISTS loose JSONB")    # [{code, kg, raw}] – скан не нашёлся в накладных
+    db._execute("ALTER TABLE client_returns ADD COLUMN IF NOT EXISTS photos JSONB")   # [file_id] – фото этикеток привлечённой
 
 
 # ─── этикетка ───
@@ -165,12 +172,22 @@ async def _create_ms_return(session, demand_id: str, items: list[dict], note: st
         return {"id": js["id"], "name": js.get("name"), "demand_name": d.get("name")}
 
 
+def _photo_bytes(data_url: str) -> bytes | None:
+    try:
+        b = base64.b64decode(str(data_url).split(",", 1)[-1], validate=False)
+        return b if 1000 < len(b) < 5 * 1024 * 1024 else None
+    except Exception:
+        return None
+
+
 async def submit(db, bot, uid: int, day, order_no: str, body: dict) -> tuple[bool, str]:
-    items = [it for it in (body.get("items") or []) if it.get("product_id") and float(it.get("qty") or 0) > 0]
-    if not items:
-        return False, "Добавь хотя бы одну позицию – сканом или из списка."
-    if any(not it.get("demand_id") for it in items):
-        return False, "У позиции не найдена накладная – выбери её из списка."
+    items = [it for it in (body.get("items") or [])
+             if it.get("product_id") and it.get("demand_id") and float(it.get("qty") or 0) > 0]
+    loose = [{"code": str(it.get("code") or ""), "kg": it.get("qty"), "raw": it.get("raw") or ""}
+             for it in (body.get("items") or []) if not it.get("product_id") and it.get("code")]
+    photos = [b for b in (_photo_bytes(x) for x in (body.get("photos") or [])[:MAX_PHOTOS]) if b]
+    if not items and not loose and not photos:
+        return False, "Отсканируй этикетку нашей продукции или сфоткай этикетку привлечённой."
     reason = (body.get("reason") or "").strip()
     if reason not in REASONS:
         return False, "Выбери причину возврата."
@@ -180,42 +197,82 @@ async def submit(db, bot, uid: int, day, order_no: str, body: dict) -> tuple[boo
     mtag, mchat = await dc._resolve_manager_chat(agent_id) if agent_id else (None, None)
     row = db._fetchone("""
         INSERT INTO client_returns (unit_id, route_day, order_no, agent_id, agent_name, manager_tag,
-                                    reason, comment, items)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                                    reason, comment, items, loose)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (uid, day, order_no, agent_id, body.get("agent_name"), mtag, reason, comment or None,
-         json.dumps(items, ensure_ascii=False)))
+         json.dumps(items, ensure_ascii=False), json.dumps(loose, ensure_ascii=False)))
     rid = row["id"]
     asyncio.create_task(_finalize(db, bot, rid, uid, order_no, items, reason, comment,
-                                  body.get("agent_name") or "", mtag, mchat))
-    return True, "↩️ Возврат записан. Черновик в МойСклад и сообщения менеджеру, логисту и бухгалтеру уходят."
+                                  body.get("agent_name") or "", mtag, mchat,
+                                  loose=loose, photos=photos, point_demand_id=body.get("point_demand_id") or ""))
+    return True, "↩️ Возврат записан. Менеджер, логист и бухгалтер получат сообщение. Товар вези в цех."
 
 
-async def _finalize(db, bot, rid, uid, order_no, items, reason, comment, agent_name, mtag, mchat):
+async def _product_names(codes: list[str]) -> dict:
+    out = {}
+    try:
+        async with aiohttp.ClientSession() as s:
+            for c in codes[:10]:
+                rows = (await _get(s, "entity/product", filter=f"code={c}", limit=1)).get("rows", [])
+                if rows:
+                    out[c] = rows[0].get("name") or ""
+    except Exception as e:
+        logger.warning("client_returns: имена по кодам %s: %s", codes, e)
+    return out
+
+
+async def _finalize(db, bot, rid, uid, order_no, items, reason, comment, agent_name, mtag, mchat,
+                    loose=None, photos=None, point_demand_id=""):
     import driver_checklist as dc
     import route_registry as rr
     unit = rr.UNITS.get(uid) if hasattr(rr, "UNITS") else None
     unit_name = (unit or {}).get("name") if isinstance(unit, dict) else (unit or uid)
     note = (f"Возврат от клиента, водитель (машина {unit_name}), точка {order_no}. Причина: {reason}."
             + (f" {comment}" if comment else "") + " Создано формой водителя – не проводить до приёмки в цехе.")
+    loose, photos = loose or [], photos or []
+    names = await _product_names(sorted({x["code"] for x in loose})) if loose else {}
     by_demand: dict[str, list] = {}
     for it in items:
         by_demand.setdefault(it["demand_id"], []).append(it)
+    # Привлечённая по фото и сканы вне накладных: пустой черновик по накладной точки – позиции и
+    # накладную по фото уточняют менеджер и бухгалтер; с позициями он встанет в очередь цеха.
+    todo_note = ""
+    if (loose or photos) and point_demand_id:
+        todo_note = (note.replace(" Создано формой", " ПОЗИЦИИ УТОЧНИТЬ по фото этикеток в Telegram"
+                                  + (" и сканам: " + ", ".join(f"код {x['code']} {x['kg'] or ''} кг" for x in loose)
+                                     if loose else "") + ". Создано формой"))
+        by_demand.setdefault(point_demand_id, [])
     made = []
     if os.getenv("RETURNS_MS_WRITE", "1") == "1":
         async with aiohttp.ClientSession() as s:
             for did, its in by_demand.items():
                 try:
-                    made.append(await _create_ms_return(s, did, its, note))
+                    is_todo = bool(todo_note) and did == point_demand_id
+                    m = await _create_ms_return(s, did, its, todo_note if is_todo else note)
+                    m["todo"] = is_todo
+                    made.append(m)
                 except Exception as e:
                     logger.warning("client_returns %s: возврат по %s не создан: %s", rid, did, e)
-                    made.append({"id": None, "demand_name": its[0].get("demand_name"), "error": str(e)[:200]})
+                    made.append({"id": None, "demand_name": (its[0].get("demand_name") if its else "точки"),
+                                 "error": str(e)[:200]})
     db._execute("UPDATE client_returns SET ms_returns=%s WHERE id=%s", (json.dumps(made, ensure_ascii=False), rid))
 
     lines = []
     for did, its in by_demand.items():
+        if not its:
+            continue
         lines.append(f"Накладная {its[0].get('demand_name') or '?'}:")
         lines += [f"  • {it.get('code') or ''} {it.get('name') or ''} – {_fmt_qty(float(it['qty']), it.get('uom'))}"
                   for it in its]
+    if loose:
+        lines.append("Сканы не нашлись в последних накладных клиента – накладную определить:")
+        lines += [f"  • код {x['code']} {names.get(x['code'], '')} – {x['kg'] or '?'} кг" for x in loose]
+    if photos:
+        lines.append(f"Привлечённая: {len(photos)} фото этикеток – позиции определить по фото.")
+    todo = [m for m in made if m.get("id") and m.get("todo")]
+    if todo:
+        lines.append(f"В черновик возврата №{todo[0]['name']} (накладная {todo[0].get('demand_name')}) добавьте "
+                     "позиции по фото – с ними возврат встанет в очередь цеха.")
     docs = ", ".join(f"№{m['name']}" for m in made if m.get("id"))
     fails = [m for m in made if not m.get("id")]
     text = (f"↩️ Едет возврат\nКлиент: {agent_name}\nМашина {unit_name}, точка {order_no}\n"
@@ -228,11 +285,22 @@ async def _finalize(db, bot, rid, uid, order_no, items, reason, comment, agent_n
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("Вычерк из отгрузки", callback_data=f"cret:{rid}:strike")],
                                [InlineKeyboardButton("Официальный возврат", callback_data=f"cret:{rid}:official")]])
     import edo_unsigned
+    file_ids: list[str] = []
     for cid in _recipients(mchat, edo_unsigned._rudneva_chat_id(), dc._logist_chat_ids()):
         try:
+            if photos:
+                src = file_ids or [io.BytesIO(b) for b in photos]
+                if len(src) == 1:                # альбом в Telegram – от 2 фото
+                    sent = [await bot.send_photo(chat_id=cid, photo=src[0])]
+                else:
+                    sent = await bot.send_media_group(chat_id=cid, media=[InputMediaPhoto(x) for x in src])
+                if not file_ids:
+                    file_ids = [m.photo[-1].file_id for m in sent if m.photo]
             await bot.send_message(chat_id=cid, text=text, reply_markup=kb)
         except Exception as e:
             logger.warning("client_returns %s → %s: %s", rid, cid, e)
+    if file_ids:
+        db._execute("UPDATE client_returns SET photos=%s WHERE id=%s", (json.dumps(file_ids), rid))
 
 
 def _recipients(*parts) -> list:

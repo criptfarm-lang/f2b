@@ -8271,7 +8271,8 @@ def main():
             return web.json_response({"error": str(e)}, status=500)
 
     async def run_web():
-        web_app = web.Application()
+        # 15 МБ: фото этикеток из формы возврата водителя (client_returns.py), по умолчанию aiohttp – 1 МБ
+        web_app = web.Application(client_max_size=15 * 1024 ** 2)
         web_app.router.add_post("/webhook/moysklad", handle_ms_webhook)
         web_app.router.add_post("/webhook/wazzup", handle_wazzup_webhook)
         web_app.router.add_get("/webhook/sipuni", handle_sipuni_webhook)

@@ -557,15 +557,17 @@ _FORM_CSS = (".sd{margin-top:10px;padding-top:10px;border-top:1px solid #eee}"
              ".retbox{margin-top:8px;padding:10px;border:1px dashed #0d2b45;border-radius:10px;background:#f8fafc}"
              ".retbox h4{margin:10px 0 6px;font-size:14px}"
              ".retbox video{width:100%;max-height:220px;background:#000;border-radius:8px}"
-             ".rtabs{display:flex;gap:6px;margin:6px 0}"
-             ".rtabs button{flex:1;padding:8px;border:1px solid #d7dbe0;border-radius:8px;background:#fff;font-size:14px}"
-             ".rtabs button.on{background:#0d2b45;color:#fff;border-color:#0d2b45}"
              ".rpos{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #e6e7ee;font-size:14px}"
              ".rpos .nm{flex:1}.rpos small{color:#667}"
              ".rpos button{border:1px solid #d7dbe0;border-radius:8px;background:#fff;padding:6px 10px;font-size:14px}"
              ".rpos input{width:70px;padding:6px;font-size:15px;border:1px solid #d7dbe0;border-radius:8px;text-align:right}"
              ".retbox select,.retbox textarea,.retbox .code{width:100%;box-sizing:border-box;padding:8px;font-size:15px;"
              "border:1px solid #d7dbe0;border-radius:10px;margin:4px 0}"
+             ".rph{text-align:center;box-sizing:border-box}"
+             ".rthumbs{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0}"
+             ".rth{position:relative}.rth img{width:64px;height:64px;object-fit:cover;border-radius:8px;display:block}"
+             ".rth button{position:absolute;top:-6px;right:-6px;border:0;border-radius:50%;width:22px;height:22px;"
+             "background:#b91c1c;color:#fff;font-size:12px;padding:0}"
              ".rtoast{font-size:14px;color:#166534;min-height:18px;margin:4px 0}"
              ".rtoast.err{color:#b91c1c}")
 
@@ -610,7 +612,9 @@ _FORM_JS = (
 
 # Форма «Клиент вернул». Скан – камерой (BarcodeDetector, иначе библиотека ZXing, как в ревизии
 # цеха) или вводом цифр штрихкода. Весовая этикетка «2…»: знаки 3–7 – код товара, 8–12 – граммы;
-# GS1-128 – GTIN и вес. Позиция ищется в накладной точки, потом в 3 прошлых накладных клиента.
+# GS1-128 – GTIN и вес. Позиция ищется в накладной точки, потом в 3 прошлых накладных клиента;
+# не нашлась – всё равно принимается («накладную определить»). Привлечённая – только фото этикеток:
+# водитель не выбирает ни позицию, ни накладную (собственник 23.10.2026, после жалобы водителей).
 _RET_JS = r"""
 var RET={};
 function retEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
@@ -621,7 +625,7 @@ function retOpen(btn){var w=btn.closest('.ret'),box=w.querySelector('.retbox');
   box.innerHTML='Загружаю накладные клиента…';
   fetch(retUrl(w)+'&order='+encodeURIComponent(w.dataset.order)).then(function(r){return r.json();}).then(function(d){
     if(!d.ok){box.innerHTML='<div class="rtoast err">'+retEsc(d.msg||'Не загрузилось')+'</div>';return;}
-    RET[w.dataset.order]={d:d,items:[],tab:'today',last:{}};retDraw(w);
+    RET[w.dataset.order]={d:d,items:[],photos:[],last:{}};retDraw(w);
   }).catch(function(e){box.innerHTML='<div class="rtoast err">Сбой: '+retEsc(e.message||e)+'</div>';});}
 function retDraw(w){var st=RET[w.dataset.order],d=st.d,box=w.querySelector('.retbox');
   box.innerHTML='<h4>Наша продукция – сканируй этикетку</h4>'
@@ -629,29 +633,21 @@ function retDraw(w){var st=RET[w.dataset.order],d=st.d,box=w.querySelector('.ret
    +'<video class="rv" hidden playsinline muted></video>'
    +'<input class="code" inputmode="numeric" placeholder="или цифры штрихкода" onkeydown="if(event.key===\'Enter\'){retCode(this.closest(\'.ret\'),this.value);this.value=\'\';}">'
    +'<div class="rtoast"></div>'
-   +'<h4>Привлечённая – выбери из отгруженного</h4><div class="rdem"></div>'
    +'<h4>Возвращают</h4><div class="ritems"></div>'
+   +'<h4>Привлечённая – сфоткай этикетку</h4>'
+   +'<label class="btn2 rph">📸 Фото этикетки<input type="file" accept="image/*" capture="environment" hidden onchange="retPhoto(this)"></label>'
+   +'<div class="rthumbs"></div>'
    +'<h4>Причина</h4><select class="rreason"><option value="">– выбери –</option>'
    +d.reasons.map(function(r){return '<option>'+retEsc(r)+'</option>';}).join('')+'</select>'
    +'<textarea class="rcomm" placeholder="Комментарий: что не так"></textarea>'
    +'<button type="button" class="btn" onclick="retSend(this.closest(\'.ret\'))">Оформить возврат</button><div class="msg"></div>';
-  retDem(w);retItems(w);}
-function retDem(w){var st=RET[w.dataset.order],d=st.d;
-  var dem=d.demands.filter(function(x){return st.tab==='today'?x.today:!x.today;});
-  var h='<div class="rtabs"><button type="button" class="'+(st.tab==='today'?'on':'')+'" onclick="retTab(this,\'today\')">Сегодня</button>'
-   +'<button type="button" class="'+(st.tab==='earlier'?'on':'')+'" onclick="retTab(this,\'earlier\')">Ранее (3 накладные)</button></div>';
-  if(!dem.length)h+='<div class="rpos"><small>'+(st.tab==='today'?'Сегодняшней накладной нет':'Прошлых накладных нет')+'</small></div>';
-  dem.forEach(function(dm){h+='<div class="rpos"><b>№'+retEsc(dm.name)+'</b><small>'+retEsc(dm.moment.split('-').reverse().join('.'))+'</small></div>';
-    dm.positions.forEach(function(p,i){h+='<div class="rpos"><span class="nm">'+retEsc(p.code)+' '+retEsc(p.name)+' <small>отгр. '+p.qty+' '+retEsc(p.uom)+'</small></span>'
-      +'<button type="button" onclick="retAdd(this.closest(\'.ret\'),\''+dm.id+'\','+i+',null,\'list\',\'\')">+</button></div>';});});
-  w.querySelector('.rdem').innerHTML=h;}
+  retItems(w);retThumbs(w);}
 function retItems(w){var st=RET[w.dataset.order],h='';
   if(!st.items.length)h='<div class="rpos"><small>пока ничего</small></div>';
-  st.items.forEach(function(it,k){h+='<div class="rpos"><span class="nm">'+retEsc(it.code)+' '+retEsc(it.name)+' <small>накл. №'+retEsc(it.demand_name)+'</small></span>'
+  st.items.forEach(function(it,k){h+='<div class="rpos"><span class="nm">'+retEsc(it.code)+' '+retEsc(it.name)+' <small>'+(it.demand_name?'накл. №'+retEsc(it.demand_name):'накладную определят в офисе')+'</small></span>'
     +'<input inputmode="decimal" value="'+it.qty+'" onchange="retQty(this.closest(\'.ret\'),'+k+',this.value)"><small>'+retEsc(it.uom)+'</small>'
     +'<button type="button" onclick="retDel(this.closest(\'.ret\'),'+k+')">✕</button></div>';});
   w.querySelector('.ritems').innerHTML=h;}
-function retTab(btn,t){var w=btn.closest('.ret');RET[w.dataset.order].tab=t;retDem(w);}
 function retToast(w,t,err){var e=w.querySelector('.rtoast');if(e){e.textContent=t;e.className='rtoast'+(err?' err':'');}}
 function retAdd(w,did,i,qty,src,raw){var st=RET[w.dataset.order];
   var dm=st.d.demands.filter(function(x){return x.id===did;})[0],p=dm.positions[i];
@@ -677,8 +673,23 @@ function retCode(w,raw){var st=RET[w.dataset.order],now=Date.now();
   var hit=null;st.d.demands.some(function(dm){return dm.positions.some(function(p,i){
     var ok=l.code?(p.code===l.code||p.code.replace(/^0+/,'')===l.code.replace(/^0+/,'')):(p.gtins||[]).indexOf(l.gtin)>=0;
     if(ok){hit=[dm.id,i];}return ok;});});
-  if(!hit){retToast(w,'Этого товара нет в накладной и в 3 прошлых – выбери из списка или напиши в комментарий',true);return;}
+  if(!hit){if(!l.code){retToast(w,'Этикетка не наша – сфоткай её ниже',true);return;}
+    var ex=st.items.filter(function(x){return !x.product_id&&x.code===l.code;})[0],q=l.kg||0;
+    if(ex){ex.qty=Math.round((ex.qty+q)*1000)/1000;ex.raw+=' '+raw;}
+    else st.items.push({demand_id:null,demand_name:'',product_id:null,code:l.code,name:'',qty:q,uom:'кг',source:'scan',raw:raw});
+    retItems(w);retToast(w,'Добавлено: код '+l.code+(q?' +'+q+' кг':''));return;}
   retAdd(w,hit[0],hit[1],l.kg,'scan',raw);}
+function retThumbs(w){var st=RET[w.dataset.order],h='';
+  st.photos.forEach(function(p,k){h+='<span class="rth"><img src="'+p+'"><button type="button" onclick="retPhDel(this.closest(\'.ret\'),'+k+')">✕</button></span>';});
+  w.querySelector('.rthumbs').innerHTML=h+(st.photos.length?'<small>фото: '+st.photos.length+'</small>':'');}
+function retPhDel(w,k){RET[w.dataset.order].photos.splice(k,1);retThumbs(w);}
+function retPhoto(inp){var w=inp.closest('.ret'),st=RET[w.dataset.order],f=inp.files&&inp.files[0];inp.value='';if(!f)return;
+  if(st.photos.length>=10){retToast(w,'Не больше 10 фото',true);return;}
+  var img=new Image(),u=URL.createObjectURL(f);img.onload=function(){var k=Math.min(1,1280/Math.max(img.width,img.height));
+    var c=document.createElement('canvas');c.width=Math.round(img.width*k);c.height=Math.round(img.height*k);
+    c.getContext('2d').drawImage(img,0,0,c.width,c.height);URL.revokeObjectURL(u);
+    st.photos.push(c.toDataURL('image/jpeg',0.7));retThumbs(w);};
+  img.onerror=function(){retToast(w,'Фото не открылось, сфоткай ещё раз',true);};img.src=u;}
 function retStop(w){var v=w.querySelector('video.rv');if(w._rs){w._rs.getTracks().forEach(function(t){t.stop();});w._rs=null;}
   if(w._rz){try{w._rz.reset();}catch(e){}w._rz=null;}w._scan=false;if(v)v.hidden=true;}
 function retLoadZx(cb){if(window.ZXing)return cb();var s=document.createElement('script');s.src='/route-static/zxing.min.js';s.onload=cb;
@@ -697,12 +708,13 @@ function retCam(btn){var w=btn.closest('.ret'),v=w.querySelector('video.rv');
     .catch(function(e){retToast(w,'Камера не открылась: '+(e.name||e)+' – введи цифры штрихкода',true);});}
 function retSend(w){var st=RET[w.dataset.order],b0=w.querySelector('.retbox');var m=b0.querySelector('.msg');
   st.reason=b0.querySelector('.rreason').value;st.comment=b0.querySelector('.rcomm').value;
-  if(!st.items.length){m.textContent='Добавь позицию – сканом или из списка';return;}
-  if(st.items.some(function(x){return !(x.qty>0);})){m.textContent='Укажи количество у каждой позиции';return;}
+  if(!st.items.length&&!st.photos.length){m.textContent='Отсканируй нашу этикетку или сфоткай привлечённую';return;}
+  if(st.items.some(function(x){return x.product_id&&!(x.qty>0);})){m.textContent='Укажи количество у каждой позиции';return;}
   if(!st.reason){m.textContent='Выбери причину';return;}
   var b=w.querySelector('.retbox .btn');b.disabled=true;b.textContent='Оформляю…';
   fetch(retUrl(w),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order_no:w.dataset.order,
-    agent_id:st.d.agent_id,agent_name:st.d.agent_name,items:st.items,reason:st.reason,comment:st.comment||''})})
+    agent_id:st.d.agent_id,agent_name:st.d.agent_name,items:st.items,photos:st.photos,
+    point_demand_id:((st.d.demands.filter(function(x){return x.today;})[0])||{}).id||'',reason:st.reason,comment:st.comment||''})})
    .then(function(r){return r.json();}).then(function(d){
      if(d.ok){retStop(w);delete RET[w.dataset.order];w.querySelector('.retbox').innerHTML='<div class="done-badge">'+retEsc(d.msg)+'</div>';}
      else{m.textContent=d.msg||'Ошибка';b.disabled=false;b.textContent='Оформить возврат';}})
