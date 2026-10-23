@@ -1303,3 +1303,15 @@ def test_first_touch_watch_hands_overdue_lead(monkeypatch):
 def test_first_touch_watch_off_without_first_touch():
     assert asyncio.run(sales_dialog.first_touch_watch(FakeApp(), None, "x", {},
                                                       datetime.now(MSK))) == 0
+
+
+def test_first_touch_window_from_9():
+    """Свежей заявке агент пишет с 9:00, перенесённой партией и оживлению – с 10:00."""
+    policy = sales_dialog.channel_policy.__globals__["DEFAULT_CHANNELS"]
+    now = datetime(2026, 10, 23, 9, 30, tzinfo=MSK)
+    fresh = {"source": "first", "chat_type": "telegram", "taken_at_lead": now}
+    assert sales_dialog.initiative_block(fresh, policy, {}, now) is None
+    batch = dict(fresh, activate_on=date(2026, 9, 29))
+    assert sales_dialog.initiative_block(batch, policy, {}, now) == "вне окна инициативы"
+    silent = {"source": "silent", "chat_type": "telegram"}
+    assert sales_dialog.initiative_block(silent, policy, {}, now) == "вне окна инициативы"

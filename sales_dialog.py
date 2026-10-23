@@ -274,6 +274,9 @@ CHANNELS_KEY = "_channels"
 DEFAULT_CHANNELS = {
     "limits": {"telegram": 10, "max": 5, "whatsapp": 0},   # инициатив в день на канал
     "window": [10, 17],                  # часы МСК, пн–пт
+    # Свежей заявке – с 9:00: иначе утренняя ждёт до 10 и уходит на звонок по
+    # сторожу первого касания (собственник 23.10.2026).
+    "first_touch_window": [9, 17],
     "interval_min": [20, 45],            # случайная пауза между инициативами в канале
     "first_touch_channels": ["telegram", "max"],  # куда первым пишем новому сайт-лиду
     "revive_channels": ["telegram"],     # где оживляем молчащий диалог (MAX – нет, 13.10.2026)
@@ -346,6 +349,8 @@ def initiative_block(row: dict, policy: dict, used: dict, now: datetime) -> str 
     if ch in (policy.get("paused") or {}):
         return f"канал {ch} на паузе: {policy['paused'][ch]}"
     lo, hi = policy.get("window") or [10, 17]
+    if row.get("source") == "first" and not row.get("activate_on"):
+        lo, hi = policy.get("first_touch_window") or [lo, hi]
     if now.weekday() >= 5 or not (lo <= now.hour < hi):
         return "вне окна инициативы"
     if used.get(ch, 0) >= int((policy.get("limits") or {}).get(ch, 0)):
