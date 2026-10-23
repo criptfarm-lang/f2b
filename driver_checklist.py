@@ -344,8 +344,31 @@ async def _fetch_demand_detail(demand_id: str) -> dict:
     }
 
 
+class MsUnavailable(Exception):
+    """МойСклад не ответил (429 / 5xx / сеть) — это НЕ «документа нет»."""
+
+
+async def _ms_rows(session, url, headers, tries=3):
+    """GET списка из МС с повтором на 429/5xx. Нет ответа → MsUnavailable."""
+    for i in range(tries):
+        try:
+            async with session.get(url, headers=headers) as r:
+                if r.status == 200:
+                    return (await r.json()).get("rows", [])
+                if r.status != 429 and r.status < 500:
+                    raise MsUnavailable(f"HTTP {r.status}")
+                last = f"HTTP {r.status}"
+        except aiohttp.ClientError as e:
+            last = str(e)
+        if i < tries - 1:
+            await asyncio.sleep(2 + 2 * i)
+    raise MsUnavailable(last)
+
+
 async def _resolve_stop_doc(doc_no: str):
     """№ точки реестра → («demand»|«move», id) — документ, по которому сдаём точку.
+    («error», None) — МС не ответил: точку нельзя считать «не отгруженной»
+    (23.10.2026 при 429 водитель 4 раза получил «не отгружена» по отгруженному 04946).
 
     Точка в реестре кодируется номером ЗАКАЗА, поэтому идём от заказа, а не от отгрузки:
 
@@ -368,10 +391,7 @@ async def _resolve_stop_doc(doc_no: str):
     headers = get_headers()
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{MS_BASE}/entity/customerorder?filter={f}&limit=1", headers=headers
-            ) as r:
-                rows = (await r.json()).get("rows", []) if r.status == 200 else []
+            rows = await _ms_rows(session, f"{MS_BASE}/entity/customerorder?filter={f}&limit=1", headers)
             if rows:
                 o = rows[0]
                 for dm in o.get("demands") or []:
@@ -386,14 +406,15 @@ async def _resolve_stop_doc(doc_no: str):
                         return "move", href.rstrip("/").split("/")[-1]
                 return None, None
             # Заказа с таким номером нет — значит на точке номер отгрузки (печатные QR).
-            async with session.get(
-                f"{MS_BASE}/entity/demand?filter={f}&order=moment,desc&limit=1", headers=headers
-            ) as r:
-                rows = (await r.json()).get("rows", []) if r.status == 200 else []
+            rows = await _ms_rows(
+                session, f"{MS_BASE}/entity/demand?filter={f}&order=moment,desc&limit=1", headers)
             if rows:
                 return "demand", rows[0].get("id")
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        logger.warning("_resolve_stop_doc %s: %s", doc_no, e)
+        logger.warning("_resolve_stop_doc %s: МС не ответил: %s", doc_no, e)
+        return "error", None
     return None, None
 
 
@@ -1563,18 +1584,31 @@ async def web_submit(db, bot, uid, order_no, *, money, doc, items, accepted, cla
         # Поэтому ждём ограниченно, а дальше принимаем точку и дописываем фоном.
         async def _resolve():
             kind, did = await _resolve_stop_doc(doc_no)
+            if kind == "error":
+                raise MsUnavailable(doc_no)
             if kind == "demand":
                 return did, await _fetch_demand_detail(did)
             if kind == "move":
                 return did, await _fetch_move_detail(did)
             return None, None
         if deferred:
-            demand_id, det = await _resolve()
+            # Фоновая дозапись: МС может лежать на лимите минутами — ждём до ~10 мин.
+            for i in range(10):
+                try:
+                    demand_id, det = await _resolve()
+                    break
+                except MsUnavailable:
+                    if i == 9:
+                        raise
+                    await asyncio.sleep(60)
         else:
             demand_id, det = await asyncio.wait_for(_resolve(), timeout=_WEB_SUBMIT_MS_TIMEOUT)
-    except asyncio.TimeoutError:
-        logger.warning("web_submit %s: МойСклад не ответил за %d с — принимаю точку отложенно",
-                       doc_no, _WEB_SUBMIT_MS_TIMEOUT)
+    except (asyncio.TimeoutError, MsUnavailable) as e:
+        if deferred:
+            logger.error("web_submit %s: МойСклад так и не ответил, сдача не дописана: %s", doc_no, e)
+            return False, "МойСклад не отвечает."
+        logger.warning("web_submit %s: МойСклад не ответил (%s) — принимаю точку отложенно",
+                       doc_no, type(e).__name__)
         try:
             route_dispatch.mark_done_by_unit(uid, doc_no, day)
         except Exception as e:

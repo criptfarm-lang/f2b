@@ -115,6 +115,8 @@ async def options(order_no: str) -> dict:
     import driver_checklist as dc
     import route_dispatch
     kind, did = await dc._resolve_stop_doc(route_dispatch._doc_no(order_no))
+    if kind == "error":
+        return {"ok": False, "msg": "МойСклад сейчас не отвечает – попробуй через минуту."}
     if kind != "demand" or not did:
         return {"ok": False, "msg": "Точка ещё не отгружена складом – возврат оформить не к чему."}
     async with aiohttp.ClientSession() as s:
