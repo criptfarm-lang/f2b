@@ -787,13 +787,20 @@ def lead_brief(lead: dict) -> str:
     return "\n".join(out)
 
 
-def site_request(notes: list) -> str:
-    """Текст заявки с сайта из примечаний: что человек смотрел и откуда он."""
+def site_request(notes: list, lead_created: int | None = None) -> str:
+    """Текст заявки с сайта из примечаний: что человек написал, что смотрел и откуда он."""
     out = []
     for n in notes:
         p = n.get("params") or {}
         txt = str(p.get("text") or "")
-        if "Данные с сайта" in txt or "посещенные страницы" in txt:
+        # Комментарий из формы – обычное примечание без автора, пришедшее вместе
+        # с заявкой. Без него агент писал «заявка без деталей» человеку, который
+        # уже назвал и прайс, и город (lead 44875763, 21.10.2026).
+        if (n.get("note_type") == "common" and not n.get("created_by") and lead_created
+                and abs(int(n.get("created_at") or 0) - lead_created) <= 300
+                and txt.strip() and "Данные с сайта" not in txt):
+            out.append(f"комментарий клиента в заявке: «{txt.strip()[:300]}»")
+        elif "Данные с сайта" in txt or "посещенные страницы" in txt:
             for line in txt.splitlines():
                 if line.startswith(("последняя страница", "посещенные страницы")):
                     out.append(line.strip())
@@ -803,7 +810,7 @@ def site_request(notes: list) -> str:
                     zone = re.search(r"\(([^)]+)\)", line)
                     if zone:
                         out.append(f"часовой пояс заявки: {zone.group(1)}")
-    return "\n".join(dict.fromkeys(out))[:400]
+    return "\n".join(dict.fromkeys(out))[:700]
 
 
 async def _amo_notes(session: aiohttp.ClientSession, lead_id: int) -> list:
@@ -1323,7 +1330,7 @@ async def build_context(db, session: aiohttp.ClientSession, row: dict) -> dict:
 
     notes = await _amo_notes(session, row["lead_id"])
     brief = lead_brief(lead)
-    site = site_request(notes)
+    site = site_request(notes, lead.get("created_at"))
     openers = recent_openers(db, row["campaign"])
     worked = winning_openers(db, row["campaign"])
     persona = persona_for(row.get("assignee_amo_id"))
@@ -1560,12 +1567,22 @@ def check_prices(draft: dict, prices: dict, allowed: set | None = None) -> list:
     # Тариф перевозчика человек называет округлённо («около 14 400» вместо 14 417),
     # и это нормально. Цены на товар округлять нельзя — они сверены точно выше.
     loose = sorted(float(x) for x in (allowed or set()))
+    # Доставка в пересчёте на кг: тариф, делённый на вес из этого же текста
+    # («на 100 кг – около 180 ₽/кг»), и цена товара с этой надбавкой. Такие числа
+    # раньше уводили черновик к человеку (lead 44875763, 26.10.2026).
+    text = draft.get("text") or ""
+    weights = {float(w.replace(" ", "").replace(" ", ""))
+               for w in re.findall(r"\b(\d[\d  ]*)\s*кг\b", text)}
+    per_kg = [a / w for a in loose if a != 7000 for w in weights if w >= 10]
+    per_kg += [float(c["price"]) + x for c in draft.get("price_claims") or [] for x in per_kg]
     for num in re.findall(r"\b(\d[\d\s ]{2,})\s*₽", draft.get("text") or ""):
         plain = num.replace(" ", "").replace(" ", "")
         if plain in declared:
             continue
         val = float(plain)
         if any(abs(val - a) <= max(a * 0.03, 1) for a in loose):
+            continue
+        if any(abs(val - a) <= max(a * 0.05, 2) for a in per_kg):
             continue
         problems.append(f"в тексте число {num.strip()} ₽, не объявленное в price_claims")
     return problems
