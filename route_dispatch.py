@@ -321,9 +321,21 @@ def _driver_for_unit(unit_id):
     return (None, None)
 
 
-def _upsert_draft(snap_date, unit_id, driver_id, snap):
+def _upsert_draft(snap_date, unit_id, driver_id, snap) -> bool:
+    """Черновик маршрута. Если машина уже подтверждена ровно с этими точками в этом
+    порядке – отметку «подтверждено» не снимаем (27.10.2026: «Маршруты → Сегодня» перед
+    утверждением в «Развозке» сбрасывал все машины в черновик, и реестр уходил всем,
+    хотя забор добавили в одну). Возвращает True, если маршрут остался подтверждённым."""
     if _DB is None:
-        return
+        return False
+    if _same_as_confirmed(snap_date, unit_id, snap):
+        try:
+            _DB._execute("UPDATE route_dispatch SET driver_chat_id=%s, stops=%s, updated_at=now() "
+                         "WHERE snap_date=%s AND unit_id=%s",
+                         (driver_id, json.dumps(snap, ensure_ascii=False), snap_date, unit_id))
+        except Exception as e:
+            logger.warning("_upsert_draft keep confirmed: %s", e)
+        return True
     try:
         _DB._execute("""
             INSERT INTO route_dispatch (snap_date, unit_id, driver_chat_id, status, stops, updated_at)
@@ -335,6 +347,7 @@ def _upsert_draft(snap_date, unit_id, driver_id, snap):
         """, (snap_date, unit_id, driver_id, json.dumps(snap, ensure_ascii=False)))
     except Exception as e:
         logger.warning("_upsert_draft: %s", e)
+    return False
 
 
 # ─── Плановое время выезда ───────────────────────────────────────────────────
@@ -807,12 +820,12 @@ async def _collect_and_send(context, target_date, to_chat):
         stops = pkg["stops"]
         snap = [{"order_no": s["order_no"], "client": s.get("client"), "seq": s.get("seq"),
                  "is_pickup": bool(s.get("is_pickup"))} for s in stops]
-        _upsert_draft(target_date, uid, pkg["driver_id"], snap)
+        confirmed = _upsert_draft(target_date, uid, pkg["driver_id"], snap)
 
         km = rr.mileage_km(order_routes, uid, [s.get("oid") for s in stops])
         _PKG_CACHE[(dstr, uid)] = (pkg, km)  # чтобы «Подтвердить» не пересобирал всё заново
         caption = _card_caption(uid, pkg, km, date_str)
-        kb = _route_kb(dstr, uid, day_off, depart_hm(target_date, uid))
+        kb = _route_kb(dstr, uid, day_off, depart_hm(target_date, uid), confirmed)
         await _send_pdf(context.bot, to_chat, pkg["pdf"],
                         f"reestr_{uid}_{target_date.isoformat()}.pdf",
                         caption[:1024], reply_markup=kb)
