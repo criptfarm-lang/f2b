@@ -1055,6 +1055,140 @@ async def _send_position_removed_alert(
         logger.error(f"position_removed: отправка упала для {order_name}: {e}", exc_info=True)
 
 
+# ─── Сторож «откат чужой правки» (старая вкладка МС) → группа PRO ────────────
+# План: plans/2026-10-27-сторож-отката-чужой-правки-в-заказе.md
+# Заказ висит открытым во вкладке браузера, пока его правят другие (склад ставит
+# вес, удаляет позицию). Сохранение из старой вкладки записывает её копию
+# целиком и молча откатывает чужие правки. В аудите это правка от того, кто
+# сохранил, и выглядит как «он сам поменял» (заказы 05006, 04952 26.10.2026).
+# Признак: человек (source=app) одним сохранением вернул количество позиции или
+# саму позицию ровно к значению ДО последней правки другого сотрудника.
+# Резерв, статус, дата оплаты не считаем: проверка на 2 неделях истории дала
+# сотни срабатываний по ним (снятие резерва при отгрузке, круг согласования,
+# бот проставляет дату заново) и 12 – по количеству/составу, все настоящие.
+async def check_rollback(order_href: str, bot, db):
+    try:
+        from moysklad import get_headers
+        from datetime import timedelta
+        import aiohttp
+
+        headers = get_headers()
+        order_id = order_href.split("?")[0].rstrip("/").split("/")[-1]
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{MS_BASE}/entity/customerorder/{order_id}/audit",
+                headers=headers,
+                params={"limit": 100},
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    logger.warning(f"check_rollback({order_id}): audit {r.status}: {body[:200]}")
+                    return
+                audit = await r.json()
+
+        rows = sorted(audit.get("rows", []) or [], key=lambda ev: ev.get("moment", ""))
+        border = _now_msk_naive() - timedelta(minutes=POSITION_REMOVED_WINDOW_MIN)
+        # имя позиции → (uid, количество до, количество после, момент) последней правки
+        last: dict = {}
+        found = []
+
+        for ev in rows:
+            if ev.get("eventType") != "update":
+                continue
+            pos_diff = (ev.get("diff") or {}).get("positions")
+            if not isinstance(pos_diff, list):
+                continue
+            changes = []
+            for item in pos_diff:
+                if not isinstance(item, dict):
+                    continue
+                old, new = item.get("oldValue"), item.get("newValue")
+                name = ((old or new or {}).get("assortment") or {}).get("name")
+                if not name:
+                    continue
+                q_old = None if old is None else old.get("quantity")
+                q_new = None if new is None else new.get("quantity")
+                if q_old == q_new:
+                    continue  # менялся только резерв/цена
+                changes.append((name, q_old, q_new))
+
+            uid = ev.get("uid", "")
+            moment = _parse_ms_moment(ev.get("moment", ""))
+            if ev.get("source") == "app" and moment and moment >= border:
+                reverted = []
+                for name, q_old, q_new in changes:
+                    prev = last.get(name)
+                    if (prev and prev[0] != uid and prev[0] != "f@vicpure"
+                            and q_old == prev[2] and q_new == prev[1]):
+                        reverted.append((name, q_old, q_new, prev[0], prev[3]))
+                if reverted:
+                    found.append((ev, reverted))
+            for name, q_old, q_new in changes:
+                last[name] = (uid, q_old, q_new, ev.get("moment", ""))
+
+        if not found:
+            return
+
+        order = await _load_order(order_href.split("?")[0], headers)
+        if not order:
+            return
+        for ev, reverted in found:
+            if not db.try_claim_position_removed(order_id, f"rollback|{ev.get('moment', '')}"):
+                continue
+            who = await _employee_name_by_uid(ev.get("uid", ""), headers)
+            lines = []
+            for name, q_old, q_new, prev_uid, prev_moment in reverted:
+                prev_who = await _employee_name_by_uid(prev_uid, headers)
+                lines.append((name, q_old, q_new, prev_who, _parse_ms_moment(prev_moment)))
+            await _send_rollback_alert(bot, order=order, order_id=order_id, who=who,
+                                       moment=_parse_ms_moment(ev.get("moment", "")), lines=lines)
+    except Exception as e:
+        logger.error(f"check_rollback: {e}", exc_info=True)
+
+
+async def _send_rollback_alert(bot, *, order: dict, order_id: str, who: str, moment, lines: list):
+    import html as _html
+
+    chat_id = _pro_chat_id()
+    if not chat_id:
+        logger.error("rollback: некому слать (нет PRO_CHAT_ID/GROUP_CHAT_ID)")
+        return
+
+    def h(v) -> str:
+        return _html.escape(str(v), quote=False)
+
+    def q(v) -> str:
+        if v is None:
+            return "нет позиции"
+        return f"{v:,.3f}".rstrip("0").rstrip(".").replace(",", " ").replace(".", ",")
+
+    order_name = order.get("name", order_id)
+    url = f"https://online.moysklad.ru/app/#customerorder/edit?id={order_id}"
+    body = "\n".join(
+        f"• {h(name)}: {q(q_old)} → {q(q_new)}\n"
+        f"   отменена правка {h(prev_who)}"
+        + (f" от {prev_dt.strftime('%d.%m %H:%M')}" if prev_dt else "")
+        for name, q_old, q_new, prev_who, prev_dt in lines
+    )
+    text = (
+        f"⚠️ Откат чужой правки в заказе\n\n"
+        f"📦 Заказ <a href=\"{url}\">{h(order_name)}</a> · {h((order.get('state') or {}).get('name', ''))}\n"
+        f"🏢 {h((order.get('agent') or {}).get('name', '—'))}\n"
+        f"👔 Менеджер: {h((order.get('owner') or {}).get('name', '—'))}\n\n"
+        f"🧍 Сохранение от {h(who)} в {moment.strftime('%H:%M') if moment else '—'} вернуло:\n"
+        f"{body}\n\n"
+        f"Похоже, заказ был открыт в старой вкладке. Проверьте, какое значение верное. "
+        f"Перед правкой заказа обновляйте страницу (F5), после – закрывайте вкладку."
+    )
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
+                               disable_web_page_preview=True)
+        logger.info(f"rollback: заказ {order_name}, {who}, позиций {len(lines)} → PRO")
+    except Exception as e:
+        logger.error(f"rollback: отправка упала для {order_name}: {e}", exc_info=True)
+
+
 async def sweep_positions_removed(bot, db):
     """Safety-net к webhook-пути: раз в 15 мин прогоняет свежие заказы.
 
@@ -1091,11 +1225,13 @@ async def sweep_positions_removed(bot, db):
         rows = data.get("rows", []) or []
         checked = 0
         for order in rows:
-            state_id = (order.get("state") or {}).get("meta", {}).get("href", "").split("/")[-1]
-            if state_id not in PICKING_STATE_IDS:
-                continue
             href = (order.get("meta") or {}).get("href", "")
             if not href:
+                continue
+            # Откат чужой правки ловим в любом статусе (план 2026-10-27).
+            await check_rollback(href, bot, db)
+            state_id = (order.get("state") or {}).get("meta", {}).get("href", "").split("/")[-1]
+            if state_id not in PICKING_STATE_IDS:
                 continue
             await check_positions_removed(href, bot, db)
             checked += 1

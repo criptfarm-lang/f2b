@@ -8715,11 +8715,12 @@ async def process_ms_webhook(data: dict, bot):
             # position_removed_notifications (order_id + момент правки + позиция).
             # План: 2026-08-19-алерт-удалена-позиция-при-сборке.md
             if action == "UPDATE":
-                from notifier import check_positions_removed
+                from notifier import check_positions_removed, check_rollback
                 async def _delayed_removed(href=order_href, oid=order_id):
                     try:
                         await asyncio.sleep(45)
                         await check_positions_removed(href, bot, db)
+                        await check_rollback(href, bot, db)
                     except Exception as ex_pr:
                         logger.warning(f"delayed check_positions_removed({oid}): {ex_pr}")
                 asyncio.create_task(_delayed_removed())
