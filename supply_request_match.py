@@ -213,7 +213,7 @@ def load_recent_requests(conn, days: int = MATCH_WINDOW_DAYS) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute("""
             select request_id, created_at, created_by_name, species, subspecies,
-                   weight_class, volume_kg, target_price_rub_kg, client_name, raw_text
+                   weight_class, volume_kg, volume_period, target_price_rub_kg, client_name, raw_text
               from procurement.requests
              where created_at >= %s
                and coalesce(created_by_tg, 0) <> %s
@@ -300,7 +300,10 @@ def match_position(name: str, qty: float, price: float, requests: list[dict],
     # Заявки с совпавшим калибром — вперёд: они точнее описывают заказанное.
     matched.sort(key=lambda r: (r.get("caliber") != caliber, r.get("created_at")))
 
-    volume_req = sum(float(r["volume_kg"]) for r in matched if r.get("volume_kg"))
+    # Объём заявки бывает на неделю/месяц/год — сравниваем заказ с месячной потребностью.
+    from request_handler import monthly_volume
+    volume_req = sum(monthly_volume(r["volume_kg"], r.get("volume_period"))
+                     for r in matched if r.get("volume_kg"))
     prices = [float(r["target_price_rub_kg"]) for r in matched if r.get("target_price_rub_kg")]
     price_target = max(prices) if prices else None
     price_min = min(prices) if prices else None
@@ -383,7 +386,7 @@ def format_line(res: dict, icon) -> str:
     parts = [f"{who} {ids}"]
     if res.get("volume_req") and not res.get("volume_note"):
         vr = res.get("volume_ratio")
-        vol = f"просили {res['volume_req']:.0f} кг"
+        vol = f"просили {res['volume_req']:.0f} кг/мес"
         if vr is not None and vr > VOLUME_GREEN_RATIO:
             vol += f", заказ {vr:.1f}×"
         parts.append(vol)

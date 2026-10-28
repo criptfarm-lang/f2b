@@ -160,12 +160,18 @@ product_form: сырьё, слабосоль, сильносоль, х/к (хо�
 
 weight_class: свободный текст («5-6», «4+», «1.5-2.0», «2-3», «3.5+»).
 
-volume_kg: МЕСЯЧНАЯ потребность клиента в килограммах — сколько ему нужно
-товара за месяц. «200 кг» → 200. «1 тонна» → 1000. «1 т в месяц» → 1000.
+volume_kg: потребность клиента в килограммах РОВНО КАК НАПИСАЛ менеджер,
+НЕ пересчитывай в месяц. «200 кг» → 200. «1 тонна» → 1000. «1 т в месяц» → 1000.
+«1 500 кг на год» → 1500 (а не 125).
 ВАЖНО: если число рядом с упаковкой («бочка 100 кг», «канистра 5л», «пакет 1 кг»)
 — это размер тары, идёт в package, а НЕ в volume_kg.
-В volume_kg идёт ОТДЕЛЬНОЕ число общего месячного потребления.
+В volume_kg идёт ОТДЕЛЬНОЕ число общего потребления.
 Если непонятно (одиночное число без контекста) — оставь volume_kg=null.
+
+volume_period: за какой срок объём volume_kg — «неделя», «месяц» или «год».
+«в неделю», «неделя», «еженедельно» → «неделя»; «в месяц», «мес», «ежемесячно»
+→ «месяц»; «в год», «на год», «год», «годовой» → «год». Если срок не назван —
+null. Если volume_kg=null — тоже null.
 
 package: вид упаковки / тара (свободный текст). Примеры:
 «бочка 100 кг», «канистра 5 л», «лоток 250 г», «пакет 1 кг»,
@@ -230,7 +236,7 @@ confidence: 0.00-1.00. < 0.50 если основные поля (species + proc
 100 кг для ЗДРАСТЕ, 40 кг для Чайна Ньюс» →
 [{{"species": "кальмар", "subspecies": "командорский", "brand": null,
  "region": null, "weight_class": null, "processing": null, "state": null,
- "product_form": "сырьё", "package": null, "volume_kg": 140,
+ "product_form": "сырьё", "package": null, "volume_kg": 140, "volume_period": null,
  "target_price_rub_kg": 830, "target_date": null,
  "client_hint": "ЗДРАСТЕ, Чайна Ньюс", "confidence": 0.92}}]
 
@@ -238,24 +244,24 @@ confidence: 0.00-1.00. < 0.50 если основные поля (species + proc
 ООО ТК по 360 ₽; филе бедра б/к монолит 500 кг ООО ТК по 370 ₽» →
 [{{"species": "птица", "subspecies": "курица", "brand": null, "region": null,
  "weight_class": null, "processing": null, "state": null, "product_form": "сырьё",
- "package": "подложка", "volume_kg": 2000, "target_price_rub_kg": 360,
+ "package": "подложка", "volume_kg": 2000, "volume_period": null, "target_price_rub_kg": 360,
  "target_date": null, "client_hint": "ООО ТК", "confidence": 0.9}},
  {{"species": "птица", "subspecies": "курица", "brand": null, "region": null,
  "weight_class": null, "processing": null, "state": null, "product_form": "сырьё",
- "package": "монолит", "volume_kg": 500, "target_price_rub_kg": 370,
+ "package": "монолит", "volume_kg": 500, "volume_period": null, "target_price_rub_kg": 370,
  "target_date": null, "client_hint": "ООО ТК", "confidence": 0.9}}]
 
 Пример рыба: «Лосось ПБГ 5-6 охл 200 кг к четвергу, клиенту по 720 ₽» →
 [{{"species": "лосось", "subspecies": null, "brand": null, "region": null,
  "weight_class": "5-6", "processing": "ПБГ", "state": "охл",
- "product_form": "сырьё", "package": null, "volume_kg": 200,
+ "product_form": "сырьё", "package": null, "volume_kg": 200, "volume_period": null,
  "target_price_rub_kg": 720, "target_date": "2026-05-28",
  "client_hint": null, "confidence": 0.95}}]
 
 Пример сопутка: «майонез Печагин 100 кг 240 ₽» →
 [{{"species": "майонез", "subspecies": null, "brand": "Печагин", "region": null,
  "weight_class": null, "processing": null, "state": null,
- "product_form": null, "package": null, "volume_kg": 100,
+ "product_form": null, "package": null, "volume_kg": 100, "volume_period": null,
  "target_price_rub_kg": 240, "target_date": null,
  "client_hint": null, "confidence": 0.95}}]
 """
@@ -278,6 +284,32 @@ class ParsedRequest:
     client_hint: Optional[str]
     confidence: float
     raw_text: str = ""
+    volume_period: Optional[str] = None   # неделя / месяц / год, None — не указан
+
+
+VOLUME_PERIOD_ENUM = {"неделя", "месяц", "год"}
+# Сколько периодов в месяце — для пересчёта «≈ N кг/мес».
+_PER_MONTH = {"неделя": 52 / 12, "месяц": 1.0, "год": 1 / 12}
+_PERIOD_SHORT = {"неделя": "нед", "месяц": "мес", "год": "год"}
+
+
+def monthly_volume(volume_kg, period: Optional[str]) -> Optional[float]:
+    """Объём заявки в пересчёте на месяц. Период не указан — число как есть."""
+    if volume_kg is None:
+        return None
+    return float(volume_kg) * _PER_MONTH.get(period or "месяц", 1.0)
+
+
+def fmt_volume(volume_kg, period: Optional[str]) -> Optional[str]:
+    """«1500 кг/год (≈125 кг/мес)», «200 кг/мес», «200 кг»."""
+    if volume_kg is None:
+        return None
+    s = f"{float(volume_kg):g} кг"
+    if period in _PERIOD_SHORT:
+        s += f"/{_PERIOD_SHORT[period]}"
+    if period in ("неделя", "год"):
+        s += f" (≈{monthly_volume(volume_kg, period):.0f} кг/мес)"
+    return s
 
 
 def _validate_enum(v: Optional[str], allowed: set) -> Optional[str]:
@@ -317,6 +349,12 @@ def _merge_request_objs(objs: list) -> Optional[dict]:
         for k, val in o.items():
             if merged.get(k) in (None, "") and val not in (None, ""):
                 merged[k] = val
+    periods = {o.get("volume_period") for o in objs if o.get("volume_kg") is not None}
+    if len(periods) > 1:
+        # Объёмы клиентов за разные сроки — складываем в пересчёте на месяц.
+        total = sum(monthly_volume(float(o["volume_kg"]), o.get("volume_period"))
+                    for o in objs if o.get("volume_kg") is not None)
+        merged["volume_period"] = "месяц"
     merged["volume_kg"] = total if has_vol else None
     merged["client_hint"] = ", ".join(hints) if hints else None
     return merged
@@ -434,6 +472,7 @@ def _build_parsed(data: dict, text: str, today: date) -> ParsedRequest:
         client_hint=data.get("client_hint"),
         confidence=float(data.get("confidence") or 0.0),
         raw_text=text,
+        volume_period=_validate_enum(data.get("volume_period"), VOLUME_PERIOD_ENUM),
     )
 
 
@@ -487,13 +526,13 @@ def insert_request(db, parsed: ParsedRequest, created_by_tg: int,
                 species, subspecies, brand, region, weight_class,
                 processing, state, product_form, package,
                 volume_kg, target_price_rub_kg, target_date,
-                client_name, assigned_to, llm_confidence
+                client_name, assigned_to, llm_confidence, volume_period
             ) VALUES (
                 %s, %s, %s,
                 %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s,
-                %s, %s, %s
+                %s, %s, %s, %s
             )
             RETURNING request_id
             """,
@@ -505,6 +544,7 @@ def insert_request(db, parsed: ParsedRequest, created_by_tg: int,
                 parsed.volume_kg, parsed.target_price_rub_kg,
                 parsed.target_date,
                 parsed.client_hint, assigned_to, parsed.confidence,
+                parsed.volume_period,
             ),
         )
         request_id = cur.fetchone()["request_id"]
@@ -532,7 +572,7 @@ REQUIRED_FIELDS: list[tuple[str, str]] = []
 # доступно всегда.
 RECOMMENDED_FIELDS = [
     ("species",              "вид/категория"),
-    ("volume_kg",            "месячная потребность (кг)"),
+    ("volume_kg",            "объём (кг в неделю/месяц/год)"),
     ("target_price_rub_kg",  "цена для клиента (₽/кг)"),
     ("weight_class",         "навеска"),
 ]
@@ -634,7 +674,9 @@ def format_preview(parsed: ParsedRequest, assigned_to: Optional[str],
         lines.append(_fmt_field("Состояние", parsed.state))
     if parsed.product_form and parsed.product_form != "сырьё":
         lines.append(_fmt_field("Форма", parsed.product_form))
-    lines.append(_fmt_field("Месячная потребность", parsed.volume_kg, " кг"))
+    lines.append(_fmt_field("Объём", fmt_volume(parsed.volume_kg, parsed.volume_period)))
+    if parsed.volume_kg is not None and not parsed.volume_period:
+        lines.append("    _срок не указан — допиши «в месяц» / «в год» / «в неделю»_")
     if parsed.package:
         lines.append(_fmt_field("Упаковка", parsed.package))
     lines.append(_fmt_field("Цена для клиента", parsed.target_price_rub_kg, " ₽/кг"))
@@ -693,7 +735,7 @@ def format_assignee_notification(request_id: int, parsed: ParsedRequest,
     if parsed.product_form and parsed.product_form != "сырьё":
         parts.append(parsed.product_form)
     if parsed.volume_kg:
-        parts.append(f"{parsed.volume_kg:g} кг")
+        parts.append(fmt_volume(parsed.volume_kg, parsed.volume_period))
     if parsed.package:
         parts.append(parsed.package)
     summary = " · ".join(parts) if parts else "(детали в карточке)"
