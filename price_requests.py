@@ -178,7 +178,9 @@ def _sku(row) -> str:
     return f"{row['sku_code']} {row.get('sku_name') or ''}".strip()
 
 
-async def _drop_buttons(bot, row) -> None:
+async def _drop_cards(bot, row) -> None:
+    """Решённый запрос из чата убираем (собственник 30.10.2026). Старше 48 часов Telegram
+    удалять не даёт – тогда только снимаем кнопки."""
     msgs = row.get("tg_messages") or []
     if isinstance(msgs, str):
         import json
@@ -188,9 +190,12 @@ async def _drop_buttons(bot, row) -> None:
             msgs = []
     for m in msgs:
         try:
-            await bot.edit_message_reply_markup(chat_id=m["chat_id"], message_id=m["message_id"], reply_markup=None)
+            await bot.delete_message(chat_id=m["chat_id"], message_id=m["message_id"])
         except Exception:
-            pass
+            try:
+                await bot.edit_message_reply_markup(chat_id=m["chat_id"], message_id=m["message_id"], reply_markup=None)
+            except Exception:
+                pass
 
 
 async def _approve(bot, req_id: int, price: float, from_status: tuple[str, ...],
@@ -204,7 +209,7 @@ async def _approve(bot, req_id: int, price: float, from_status: tuple[str, ...],
         (price, decided_by, valid_until, req_id, list(from_status)))
     if not row:
         return None
-    await _drop_buttons(bot, row)
+    await _drop_cards(bot, row)
     chat = _manager_chat(row["manager_tag"])
     if chat:
         asked = float(row["price_requested"])
@@ -314,8 +319,10 @@ async def handle_price_request_callback(update, context):
             await query.answer(f"Уже обработано: {row['status']}", show_alert=True)
             return
         await query.answer("Согласовано")
-        await query.message.reply_text(
-            f"✅ №{req_id} согласовано: {_rub(done['approved_price'])} ₽/кг, "
+        # карточка уже удалена – ответить на неё нельзя, пишем в чат
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"✅ №{req_id} согласовано: {_rub(done['approved_price'])} ₽/кг, "
             f"до {done['valid_until']:%d.%m} на один заказ. Менеджер уведомлён.")
         return
 
