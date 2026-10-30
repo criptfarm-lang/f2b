@@ -13,7 +13,9 @@
   после обработчика сообщение удаляется.
 
 Исключение – итог с ошибкой (⚠️, «ошибка», «не удалось», «исключение»):
-такое сообщение оставляем, чтобы ошибку было видно.
+такое сообщение оставляем, чтобы ошибку было видно. Смотрим только строки,
+которых не было в карточке: «⚠️» в теле карточки – не итог (30.10.2026, из-за
+этого не удалялись превью сторис).
 
 Техника: правки сообщений ловим обёрткой методов ExtBot на уровне класса
 (экземпляр Bot заморожен), удаление – обработчиком в последней группе, PTB
@@ -36,7 +38,8 @@ _ERROR_MARKS = ("⚠️", "ошибк", "не удалось", "исключен
 # (chat_id, message_id) → True, если кнопки сняты успешной правкой,
 # False – сняты, но итог с ошибкой (не удаляем).
 _kb_removed: dict = {}
-_watched: set = set()
+# (chat_id, message_id) → строки карточки до нажатия.
+_watched: dict = {}
 
 
 def _has_kb(markup) -> bool:
@@ -56,8 +59,10 @@ def _wrap(name: str):
                 if _has_kb(a.get("reply_markup")):
                     _kb_removed.pop(key, None)
                 else:
-                    text = str(a.get("text") or a.get("caption") or "").lower()
-                    _kb_removed[key] = not any(m in text for m in _ERROR_MARKS)
+                    text = str(a.get("text") or a.get("caption") or "")
+                    added = "\n".join(l for l in text.splitlines()
+                                      if l.strip() not in _watched[key]).lower()
+                    _kb_removed[key] = not any(m in added for m in _ERROR_MARKS)
         except Exception as e:
             logger.warning(f"button_cleanup {name}: {e!r}")
         return res
@@ -80,15 +85,20 @@ def register(app, owner_id: int) -> None:
     async def pre(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = _key(update)
         if key:
-            _watched.add(key)
+            m = update.callback_query.message
+            _watched[key] = {l.strip() for l in (m.text or m.caption or "").splitlines()}
             _kb_removed.pop(key, None)
 
     async def post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = _key(update)
         if not key:
             return
-        _watched.discard(key)
-        if _kb_removed.pop(key, False):
+        _watched.pop(key, None)
+        removed = _kb_removed.pop(key, None)
+        if removed is not True:
+            logger.info(f"button_cleanup: оставил {key} ({update.callback_query.data}): "
+                        + ("кнопки не сняты" if removed is None else "итог с ошибкой"))
+        if removed:
             try:
                 await context.bot.delete_message(chat_id=key[0], message_id=key[1])
             except Exception as e:

@@ -238,16 +238,6 @@ def _make_callback(db):
             await q.answer("Не разобрал кнопку")
             return
         action, job_id, rev = m.group(1), int(m.group(2)), int(m.group(3))
-        base = q.message.caption or ""
-        ents = q.message.caption_entities
-
-        async def mark(text, keep_keys=False):
-            try:
-                await q.edit_message_caption(caption=(base + "\n\n" + text)[:1024], caption_entities=ents,
-                                             reply_markup=q.message.reply_markup if keep_keys else None)
-            except Exception:
-                logger.exception("stories_studio: не поправил подпись превью №%s", job_id)
-
         if action == "note":
             row = db._fetchone(
                 "UPDATE publishing.story_jobs SET status = 'awaiting_note', updated_at = now() "
@@ -283,7 +273,15 @@ def _make_callback(db):
         text = {"pub": "Ставлю в расписание…", "now": "Публикую сейчас…",
                 "ideas": "Ищу другую подачу – пришлю новую версию.", "cancel": "Отменено."}[action]
         await q.answer(text)
-        await mark(text)
+        # нажал – из ленты убираем, итог коротким сообщением пришлёт сборщик (собственник 30.10.2026)
+        try:
+            await q.message.delete()
+        except Exception as e:
+            if "not found" not in str(e).lower():   # старше 48 часов Telegram удалять не даёт
+                try:
+                    await q.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    logger.exception("stories_studio: не снял кнопки с превью №%s", job_id)
 
     return handle
 
@@ -327,6 +325,20 @@ def _note_target(db, message):
     return row["id"] if row else None
 
 
+def _sched_target(db, message):
+    """Ответ «снять» или «сейчас» на строку «выйдет …»: кнопок у неё нет, чтобы не висела в ленте."""
+    user = message.from_user
+    reply = message.reply_to_message
+    word = (message.text or "").strip().lower()
+    if not reply or word not in ("снять", "сейчас") or not user or user.id != _owner_id() \
+            or message.chat_id != user.id:
+        return None
+    row = db._fetchone(
+        "SELECT id FROM publishing.story_jobs WHERE chat_id = %s AND preview_message_id = %s "
+        "AND status IN ('approved', 'scheduled')", (message.chat_id, reply.message_id))
+    return (row["id"], word) if row else None
+
+
 class _NoteFilter(filters.MessageFilter):
     def __init__(self, db):
         super().__init__(name="StoriesNote")
@@ -338,7 +350,7 @@ class _NoteFilter(filters.MessageFilter):
         if not _enabled(self.db):
             return False
         try:
-            return _note_target(self.db, message) is not None
+            return _note_target(self.db, message) is not None or _sched_target(self.db, message) is not None
         except Exception:
             logger.exception("stories_studio: не проверил правку")
             return False
@@ -347,6 +359,24 @@ class _NoteFilter(filters.MessageFilter):
 def _make_note_handler(db):
     async def handle(update, context):
         message = update.effective_message
+        target = _sched_target(db, message)
+        if target:
+            job_id, word = target
+            sql = ("UPDATE publishing.story_jobs SET status = 'cancelled', scheduled_at = NULL, updated_at = now() "
+                   if word == "снять" else
+                   "UPDATE publishing.story_jobs SET status = 'publish_requested', updated_at = now() ")
+            row = db._fetchone(sql + "WHERE id = %s AND status IN ('approved', 'scheduled') RETURNING id", (job_id,))
+            if not row:
+                await message.reply_text(f"Сторис №{job_id} уже в работе или опубликована.")
+            elif word == "снять":
+                await message.reply_text(f"Сторис №{job_id} снята с расписания.")
+                try:
+                    await message.reply_to_message.delete()
+                except Exception:
+                    logger.info("stories_studio: не удалил строку расписания №%s", job_id)
+            else:
+                await message.reply_text(f"Публикую сторис №{job_id}.")
+            return
         job_id = _note_target(db, message)
         if not job_id:
             return
