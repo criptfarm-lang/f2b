@@ -22,7 +22,8 @@ type=0 (status_id=85554790): именно сюда лид попадает пр�
                     (ТОЛЬКО менеджерам ОП; закупщиков/не-ОП штраф не касается).
     Каждый уровень шлётся один раз. После L3 — тишина (один штраф на вход в статус).
   - Адресат — личка ответственного (reverse manager_chats.amo_user_id → user_id). Если
-    связки нет — fallback на OWNER_CHAT_ID с пометкой.
+    связки нет — fallback на Руслана (STUCK_LEAD_FALLBACK_CHAT_ID): проверить сделку и
+    переставить ответственного. Чат Руслана недоступен — OWNER_CHAT_ID.
 
 Планы: plans/2026-07-14-пинг-зависших-лидов-неразобранное.md,
        plans/2026-07-28-штраф-зависание-неразобранное.md
@@ -65,6 +66,9 @@ MSK = timezone(timedelta(hours=3))
 
 _owner_raw = os.getenv("OWNER_CHAT_ID")
 OWNER_CHAT_ID = int(_owner_raw) if _owner_raw else None
+# Кто разбирает лиды без досягаемого ответственного (Руслан Белов)
+_fallback_raw = os.getenv("STUCK_LEAD_FALLBACK_CHAT_ID", "555437878")
+FALLBACK_CHAT_ID = int(_fallback_raw) if _fallback_raw else None
 
 # Кэш имён пользователей amoCRM (id → имя), чтобы не дёргать /users на каждом тике
 _user_name_cache: dict = {}
@@ -203,7 +207,8 @@ async def _fetch_stage_leads() -> list:
 def _resolve_target(db, responsible_id):
     """
     Возвращает (chat_id, is_fallback). Реверс manager_chats.amo_user_id → user_id.
-    Если связки нет / чат заблокирован — fallback на OWNER_CHAT_ID.
+    Если связки нет / чат заблокирован — fallback на дежурного разборщика (Руслан),
+    он определяет и ставит ответственного. Если и его чат недоступен — OWNER_CHAT_ID.
     """
     if responsible_id:
         row = db._fetchone(
@@ -212,6 +217,13 @@ def _resolve_target(db, responsible_id):
         )
         if row and row.get("user_id") and not row.get("is_blocked"):
             return int(row["user_id"]), False
+    if FALLBACK_CHAT_ID:
+        row = db._fetchone(
+            "SELECT is_blocked FROM manager_chats WHERE user_id=%s",
+            (FALLBACK_CHAT_ID,),
+        )
+        if row and not row.get("is_blocked"):
+            return FALLBACK_CHAT_ID, True
     return OWNER_CHAT_ID, True
 
 
@@ -316,8 +328,10 @@ async def poll_job(app, db):
             if is_fallback:
                 mgr = await _get_user_name(responsible_id) if responsible_id else "не назначен"
                 text = (
-                    f"⚠️ Ответственный *{mgr}* — нет личного чата с ботом, пингую тебя.\n\n"
-                    + text
+                    f"⚠️ Лид без движения на «Неразобранном» ~{target_level} ч.\n"
+                    f"Ответственный {mgr} – нет личного чата с ботом.\n\n"
+                    f"👤 {client}\n🔗 {url}\n\n"
+                    f"Проверь сделку без движения, определи и переставь ответственного."
                 )
 
             try:
