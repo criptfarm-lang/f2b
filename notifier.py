@@ -1701,8 +1701,9 @@ def _build_approval_text(
 ) -> str:
     """
     Шаблон алерта. Порядок строк (по убыванию важности):
-      Лимит → Договор → Нотар. оговорка → Просрочка → ДДС → УПД → Сайт → Контакты → Адрес → Цена
-      → Привлечённые (статус согласования закупщиком, если он участвует).
+      шапка (клиент, долг, заказ, лимит, просрочка, оплата, менеджер) →
+      Надёжность, Договор, Нотар. оговорка → ДДС, УПД, ЭДО → Сайт, Контакты, Адрес,
+      Ресторан → Цена → Привлечённые (статус согласования закупщиком, если он участвует).
     all-green → одна сводная строка; иначе — строки светофора.
     """
     from datetime import datetime, timezone, timedelta
@@ -1746,10 +1747,30 @@ def _build_approval_text(
     if attracted_line:
         all_green = False
 
+    # Шапка (форма 04.11.2026): клиент и долг жирным, заказ, лимит, просрочка,
+    # оплата, менеджер. Красное в шапке помечено 🔴 в начале строки.
+    if credit["color"] == "yellow":
+        limit_s = "🟡 Лимит - не задан, заполните в карточке МС"
+    else:
+        limit_s = f"Лимит - {_fmt_money(credit['limit'])} р"
+        if credit["color"] == "red":
+            limit_s = f"🔴 {limit_s}, с заказом {_fmt_money(credit['effective_debt'])} р"
+    if overdue["color"] == "red":
+        overdue_s = (f"🔴 *Просрочка - {overdue.get('days', 0)} дн, "
+                     f"{_fmt_money(overdue.get('debt', 0))} р*")
+    else:
+        overdue_s = "Просрочка - нет"
+    payment_s = (f"Оплата - {payment_planned_date}" if payment_planned_date
+                 else "🔴 Оплата - не задана")
     header = (
-        f"🔔 *{_md_bold(client_name)}* · {_fmt_money(order_sum)} ₽\n"
-        f"Заказ {order_name}\n"
-        f"👔 {manager_name} · 🕐 {sent_at}\n"
+        f"*{_md_bold(client_name)}*\n"
+        f"*Долг - {_fmt_money(credit.get('current_debt', 0) or 0)} р*\n"
+        f"Заказ - {_fmt_money(order_sum)} р\n"
+        f"{limit_s}\n"
+        f"{overdue_s}\n"
+        + (f"{late_line}\n" if late_line else "")
+        + f"{payment_s}\n"
+        f"👔 {manager_name} · Заказ {order_name} · 🕐 {sent_at}\n"
     )
     if control:
         note = (control.get("note") or "").strip()
@@ -1778,28 +1799,11 @@ def _build_approval_text(
         )
         return header + body
 
-    lines = ["\n"]
+    # Блоки через пустую строку: надёжность и договор → деньги и документы →
+    # карточка клиента → цена. Лимит, просрочка и оплата – в шапке.
+    lines = [""]
     if rel_line:
         lines.append(rel_line)
-
-    # 1. Лимит
-    # snapshot-маркер: долг = balance на момент webhook'а. К моменту, когда
-    # согласующий откроет UI «Взаиморасчёты», цифра уже может вырасти из-за
-    # новых отгрузок — это не баг, см. plans/2026-05-21, Фаза 6.
-    if credit["color"] == "yellow":
-        cd = credit.get("current_debt", 0) or 0
-        lines.append(
-            f"🟡 *Лимит:* не задан — заполните в карточке МС "
-            f"· текущий долг {_fmt_money(cd)} ₽ _(на {sent_at})_"
-        )
-    else:
-        lines.append(
-            f"{_icon(credit['color'])} *Лимит:* долг {_fmt_money(credit['current_debt'])} "
-            f"+ заказ {_fmt_money(credit['order_sum'])} "
-            f"= {_fmt_money(credit['effective_debt'])} ₽ "
-            f"из {_fmt_money(credit['limit'])} ₽ "
-            f"_(на {sent_at})_"
-        )
 
     # 2. Договор
     # Цвет: 🟢 подписан / 🔴 не подписан. № договора и дни отсрочки — справка,
@@ -1825,24 +1829,7 @@ def _build_approval_text(
     else:
         lines.append("🔴 *Нотар. оговорка:* нет — долг только через суд")
 
-    # 3. Просрочка
-    if overdue["color"] == "red":
-        lines.append(
-            f"🔴 *Просрочка:* {overdue.get('days', 0)} дн "
-            f"/ {_fmt_money(overdue.get('debt', 0))} ₽"
-        )
-    else:
-        lines.append(f"🟢 *Просрочка:* нет")
-    if late_line:
-        lines.append(late_line)
-
-    # 3a. Дата планируемой оплаты — то, что бот проставил автоматом
-    # из План.даты отгрузки + дней отсрочки (план 2026-05-20-автоподстановка).
-    # 🔴 если пустая — сигнал: контрагент без отсрочки или autofill не отработал.
-    if payment_planned_date:
-        lines.append(f"🟢 *Оплата:* {payment_planned_date}")
-    else:
-        lines.append(f"🔴 *Оплата:* не задана")
+    lines.append("")
 
     # 4. ДДС
     explain = cashflow.get("explain", "")
@@ -1865,6 +1852,8 @@ def _build_approval_text(
     if edo_chz:
         shown = ", ".join(n[:40] for n in edo_chz[:5]) + (f" и ещё {len(edo_chz) - 5}" if len(edo_chz) > 5 else "")
         lines.append(f"⛔ *ЧЗ в заказе:* {shown} – коды не перейдут клиенту, пока он не подпишет документы")
+
+    lines.append("")
 
     # 5. Сайт
     if site["color"] == "green":
@@ -1902,6 +1891,8 @@ def _build_approval_text(
             lines.append(f"🟢 *Ресторан:* {_md(restaurant['value'][:60])}")
         else:
             lines.append("🔴 *Ресторан:* не заполнен")
+
+    lines.append("")
 
     # 7. Цена — внизу, длинный список не мешает читать остальные строки
     items = price.get("items", [])
