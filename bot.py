@@ -7045,7 +7045,7 @@ def main():
 
     # ─── Покрытие ГП на завтра: Маланчук нажал «Решено» (доработка №15) ──────
     async def handle_gp_coverage_resolved(update, context):
-        """Кнопка «Решено» под «ГП не покрыта». Повторы шлёт f2b-production
+        """Кнопка «Решено» под «ГП не покрыта» и «На контроле» под предварительной сверкой 16:00. Повторы шлёт f2b-production
         (chilled_coverage), он перестаёт, увидев эту метку в production.app_settings."""
         q = update.callback_query
         if not q.from_user or q.from_user.id not in (OWNER_CHAT_ID, PARTNER_CHAT_ID):
@@ -7063,14 +7063,16 @@ def main():
             logger.exception("покрытие ГП: не записал «Решено»")
             await q.answer(f"Не записал: {exc}", show_alert=True)
             return
-        await q.answer("Принято, повторов больше не будет")
+        ctl = q.data.startswith("chctl:")
+        await q.answer("Взято на контроль, повторов больше не будет" if ctl else "Принято, повторов больше не будет")
         try:
             await q.edit_message_reply_markup(InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Решено – принято", callback_data="chcov:done")]]))
+                [[InlineKeyboardButton("На контроле – принято" if ctl else "Решено – принято",
+                                       callback_data="chcov:done")]]))
         except Exception:
             pass
 
-    app.add_handler(CallbackQueryHandler(handle_gp_coverage_resolved, pattern=r"^chcov:\d{12}$"))
+    app.add_handler(CallbackQueryHandler(handle_gp_coverage_resolved, pattern=r"^(chcov|chctl):\d{12}$"))
 
     # ─── Патруль камер: выбор пункта для публикации ──────────────────────────
     async def handle_patrol_callback(update, context):
