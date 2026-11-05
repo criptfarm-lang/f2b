@@ -5860,7 +5860,11 @@ async def compute_price_color(order_href: str) -> dict:
                 price_type_name = "Цена опт"
                 client_type = "опт"
             else:
-                return {"color": "green", "items": [], "attracted_items": []}
+                # Без тега хорека/опт не знаем, с каким прайсом сверять: не «в норме»,
+                # а «не проверена» (05.11.2026: тег «хорика» тихо давал зелёный).
+                return {"color": "yellow", "items": [], "attracted_items": [],
+                        "unchecked": "у клиента нет тега хорека/опт",
+                        "agent_id": agent.get("id"), "agent_inn": agent.get("inn")}
 
             positions = order.get("positions", {}) or {}
             for pos in (positions.get("rows", []) if isinstance(positions, dict) else []):
@@ -5918,6 +5922,9 @@ async def compute_price_color(order_href: str) -> dict:
                         it["margin_pct"] = (it["order_price"] - cost) / it["order_price"] * 100
     except Exception as e:
         logger.error(f"compute_price_color: {e}")
+        return {"color": "yellow", "items": items, "attracted_items": attracted,
+                "unchecked": "ошибка проверки",
+                "agent_id": agent.get("id"), "agent_inn": agent.get("inn")}
     # agent_* – для сверки с ценами, согласованными в дашборде менеджера (price_requests)
     return {"color": "red" if items else "green", "items": items,
             "attracted_items": attracted,

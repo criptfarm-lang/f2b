@@ -1914,6 +1914,8 @@ def _build_approval_text(
             )
         if n > 5:
             lines.append(f"   • … и ещё {n - 5} {'позиция' if n - 5 == 1 else 'позиций'}")
+    elif price.get("unchecked"):
+        lines.append(f"🟡 *Цена:* не проверена – {price['unchecked']}")
     else:
         lines.append("🟢 *Цена:* в норме")
     for it in (price.get("dashboard_items") or [])[:5]:
@@ -2112,7 +2114,7 @@ async def check_approval_needed(order_href: str, bot, db):
         cashflow = _norm(cashflow, {"color": "yellow", "n_days": None, "explain": "?",
                                     "payments_sum": 0, "current_debt": 0.0})
         overdue = _norm(overdue, {"color": "yellow", "days": 0, "debt": 0})
-        price = _norm(price, {"color": "yellow", "items": []})
+        price = _norm(price, {"color": "yellow", "items": [], "unchecked": "проверка не ответила"})
         upd_debt = _norm(upd_debt, {"color": "yellow", "count": 0, "sum": 0})
 
         # Цены, которые собственник уже согласовал в дашборде менеджера («ЗАПРОС ЦЕНЫ»):

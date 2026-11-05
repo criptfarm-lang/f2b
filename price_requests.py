@@ -127,7 +127,7 @@ def apply_dashboard_approvals(price: dict, order_name: str) -> dict:
     red = split(items)
     attracted_left = split(attracted)
     return {**price, "items": red, "attracted_items": attracted_left, "dashboard_items": ok,
-            "color": "red" if red else "green"}
+            "color": "red" if red else ("yellow" if price.get("unchecked") else "green")}
 
 
 def _owner_id() -> int:
