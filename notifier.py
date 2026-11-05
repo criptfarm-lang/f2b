@@ -1759,7 +1759,7 @@ def _build_approval_text(
         overdue_s = (f"🔴 *Просрочка - {overdue.get('days', 0)} дн, "
                      f"{_fmt_money(overdue.get('debt', 0))} р*")
     else:
-        overdue_s = "Просрочка - нет"
+        overdue_s = "🟢 Просрочка - нет"
     payment_s = (f"Оплата - {payment_planned_date}" if payment_planned_date
                  else "🔴 Оплата - не задана")
     header = (
