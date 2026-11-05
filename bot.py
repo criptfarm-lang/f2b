@@ -7043,6 +7043,35 @@ def main():
 
     app.add_handler(CallbackQueryHandler(handle_dashamail_callback, pattern="^dashamail:"))
 
+    # ─── Покрытие ГП на завтра: Маланчук нажал «Решено» (доработка №15) ──────
+    async def handle_gp_coverage_resolved(update, context):
+        """Кнопка «Решено» под «ГП не покрыта». Повторы шлёт f2b-production
+        (chilled_coverage), он перестаёт, увидев эту метку в production.app_settings."""
+        q = update.callback_query
+        if not q.from_user or q.from_user.id not in (OWNER_CHAT_ID, PARTNER_CHAT_ID):
+            await q.answer("⛔ Только для руководителя.", show_alert=True)
+            return
+        token = q.data.split(":", 1)[1]
+        try:
+            db._execute(
+                "INSERT INTO production.app_settings (key, value, updated_at) "
+                "VALUES ('chilled_cov_resolved', %s, now()) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                (token,),
+            )
+        except Exception as exc:
+            logger.exception("покрытие ГП: не записал «Решено»")
+            await q.answer(f"Не записал: {exc}", show_alert=True)
+            return
+        await q.answer("Принято, повторов больше не будет")
+        try:
+            await q.edit_message_reply_markup(InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Решено – принято", callback_data="chcov:done")]]))
+        except Exception:
+            pass
+
+    app.add_handler(CallbackQueryHandler(handle_gp_coverage_resolved, pattern=r"^chcov:\d{12}$"))
+
     # ─── Патруль камер: выбор пункта для публикации ──────────────────────────
     async def handle_patrol_callback(update, context):
         """Кнопка «Публикуем N» под кадром патруля.
