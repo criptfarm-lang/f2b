@@ -26,9 +26,18 @@ STATUS_NOTE = {
 }
 
 
+_schema_ok = False
+
+
 def ensure_schema(db) -> None:
+    """Один раз за жизнь процесса: проверка ввода цены идёт на каждое личное
+    сообщение руководителя, ALTER на каждое – лишние блокировки таблицы."""
+    global _schema_ok
+    if _schema_ok:
+        return
     db._execute("ALTER TABLE manager_claims ADD COLUMN IF NOT EXISTS awaiting_by BIGINT")
     db._execute("ALTER TABLE manager_claims ADD COLUMN IF NOT EXISTS awaiting_since TIMESTAMPTZ")
+    _schema_ok = True
 
 
 def _items(row) -> list:
