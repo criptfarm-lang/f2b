@@ -1434,6 +1434,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Видео-файл сохранён в базу.")
             return
 
+    # Уценка из претензии менеджера: руководитель нажал «✏️ Другая цена» и пишет число
+    if _u and message.text and message.chat_id == _u.id and _u.id in (OWNER_CHAT_ID, PARTNER_CHAT_ID):
+        try:
+            import manager_claim_actions as mca
+            handled, done = await mca.price_input(
+                message, context, db, "Виктор" if _u.id == OWNER_CHAT_ID else "Маланчук")
+            if done:
+                await _claim_finalize(context.bot, done, mca.manager_push(done))
+            if handled:
+                return
+        except Exception as e:
+            logger.warning(f"manager claim price input: {e}")
+
     # Ценовое согласование: согласующий (собственник или закупщик) нажал «✏️ Другая цена» и пишет число
     if _u and message.text and message.chat_id == _u.id:
         try:
@@ -4627,6 +4640,9 @@ _CLAIM_STATUS_RU = {
     "pending": "ожидает решения", "resolved": "решено без последствий",
     "fix_docs": "исправление документов", "finance": "финансовое решение",
     "acked": "принято",
+    "accepted": "возврат принимаем", "declined": "возврат не принимаем",
+    "approved": "уценка согласована", "counter": "согласована другая цена",
+    "awaiting_price": "руководитель вводит цену",
 }
 
 # Решение по кнопке: статус, заметка менеджеру в дашборде, подпись в чате
@@ -4656,6 +4672,11 @@ _CLAIM_DECISIONS = {
         "label": "✅ Решено без последствий",
         "push": "✅ По вашей претензии №{id} (клиент «{cli}») принято решение: *решено без последствий*.",
     },
+    # Возврат и уценка – решение и рассылку делает manager_claim_actions.
+    "mclaim_accept": {"new_flow": True},
+    "mclaim_decline": {"new_flow": True},
+    "mclaim_approve": {"new_flow": True},
+    "mclaim_counter": {"new_flow": True},
     "mclaim_ack": {
         "status": "acked",
         "note": "Замечание принято к сведению руководством.",
@@ -4663,6 +4684,32 @@ _CLAIM_DECISIONS = {
         "push": "✅ Ваше замечание №{id} (клиент «{cli}») принято к сведению руководством.",
     },
 }
+async def _claim_finalize(bot, row: dict, push_text: str) -> None:
+    """Итог по возврату/уценке: снять кнопки во всех копиях и написать менеджеру."""
+    tg_messages = row.get("tg_messages") or []
+    if isinstance(tg_messages, str):
+        import json as _json
+        try:
+            tg_messages = _json.loads(tg_messages)
+        except Exception:
+            tg_messages = []
+    for m in tg_messages:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=m["chat_id"], message_id=m["message_id"], reply_markup=None)
+        except Exception:
+            pass
+    mgr_chat = _resolve_manager_chat(row.get("manager_tag"))
+    if mgr_chat and push_text:
+        try:
+            await bot.send_message(chat_id=mgr_chat, text=push_text)
+        except Exception as e:
+            logger.warning("claim %s: не уведомил менеджера %s: %r", row.get("id"), row.get("manager_tag"), e)
+    elif not mgr_chat:
+        logger.warning("claim %s: chat_id менеджера '%s' не найден – пуш пропущен",
+                       row.get("id"), row.get("manager_tag"))
+
+
 def _resolve_manager_chat(tag: str):
     """chat_id менеджера по тегу претензии. None если тег неизвестен.
 
@@ -4705,7 +4752,8 @@ async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     what = "Замечание" if (row.get("kind") or "claim") == "remark" else "Претензия"
 
-    if row.get("status") != "pending":
+    # awaiting_price – по уценке нажали «Другая цена», но цену ещё не ввели: кнопки живы.
+    if row.get("status") not in ("pending", "awaiting_price"):
         await query.answer(
             f"Уже обработано: {_CLAIM_STATUS_RU.get(row.get('status'), row.get('status'))}",
             show_alert=True)
@@ -4716,6 +4764,14 @@ async def handle_claim_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     decided_by = "Виктор" if uid == OWNER_CHAT_ID else "Маланчук"
+    if decision.get("new_flow"):
+        # Возврат и уценка (план 2026-11-06-претензии-возврат-уценка): склад, Руднева, протокол.
+        import manager_claim_actions as mca
+        reply, done = await mca.decide(context.bot, db, row, action, uid, decided_by)
+        if done:
+            await _claim_finalize(context.bot, done, mca.manager_push(done))
+        await query.message.reply_text(reply)
+        return
     new_status, note = decision["status"], decision["note"]
 
     # Идемпотентно: меняем только из pending (защита от двойного клика второй копией).
@@ -6826,7 +6882,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_chz_callback, pattern="^chz:"))
     app.add_handler(CallbackQueryHandler(handle_doc_approval_callback, pattern="^doc_(approve|reject):"))
     app.add_handler(CallbackQueryHandler(handle_claim_callback,
-                                         pattern="^mclaim_(resolved|fix|finance|ack):"))
+                                         pattern="^mclaim_(resolved|fix|finance|ack|accept|decline|approve|counter):"))
     # Ценовое согласование из дашборда менеджера (quiz-game) – светофор «ЗАПРОС ЦЕНЫ»
     from price_requests import handle_price_request_callback
     app.add_handler(CallbackQueryHandler(handle_price_request_callback, pattern="^preq_(ok|other):"))
