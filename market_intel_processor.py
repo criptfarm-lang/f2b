@@ -613,55 +613,108 @@ async def parse_xls_message(xls_path: str, caption: str = "", debug_label: str =
                               _debug_label=debug_label, _debug_db=debug_db)
 
 
-async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str = "", debug_db=None, original_filename: str = "") -> dict:
-    """PDF → native document block в Claude Sonnet 4.6.
+def _flatten_pdf_to_text(pdf_path: str, total_max_chars: int = 90000) -> str:
+    """PDF с текстовым слоем → плоский текст по страницам (как _flatten_xls_to_text).
 
-    План 2026-05-28: одна ступень — Sonnet видит PDF + caption (text_raw из TG)
-    одним вызовом, разбирает шапки таблиц, объединённые ячейки, многоколоночность,
-    применяет модификаторы цены из caption ("+7 для МСК"). Стоимость ~5 ₽/PDF.
-    Предыдущая итерация (pdfplumber → плоский текст → Haiku) на табличных прайсах
-    типа Мореодор давала lots=[] — Haiku не справлялся с грязным текстовым месивом.
+    С каждой страницы берём таблицы pdfplumber («ячейка | ячейка»), если они покрывают
+    основную часть текста, иначе – текст страницы построчно. Пустая строка на выходе = скан.
     """
-    pdf_bytes = Path(pdf_path).read_bytes()
-    if not pdf_bytes:
+    import pdfplumber
+    parts: list[str] = []
+    total = 0
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            rows = []
+            for table in page.extract_tables() or []:
+                for row in table:
+                    cells = [(c or "").strip().replace("|", "/").replace("\n", " ") for c in row]
+                    if any(cells):
+                        rows.append(" | ".join(cells))
+            lines = rows if rows and len("".join(rows)) >= 0.5 * len(text) else text.splitlines()
+            lines = [l[:500] for l in lines if l.strip()]
+            if not lines:
+                continue
+            parts.append(f"\n=== Страница {i} ===")
+            for n, line in enumerate(lines, start=1):
+                parts.append(f"R{n}: {line}")
+                total += len(line) + 1
+                if total > total_max_chars:
+                    parts.append(f"\n... (truncated at total {total_max_chars} chars)\n")
+                    return "\n".join(parts)
+    return "\n".join(parts)
+
+
+PDF_SCAN_MIN_CHARS = 200   # меньше текста во всём PDF – считаем сканом
+PDF_SCAN_MAX_PAGES = 6
+
+
+def _render_pdf_pages(pdf_path: str, max_pages: int = PDF_SCAN_MAX_PAGES) -> list[str]:
+    """Скан-PDF → JPEG-страницы в base64 (для разбора как фото)."""
+    import io
+    import pypdfium2 as pdfium
+    out = []
+    doc = pdfium.PdfDocument(pdf_path)
+    try:
+        for i in range(min(len(doc), max_pages)):
+            img = doc[i].render(scale=2).to_pil().convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            out.append(base64.b64encode(buf.getvalue()).decode())
+    finally:
+        doc.close()
+    return out
+
+
+async def parse_pdf_message(pdf_path: str, caption: str = "", debug_label: str = "", debug_db=None, original_filename: str = "") -> dict:
+    """PDF → текст на сервере (pdfplumber) → Sonnet, как Excel; скан → картинки → Haiku, как фото.
+
+    До 06.11.2026 PDF целиком уходил в Sonnet документом. С 15.10 такие запросы режет
+    пересыльщик (утечка расходов: обрывы и платные повторы), и PDF-прайсы не разбирались.
+    Текст достаём бесплатно: в очереди 06.11 текстовый слой был у 36 PDF из 37.
+    Sonnet, а не Haiku: в мае Haiku на плоском тексте табличных прайсов (Мореодор) давал lots=[].
+    """
+    try:
+        flat_text = _flatten_pdf_to_text(pdf_path)
+    except Exception as e:
+        logger.error(f"market_intel: PDF flatten failed for {pdf_path}: {e!r}")
+        flat_text = ""
+    head = (
+        f"Caption от пересылающего: {caption or '(нет caption)'}\n"
+        f"Оригинальное имя файла: {original_filename or '(нет)'}\n"
+        f"   ВАЖНО: имя файла часто содержит бренд поставщика. Используй как первый\n"
+        f"   источник supplier_hint когда caption пустой.\n\n"
+        f"Извлеки ВСЕ товарные позиции прайса. Применяй правила цены МСК / предоплата /\n"
+        f"caption-модификаторы из system prompt.\n"
+        f"supplier_hint - источники в порядке приоритета:\n"
+        f"  1) Имя файла (бренд в начале имени)\n"
+        f"  2) Шапка прайса (название компании в верхних строках)\n"
+        f"  3) Реквизиты (ИНН/название юрлица если явно поставщик)\n"
+        f"НЕ возвращай: «Мониторинг», «Эф», «ФИШ ТУ БИЗНЕС», «прайс», «прайс-лист».\n"
+        f"Если бренда совсем нет — supplier_hint=null.\n"
+        f"Шапку, реквизиты, секции-заголовки CAPS — игнорируй (контекст, не лот).\n"
+    )
+
+    if len(flat_text) >= PDF_SCAN_MIN_CHARS:
+        content = [{"type": "text", "text": (
+            f"PDF-прайс поставщика F2B, текст извлечён построчно по страницам\n"
+            f"(«Rн: ячейка | ячейка» для таблиц или строка текста).\n"
+            f"Если есть колонки «СПб» и «Мск» — бери цену из колонки «Мск».\n\n"
+            + head + f"\nТекст прайса:\n{flat_text}"
+        )}]
+        # max_tokens=32768: см. parse_xls_message (большие прайсы обрезались на 16384).
+        return await _call_claude(content, max_tokens=32768, model=ANTHROPIC_PDF_MODEL,
+                                  _debug_label=debug_label, _debug_db=debug_db)
+
+    pages = _render_pdf_pages(pdf_path)
+    if not pages:
         logger.warning(f"market_intel: PDF {pdf_path} пустой")
         return {"supplier_hint": None, "received_at": None, "lots": []}
-    pdf_b64 = base64.b64encode(pdf_bytes).decode()
-
-    content = [
-        {
-            "type": "document",
-            "source": {
-                "type": "base64",
-                "media_type": "application/pdf",
-                "data": pdf_b64,
-            },
-        },
-        {
-            "type": "text",
-            "text": (
-                f"PDF-прайс поставщика F2B.\n"
-                f"Caption: {caption or '(нет caption)'}\n"
-                f"Оригинальное имя файла: {original_filename or '(нет)'}\n"
-                f"   ВАЖНО: имя файла часто содержит бренд поставщика. Используй как первый\n"
-                f"   источник supplier_hint когда caption пустой.\n\n"
-                f"Извлеки ВСЕ товарные позиции прайса. Применяй правила цены МСК / предоплата /\n"
-                f"caption-модификаторы из system prompt.\n"
-                f"supplier_hint - источники в порядке приоритета:\n"
-                f"  1) Имя файла (бренд в начале имени)\n"
-                f"  2) Шапка PDF (логотип/название компании в верхних строках)\n"
-                f"  3) Реквизиты (ИНН/название юрлица если явно поставщик)\n"
-                f"НЕ возвращай: «Мониторинг», «Эф», «ФИШ ТУ БИЗНЕС», «прайс», «прайс-лист».\n"
-                f"Если бренда совсем нет — supplier_hint=null.\n\n"
-                f"Извлекай ВСЕ товарные строки таблицы. Не оценивай категорию.\n"
-                f"Шапку, реквизиты, секции-заголовки CAPS — игнорируй (контекст, не лот)."
-            ),
-        },
-    ]
-    # max_tokens=32768: см. parse_xls_message — Sonnet 4.6 умеет до 64k,
-    # Мореодор 108/~400 confirmed из-за обрезки.
-    return await _call_claude(content, max_tokens=32768, model=ANTHROPIC_PDF_MODEL,
-                              _debug_label=debug_label, _debug_db=debug_db)
+    logger.info(f"market_intel: PDF {pdf_path} без текстового слоя, разбираю {len(pages)} стр. как фото")
+    content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}}
+               for b in pages]
+    content.append({"type": "text", "text": "Скан PDF-прайса поставщика F2B (страницы картинками).\n" + head})
+    return await _call_claude(content, _debug_label=debug_label, _debug_db=debug_db)
 
 
 def _supplier_slug_from_hint(hint: str) -> tuple[Optional[str], bool]:
@@ -866,6 +919,10 @@ async def process_pending(db, limit: int = 20) -> dict:
                                                      original_filename=original_filename)
                 except Exception as e:
                     logger.exception(f"market_intel: msg {msg_id} XLS parse failed: {e!r}")
+                    _PDF_FAILS[msg_id] = _PDF_FAILS.get(msg_id, 0) + 1
+                    if _PDF_FAILS[msg_id] >= PDF_MAX_FAILS:
+                        logger.error(f"market_intel: msg {msg_id} XLS – {PDF_MAX_FAILS} неудачи подряд, больше не пробую")
+                        db.mark_market_intel_processed(msg_id)
                     stats["failed"] += 1
                     continue
             else:
