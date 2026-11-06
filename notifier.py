@@ -1313,9 +1313,27 @@ async def check_order_not_agreed(order_href: str, bot, db):
             logger.info(f"not-agreed: заказ {order_id} (sum_hash={sum_hash}) уже уведомлялся, пропуск")
             return
 
+        # Просрочка клиента – тем же расчётом, что в светофоре согласования,
+        # чтобы сумма заказа не читалась как долг. Не посчиталось – строку не пишем.
+        overdue_line = ""
+        if reason_code == 2:
+            agent_id = order.get("agent", {}).get("meta", {}).get("href", "").split("/")[-1]
+            try:
+                import asyncio
+                from moysklad import compute_overdue_color
+                ov = await asyncio.wait_for(compute_overdue_color(agent_id), timeout=20.0)
+                debt, days = ov.get("debt", 0) or 0, ov.get("days", 0) or 0
+                if debt > 0:
+                    overdue_line = f"Просрочка клиента: {_fmt_money(debt)} ₽, {days} дн.\n"
+                elif ov.get("color") == "green":
+                    overdue_line = "Просрочки у клиента нет.\n"
+            except Exception as e:
+                logger.warning(f"not-agreed: просрочка {agent_id} не посчиталась: {e}")
+
         text = (
             f"⚠️ Заказ {order_name} – {reason_title}\n"
-            f"🏢 {agent_name} · {_fmt_money(order_sum)} ₽\n"
+            f"🏢 {agent_name} · заказ на {_fmt_money(order_sum)} ₽\n"
+            f"{overdue_line}"
             f"{reason_todo}"
             f"{note}"
         )
