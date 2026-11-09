@@ -2004,7 +2004,31 @@ def approval_keyboard(alert_id: int, with_ok: bool = True):
     ]])
 
 
+# Заказ, по которому проверка уже идёт → True = за время прогона пришла ещё правка.
+# Правки заказа шлют вебхук за вебхуком; параллельные прогоны толкаются в МС
+# и не укладываются в сроки проверок (05273, 09.11.2026: 5 прогонов за 20 с).
+_approval_running: dict[str, bool] = {}
+
+
 async def check_approval_needed(order_href: str, bot, db):
+    """Один прогон на заказ за раз: пришёл вебхук во время прогона – после него
+    будет ровно один повтор со свежими данными."""
+    if order_href in _approval_running:
+        _approval_running[order_href] = True
+        logger.info(f"check_approval_needed: уже идёт по {order_href.rsplit('/', 1)[-1]} – повтор после")
+        return
+    _approval_running[order_href] = False
+    try:
+        while True:
+            await _check_approval_needed_once(order_href, bot, db)
+            if not _approval_running.get(order_href):
+                break
+            _approval_running[order_href] = False
+    finally:
+        _approval_running.pop(order_href, None)
+
+
+async def _check_approval_needed_once(order_href: str, bot, db):
     """
     Объединённый алерт согласующим (OWNER + Маланчук, env APPROVERS_CHAT_IDS) при
     попадании заказа в статус «На согласовании» или «ЗА ЛИМИТОМ».
@@ -2102,22 +2126,24 @@ async def check_approval_needed(order_href: str, bot, db):
         if control:
             logger.info(f"check_approval_needed: {agent_name} — в листе контроля")
 
-        # 3. Параллельно: cashflow, overdue, price, upd_debt (+ timeout 20с с fallback)
-        try:
-            cashflow, overdue, price, upd_debt, late_history = await asyncio.wait_for(
-                asyncio.gather(
-                    compute_cashflow_color(agent_id),
-                    compute_overdue_color(agent_id),
-                    compute_price_color(order_href),
-                    compute_upd_debt_color(agent_id),
-                    compute_late_history(agent_id, int(cp_attrs.get("days_delay") or 0)),
-                    return_exceptions=True,
-                ),
-                timeout=20.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"check_approval_needed: timeout для {order_name}")
-            cashflow = overdue = price = upd_debt = late_history = None
+        # 3. Параллельно: cashflow, overdue, price, upd_debt. Срок у каждой проверки свой:
+        # медленная не обнуляет остальные (раньше общий 20 с гасил все пять разом).
+        async def _limited(coro, what):
+            try:
+                return await asyncio.wait_for(coro, timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"check_approval_needed: timeout {what} для {order_name}")
+                return None
+
+        cashflow, overdue, price, upd_debt, late_history = await asyncio.gather(
+            _limited(compute_cashflow_color(agent_id), "ДДС"),
+            _limited(compute_overdue_color(agent_id), "просрочка"),
+            _limited(compute_price_color(order_href), "цена"),
+            _limited(compute_upd_debt_color(agent_id), "УПД"),
+            _limited(compute_late_history(agent_id, int(cp_attrs.get("days_delay") or 0)),
+                     "история"),
+            return_exceptions=True,
+        )
         if isinstance(late_history, Exception):
             logger.warning(f"check_approval_needed: история просрочек → {late_history!r}")
             late_history = None
