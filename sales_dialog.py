@@ -612,7 +612,7 @@ async def _amo_user_active(session: aiohttp.ClientSession, user_id: int) -> bool
 
 async def hand_to_manager(app, db, msg: dict,
                           task_text: str = "Ответить клиенту: диалог передан от агента",
-                          task_hours: int = 3) -> str:
+                          task_hours: int = 3, target: int | None = None) -> str:
     """Возврат раскачанного лида человеку: сделка, контакты, задача и сообщение в Telegram.
 
     Возвращаем тому менеджеру, который вёл лид до агента, — он помнит клиента и
@@ -627,8 +627,11 @@ async def hand_to_manager(app, db, msg: dict,
     prev = (lead or {}).get("prev_responsible_user_id")
     done = []
     async with aiohttp.ClientSession() as session:
-        target = prev if prev and await _amo_user_active(session, prev) else INESSA_AMO_USER
-        if prev and target != prev:
+        if target is not None:
+            done.append("отдаём менеджеру, который уже говорил с клиентом")
+        else:
+            target = prev if prev and await _amo_user_active(session, prev) else INESSA_AMO_USER
+        if prev and target == INESSA_AMO_USER and target != prev:
             done.append("прежний менеджер не работает, отдаём Инессе")
         ok = await _amo_write(session, f"/leads/{lead_id}",
                               {"pipeline_id": ATTRACT_PIPELINE, "status_id": ATTRACT_FIRST_STATUS,
@@ -1965,6 +1968,8 @@ async def _tick_campaign(app, db, campaign: str) -> None:
 
     # Свежая заявка не ждёт агента дольше получаса – иначе менеджеру на звонок.
     await first_touch_watch(app, db, campaign, cfg, now)
+    # Клиент ответил туда, где агент его не видит, или замолчал – менеджеру.
+    await stuck_watch(app, db, campaign, cfg, now)
     # Протухшие карточки гасим до отбора: иначе одна неразобранная блокирует
     # очередь до конца дня (25.09.2026 так встали все партии после 11:28).
     await expire_stale(app, db, campaign)
@@ -2112,6 +2117,177 @@ async def first_touch_watch(app, db, campaign: str, cfg: dict, now: datetime) ->
             f"за {FIRST_TOUCH_SLA_MIN} минут"), task_hours=CALL_TASK_HOURS)
         _heartbeat(db, f"{campaign}: лид {r['lead_id']} ушёл на звонок по сторожу: {what}")
         n += 1
+    return n
+
+
+# Сторож зависших диалогов (собственник 10.11.2026: «чини так, чтобы менеджеры
+# видели ответы либо замершие сделки и звонили, если нет ответа»). Разбор 10.11:
+# из 12 сайт-лидов недели 8 висели на «Эф». Клиенты после заявки пишут в
+# WhatsApp (кнопка на сайте, интеграция Wazzup `com.wazzup24.wz`), а эти
+# сообщения не доходят до `wazzup_messages` – агент их не видит, сделка на «Эф»,
+# у менеджеров в списках её нет. Молчащих после касаний агента не передавал
+# никто: «оживление» – один повтор и только тем, кто хоть раз писал сам, дальше
+# лид лежал вечно (на 10.11 – 32 таких за 30 дней).
+# Источник правды – события amoCRM по сделке и контакту: в них видны все каналы.
+STUCK_REPLY_MIN = 15          # рабочих минут ждём, что ответ клиенту дадут
+STUCK_SILENT_WORKDAYS = 2     # рабочих дней тишины – звонок
+STUCK_MAX_AGE_DAYS = 30       # старше – не поднимаем
+STUCK_EVERY_MIN = 10          # как часто ходим в amoCRM
+STUCK_PER_RUN = 3             # передач за прогон: очередь не вываливается разом
+CHAT_IN, CHAT_OUT = "incoming_chat_message", "outgoing_chat_message"
+HUMAN_TOUCH = {CHAT_OUT, "outgoing_call", "incoming_call"}
+_stuck_last_run: dict = {}
+
+
+def _stuck_candidates(db, campaign: str) -> list:
+    """Активные лиды кампании, которым агент уже написал хотя бы раз."""
+    return db._fetchall("""
+        SELECT l.campaign, l.lead_id, l.lead_name, l.contact_id, l.created_at,
+               lastin.sent_at AT TIME ZONE 'UTC' AS last_in,
+               (SELECT max(w.sent_at) AT TIME ZONE 'UTC' FROM wazzup_messages w
+                 WHERE w.chat_id = ANY(c.ids)) AS last_chat,
+               (SELECT count(*) FROM sales_dialog_messages d
+                 WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id AND d.verdict = 'sent'
+                   AND d.sent_at > coalesce(lastin.sent_at AT TIME ZONE 'UTC',
+                                            '-infinity'::timestamptz)) AS sent_after_in,
+               EXISTS (SELECT 1 FROM sales_dialog_messages d
+                        WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
+                          AND d.verdict IN ('draft', 'edited', 'sending')) AS has_draft
+        FROM sales_dialog_leads l
+        CROSS JOIN LATERAL (SELECT coalesce(l.all_chat_ids, ARRAY[l.chat_id]) AS ids) c
+        LEFT JOIN LATERAL (
+            SELECT w.sent_at FROM wazzup_messages w
+            WHERE w.chat_id = ANY(c.ids) AND NOT w.is_outbound
+            ORDER BY w.sent_at DESC LIMIT 1) lastin ON true
+        WHERE l.campaign = %s AND l.status = 'active' AND l.activate_on IS NULL
+          AND l.created_at > now() - (%s || ' days')::interval
+          AND EXISTS (SELECT 1 FROM sales_dialog_messages d
+                       WHERE d.campaign = l.campaign AND d.lead_id = l.lead_id
+                         AND d.verdict = 'sent')
+        ORDER BY l.created_at""", (campaign, str(STUCK_MAX_AGE_DAYS)))
+
+
+def _known_message_ids(db, ids: list) -> set:
+    if not ids:
+        return set()
+    rows = db._fetchall("SELECT message_id FROM wazzup_messages WHERE message_id = ANY(%s)",
+                        (list(ids),))
+    return {r["message_id"] for r in rows}
+
+
+def stuck_verdict(row: dict, events: list, known_ids: set, now: datetime,
+                  cfg: dict, max_followups: int) -> tuple | None:
+    """Что делать с лидом: `('reply' | 'human' | 'silent', текст задачи)` или None.
+
+    `events` – события amoCRM по сделке и контакту (type, created_at, created_by,
+    message_id). Входящее, которое агент видит сам (`known_ids`), не трогаем:
+    на него ответит очередь агента.
+    """
+    created = int(row["created_at"].timestamp())
+    evs = sorted((e for e in events if e["created_at"] >= created),
+                 key=lambda e: e["created_at"])
+    last_in = next((e for e in reversed(evs) if e["type"] == CHAT_IN), None)
+    if last_in and last_in.get("message_id") not in known_ids:
+        answered = any(e["type"] in HUMAN_TOUCH - {"incoming_call"}
+                       and e["created_at"] > last_in["created_at"] for e in evs)
+        at = datetime.fromtimestamp(last_in["created_at"], MSK)
+        if not answered and work_minutes(at, now, cfg) >= STUCK_REPLY_MIN:
+            return ("reply", "Ответить клиенту: написал в чат (WhatsApp или другой канал, "
+                             "которого агент не видит), ответа нет")
+    # Менеджер уже звонит или пишет клиенту, а сделка всё ещё на «Эф» – в его
+    # списках её нет. Переводим на него.
+    if last_human(evs):
+        return ("human", "Сделка теперь на тебе: ты уже говорил с клиентом, "
+                         "агент из диалога вышел")
+    if row.get("has_draft"):
+        return None
+    if row.get("last_in") and (row.get("sent_after_in") or 0) < max_followups:
+        return None          # агент ещё может напомнить о себе сам
+    stamps = [e["created_at"] for e in evs]
+    for k in ("last_chat", "last_in"):
+        if row.get(k):
+            stamps.append(int(row[k].timestamp()))
+    last = datetime.fromtimestamp(max(stamps), MSK) if stamps else row["created_at"]
+    if last < workdays_ago(now, STUCK_SILENT_WORKDAYS):
+        days = (now.date() - last.astimezone(MSK).date()).days
+        return ("silent", f"Позвонить клиенту: заявка с сайта, на сообщения агента "
+                          f"не отвечает {days} дн.")
+    return None
+
+
+def last_human(events: list) -> int | None:
+    """Кто из людей последним звонил или писал клиенту – тому и отдаём."""
+    for e in sorted(events, key=lambda e: e["created_at"], reverse=True):
+        if e["type"] in HUMAN_TOUCH and e.get("created_by") not in (None, 0, AGENT_AMO_USER):
+            return e["created_by"]
+    return None
+
+
+async def _amo_events(session, lead_id: int, contact_ids: list) -> list:
+    out = []
+    for entity, ids in (("lead", [lead_id]), ("contact", contact_ids)):
+        if not ids:
+            continue
+        d = await _amo_get(session, "/events", {
+            "filter[entity]": entity,
+            **{f"filter[entity_id][{i}]": x for i, x in enumerate(ids)},
+            **{f"filter[type][{i}]": t for i, t in
+               enumerate([CHAT_IN, CHAT_OUT, "outgoing_call", "incoming_call"])},
+            "limit": 100})
+        for e in ((d or {}).get("_embedded") or {}).get("events") or []:
+            msg = ((e.get("value_after") or [{}])[0] or {}).get("message") or {}
+            out.append({"type": e.get("type"), "created_at": e.get("created_at") or 0,
+                        "created_by": e.get("created_by"), "message_id": msg.get("id")})
+    return out
+
+
+async def stuck_watch(app, db, campaign: str, cfg: dict, now: datetime) -> int:
+    """Ответ клиента мимо агента или тишина после касаний – менеджеру с задачей."""
+    if not cfg.get("first_touch") or not app:
+        return 0
+    last = _stuck_last_run.get(campaign)
+    if last and now - last < timedelta(minutes=STUCK_EVERY_MIN):
+        return 0
+    _stuck_last_run[campaign] = now
+    max_fu = int(cfg.get("max_followups", 2))
+    n = 0
+    async with aiohttp.ClientSession() as session:
+        for r in _stuck_candidates(db, campaign):
+            if n >= STUCK_PER_RUN:
+                break
+            lead = await _amo_lead(session, r["lead_id"])
+            if not lead:
+                continue
+            contacts = [c["id"] for c in ((lead.get("_embedded") or {}).get("contacts") or [])]
+            # Сделку уже увели из воронки агента или закрыли руками – агент просто уходит.
+            if (lead.get("pipeline_id") != AGENT_PIPELINE
+                    or lead.get("responsible_user_id") != AGENT_AMO_USER
+                    or lead.get("status_id") in (142, 143)):
+                release_to_human(db, campaign, r["lead_id"], "сделку уже ведёт человек в amoCRM")
+                continue
+            events = await _amo_events(session, r["lead_id"], contacts)
+            known = _known_message_ids(db, [e["message_id"] for e in events if e.get("message_id")])
+            verdict = stuck_verdict(r, events, known, now, cfg, max_fu)
+            if not verdict:
+                continue
+            kind, task = verdict
+            human = last_human(events)
+            target = human if human and await _amo_user_active(session, human) else None
+            db._execute("""UPDATE sales_dialog_messages SET verdict='handed'
+                           WHERE campaign=%s AND lead_id=%s AND verdict IN ('draft','edited')""",
+                        (campaign, r["lead_id"]))
+            db._execute("""UPDATE sales_dialog_leads SET status='handed',
+                                  note = coalesce(note, '') || ' | ' || %s
+                           WHERE campaign=%s AND lead_id=%s AND status='active'""",
+                        ({"reply": "клиент ответил мимо агента – менеджеру",
+                         "human": "клиента уже ведёт менеджер – сделка на нём"}.get(
+                            kind, f"тишина {STUCK_SILENT_WORKDAYS} раб. дня – на звонок"),
+                         campaign, r["lead_id"]))
+            what = await hand_to_manager(app, db, dict(r), task_text=task,
+                                         task_hours=CALL_TASK_HOURS if kind == "reply" else 3,
+                                         target=target)
+            _heartbeat(db, f"{campaign}: лид {r['lead_id']} – {kind}: {what}")
+            n += 1
     return n
 
 

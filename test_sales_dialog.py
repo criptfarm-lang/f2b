@@ -1315,3 +1315,79 @@ def test_first_touch_window_from_9():
     assert sales_dialog.initiative_block(batch, policy, {}, now) == "вне окна инициативы"
     silent = {"source": "silent", "chat_type": "telegram"}
     assert sales_dialog.initiative_block(silent, policy, {}, now) == "вне окна инициативы"
+
+
+# ─── сторож зависших диалогов (10.11.2026) ───────────────────────────────────
+from sales_dialog import last_human, stuck_verdict, AGENT_AMO_USER
+
+_CFG = {"start_hour": 9, "end_hour": 19}
+
+
+def _ts(*a):
+    return int(datetime(*a, tzinfo=MSK).timestamp())
+
+
+def _row(**kw):
+    base = {"created_at": datetime(2026, 11, 9, 22, 12, tzinfo=MSK), "last_in": None,
+            "last_chat": None, "sent_after_in": 1, "has_draft": False}
+    base.update(kw)
+    return base
+
+
+def test_stuck_reply_in_whatsapp_goes_to_manager():
+    """Клиент написал в WhatsApp ночью, агент этого не видит – утром через 15 мин менеджеру."""
+    ev = [{"type": "incoming_chat_message", "created_at": _ts(2026, 11, 9, 22, 12),
+           "created_by": 0, "message_id": "wa-1"}]
+    now = datetime(2026, 11, 10, 9, 20, tzinfo=MSK)
+    assert stuck_verdict(_row(), ev, set(), now, _CFG, 1)[0] == "reply"
+    early = datetime(2026, 11, 10, 9, 10, tzinfo=MSK)
+    assert stuck_verdict(_row(), ev, set(), early, _CFG, 1) is None
+
+
+def test_stuck_reply_seen_by_agent_is_skipped():
+    ev = [{"type": "incoming_chat_message", "created_at": _ts(2026, 11, 9, 22, 12),
+           "created_by": 0, "message_id": "tg-1"}]
+    now = datetime(2026, 11, 10, 9, 40, tzinfo=MSK)
+    assert stuck_verdict(_row(), ev, {"tg-1"}, now, _CFG, 1) is None
+
+
+def test_stuck_reply_answered_by_human():
+    ev = [{"type": "incoming_chat_message", "created_at": _ts(2026, 11, 5, 18, 0),
+           "created_by": 0, "message_id": "wa-1"},
+          {"type": "outgoing_chat_message", "created_at": _ts(2026, 11, 5, 18, 42),
+           "created_by": 12625622, "message_id": "wa-2"}]
+    now = datetime(2026, 11, 6, 10, 0, tzinfo=MSK)
+    # Ответ уже дал человек – это не «ответить», а перевести сделку на него.
+    assert stuck_verdict(_row(created_at=datetime(2026, 11, 5, 13, 3, tzinfo=MSK)),
+                         ev, set(), now, _CFG, 1)[0] == "human"
+
+
+def test_stuck_silent_two_workdays():
+    """Агент написал во вторник, клиент молчит – в четверг звонок, в среду ещё рано."""
+    row = _row(created_at=datetime(2026, 11, 3, 10, 3, tzinfo=MSK),
+               last_chat=datetime(2026, 11, 3, 10, 25, tzinfo=MSK))
+    assert stuck_verdict(row, [], set(), datetime(2026, 11, 4, 12, 0, tzinfo=MSK), _CFG, 1) is None
+    v = stuck_verdict(row, [], set(), datetime(2026, 11, 5, 12, 0, tzinfo=MSK), _CFG, 1)
+    assert v[0] == "silent" and "2 дн" in v[1]
+
+
+def test_stuck_silent_waits_for_agent_followup():
+    """Клиент отвечал, агент ещё не напомнил о себе – не трогаем, это работа агента."""
+    row = _row(created_at=datetime(2026, 11, 2, 10, 0, tzinfo=MSK),
+               last_in=datetime(2026, 11, 2, 13, 25, tzinfo=MSK),
+               last_chat=datetime(2026, 11, 2, 13, 37, tzinfo=MSK), sent_after_in=0)
+    assert stuck_verdict(row, [], set(), datetime(2026, 11, 10, 12, 0, tzinfo=MSK), _CFG, 1) is None
+
+
+def test_last_human_skips_agent():
+    ev = [{"type": "outgoing_call", "created_at": 10, "created_by": 13746010},
+          {"type": "outgoing_chat_message", "created_at": 20, "created_by": AGENT_AMO_USER},
+          {"type": "outgoing_chat_message", "created_at": 30, "created_by": 0}]
+    assert last_human(ev) == 13746010
+
+
+def test_stuck_human_already_calling_gets_the_lead():
+    ev = [{"type": "outgoing_call", "created_at": _ts(2026, 11, 9, 15, 29),
+           "created_by": 13746010, "message_id": None}]
+    row = _row(created_at=datetime(2026, 11, 5, 16, 53, tzinfo=MSK))
+    assert stuck_verdict(row, ev, set(), datetime(2026, 11, 10, 10, 0, tzinfo=MSK), _CFG, 1)[0] == "human"
