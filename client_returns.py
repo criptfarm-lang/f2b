@@ -315,6 +315,16 @@ def _recipients(*parts) -> list:
     return out
 
 
+def _drafts_text(row) -> str:
+    """Черновики МС по возврату ссылками – чтобы не искать в «Возвратах покупателей»."""
+    ms = row.get("ms_returns") or []
+    if isinstance(ms, str):
+        ms = json.loads(ms)
+    links = [f"№{m.get('name')}: https://online.moysklad.ru/app/#salesreturn/edit?id={m['id']}"
+             for m in ms if m.get("id")]
+    return ("\nЧерновик в МС (открыть → «Удалить»):\n" + "\n".join(links)) if links else ""
+
+
 async def cb_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     _, rid, dec = q.data.split(":")
@@ -336,6 +346,8 @@ async def cb_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     tail = ("Евгения Руднева правит отгрузку и удаляет черновик возврата." if dec == "strike"
             else "Возврат оформляется официально: цех принимает, бухгалтерия – корректировочная.")
+    if dec == "strike":
+        tail += _drafts_text(row)
     import driver_checklist as dc
     import edo_unsigned
     text = f"↩️ Возврат {row.get('agent_name') or ''} (точка {row.get('order_no')}): {DECISIONS[dec]} – решил(а) {who}.\n{tail}"
