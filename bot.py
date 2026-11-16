@@ -7890,6 +7890,25 @@ def main():
     logger.info("arrival_check: джоба зарегистрирована на 20:00 МСК")
 
     # ────────────────────────────────────────────────────────────────────
+    # Приход сырья/привлечённых без одобрения технолога – 10:00 МСК ежедневно
+    # в личку (тихий режим – только собственнику; TECH_APPROVAL_LIVE=1 –
+    # Беляковой, Павленко, Маланчуку, собственнику). План: 2026-10-23-
+    # одобрение-технологом-приход-сырья.
+    # ────────────────────────────────────────────────────────────────────
+    from tech_approval_watch import poll_job as _tech_approval_poll
+
+    async def _tech_approval_job(context):
+        stats = await _tech_approval_poll(app)
+        if stats:
+            logger.info(f"tech_approval job: {stats}")
+
+    app.job_queue.run_daily(
+        _tech_approval_job,
+        time=_dt_time(hour=7, minute=0, tzinfo=_tz_for_job.utc),
+    )
+    logger.info("tech_approval: джоба зарегистрирована на 10:00 МСК")
+
+    # ────────────────────────────────────────────────────────────────────
     # Контроль производства — окна замеров температуры в группе.
     # 09:00 / 11:00 / 12:50 (регламент) / 14:30 / 16:00 / 17:30 МСК, Пн–Пт.
     # Ответ мастера reply'ем разбирается в quality.temp_readings.
