@@ -461,7 +461,99 @@ def _build_supply_alert_text(order: dict, pos_blocks: list[dict],
 def keyboard(order_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Согласован", callback_data=f"sappr:{order_id}"),
+        InlineKeyboardButton("❌ Не согл. информация", callback_data=f"sinfo:{order_id}"),
     ]])
+
+
+# «НЕ СОГЛ. информация» у заказа поставщику – статус заведён собственником 16.11.2026
+# (сверено с metadata purchaseorder). Закупщику – дозаполнить карточку поставщика.
+SUPPLY_STATE_NOT_AGREED_INFO = "c6e6d504-e1ba-11f1-0a80-106a0055bc26"
+# Закупщики по фамилии владельца заказа (id сверены в tech_approval_watch.py).
+BUYER_TG = {"белякова": 8267564735, "павленко": 8185545246}
+
+
+def _log_forget(order_id: str):
+    """Сбросить дедуп: после возврата «На согласовании» светофор придёт снова,
+    даже если сумма заказа не изменилась."""
+    with _db().cursor() as cur:
+        cur.execute("delete from public.supply_svetofor_log where order_id=%s", (order_id,))
+
+
+async def _fetch_order_brief(order_id: str) -> dict:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{MS_BASE}/entity/purchaseorder/{order_id}",
+                               params={"expand": "owner,agent"}, headers=get_headers(),
+                               timeout=aiohttp.ClientTimeout(total=30)) as r:
+            r.raise_for_status()
+            return await r.json()
+
+
+def _buyer_chat(owner_name: str, db=None) -> int | None:
+    low = (owner_name or "").lower()
+    for k, cid in BUYER_TG.items():
+        if k in low:
+            return cid
+    if db is not None:
+        for part in low.split():
+            try:
+                cid = db.get_manager_chat_id(part.strip(".,"))
+            except Exception:
+                cid = None
+            if cid:
+                return cid
+    return None
+
+
+async def handle_supply_info_callback(update, context):
+    """Кнопка «❌ Не согл. информация» (pattern ^sinfo:). Только Виктор.
+    Заказ → «НЕ СОГЛ. информация», закупщику (владелец заказа) – дозаполнить карточку
+    поставщика и вернуть заказ на согласование."""
+    q = update.callback_query
+    try:
+        _, order_id = (q.data or "").split(":", 1)
+    except ValueError:
+        await q.answer()
+        return
+    owner = (os.getenv("OWNER_CHAT_ID") or "").strip()
+    if owner.isdigit() and update.effective_user and update.effective_user.id != int(owner):
+        await q.answer("Нет прав")
+        return
+    await q.answer("Отмечаю…")
+    try:
+        await _patch_supply_state(order_id, SUPPLY_STATE_NOT_AGREED_INFO)
+    except Exception as e:
+        logger.error(f"supply_svetofor sinfo {order_id}: {e}")
+        await context.bot.send_message(chat_id=q.message.chat_id,
+            text=f"⚠️ Светофор ЗП: не удалось выставить «НЕ СОГЛ. информация» – {e}. Кнопка на месте.")
+        return
+    try:
+        _log_forget(order_id)
+    except Exception as e:
+        logger.warning(f"supply_svetofor: сброс дедупа {order_id}: {e!r}")
+
+    who = "—"
+    try:
+        o = await _fetch_order_brief(order_id)
+        who = ((o.get("owner") or {}).get("name") or "").strip() or "—"
+        chat = _buyer_chat(who, context.application.bot_data.get("db"))
+        link = (o.get("meta") or {}).get("uuidHref") or ""
+        text = (f"❌ Заказ поставщику {o.get('name')} не согласован: не заполнена карточка поставщика\n"
+                f"{(o.get('agent') or {}).get('name', '—')} · {_fmt_money((o.get('sum') or 0) / 100)}\n\n"
+                "Дозаполните карточку поставщика в МойСклад: договор, подписант, контакты, "
+                "реквизиты – и верните заказ в статус «На согласовании».")
+        if link:
+            text += f"\n{link}"
+        if chat:
+            await context.bot.send_message(chat_id=chat, text=text, disable_web_page_preview=True)
+            who_note = f"закупщику {who}"
+        else:
+            who_note = f"не нашёл Telegram ответственного «{who}» – сообщите сами"
+    except Exception as e:
+        logger.error(f"supply_svetofor sinfo уведомление {order_id}: {e}", exc_info=True)
+        who_note = f"уведомление не ушло: {e}"
+    base = q.message.text or ""
+    await q.edit_message_text(f"{base}\n\n→ ❌ НЕ СОГЛ. информация · {who_note}", reply_markup=None)
+    logger.info(f"supply_svetofor: заказ {order_id} → НЕ СОГЛ. информация ({who})")
 
 
 async def _patch_supply_state(order_id: str, state_id: str):

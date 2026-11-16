@@ -6877,8 +6877,9 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_approval_callback, pattern="^appr_"))
     from processing_svetofor import handle_svetofor_callback
     app.add_handler(CallbackQueryHandler(handle_svetofor_callback, pattern="^svf:"))
-    from supply_svetofor import handle_supply_approval_callback
+    from supply_svetofor import handle_supply_approval_callback, handle_supply_info_callback
     app.add_handler(CallbackQueryHandler(handle_supply_approval_callback, pattern="^sappr:"))
+    app.add_handler(CallbackQueryHandler(handle_supply_info_callback, pattern="^sinfo:"))
     from supply_svetofor import handle_chz_callback
     app.add_handler(CallbackQueryHandler(handle_chz_callback, pattern="^chz:"))
     app.add_handler(CallbackQueryHandler(handle_doc_approval_callback, pattern="^doc_(approve|reject):"))
