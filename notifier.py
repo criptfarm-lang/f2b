@@ -24,12 +24,17 @@ MS_STATE_AGREED = "005f3651-9a9a-11f0-0a80-03a900027474"
 # Планы: 2026-07-16-алерт-заказ-не-согласован.md, 2026-09-28-не-согласован-цена-оплата.md
 MS_STATE_NOT_AGREED_PRICE = "f7e3f71d-6b0b-11f1-0a80-1a5900237f4c"
 MS_STATE_NOT_AGREED_PAY = "5bd05d75-bb48-11f1-0a80-168400582a6f"
+# С 16.11.2026 третья причина – карточка покупателя не дозаполнена (сверено с МС metadata).
+MS_STATE_NOT_AGREED_INFO = "f7fccfbb-e197-11f1-0a80-0e69004879c9"
 # state_id → (код причины для дедупа, заголовок, что делать менеджеру)
 NOT_AGREED_REASONS = {
     MS_STATE_NOT_AGREED_PRICE: (1, "НЕ СОГЛАСОВАН ПО ЦЕНЕ",
                                 "Проверьте цены в заказе, доработайте и верните на согласование."),
     MS_STATE_NOT_AGREED_PAY: (2, "НЕ СОГЛАСОВАН ПО ОПЛАТЕ",
                               "Решите вопрос оплаты с клиентом и верните заказ на согласование."),
+    MS_STATE_NOT_AGREED_INFO: (3, "НЕ СОГЛАСОВАН: НЕ ЗАПОЛНЕНА КАРТОЧКА ПОКУПАТЕЛЯ",
+                               "Дозаполните карточку покупателя в МойСклад: договор, контакты, "
+                               "реквизиты и прочее – и верните заказ на согласование."),
 }
 WAZZUP_API_URL = "https://api.wazzup24.com/v3/message"
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
@@ -1241,7 +1246,7 @@ async def sweep_positions_removed(bot, db):
 
 
 async def check_order_not_agreed(order_href: str, bot, db):
-    """При переводе заказа в «НЕ СОГЛ. ЦЕНА» / «НЕ СОГЛ. ОПЛАТА» — пинг ответственному
+    """При переводе заказа в «НЕ СОГЛ. ЦЕНА» / «ОПЛАТА» / «информация» — пинг ответственному
     менеджеру с причиной.
 
     Триггер: state в NOT_AGREED_REASONS. Получатель — менеджер (owner заказа,
@@ -1997,7 +2002,7 @@ def approval_keyboard(alert_id: int, with_ok: bool = True):
     top = []
     if with_ok:
         top.append(InlineKeyboardButton("✅ Согласовано", callback_data=f"appr_ok|{alert_id}"))
-    top.append(InlineKeyboardButton("💬 Комментарий", callback_data=f"appr_comment|{alert_id}"))
+    top.append(InlineKeyboardButton("❌ Не согл. информация", callback_data=f"appr_rej_info|{alert_id}"))
     return InlineKeyboardMarkup([top, [
         InlineKeyboardButton("❌ Не согл. цена", callback_data=f"appr_rej_price|{alert_id}"),
         InlineKeyboardButton("❌ Не согл. оплата", callback_data=f"appr_rej_pay|{alert_id}"),

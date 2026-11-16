@@ -4919,12 +4919,14 @@ async def _reject_order(query, context, alert_id: int, alert_data: dict, reason:
     светофор у всех согласующих. Пинг менеджеру шлёт вебхук смены статуса
     (check_order_not_agreed) – один путь и для кнопки, и для ручной смены в МС.
     План: 2026-09-28-не-согласован-цена-оплата.md"""
-    from notifier import MS_STATE_NOT_AGREED_PRICE, MS_STATE_NOT_AGREED_PAY, _md
+    from notifier import (MS_STATE_NOT_AGREED_PRICE, MS_STATE_NOT_AGREED_PAY,
+                          MS_STATE_NOT_AGREED_INFO, _md)
     from moysklad import set_order_state, get_headers, MS_BASE
     import aiohttp
     user = query.from_user
-    state_id, label = ((MS_STATE_NOT_AGREED_PRICE, "цена") if reason == "price"
-                       else (MS_STATE_NOT_AGREED_PAY, "оплата"))
+    state_id, label = {"price": (MS_STATE_NOT_AGREED_PRICE, "цена"),
+                       "pay": (MS_STATE_NOT_AGREED_PAY, "оплата"),
+                       "info": (MS_STATE_NOT_AGREED_INFO, "информация")}[reason]
     if alert_data.get("closed_at"):
         await query.answer("Алерт уже закрыт.", show_alert=True)
         return
@@ -5079,7 +5081,7 @@ async def _finalize_two_step(query, context, alert_id: int, row: dict):
 async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обрабатывает нажатия на кнопки объединённого алерта «На согласовании / ЗА ЛИМИТОМ».
-    Callbacks: appr_ok | appr_confirm | appr_cancel | appr_comment | appr_rej_price | appr_rej_pay.
+    Callbacks: appr_ok | appr_confirm | appr_cancel | appr_comment (старые сообщения) | appr_rej_price | appr_rej_pay | appr_rej_info.
     План: 2026-05-21-объединённый-алерт-на-согласование.md, Фаза 3.
     """
     query = update.callback_query
@@ -5194,9 +5196,8 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     # --- appr_rej_price / appr_rej_pay ---
-    if action in ("appr_rej_price", "appr_rej_pay"):
-        await _reject_order(query, context, alert_id, alert_data,
-                            "price" if action == "appr_rej_price" else "pay")
+    if action in ("appr_rej_price", "appr_rej_pay", "appr_rej_info"):
+        await _reject_order(query, context, alert_id, alert_data, action[len("appr_rej_"):])
         return
 
     # --- appr_cancel ---
@@ -8771,7 +8772,7 @@ async def process_ms_webhook(data: dict, bot):
             if action in ("UPDATE", "CREATE"):
                 await check_bulk_production_order(order_href, bot, db)
 
-            # Пинг ответственному менеджеру при переводе заказа в «НЕ СОГЛ. ЦЕНА / ОПЛАТА».
+            # Пинг ответственному менеджеру при переводе заказа в «НЕ СОГЛ. ЦЕНА / ОПЛАТА / информация».
             # Notifier сам проверяет state и делает атомарный дедуп через
             # not_agreed_notifications (UNIQUE order_id+sum_hash).
             # План: 2026-07-16-алерт-заказ-не-согласован.md
