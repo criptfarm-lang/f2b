@@ -5,7 +5,8 @@
 В каждой приёмке МС есть флажок «Одобрено технологом». Технолог осматривает
 приход и ставит галочку. Если галочки нет дольше порога (охлаждённое – 1 день,
 замороженное – 3 дня, календарные дни от даты приёмки), раз в день в 10:00 МСК
-бот шлёт список в личку закупщикам, технологу и собственнику.
+бот шлёт список в личку закупщикам: Беляковой – сырьё, Павленко –
+привлечённые; каждый день в списке – штраф 5 000 ₽ за приёмку.
 
 Правило собственника 16.11.2026: одобрено, только если флажок включил технолог
 (сейчас Маланчук, uid `alexandr@vicpure`). Проверяем по аудиту приёмки: последняя
@@ -13,7 +14,7 @@
 заведении приёмки – такая галочка не считается (в аудите создания атрибутов не
 видно, значит и автора нет).
 
-Только чтение МС.
+Только чтение МС. Кому шлём – см. BUYERS (16.11.2026).
 """
 from __future__ import annotations
 
@@ -49,8 +50,6 @@ GROUP_ATTR = "ПРИВЛЕЧЕННЫЕ ТОВАРЫ"
 _GOODS_TYPES = ("product", "variant")
 
 # Адресаты (Telegram id, сверено с memory reference_f2b_telegram_chat_ids).
-OWNER_ID = 360092495
-MALANCHUK_ID = 772630562
 BELYAKOVA_ID = 8267564735
 PAVLENKO_ID = 8185545246
 
@@ -60,11 +59,14 @@ def technologist_uids() -> set[str]:
     return {u.strip() for u in raw.split(",") if u.strip()}
 
 
-def recipients() -> list[int]:
-    """Тихий режим по умолчанию – только собственнику. TECH_APPROVAL_LIVE=1 – всем."""
-    if (os.getenv("TECH_APPROVAL_LIVE") or "").strip() == "1":
-        return [BELYAKOVA_ID, PAVLENKO_ID, MALANCHUK_ID, OWNER_ID]
-    return [OWNER_ID]
+# Кому шлём (решение собственника 16.11.2026): только закупщикам, каждой – её
+# приёмки; собственнику и Маланчуку не шлём. Штраф 5 000 ₽ за каждый день,
+# когда приёмка попала в список, – запись в public.tech_approval_penalty,
+# её читает мотивация закупщиков (f2b-publisher buyer_kpi / buyer_kpi_moz).
+BUYERS = {
+    "belyakova": {"chat": BELYAKOVA_ID, "group": GROUP_RAW},
+    "kristina": {"chat": PAVLENKO_ID, "group": GROUP_ATTR},
+}
 
 
 LOG_DDL = """
@@ -75,6 +77,17 @@ create table if not exists public.tech_approval_log (
     supplies    int,
     sent_at     timestamptz default now(),
     primary key (day, chat_id)
+);
+create table if not exists public.tech_approval_penalty (
+    day         date not null,
+    buyer       text not null,
+    supply_id   text not null,
+    supply_name text,
+    supplier    text,
+    supply_day  date,
+    marked_by   text,
+    created_at  timestamptz default now(),
+    primary key (day, buyer, supply_id)
 );
 """
 
@@ -111,6 +124,17 @@ def _mark_sent(day: date, chat: int, fp: str, n: int):
               fingerprint = excluded.fingerprint, supplies = excluded.supplies,
               sent_at = now()
         """, (day, chat, fp, n))
+
+
+def _record_penalties(day: date, buyer: str, cards: list[dict]):
+    with _db().cursor() as cur:
+        for c in cards:
+            cur.execute("""
+                insert into public.tech_approval_penalty
+                  (day, buyer, supply_id, supply_name, supplier, supply_day, marked_by)
+                values (%s, %s, %s, %s, %s, %s, %s)
+                on conflict do nothing
+            """, (day, buyer, c["id"], c["name"], c["supplier"], c["day"], c["marked_by"]))
 
 
 # ── МойСклад (чтение) ────────────────────────────────────────────────────────
@@ -273,7 +297,8 @@ def render(cards: list[dict], today: date) -> str:
     lines = [f"<b>Приход без одобрения технолога</b> – {today.strftime('%d.%m')}, "
              f"{len(cards)} {_plural_supply(len(cards))}",
              "<i>охл. дольше 1 дня, с/м дольше 3 дней; галочку в приёмке ставит "
-             "Маланчук, отметка склада не считается</i>"]
+             "Маланчук, отметка склада не считается. Штраф 5 000 ₽ за каждый день "
+             "в этом списке по каждой приёмке</i>"]
     for c in cards:
         label = f"{c['name']} {c['supplier']}"
         link = f'<a href="{c["url"]}">{escape(label)}</a>' if c["url"] else escape(label)
@@ -315,24 +340,26 @@ async def _send_long(app, chat: int, text: str):
 async def run(app, dry_run: bool = False) -> dict:
     today = datetime.now(MSK).date()
     cards = await collect(today)
-    if not cards:
-        logger.info("tech_approval: всё одобрено")
-        return {"supplies": 0, "sent": 0}
-    text = render(cards, today)
-    if dry_run:
-        logger.info("tech_approval DRY-RUN:\n%s", text)
-        return {"supplies": len(cards), "sent": 0, "text": text}
-    fp, sent = fingerprint(cards), 0
-    for chat in recipients():
-        if _already_sent(today, chat, fp):
+    stats = {"supplies": len(cards)}
+    for buyer, cfg in BUYERS.items():
+        mine = [c for c in cards if cfg["group"] in c["groups"]]
+        stats[buyer] = len(mine)
+        if not mine:
+            continue
+        text = render(mine, today)
+        if dry_run:
+            logger.info("tech_approval DRY-RUN %s:\n%s", buyer, text)
+            continue
+        _record_penalties(today, buyer, mine)
+        fp = fingerprint(mine)
+        if _already_sent(today, cfg["chat"], fp):
             continue
         try:
-            await _send_long(app, chat, text)
-            _mark_sent(today, chat, fp, len(cards))
-            sent += 1
+            await _send_long(app, cfg["chat"], text)
+            _mark_sent(today, cfg["chat"], fp, len(mine))
         except Exception as e:
-            logger.error("tech_approval: не ушло в %s: %s", chat, e)
-    return {"supplies": len(cards), "sent": sent}
+            logger.error("tech_approval: не ушло %s: %s", buyer, e)
+    return stats
 
 
 async def poll_job(app) -> dict:
