@@ -1905,6 +1905,118 @@ def _heartbeat(db, status: str, problem: bool = False) -> None:
         pass
 
 
+# Чат с сайта: после формы сайт показывает кнопки WhatsApp / Telegram / MAX,
+# клиент жмёт – Wazzup заводит вторую, пустую сделку «Сделка #N» в «Привлечении»
+# на ответственного по умолчанию (собственника). Заявка при этом уже есть –
+# сделка формы с тегом «сайт». Склеиваем: контакт чата – в сделку формы, дубль
+# закрываем. Чат без формы рядом – тому, кто разбирает входящие (Руслан),
+# чтобы на собственника не падало ничего (собственник 17.11.2026).
+OWNER_AMO_USER = int(os.getenv("OWNER_AMO_USER", "11501490"))
+INBOX_AMO_USER = int(os.getenv("INBOX_AMO_USER", "12788698"))   # Руслан Белов
+DUPE_WINDOW_S = 30 * 60      # форма → кнопка мессенджера: на живых парах 2 с – 22 мин
+_dupes_ready = False
+
+
+def pair_site_lead(dupe: dict, site_leads: list, used: set) -> dict | None:
+    """Ближайшая сделка формы, созданная не раньше чем за 30 мин до чата и ещё без пары."""
+    best = None
+    for l in site_leads:
+        gap = dupe["created_at"] - l["created_at"]
+        if 0 <= gap <= DUPE_WINDOW_S and l["id"] not in used:
+            if best is None or l["created_at"] > best["created_at"]:
+                best = l
+    return best
+
+
+async def merge_messenger_dupes(app, db, session) -> int:
+    global _dupes_ready
+    if not _dupes_ready:
+        db._execute("""CREATE TABLE IF NOT EXISTS messenger_dupes (
+            lead_id BIGINT PRIMARY KEY, site_lead_id BIGINT, action TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        _dupes_ready = True
+    ts = int((datetime.now(MSK) - timedelta(days=2)).timestamp())
+    data = await _amo_get(session, "/leads", {
+        "filter[pipeline_id][]": ATTRACT_PIPELINE, "filter[created_at][from]": ts,
+        "with": "contacts", "limit": 250})
+    leads = (data.get("_embedded") or {}).get("leads") or []
+    dupes = [l for l in leads if l.get("responsible_user_id") == OWNER_AMO_USER
+             and l.get("created_by") == 0 and l.get("status_id") not in (142, 143)
+             and not (l.get("_embedded") or {}).get("tags")]
+    if not dupes:
+        return 0
+    done = {r["lead_id"] for r in db._fetchall(
+        "SELECT lead_id FROM messenger_dupes WHERE lead_id = ANY(%s)", ([d["id"] for d in dupes],))}
+    used = {r["site_lead_id"] for r in db._fetchall(
+        "SELECT site_lead_id FROM messenger_dupes WHERE site_lead_id IS NOT NULL")}
+    # Сделку формы агент мог уже унести в свою воронку – ищем по всем воронкам.
+    sdata = await _amo_get(session, "/leads", {
+        "filter[created_at][from]": ts - DUPE_WINDOW_S, "limit": 250})
+    site = [l for l in (sdata.get("_embedded") or {}).get("leads") or []
+            if {t.get("id") for t in (l.get("_embedded") or {}).get("tags") or []} & SITE_TAG_IDS]
+    sub = os.getenv("AMO_SUBDOMAIN", "victorfishtobiz")
+    n = 0
+    for d in sorted(dupes, key=lambda x: x["created_at"]):
+        if d["id"] in done:
+            continue
+        contacts = [c["id"] for c in (d.get("_embedded") or {}).get("contacts") or []]
+        if not contacts:
+            continue                      # Wazzup привязывает контакт через ~10 с – следующий тик
+        pair = pair_site_lead(d, site, used)
+        if pair:
+            owner = pair.get("responsible_user_id") or INBOX_AMO_USER
+            ok = await _amo_write(session, f"/leads/{pair['id']}/link",
+                                  [{"to_entity_id": c, "to_entity_type": "contacts"} for c in contacts],
+                                  method="POST")
+            if not ok:
+                continue
+            await _amo_write(session, "/contacts", [{"id": c, "responsible_user_id": owner}
+                                                    for c in contacts])
+            await _amo_write(session, f"/leads/{d['id']}", {
+                "status_id": 143, "responsible_user_id": owner,
+                "name": f"Дубль заявки {pair['id']} (чат с сайта)"})
+            await _amo_write(session, "/leads/notes", [{
+                "entity_id": pair["id"], "note_type": "common",
+                "params": {"text": f"Клиент после формы написал в мессенджер – контакт чата "
+                                   f"привязан сюда, дубль {d['id']} закрыт."}}], method="POST")
+            used.add(pair["id"])
+            action = "merged"
+            # Агент ведёт сделку формы – пусть видит и этот чат.
+            ch = contact_channels(await _amo_get(session, f"/contacts/{contacts[0]}"))
+            ids = [v for k, v in ch.items() if k in ("telegram", "max")]
+            if ids:
+                db._execute("""UPDATE sales_dialog_leads
+                               SET all_chat_ids = ARRAY(SELECT DISTINCT unnest(
+                                       coalesce(all_chat_ids, '{}') || %s::text[])),
+                                   chat_id = coalesce(chat_id, %s),
+                                   chat_type = CASE WHEN chat_id IS NULL THEN %s ELSE chat_type END
+                               WHERE lead_id=%s""",
+                            (ids, ids[0], "telegram" if ch.get("telegram") else "max", pair["id"]))
+        else:
+            if not await _amo_write(session, f"/leads/{d['id']}",
+                                    {"responsible_user_id": INBOX_AMO_USER}):
+                continue
+            await _amo_write(session, "/contacts", [{"id": c, "responsible_user_id": INBOX_AMO_USER}
+                                                    for c in contacts])
+            action = "to_inbox"
+            row = db._fetchone("""SELECT user_id FROM manager_chats
+                                  WHERE amo_user_id=%s AND coalesce(is_blocked,false)=false
+                                  LIMIT 1""", (INBOX_AMO_USER,))
+            if app and row:
+                try:
+                    await app.bot.send_message(row["user_id"],
+                        f"Новый чат клиента из мессенджера – разбери: "
+                        f"https://{sub}.amocrm.ru/leads/detail/{d['id']}")
+                except Exception as e:
+                    logger.warning("messenger_dupes: пинг %s: %s", row["user_id"], e)
+        db._execute("""INSERT INTO messenger_dupes (lead_id, site_lead_id, action)
+                       VALUES (%s,%s,%s) ON CONFLICT DO NOTHING""",
+                    (d["id"], pair["id"] if pair else None, action))
+        logger.info("messenger_dupes: %s %s → %s", action, d["id"], pair and pair["id"])
+        n += 1
+    return n
+
+
 async def tick(app, db) -> None:
     global _tables_ready
     try:
@@ -1916,6 +2028,11 @@ async def tick(app, db) -> None:
         _heartbeat(db, f"старт тика упал: {type(e).__name__}: {e}", problem=True)
         logger.error("sales_dialog: старт тика: %s", e, exc_info=True)
         return
+    try:
+        async with aiohttp.ClientSession() as session:
+            await merge_messenger_dupes(app, db, session)
+    except Exception as e:
+        logger.error("messenger_dupes: %s", e, exc_info=True)
     for campaign in campaigns:
         try:
             await _tick_campaign(app, db, campaign)
