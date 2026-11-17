@@ -1038,7 +1038,10 @@ async def _route_conflict_alert(bot, unit_name, stops, lag_sec, now_ts, recipien
 
 
 async def _write_fail_alert(bot, unit_name, order_no, client, cur, target, has_meta):
-    """Статус в МС не записался (PUT не 200 или статуса нет в метаданных). Сигнал владельцу+логисту."""
+    """Статус в МС не записался (PUT не 200 или статуса нет в метаданных).
+    С 17.11.2026 в Telegram не шлём (собственник: лишнее логисту) – только лог и журнал алертов."""
+    logger.warning("ms_write_fail %s №%s %s: %s → %s (meta=%s)", unit_name, order_no, client, cur, target, has_meta)
+    return
     reason = "PUT отклонён МойСкладом (не 200)" if has_meta else f"статуса «{target}» нет в метаданных МС"
     text = (f"🛑 Статус в МойСклад НЕ записан\n{unit_name} №{order_no} {client or ''}\n"
             f"{cur} → {target}: {reason}.\nПроверьте отгрузку вручную.")
