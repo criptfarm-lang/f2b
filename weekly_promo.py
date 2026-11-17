@@ -354,7 +354,7 @@ def _keyboard(oid, segment=None):
 def _owner_caption(row, cand):
     photos = row["photos"] or []
     src = photos[row["photo_idx"]]["src"] if photos else "фото нет"
-    head = f"{SLOT_TITLE.get((row['segment'], row['slot']), 'HoReCa · акция из сторис')} · фото: {src}"
+    head = f"{SLOT_TITLE.get((row['segment'], row['slot']), 'ОПТ' if row['segment'] == 'opt' else 'HoReCa · акция')} · фото: {src}"
     return f"<i>{head}</i>\n\n" + _caption(row["segment"], cand, row["price"])
 
 
