@@ -106,6 +106,8 @@ async def fetch_report_tsv(session: aiohttp.ClientSession, date_from: str,
             },
             "FieldNames": field_names,
             "ReportName": f"{report_name}_{int(time.time())}",
+            "Goals": ["545113678"],  # только цель «Заявка», не сумма всех целей Метрики
+            "AttributionModels": ["AUTO"],
             "ReportType": "CAMPAIGN_PERFORMANCE_REPORT",
             "DateRangeType": "CUSTOM_DATE",
             "Format": "TSV",
@@ -154,7 +156,8 @@ def aggregate(tsv: str) -> dict[str, dict]:
     lines = tsv.splitlines()
     if not lines:
         return {}
-    header = lines[0].split("\t")
+    header = [("Conversions" if h.startswith("Conversions_") else h)
+              for h in lines[0].split("\t")]  # Conversions_<goal>_AUTO -> Conversions
     try:
         idx = {name: header.index(name) for name in
                ("CampaignId", "Impressions", "Clicks", "Cost", "Conversions")}
