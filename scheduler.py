@@ -208,6 +208,16 @@ def setup_scheduler(app: Application, db):
         misfire_grace_time=3600, coalesce=True,
     )
 
+    # ВТ 09:30 МСК – Белову список сделок из рекламы Директа за прошлую неделю
+    # ПН–ВС со ссылками на amoCRM (собственник 17.11.2026).
+    scheduler.add_job(
+        direct_ad_leads_belov_job,
+        CronTrigger(day_of_week='tue', hour=9, minute=30, timezone=MSK),
+        args=[app],
+        id="direct_ad_leads_belov_tue_0930",
+        misfire_grace_time=3600, coalesce=True,
+    )
+
     # Автоподстановка «Дата планируемой оплаты» вынесена в PTB JobQueue в bot.py
     # (16.06.2026): AsyncIOScheduler пропускал tick 15:56 МСК даже при next_run_time
     # в job-листинге — тот же паттерн, что с market_intel 28-29.05.
@@ -1495,6 +1505,33 @@ async def direct_weekly_report_job(app: Application):
             logger.error(
                 f"direct_weekly_report_job: TG-алерт не доставлен: {send_err}")
         return {"status": "error", "error": str(e)}
+
+
+BELOV_CHAT_ID = 555437878
+
+
+async def direct_ad_leads_belov_job(app: Application):
+    """ВТ 09:30: Белову – сделки из рекламы Директа за прошлую неделю ПН–ВС."""
+    today = datetime.now(MSK).date()
+    d_from = today - timedelta(days=today.weekday() + 7)
+    d_to = d_from + timedelta(days=6)
+    try:
+        from direct_report import build_ad_leads_text, split_for_telegram
+        text = await build_ad_leads_text(d_from, d_to)
+        for chunk in split_for_telegram(text):
+            await app.bot.send_message(chat_id=BELOV_CHAT_ID, text=chunk,
+                                       disable_web_page_preview=True)
+        logger.info("direct_ad_leads_belov_job OK")
+    except Exception as e:
+        logger.error(f"direct_ad_leads_belov_job: {e}", exc_info=True)
+        owner = os.getenv("OWNER_CHAT_ID")
+        if owner:
+            try:
+                await app.bot.send_message(
+                    chat_id=int(owner),
+                    text=f"⚠️ Список рекламных заявок Белову не ушёл: {e}")
+            except Exception:
+                logger.error("direct_ad_leads_belov_job: алерт не доставлен")
 
 
 async def refresh_op_report_cache_job(app: Application, db):

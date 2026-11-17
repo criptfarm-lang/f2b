@@ -499,6 +499,64 @@ def block_leads(leads: dict, weekly: dict) -> list[str]:
     return lines
 
 
+def _cf(lead: dict, name: str):
+    for c in lead.get("custom_fields_values") or []:
+        if c.get("field_name") == name and c.get("values"):
+            return c["values"][0].get("value")
+    return None
+
+
+async def build_ad_leads_text(d_from: date, d_to: date) -> str:
+    """Список сделок amoCRM из рекламы Директа за [d_from, d_to] со ссылками.
+
+    Реклама = сайт-лид (тег «сайт»/«сайт заявка») с меткой клика yclid.
+    Рассылка Белову по ВТ (scheduler.direct_ad_leads_belov_job).
+    """
+    ts_from = int(datetime.combine(d_from, datetime.min.time(), MSK).timestamp())
+    ts_to = int(datetime.combine(d_to + timedelta(days=1), datetime.min.time(),
+                                 MSK).timestamp()) - 1
+    async with aiohttp.ClientSession() as session:
+        users_raw = await amo_get(session, "/users", {"limit": 250})
+        users = {u["id"]: u["name"]
+                 for u in users_raw.get("_embedded", {}).get("users", [])}
+        statuses: dict[int, str] = {}
+        for pid in PIPELINES:
+            st_raw = await amo_get(session, f"/leads/pipelines/{pid}", {})
+            statuses.update({s["id"]: s["name"] for s in
+                             st_raw.get("_embedded", {}).get("statuses", [])})
+        leads: list[dict] = []
+        page = 1
+        while True:
+            d = await amo_get(session, "/leads", {
+                "filter[pipeline_id][]": list(PIPELINES),
+                "filter[created_at][from]": ts_from,
+                "filter[created_at][to]": ts_to,
+                "limit": 250, "page": page,
+            })
+            chunk = d.get("_embedded", {}).get("leads", [])
+            leads.extend(chunk)
+            if len(chunk) < 250:
+                break
+            page += 1
+            await asyncio.sleep(RATE_DELAY)
+    ads = sorted((l for l in leads if is_site_lead(l) and _cf(l, "yclid")),
+                 key=lambda l: l["created_at"])
+    head = (f"Заявки с рекламы Яндекс за {d_from:%d.%m}–{d_to:%d.%m}: "
+            f"{len(ads)} шт.")
+    if not ads:
+        return head
+    lines = [head, ""]
+    for i, l in enumerate(ads, 1):
+        st = l["status_id"]
+        label = ("Не реализовано" if st == STATUS_LOST else
+                 "Реализовано" if st == STATUS_WON else statuses.get(st, "?"))
+        when = datetime.fromtimestamp(l["created_at"], MSK).strftime("%d.%m %H:%M")
+        lines.append(f"{i}. {when} · {label} · "
+                     f"{users.get(l['responsible_user_id'], '?')}\n"
+                     f"https://{AMO_SUBDOMAIN}.amocrm.ru/leads/detail/{l['id']}")
+    return "\n".join(lines)
+
+
 async def build_report() -> str:
     """Собирает готовый текст сводки. Кидает DirectError с внятным текстом."""
     today = datetime.now(MSK).date()
