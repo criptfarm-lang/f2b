@@ -232,7 +232,7 @@ def _kind(name):
     if "с/с" in n or "солен" in n:
         return r"солен|солё|с/с|посол"
     if "охл" in n:
-        return r"охл|приём|прием|приемк|приёмк"
+        return r"охл"
     return None
 
 
@@ -245,8 +245,8 @@ def _content_photos(db, name):
     kind = _kind(name)
     if " - ломтики" in n or "ломтик" in n:
         kind = r"нарезк|ломтик|слайс"
-    if not kind and not re.search(r"саку|кальмар|кревет|гребеш|угор|лангуст", n):
-        return []          # филе с/м: разделку (Трим) по подписи не узнать – только фото с сайта (собственник 17.11)
+    if (not kind or "ОХЛ" in name.upper()) and not re.search(r"саку|кальмар|кревет|гребеш|угор|лангуст", n):
+        return []          # филе с/м и охл.: разделку (Трим) по подписи не узнать – только фото с сайта (собственник 17.11)
     rows = db._fetchall(
         "SELECT id, caption, media FROM publishing.story_jobs WHERE source_chat_id = %s OR chat_id = %s "
         "ORDER BY id DESC LIMIT 200", (CONTENT_CHAT_ID, CONTENT_CHAT_ID))
@@ -254,7 +254,9 @@ def _content_photos(db, name):
     slice_item = bool(re.search(r"ломтик|нарезк|слайс", n))
     for r in rows:
         cap = (r["caption"] or "").lower()
-        if not re.search(sp, cap) or re.search(r"суповой|набор|отход|хребт|голов", cap):
+        if not re.search(sp, cap) or re.search(
+                r"суповой|набор|отход|хребт|голов|приём|прием|партия|короб|паллет|отгруз|отправ|камер|инвентар", cap):
+            # на таких фото коробки и паллеты, а не рыба (собственник 17.11)
             continue
         if sum(1 for _, rx in _SPECIES[:6] if re.search(rx, cap)) > 1:
             continue                                   # «нарезки из лосося и форели» – не про один товар
