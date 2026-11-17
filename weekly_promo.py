@@ -38,6 +38,7 @@ CONTENT_CHAT_ID = int(os.getenv("CONTENT_CHAT_ID", "-1001433042091"))
 STORE = "Основной склад"
 RUN_HOUR = 10
 REPEAT_WEEKS = 3            # товар, предложенный недавно, не повторяем столько недель
+SEND_GAP_SEC = 60
 
 FOOTER = "Заказ: t.me/fishtobiz\n8 800 700-27-03 · WhatsApp/MAX +7 993 700-70-87"
 TERM = "Цена действует 3 дня с момента публикации."
@@ -338,14 +339,15 @@ def _keyboard(oid):
         [InlineKeyboardButton("Другая цена", callback_data=f"po:price:{oid}"),
          InlineKeyboardButton("Другая", callback_data=f"po:next:{oid}")],
         [InlineKeyboardButton("Другое фото", callback_data=f"po:photo:{oid}"),
-         InlineKeyboardButton("Опубликовать", callback_data=f"po:pub:{oid}")],
+         InlineKeyboardButton("Отмена", callback_data=f"po:cancel:{oid}")],
+        [InlineKeyboardButton("Опубликовать", callback_data=f"po:pub:{oid}")],
     ])
 
 
 def _owner_caption(row, cand):
     photos = row["photos"] or []
     src = photos[row["photo_idx"]]["src"] if photos else "фото нет"
-    head = f"{SLOT_TITLE[(row['segment'], row['slot'])]} · фото: {src}"
+    head = f"{SLOT_TITLE.get((row['segment'], row['slot']), 'HoReCa · акция из сторис')} · фото: {src}"
     return f"<i>{head}</i>\n\n" + _caption(row["segment"], cand, row["price"])
 
 
@@ -356,6 +358,8 @@ async def _media(row):
     p = photos[row["photo_idx"] % len(photos)]
     if p["type"] == "file_id":
         return p["v"]
+    if p["type"] == "path":
+        return open(p["v"], "rb")
     return await asyncio.to_thread(_download_jpeg, p["v"])
 
 
@@ -406,8 +410,13 @@ async def run_week(bot, db, today=None):
     owner = _owner_id()
     await bot.send_message(owner, "Акционные объявления недели на утверждение: ОПТ – 2, HoReCa – 4.\n"
                                   "«Другая цена» – ответьте числом, «Другая» – следующий товар, "
-                                  "«Опубликовать» – в канал. Не нажали – не публикуется.")
+                                  "«Опубликовать» – в канал, «Отмена» – убрать. Не нажали – не публикуется.\n"
+                                  "Карточки придут по одной в минуту.")
+    first = True
     for (segment, slot), cands in pools.items():
+        if not first:
+            await asyncio.sleep(SEND_GAP_SEC)          # не скопом – по карточке в минуту (собственник 17.11)
+        first = False
         cands = [dict(c) for c in cands]
         got = await _resolve(db, segment, cands, 0)
         if not got:
@@ -426,7 +435,7 @@ async def run_week(bot, db, today=None):
 
 # ── Кнопки ───────────────────────────────────────────────────────────────────
 
-_CB = re.compile(r"^po:(price|next|photo|pub):(\d+)$")
+_CB = re.compile(r"^po:(price|next|photo|pub|cancel):(\d+)$")
 
 
 async def _refresh(q, row):
@@ -438,6 +447,21 @@ async def _refresh(q, row):
         return
     await q.edit_message_media(InputMediaPhoto(media, caption=_owner_caption(row, cand), parse_mode="HTML"),
                                reply_markup=_keyboard(row["id"]))
+
+
+async def _cleanup(bot, q, row):
+    """Опубликованная или отменённая карточка стирается из лички вместе с вопросом о цене."""
+    for mid in (row.get("prompt_message_id"), q.message.message_id if q.message else None):
+        if not mid:
+            continue
+        try:
+            await bot.delete_message(row["chat_id"], mid)
+        except Exception:
+            try:
+                if mid == q.message.message_id:
+                    await q.edit_message_reply_markup(reply_markup=None)   # старше 48 ч удалить нельзя
+            except Exception:
+                pass
 
 
 def _make_callback(db):
@@ -452,14 +476,22 @@ def _make_callback(db):
             return
         action, oid = m.group(1), int(m.group(2))
         row = _row(db, oid)
-        if not row or row["status"] == "published":
-            await q.answer("Уже опубликовано." if row else "Карточка не найдена.", show_alert=True)
+        if not row or row["status"] in ("published", "cancelled"):
+            await q.answer({"published": "Уже опубликовано.", "cancelled": "Отменено."}.get(
+                row["status"] if row else "", "Карточка не найдена."), show_alert=True)
             try:
                 await q.edit_message_reply_markup(reply_markup=None)
             except Exception:
                 pass
             return
         try:
+            if action == "cancel":
+                row = db._fetchone("UPDATE publishing.promo_offers SET status = 'cancelled', updated_at = now() "
+                                   "WHERE id = %s AND status = 'pending' RETURNING *", (oid,))
+                await q.answer("Отменено")
+                if row:
+                    await _cleanup(context.bot, q, row)
+                return
             if action == "price":
                 await q.answer()
                 cand = row["candidates"][row["idx"]]
@@ -498,7 +530,7 @@ def _make_callback(db):
                 if not row:
                     await q.answer("Уже публикую.", show_alert=True)
                     return
-                await q.answer("Публикую…")
+                await q.answer("Публикую в канал " + ("ОПТ" if row["segment"] == "opt" else "HoReCa"))
                 cand = row["candidates"][row["idx"]]
                 chan = OPT_CHANNEL_ID if row["segment"] == "opt" else HORECA_CHANNEL_ID
                 media = await _media(row)
@@ -514,10 +546,7 @@ def _make_callback(db):
                     raise
                 db._execute("UPDATE publishing.promo_offers SET status = 'published', published_message_id = %s, "
                             "published_at = now(), updated_at = now() WHERE id = %s", (msg.message_id, oid))
-                where = "ОПТ" if row["segment"] == "opt" else "HoReCa"
-                await q.edit_message_reply_markup(reply_markup=None)
-                await q.message.reply_text(f"Опубликовано в канале {where}: {cand['name']} – "
-                                           f"{_fmt_price(row['price'])} ₽.")
+                await _cleanup(context.bot, q, row)
         except Exception as e:
             logger.exception("weekly_promo: кнопка %s №%s", action, oid)
             try:
@@ -572,7 +601,12 @@ def _make_price_handler(db):
                                                    reply_markup=_keyboard(row["id"]))
         except Exception:
             logger.exception("weekly_promo: не обновил карточку №%s", row["id"])
-        await msg.reply_text(f"Цена {_fmt_price(price)} ₽ – карточка обновлена.")
+        for mid in (msg.message_id, msg.reply_to_message.message_id):   # вопрос и ответ не копим в личке
+            try:
+                await context.bot.delete_message(msg.chat_id, mid)
+            except Exception:
+                pass
+        db._execute("UPDATE publishing.promo_offers SET prompt_message_id = NULL WHERE id = %s", (row["id"],))
         raise ApplicationHandlerStop
 
     return handle
@@ -601,6 +635,6 @@ def _make_job(db):
 def register(app, db):
     db._execute(SCHEMA)
     app.add_handler(MessageHandler(filters.TEXT & filters.REPLY & _PriceReply(db), _make_price_handler(db)), group=-1)
-    app.add_handler(CallbackQueryHandler(_make_callback(db), pattern=r"^po:(price|next|photo|pub):"))
+    app.add_handler(CallbackQueryHandler(_make_callback(db), pattern=r"^po:(price|next|photo|pub|cancel):"))
     app.job_queue.run_repeating(_make_job(db), interval=600, first=90, name="weekly_promo")
     logger.info("weekly_promo: зарегистрирован")
