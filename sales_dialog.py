@@ -612,7 +612,8 @@ async def _amo_user_active(session: aiohttp.ClientSession, user_id: int) -> bool
 
 async def hand_to_manager(app, db, msg: dict,
                           task_text: str = "Ответить клиенту: диалог передан от агента",
-                          task_hours: int = 3, target: int | None = None) -> str:
+                          task_hours: int = 3, target: int | None = None,
+                          agent_label: str = "Что готовил агент (не отправлено)") -> str:
     """Возврат раскачанного лида человеку: сделка, контакты, задача и сообщение в Telegram.
 
     Возвращаем тому менеджеру, который вёл лид до агента, — он помнит клиента и
@@ -657,7 +658,7 @@ async def hand_to_manager(app, db, msg: dict,
             + (f"{task_text}\n" if not task_text.startswith("Ответить клиенту") else "")
             + f"https://{os.getenv('AMO_SUBDOMAIN', 'victorfishtobiz')}.amocrm.ru/leads/detail/{lead_id}\n\n"
             f"Последнее от клиента: {(msg.get('inbound_text') or '—')[:300]}\n\n"
-            f"Что готовил агент (не отправлено):\n{(msg.get('draft_text') or '—')[:600]}")
+            f"{agent_label}:\n{(msg.get('draft_text') or '—')[:600]}")
     chat = MANAGER_TG.get(target)
     if chat:
         try:
@@ -2975,6 +2976,35 @@ async def _do_send(db, row_id: int, text: str) -> tuple[bool, str]:
     return ok, info
 
 
+FIRST_TOUCH_TASK = ("Позвонить клиенту: заявка с сайта, агент написал ему в {ch}. "
+                    "Звони сегодня, пока помнит про заявку")
+
+
+async def _after_send_success(app, db, row_id: int) -> str:
+    """Первое касание ушло – сразу менеджеру со звонком, агент не ждёт ответа.
+
+    17.11.2026 (Белов): лид 13.11 ждал 2 рабочих дня тишины, к звонку клиент
+    уже не помнил про заявку. Теперь агент только здоровается и представляется
+    в мессенджере, сделка в тот же момент возвращается менеджеру с задачей.
+    """
+    msg = db._fetchone("SELECT * FROM sales_dialog_messages WHERE id=%s", (row_id,))
+    if not msg or not str(msg.get("inbound_message_id") or "").startswith("first:"):
+        return ""
+    db._execute("""UPDATE sales_dialog_leads SET status='handed',
+                          note = coalesce(note, '') || ' | первое сообщение ушло – сразу менеджеру'
+                   WHERE campaign=%s AND lead_id=%s AND status='active'""",
+                (msg["campaign"], msg["lead_id"]))
+    m = dict(msg)
+    m["draft_text"] = msg.get("final_text") or msg.get("draft_text")
+    m["inbound_text"] = None
+    what = await hand_to_manager(app, db, m,
+                                 task_text=FIRST_TOUCH_TASK.format(ch=row_channel(msg)),
+                                 task_hours=CALL_TASK_HOURS,
+                                 agent_label="Агент написал клиенту")
+    _heartbeat(db, f"{msg['campaign']}: лид {msg['lead_id']} – первое касание, менеджеру: {what}")
+    return f"; менеджеру: {what}"
+
+
 def register(app, db) -> None:
     """Кнопки под карточкой и приём отредактированного текста ответом на неё."""
     from telegram.ext import CallbackQueryHandler, MessageHandler, filters
@@ -3037,7 +3067,9 @@ def register(app, db) -> None:
             ok, info = await _do_send(db, row_id, (msg or {}).get("draft_text") or "")
             if not ok:
                 info += await _after_send_failure(app, db, row_id, info)
-            await q.edit_message_text(base + ("\n\n[отправлено клиенту]" if ok else f"\n\n[не отправлено: {info}]"))
+            else:
+                info = await _after_send_success(app, db, row_id)
+            await q.edit_message_text(base + (f"\n\n[отправлено клиенту{info}]" if ok else f"\n\n[не отправлено: {info}]"))
         await q.answer()
 
     async def on_edit_reply(update, context):
@@ -3081,8 +3113,10 @@ def register(app, db) -> None:
         ok, info = await _do_send(db, row_id, text)
         if not ok:
             info += await _after_send_failure(app, db, row_id, info)
+        else:
+            info = await _after_send_success(app, db, row_id)
         await update.effective_message.reply_text(
-            "Отправлено клиенту." if ok else f"Не отправлено: {info}")
+            f"Отправлено клиенту{info}." if ok else f"Не отправлено: {info}")
         # Иначе следом ответит общий гейт «я только присылаю уведомления».
         raise ApplicationHandlerStop
 
