@@ -6887,7 +6887,7 @@ def main():
                                          pattern="^mclaim_(resolved|fix|finance|ack|accept|decline|approve|counter):"))
     # Ценовое согласование из дашборда менеджера (quiz-game) – светофор «ЗАПРОС ЦЕНЫ»
     from price_requests import handle_price_request_callback
-    app.add_handler(CallbackQueryHandler(handle_price_request_callback, pattern="^preq_(ok|other):"))
+    app.add_handler(CallbackQueryHandler(handle_price_request_callback, pattern="^preq_(ok|other|all|done):"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_link_callback, pattern="^(wazzup_link|wazzup_role|wazzup_pick|wazzup_seg|wazzup_mgr|wazzup_mailing|wazzup_later)"))
     app.add_handler(CallbackQueryHandler(handle_wazzup_ignore_callback, pattern="^wazzup_ignore"))
 

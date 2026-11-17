@@ -198,8 +198,58 @@ async def _drop_cards(bot, row) -> None:
                 pass
 
 
+_OPEN = ("pending", "awaiting_price", "calculating")
+
+
+def _batch_markup(rows: list[dict]) -> InlineKeyboardMarkup:
+    """Карточка запроса из нескольких позиций: по позиции «✅ N · цена» / «✏️ N другая»,
+    решённая – одна кнопка-отметка; внизу «Согласовать всё», пока есть нерешённые.
+    Исходный вид кнопок строит дашборд (quiz-game main._price_batch_markup)."""
+    kb = []
+    for n, r in enumerate(rows, 1):
+        if r["status"] == "approved":
+            kb.append([InlineKeyboardButton(f"✅ {n} · {_rub(r['approved_price'])} согласовано",
+                                            callback_data=f"preq_done:{r['id']}")])
+        else:
+            kb.append([InlineKeyboardButton(f"✅ {n} · {_rub(r['price_requested'])}", callback_data=f"preq_ok:{r['id']}"),
+                       InlineKeyboardButton(f"✏️ {n} другая", callback_data=f"preq_other:{r['id']}")])
+    if any(r["status"] in _OPEN for r in rows):
+        kb.append([InlineKeyboardButton("✅ Согласовать всё", callback_data=f"preq_all:{rows[0]['batch_id']}")])
+    return InlineKeyboardMarkup(kb)
+
+
+def _card_rows(row: dict) -> list[dict]:
+    """Позиции, которые стоят в одной карточке с этой: тот же запрос, тот же согласующий."""
+    if not row.get("batch_id"):
+        return [row]
+    return _all("""SELECT * FROM price_requests WHERE batch_id=%s AND approver_chat IS NOT DISTINCT FROM %s
+                   ORDER BY id""", (row["batch_id"], row.get("approver_chat")))
+
+
+async def _refresh_cards(bot, row: dict) -> None:
+    """После решения: одиночная карточка удаляется; в карточке из нескольких позиций
+    решённая позиция становится отметкой, карточка удаляется, когда решены все."""
+    grp = _card_rows(row)
+    if len(grp) <= 1 or not any(r["status"] in _OPEN for r in grp):
+        await _drop_cards(bot, row)
+        return
+    msgs = row.get("tg_messages") or []
+    if isinstance(msgs, str):
+        import json
+        try:
+            msgs = json.loads(msgs)
+        except Exception:
+            msgs = []
+    kb = _batch_markup(grp)
+    for m in msgs:
+        try:
+            await bot.edit_message_reply_markup(chat_id=m["chat_id"], message_id=m["message_id"], reply_markup=kb)
+        except Exception as e:
+            logger.warning("price request %s: кнопки карточки не обновлены (%r)", row["id"], e)
+
+
 async def _approve(bot, req_id: int, price: float, from_status: tuple[str, ...],
-                   decided_by: str = "Виктор") -> dict | None:
+                   decided_by: str = "Виктор", notify: bool = True, refresh: bool = True) -> dict | None:
     """Согласовать цену: статус, срок, снять кнопки, пуш менеджеру. None – уже обработано."""
     valid_until = datetime.now(MSK).date() + timedelta(days=VALID_DAYS)
     row = _one(
@@ -209,9 +259,12 @@ async def _approve(bot, req_id: int, price: float, from_status: tuple[str, ...],
         (price, decided_by, valid_until, req_id, list(from_status)))
     if not row:
         return None
-    await _drop_cards(bot, row)
+    if refresh:
+        await _refresh_cards(bot, row)
     chat = _manager_chat(row["manager_tag"])
-    if chat:
+    if not notify:
+        pass
+    elif chat:
         asked = float(row["price_requested"])
         other = f" (вы просили {_rub(asked)})" if abs(float(price) - asked) >= 0.5 else ""
         qty = f", {_rub(row['qty_kg'])} кг" if row.get("qty_kg") else ""
@@ -293,8 +346,47 @@ async def _amend_order_alerts(bot, req: dict, price: float) -> None:
         return      # заказ один – дальше не ищем
 
 
+async def _approve_all(bot, query, uid: int, batch_id: int) -> None:
+    """«Согласовать всё» в карточке запроса из нескольких позиций: каждая – по цене менеджера.
+    Только позиции этой карточки (у Кристины – своя), менеджеру – один общий пуш."""
+    chat_id = query.message.chat_id
+    rows = [r for r in _all("""SELECT * FROM price_requests WHERE batch_id=%s
+                                 AND status IN ('pending','awaiting_price') ORDER BY id""", (batch_id,))
+            if int(r.get("approver_chat") or 0) == chat_id and _can_decide(uid, r)]
+    if not rows:
+        await query.answer("Уже обработано.", show_alert=True)
+        return
+    who = _decider_name(uid)
+    done = []
+    for r in rows:
+        d = await _approve(bot, r["id"], float(r["price_requested"]), ("pending", "awaiting_price"), who,
+                           notify=False, refresh=False)
+        if d:
+            done.append(d)
+    if not done:
+        await query.answer("Уже обработано.", show_alert=True)
+        return
+    await _refresh_cards(bot, done[-1])
+    await query.answer("Согласовано всё")
+    valid = done[0]["valid_until"]
+    pos = "\n".join(f"• {_sku(d)}" + (f", {_rub(d['qty_kg'])} кг" if d.get("qty_kg") else "")
+                    + f" – {_rub(d['approved_price'])} ₽/кг" for d in done)
+    mgr = _manager_chat(done[0]["manager_tag"])
+    if mgr:
+        whos = "" if who == "Виктор" else f" ({who})"
+        try:
+            await bot.send_message(chat_id=mgr, text=(
+                f"✅ Цены согласованы{whos} – запрос №{batch_id}\n\nКлиент: {done[0]['client_name']}\n{pos}\n\n"
+                f"Действует до {valid:%d.%m} на один заказ. Оформите заказ в МойСкладе – "
+                f"при согласовании он пройдёт с пометкой «согласовано в дашборде»."))
+        except Exception as e:
+            logger.warning("price batch %s: не уведомил менеджера (%r)", batch_id, e)
+    await bot.send_message(chat_id=chat_id, text=(
+        f"✅ №{batch_id} согласовано всё ({len(done)} поз.), до {valid:%d.%m} на один заказ. Менеджер уведомлён."))
+
+
 async def handle_price_request_callback(update, context):
-    """Кнопки светофора «ЗАПРОС ЦЕНЫ»: preq_ok:<id> / preq_other:<id>."""
+    """Кнопки светофора «ЗАПРОС ЦЕНЫ»: preq_ok:<id> / preq_other:<id> / preq_all:<batch> / preq_done:<id>."""
     query = update.callback_query
     uid = update.effective_user.id if update.effective_user else 0
     try:
@@ -302,6 +394,15 @@ async def handle_price_request_callback(update, context):
         req_id = int(sid)
     except (ValueError, TypeError):
         await query.answer()
+        return
+    if action == "preq_done":
+        await query.answer("Эта позиция уже согласована.")
+        return
+    if action == "preq_all":
+        if uid not in approver_ids():
+            await query.answer("Решает тот, кому пришёл запрос.", show_alert=True)
+            return
+        await _approve_all(context.bot, query, uid, req_id)
         return
 
     row = _one("SELECT * FROM price_requests WHERE id=%s", (req_id,))
