@@ -241,6 +241,37 @@ def _kind(name):
     return None
 
 
+def _exact_photos(db, name):
+    """Фото из «Контент F2B», в подписи которого стоит название товара (как в МойСкладе) или его артикул."""
+    key = re.sub(r"[\W_]+", "", _norm(name))
+    rows = db._fetchall(
+        "SELECT id, caption, media FROM publishing.story_jobs WHERE source_chat_id = %s "
+        "ORDER BY id DESC LIMIT 300", (CONTENT_CHAT_ID,))
+    out = []
+    for r in rows:
+        cap = re.sub(r"[\W_]+", "", _norm(r["caption"] or ""))
+        # название целиком, с размером (без хвоста «кг»), а не «похоже»
+        if len(cap) >= 15 and (cap.startswith(key) or (key.startswith(cap) and len(cap) >= len(key) - 3)):
+            for m in r["media"] or []:
+                if m.get("kind") == "photo" and m.get("file_id"):
+                    out.append({"type": "file_id", "v": m["file_id"], "src": f"Контент №{r['id']}: {r['caption'][:60]}"})
+    return out
+
+
+def _specs(t):
+    t = t.lower().replace(",", ".")
+    trim = re.search(r"трим\s*(ст\.?\s*)?([а-яa-z]{1,2})\b", t)
+    size = re.search(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)", t)
+    return (trim.group(2) if trim else None), (size.groups() if size else None)
+
+
+def _spec_conflict(name, cap):
+    """Подпись называет разделку (Трим) или размер, и они не как у товара."""
+    nt, ns = _specs(name)
+    ct, cs = _specs(cap)
+    return bool((ct and nt and ct != nt) or (cs and ns and cs != ns) or (ct and not nt))
+
+
 def _content_photos(db, name):
     """Фото из «Контент F2B», где в подписи есть и вид рыбы, и способ обработки (если он есть у товара)."""
     n = name.lower()
@@ -263,6 +294,8 @@ def _content_photos(db, name):
                 r"суповой|набор|отход|хребт|голов|приём|прием|партия|короб|паллет|отгруз|отправ|камер|инвентар", cap):
             # на таких фото коробки и паллеты, а не рыба (собственник 17.11)
             continue
+        if _spec_conflict(n, cap):
+            continue                                   # в подписи другая разделка или размер
         if sum(1 for _, rx in _SPECIES[3:9] if re.search(rx, cap)) > 1:
             continue                                   # «нарезки из лосося и форели» – не про один товар
         if bool(re.search(r"нарезк|ломтик|слайс", cap)) != slice_item:
@@ -302,7 +335,9 @@ def _norm(s):
 
 
 def _photos_for(db, name):
-    photos = _content_photos(db, name)
+    photos = _exact_photos(db, name)
+    seen = {x["v"] for x in photos}
+    photos += [x for x in _content_photos(db, name) if x["v"] not in seen]
     try:
         for url in _site_images().get(_norm(name), [])[:2]:
             photos.append({"type": "url", "v": url, "src": "сайт f2b.group"})
@@ -375,7 +410,9 @@ def _price_for(segment, info):
 
 
 async def _resolve(db, segment, cands, start):
-    """С позиции start – первый кандидат с ценой. Возвращает (idx, cand, price, photos) или None."""
+    """С позиции start – первый кандидат с ценой и фото; если с фото нет ни одного – первый с ценой.
+    Возвращает (idx, cand, price, photos) или None."""
+    fallback = None
     for i in range(start, len(cands)):
         info = await asyncio.to_thread(_prices, cands[i]["code"])
         if not info or info["archived"]:
@@ -385,8 +422,10 @@ async def _resolve(db, segment, cands, start):
             continue
         cands[i].update(name=info["name"], unit=info["unit"])
         photos = await asyncio.to_thread(_photos_for, db, info["name"])
-        return i, cands[i], price, photos
-    return None
+        if photos:
+            return i, cands[i], price, photos
+        fallback = fallback or (i, cands[i], price, photos)
+    return fallback
 
 
 async def _send_card(bot, db, row):
@@ -546,13 +585,21 @@ def _make_callback(db):
                     (json.dumps(cands, ensure_ascii=False), idx, price, json.dumps(photos, ensure_ascii=False), oid))
                 await _refresh(q, row)
             elif action == "photo":
-                n = len(row["photos"] or [])
-                if n < 2:
+                # список заново: фото, присланное в «Контент» после отправки карточки, тоже в ходу
+                cand = row["candidates"][row["idx"]]
+                old_list = row["photos"] or []
+                cur = old_list[row["photo_idx"] % len(old_list)]["v"] if old_list else None
+                fresh = [x for x in old_list if x["type"] == "path"]
+                fresh += await asyncio.to_thread(_photos_for, db, cand["name"])
+                vs = [x["v"] for x in fresh]
+                if not fresh or vs == [cur]:
                     await q.answer("Другого фото нет.", show_alert=True)
                     return
+                nxt = (vs.index(cur) + 1) % len(vs) if cur in vs else 0
                 await q.answer()
-                row = db._fetchone("UPDATE publishing.promo_offers SET photo_idx = (photo_idx + 1) %% %s, "
-                                   "updated_at = now() WHERE id = %s RETURNING *", (n, oid))
+                row = db._fetchone("UPDATE publishing.promo_offers SET photos = %s, photo_idx = %s, "
+                                   "updated_at = now() WHERE id = %s RETURNING *",
+                                   (json.dumps(fresh, ensure_ascii=False), nxt, oid))
                 await _refresh(q, row)
             elif action == "pub":
                 row = db._fetchone("UPDATE publishing.promo_offers SET status = 'publishing', updated_at = now() "
