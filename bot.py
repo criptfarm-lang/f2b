@@ -7253,6 +7253,14 @@ def main():
         stories_studio.register(app, db)
     except Exception as e:
         logger.exception(f"stories_studio.register упал: {e}")
+    # Акционные объявления по вторникам (17.11.2026): ОПТ 2 + HoReCa 4 карточки собственнику,
+    # кнопки «Другая цена / Другая / Другое фото / Опубликовать» → каналы opt / horeca.
+    # План: 2026-11-17-акционные-объявления-по-вторникам (репо «второй мозг»).
+    try:
+        import promo_offers
+        promo_offers.register(app, db)
+    except Exception as e:
+        logger.exception(f"promo_offers.register упал: {e}")
     try:
         import route_registry
         route_registry.register(app)
