@@ -40,7 +40,9 @@ RUN_HOUR = 10
 REPEAT_WEEKS = 3            # товар, предложенный недавно, не повторяем столько недель
 SEND_GAP_SEC = 60
 
-FOOTER = "Заказ: t.me/fishtobiz\n8 800 700-27-03 · WhatsApp/MAX +7 993 700-70-87"
+MAX_URL = "https://max.ru/u/f9LHodD0cOJK0mNXf5ra8sG0gRn_OteEQFMrTDbiOXsAXwQS1zDkIMO46-0"
+FOOTER = (f'Заказать: <a href="{MAX_URL}">MAX</a> · <a href="https://t.me/fishtobiz">Telegram</a> · '
+          '<a href="https://wa.me/79937007087">WhatsApp</a>\n8 800 700-27-03')
 TERM = "Цена действует 3 дня с момента публикации."
 SLOT_TITLE = {("opt", 1): "ОПТ 1", ("opt", 2): "ОПТ 2", ("horeca", 1): "HoReCa · зависший",
               ("horeca", 2): "HoReCa · охлаждёнка", ("horeca", 3): "HoReCa · привлечённый",
