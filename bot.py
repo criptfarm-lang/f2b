@@ -7532,7 +7532,9 @@ def main():
         except Exception as e:
             logger.error(f"logi_morning_check job wrapper: {e}", exc_info=True)
 
-    app.job_queue.run_repeating(_logi_morning_check_wrapper, interval=1800, first=90)
+    # Выключено 17.11.2026 по решению собственника: ложные «без машины» по брошенным
+    # заявкам Логистики (05427), раскладка теперь в «Развозке» – лишнее логисту.
+    # app.job_queue.run_repeating(_logi_morning_check_wrapper, interval=1800, first=90)
 
     # ────────────────────────────────────────────────────────────────────
     # Время приёмки не проставлено в заказе — пинг ответственному менеджеру
