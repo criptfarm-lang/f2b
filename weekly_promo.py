@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS publishing.promo_offers (
     updated_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE (week, segment, slot)
 );
+ALTER TABLE publishing.promo_offers ADD COLUMN IF NOT EXISTS story_job_id bigint;
 """
 
 
@@ -337,14 +338,17 @@ def _caption(segment, cand, price):
     return s + f"{TERM}\n\n{FOOTER}"
 
 
-def _keyboard(oid):
-    return InlineKeyboardMarkup([
+def _keyboard(oid, segment=None):
+    rows = [
         [InlineKeyboardButton("Другая цена", callback_data=f"po:price:{oid}"),
          InlineKeyboardButton("Другая", callback_data=f"po:next:{oid}")],
         [InlineKeyboardButton("Другое фото", callback_data=f"po:photo:{oid}"),
          InlineKeyboardButton("Отмена", callback_data=f"po:cancel:{oid}")],
         [InlineKeyboardButton("Опубликовать", callback_data=f"po:pub:{oid}")],
-    ])
+    ]
+    if segment == "horeca":   # сторис Telegram + Instagram через сторис-студию (собственник 17.11)
+        rows[2].append(InlineKeyboardButton("В сторис", callback_data=f"po:story:{oid}"))
+    return InlineKeyboardMarkup(rows)
 
 
 def _owner_caption(row, cand):
@@ -390,10 +394,10 @@ async def _send_card(bot, db, row):
     media = await _media(row)
     if media is None:
         msg = await bot.send_message(row["chat_id"], _owner_caption(row, cand) + "\n\n(фото не нашёл – «Другое фото» не поможет)",
-                                     parse_mode="HTML", reply_markup=_keyboard(row["id"]))
+                                     parse_mode="HTML", reply_markup=_keyboard(row["id"], row["segment"]))
     else:
         msg = await bot.send_photo(row["chat_id"], media, caption=_owner_caption(row, cand), parse_mode="HTML",
-                                   reply_markup=_keyboard(row["id"]))
+                                   reply_markup=_keyboard(row["id"], row["segment"]))
     db._execute("UPDATE publishing.promo_offers SET message_id = %s, updated_at = now() WHERE id = %s",
                 (msg.message_id, row["id"]))
 
@@ -438,7 +442,7 @@ async def run_week(bot, db, today=None):
 
 # ── Кнопки ───────────────────────────────────────────────────────────────────
 
-_CB = re.compile(r"^po:(price|next|photo|pub|cancel):(\d+)$")
+_CB = re.compile(r"^po:(price|next|photo|pub|cancel|story):(\d+)$")
 
 
 async def _refresh(q, row):
@@ -446,10 +450,10 @@ async def _refresh(q, row):
     media = await _media(row)
     if media is None:
         await q.edit_message_caption(caption=_owner_caption(row, cand), parse_mode="HTML",
-                                     reply_markup=_keyboard(row["id"]))
+                                     reply_markup=_keyboard(row["id"], row["segment"]))
         return
     await q.edit_message_media(InputMediaPhoto(media, caption=_owner_caption(row, cand), parse_mode="HTML"),
-                               reply_markup=_keyboard(row["id"]))
+                               reply_markup=_keyboard(row["id"], row["segment"]))
 
 
 async def _cleanup(bot, q, row):
@@ -494,6 +498,29 @@ def _make_callback(db):
                 await q.answer("Отменено")
                 if row:
                     await _cleanup(context.bot, q, row)
+                return
+            if action == "story":
+                if row.get("story_job_id"):
+                    await q.answer(f"Сторис уже в работе (№{row['story_job_id']}).", show_alert=True)
+                    return
+                ph = (q.message.photo or [None])[-1] if q.message else None
+                if not ph:
+                    await q.answer("В карточке нет фото – сторис не из чего собрать.", show_alert=True)
+                    return
+                cand = row["candidates"][row["idx"]]
+                item = {"kind": "photo", "file_id": ph.file_id, "file_unique_id": ph.file_unique_id,
+                        "width": ph.width, "height": ph.height, "file_size": ph.file_size,
+                        "message_id": q.message.message_id, "as_document": False}
+                text = (f"Акция для ресторанов. {cand['name']}, арт. {cand['code']}. "
+                        f"{_fmt_price(row['price'])} ₽/{cand.get('unit', 'кг')}. {TERM} "
+                        "Доставка по Москве бесплатно. Заказ – t.me/fishtobiz")
+                job = db._fetchone(
+                    "INSERT INTO publishing.story_jobs (chat_id, author_id, source_chat_id, media, caption, status) "
+                    "VALUES (%s, %s, %s, %s, %s, 'queued') RETURNING id",
+                    (row["chat_id"], row["chat_id"], row["chat_id"], json.dumps([item], ensure_ascii=False), text))
+                db._execute("UPDATE publishing.promo_offers SET story_job_id = %s WHERE id = %s", (job["id"], oid))
+                await q.answer("Собираю сторис – превью придёт отдельным сообщением, там «Сейчас» "
+                               "публикует в Telegram и Instagram.", show_alert=True)
                 return
             if action == "price":
                 await q.answer()
@@ -601,7 +628,7 @@ def _make_price_handler(db):
         try:
             await context.bot.edit_message_caption(chat_id=row["chat_id"], message_id=row["message_id"],
                                                    caption=_owner_caption(row, cand), parse_mode="HTML",
-                                                   reply_markup=_keyboard(row["id"]))
+                                                   reply_markup=_keyboard(row["id"], row["segment"]))
         except Exception:
             logger.exception("weekly_promo: не обновил карточку №%s", row["id"])
         for mid in (msg.message_id, msg.reply_to_message.message_id):   # вопрос и ответ не копим в личке
@@ -638,6 +665,6 @@ def _make_job(db):
 def register(app, db):
     db._execute(SCHEMA)
     app.add_handler(MessageHandler(filters.TEXT & filters.REPLY & _PriceReply(db), _make_price_handler(db)), group=-1)
-    app.add_handler(CallbackQueryHandler(_make_callback(db), pattern=r"^po:(price|next|photo|pub|cancel):"))
+    app.add_handler(CallbackQueryHandler(_make_callback(db), pattern=r"^po:(price|next|photo|pub|cancel|story):"))
     app.job_queue.run_repeating(_make_job(db), interval=600, first=90, name="weekly_promo")
     logger.info("weekly_promo: зарегистрирован")
