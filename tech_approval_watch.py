@@ -37,7 +37,9 @@ logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
 
 ATTR_ID = "a8d905d3-cef5-11f1-0a80-0c62001b7a68"   # «Одобрено технологом», supply
-ATTR_NAME = "Одобрено технологом"
+ATTR_NAME = "Одобрено ответственным"
+# 18.11.2026 собственник переименовал флажок; в старых записях аудита – прежнее имя.
+ATTR_NAMES = ("Одобрено ответственным", "Одобрено технологом")
 
 # Контроль только приёмок с этой даты (решение 23.10.2026).
 START = date.fromisoformat(os.getenv("TECH_APPROVAL_START", "2026-10-24"))
@@ -174,9 +176,10 @@ async def approval_by_audit(session, supply_id: str) -> tuple[bool, str | None]:
     data = await _get(session, f"{MS_BASE}/entity/supply/{supply_id}/audit", {"limit": 100})
     for row in data.get("rows", []):          # МС отдаёт от новых к старым
         diff = row.get("diff") or {}
-        if ATTR_NAME not in diff:
+        name = next((n for n in ATTR_NAMES if n in diff), None)
+        if not name:
             continue
-        v = diff[ATTR_NAME]
+        v = diff[name]
         new = v.get("newValue") if isinstance(v, dict) else v
         uid = row.get("uid")
         return (new is True and uid in technologist_uids()), uid
