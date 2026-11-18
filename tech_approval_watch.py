@@ -259,14 +259,10 @@ async def collect(today: date | None = None) -> list[dict]:
                 continue
             card["age"], card["overdue"] = age, age - limit
             card["marked_by"] = None
+            # С 18.11.2026 галочку «Одобрено ответственным» может ставить любой (собственник) –
+            # стоит галочка, значит одобрено; кто ставил, больше не проверяем.
             if card["flag"] is True:
-                ok, uid = await approval_by_audit(session, card["id"])
-                await asyncio.sleep(0.5)
-                if ok:
-                    continue
-                if names is None:
-                    names = await _employee_names(session)
-                card["marked_by"] = (names.get(uid) or uid) if uid else "склад при заведении"
+                continue
             out.append(card)
     out.sort(key=lambda c: c["age"], reverse=True)
     return out
