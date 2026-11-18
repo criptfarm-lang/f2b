@@ -7238,6 +7238,12 @@ def main():
         button_cleanup.register(app, OWNER_CHAT_ID)
     except Exception as e:
         logger.exception(f"button_cleanup.register упал: {e}")
+    # Аварийный протокол (18.11.2026): «авария» от собственника → всё на офисную коробочку
+    try:
+        import alarm_failover
+        alarm_failover.register(app, OWNER_CHAT_ID)
+    except Exception as e:
+        logger.exception(f"alarm_failover.register упал: {e}")
     # Накопитель доработок (07.10.2026): «ДОРАБОТКА …» от собственника в личке →
     # таблица dev_backlog, разбирает сессия Claude (скилл f2b-dorabotka).
     try:
