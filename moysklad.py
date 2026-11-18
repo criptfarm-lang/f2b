@@ -5155,25 +5155,32 @@ async def load_counterparty_attrs(agent_id: str) -> dict:
     из Wazzup-блока) без второго GET.
     """
     url = f"{MS_BASE}/entity/counterparty/{agent_id}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                headers=get_headers(),
-                params={"expand": "attributes"},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"load_counterparty_attrs: {resp.status} для {agent_id}")
-                    return {"site": "", "max": "", "telegram": "", "credit_limit": 0,
-                            "contract_signed": False, "contract_number": "", "days_delay": 0,
-                            "notary_clause": False, "_raw_attrs": []}
-                cp = await resp.json()
-    except Exception as e:
-        logger.error(f"load_counterparty_attrs: {e}")
+    # 18.11.2026: МС ответил 503 на АТЛАНТИДУ – пустая карточка ушла в светофор как
+    # «договор не подписан / лимит не задан / сайт пуст», а менеджеру – ложное «исправьте».
+    # Теперь: 3 попытки, не вышло – _error=True, светофор пишет «не проверено».
+    cp = None
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(2 * attempt)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    headers=get_headers(),
+                    params={"expand": "attributes"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        cp = await resp.json()
+                        break
+                    logger.error(f"load_counterparty_attrs: {resp.status} для {agent_id} "
+                                 f"(попытка {attempt + 1})")
+        except Exception as e:
+            logger.error(f"load_counterparty_attrs: {e!r} (попытка {attempt + 1})")
+    if cp is None:
         return {"site": "", "max": "", "telegram": "", "credit_limit": 0,
                 "contract_signed": False, "contract_number": "", "days_delay": 0,
-                "notary_clause": False, "_raw_attrs": []}
+                "notary_clause": False, "_raw_attrs": [], "_error": True}
 
     attrs = cp.get("attributes", []) or []
     return {
@@ -5722,9 +5729,18 @@ async def compute_cashflow_color(agent_id: str, today=None, window_days: int = 3
 
     # Клиент был в авансе или без долга 30 дней назад — точно 🟢
     if opening <= 0:
+        # «клиент в авансе» – только когда долга нет; если долг есть, но 30 дн назад
+        # его не было – это свежие отгрузки (18.11.2026: АТЛАНТИДА с долгом 683 тыс.
+        # получила «клиент в авансе»).
+        if debt_today > 0:
+            explain = f"долг весь за последние {window_days} дн – раньше долга не было"
+        elif balance > 0:
+            explain = "клиент в авансе"
+        else:
+            explain = "долга нет"
         return {"color": "green", "n_days": 0, "opening_balance": opening,
                 "payments_sum": payments_sum, "current_debt": debt_today,
-                "explain": "клиент в авансе"}
+                "explain": explain}
 
     # 4. Подбираем N: сортируем платежи по дате убыв., копим кумулятив
     today_dt = datetime.combine(today, datetime.min.time())

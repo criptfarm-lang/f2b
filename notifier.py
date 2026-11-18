@@ -1772,7 +1772,9 @@ def _build_approval_text(
 
     # Шапка (форма 04.11.2026): клиент и долг жирным, заказ, лимит, просрочка,
     # оплата, менеджер. Красное в шапке помечено 🔴 в начале строки.
-    if credit["color"] == "yellow":
+    if credit.get("unchecked"):
+        limit_s = "🟡 Лимит - не проверен: МойСклад не отдал карточку клиента"
+    elif credit["color"] == "yellow":
         limit_s = "🟡 Лимит - не задан, заполните в карточке МС"
     else:
         limit_s = f"Лимит - {_fmt_money(credit['limit'])} р"
@@ -1840,6 +1842,8 @@ def _build_approval_text(
         else:
             parts_c.append("отсрочка не указана")
         lines.append(f"🟢 *Договор:* " + " · ".join(parts_c))
+    elif contract.get("unchecked"):
+        lines.append("🟡 *Договор:* не проверен – МойСклад не отдал карточку клиента")
     else:
         lines.append(f"🔴 *Договор:* не подписан")
 
@@ -1849,6 +1853,8 @@ def _build_approval_text(
     # 🔴 оговорки нет → только суд. На all_green не влияет (см. выше).
     if notary["color"] == "green":
         lines.append("🟢 *Нотар. оговорка:* есть — взыскание без суда")
+    elif notary.get("unchecked"):
+        lines.append("🟡 *Нотар. оговорка:* не проверена")
     else:
         lines.append("🔴 *Нотар. оговорка:* нет — долг только через суд")
 
@@ -1881,6 +1887,8 @@ def _build_approval_text(
     # 5. Сайт
     if site["color"] == "green":
         lines.append(f"🟢 *Сайт:* {site['raw_value'][:60]}")
+    elif site.get("unchecked"):
+        lines.append("🟡 *Сайт:* не проверен")
     else:
         lines.append(f"🔴 *Сайт:* {site.get('raw_value', '') or 'не заполнен'}")
 
@@ -1894,6 +1902,8 @@ def _build_approval_text(
         if contacts.get("tg_valid"):
             parts_c.append(f"TG {tg}")
         lines.append(f"🟢 *Контакты:* " + " · ".join(parts_c))
+    elif contacts.get("unchecked"):
+        lines.append("🟡 *Контакты:* не проверены")
     else:
         lines.append(f"🔴 *Контакты:* Max={mx or '—'} / TG={tg or '—'}")
 
@@ -1912,6 +1922,8 @@ def _build_approval_text(
     if restaurant and not restaurant.get("skip"):
         if restaurant["color"] == "green":
             lines.append(f"🟢 *Ресторан:* {_md(restaurant['value'][:60])}")
+        elif restaurant.get("unchecked"):
+            lines.append("🟡 *Ресторан:* не проверен")
         else:
             lines.append("🔴 *Ресторан:* не заполнен")
 
@@ -2145,8 +2157,10 @@ async def _check_approval_needed_once(order_href: str, bot, db):
             _limited(compute_overdue_color(agent_id), "просрочка"),
             _limited(compute_price_color(order_href), "цена"),
             _limited(compute_upd_debt_color(agent_id), "УПД"),
-            _limited(compute_late_history(agent_id, int(cp_attrs.get("days_delay") or 0)),
-                     "история"),
+            # Карточка не прочиталась – срок отсрочки неизвестен, со сроком 0 история
+            # врёт (18.11.2026: 2–3 дн просрочки показались как 17)
+            (_limited(compute_late_history(agent_id, int(cp_attrs.get("days_delay") or 0)),
+                      "история") if not cp_attrs.get("_error") else asyncio.sleep(0)),
             return_exceptions=True,
         )
         if isinstance(late_history, Exception):
@@ -2197,6 +2211,12 @@ async def _check_approval_needed_once(order_href: str, bot, db):
         site = compute_site_color(cp_attrs)
         restaurant = compute_restaurant_color(cp_attrs, agent_name)
         contacts = compute_contacts_color(cp_attrs)
+        if cp_attrs.get("_error"):
+            # МС не отдал карточку клиента – эти пункты не проверены, а не красные
+            un = {"color": "yellow", "unchecked": True}
+            credit = {**credit, **un}
+            contract, notary, site, contacts = dict(un), dict(un), dict(un), dict(un)
+            restaurant = {**un, "skip": restaurant.get("skip", False), "value": ""}
         address = compute_address_color(order.get("shipmentAddress"))
 
         # 5. Сборка текста + colors_json для confirmation flow
