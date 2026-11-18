@@ -518,8 +518,11 @@ async def render_page(uid: int, target: date, db, bot) -> str:
         # по прошлым накладным. Форма грузит накладные клиента по запросу, а не с маршрутом.
         # Кнопка скрыта до обсуждения инструкции командой (собственник 20.10.2026):
         # включить – RETURNS_FORM_ON=1 в env бота и перезапуск.
-        if not is_pickup and not is_manual and os.getenv("RETURNS_FORM_ON") == "1":
-            rows.append(f"<div class='ret' data-uid='{uid}' data-date='{date_iso}' "
+        # Ручная точка («ТОЧКА: ООО Поляна» – логист отправил забрать возврат): заказа нет,
+        # клиента форма ищет в МС по названию точки (кейс Боевой 18.11.2026).
+        if not is_pickup and os.getenv("RETURNS_FORM_ON") == "1":
+            ret_cli = f" data-client='{_e(client)}'" if is_manual else ""
+            rows.append(f"<div class='ret' data-uid='{uid}' data-date='{date_iso}'{ret_cli} "
                         f"data-order='{_e(order_no)}' data-token='{_e(token)}'>"
                         "<button type='button' class='btn2' onclick='retOpen(this)'>↩️ Клиент вернул</button>"
                         "<div class='retbox' hidden></div></div>")
@@ -623,7 +626,11 @@ function retOpen(btn){var w=btn.closest('.ret'),box=w.querySelector('.retbox');
   if(!box.hidden){box.hidden=true;retStop(w);return;}
   box.hidden=false;if(RET[w.dataset.order]){return;}
   box.innerHTML='Загружаю накладные клиента…';
-  fetch(retUrl(w)+'&order='+encodeURIComponent(w.dataset.order)).then(function(r){return r.json();}).then(function(d){
+  retLoad(w,'');}
+function retLoad(w,agent){var box=w.querySelector('.retbox');box.innerHTML='Загружаю накладные клиента…';
+  fetch(retUrl(w)+'&order='+encodeURIComponent(w.dataset.order)+'&client='+encodeURIComponent(w.dataset.client||'')+'&agent='+encodeURIComponent(agent)).then(function(r){return r.json();}).then(function(d){
+    if(d.ok&&d.candidates){box.innerHTML='<h4>Какой это клиент?</h4>'+d.candidates.map(function(c){
+      return '<button type="button" class="btn2" style="margin:6px 0;text-align:left" onclick="retLoad(this.closest(\'.ret\'),\''+retEsc(c.id)+'\')">'+retEsc(c.name)+(c.inn?' <small>ИНН '+retEsc(c.inn)+'</small>':'')+(c.last?' <small>посл. отгрузка '+retEsc(c.last)+'</small>':'')+'</button>';}).join('');return;}
     if(!d.ok){box.innerHTML='<div class="rtoast err">'+retEsc(d.msg||'Не загрузилось')+'</div>';return;}
     RET[w.dataset.order]={d:d,items:[],photos:[],last:{}};retDraw(w);
   }).catch(function(e){box.innerHTML='<div class="rtoast err">Сбой: '+retEsc(e.message||e)+'</div>';});}
@@ -862,7 +869,9 @@ async def handle_returns_options(request, db, bot) -> web.Response:
         return err
     import client_returns
     try:
-        return web.json_response(await client_returns.options(request.query.get("order", "")))
+        return web.json_response(await client_returns.options(request.query.get("order", ""),
+                                                                   request.query.get("client", ""),
+                                                                   request.query.get("agent", "")))
     except Exception as e:
         logger.error("returns options: %s", e, exc_info=True)
         return web.json_response({"ok": False, "msg": "МойСклад не ответил, попробуй ещё раз"})

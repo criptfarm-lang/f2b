@@ -110,10 +110,64 @@ def _demand_view(d: dict, today_id: str | None) -> dict:
             "today": d["id"] == today_id, "positions": pos}
 
 
-async def options(order_no: str) -> dict:
-    """Накладная этой точки + 3 прошлые накладные клиента с позициями – для формы водителя."""
+_LEGAL_RE = re.compile(r"^(точка\s*\d*\s*:?\s*)|\b(ооо|оао|зао|пао|ао|ип)\b|[«»\"'„“”]", re.I)
+
+
+def _client_query(client: str) -> str:
+    """«ТОЧКА: ООО "Поляна"» → «Поляна» – строка поиска контрагента в МС."""
+    return re.sub(r"\s+", " ", _LEGAL_RE.sub(" ", client or "")).strip()
+
+
+async def _demands_of_agent(s, agent_href: str) -> list:
+    return (await _get(s, "entity/demand", filter=f"agent={agent_href}", order="moment,desc",
+                       limit=EARLIER_DEMANDS + 1, expand="positions.assortment.uom")).get("rows", [])
+
+
+async def _options_by_client(client: str, agent_id: str) -> dict:
+    """Ручная точка без заказа: клиент – по названию точки, накладные – последние 4.
+    Несколько подходящих контрагентов – водитель выбирает сам (agent_id второго запроса)."""
+    async with aiohttp.ClientSession() as s:
+        if agent_id:
+            ag = await _get(s, f"entity/counterparty/{agent_id}")
+        else:
+            q = _client_query(client)
+            if len(q) < 2:
+                return {"ok": False, "msg": "У точки нет названия клиента – возврат оформить не к чему."}
+            found = (await _get(s, "entity/counterparty", search=q, limit=20)).get("rows", [])
+            found = [c for c in found if not c.get("archived")]
+            # С отгрузками – вперёд; без отгрузок нам вернуть нечего.
+            cands = []
+            for c in found[:10]:
+                last = (await _get(s, "entity/demand", filter=f"agent={c['meta']['href']}",
+                                   order="moment,desc", limit=1)).get("rows", [])
+                if last:
+                    cands.append({"id": c["id"], "name": c.get("name") or "", "inn": c.get("inn") or "",
+                                  "last": _fmt_day(last[0].get("moment")), "_m": last[0].get("moment") or ""})
+            if not cands:
+                return {"ok": False, "msg": f"В МойСклад не нашёл клиента «{q}» с отгрузками. Напиши логисту."}
+            if len(cands) > 1:
+                cands.sort(key=lambda c: c["_m"], reverse=True)
+                return {"ok": True, "candidates": [{k: v for k, v in c.items() if k != "_m"} for c in cands]}
+            ag = await _get(s, f"entity/counterparty/{cands[0]['id']}")
+        rows = await _demands_of_agent(s, ag["meta"]["href"])
+    if not rows:
+        return {"ok": False, "msg": "У клиента нет отгрузок – возврат оформить не к чему."}
+    return {"ok": True, "agent_id": ag.get("id"), "agent_name": ag.get("name"),
+            "demands": [_demand_view(r, None) for r in rows], "reasons": REASONS}
+
+
+def _fmt_day(moment) -> str:
+    m = str(moment or "")[:10]
+    return f"{m[8:10]}.{m[5:7]}" if len(m) == 10 else ""
+
+
+async def options(order_no: str, client: str = "", agent_id: str = "") -> dict:
+    """Накладная этой точки + 3 прошлые накладные клиента с позициями – для формы водителя.
+    Ручная точка без заказа (client передан) – клиент ищется по названию."""
     import driver_checklist as dc
     import route_dispatch
+    if client or agent_id:
+        return await _options_by_client(client, agent_id)
     kind, did = await dc._resolve_stop_doc(route_dispatch._doc_no(order_no))
     if kind == "error":
         return {"ok": False, "msg": "МойСклад сейчас не отвечает – попробуй через минуту."}
