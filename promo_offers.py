@@ -25,10 +25,13 @@ logger = logging.getLogger(__name__)
 PROMOS = {
     "ФТ-ОПТ": "акция форель опт",
     "ФТ-РЕСТ": "акция форель хорека",
+    # 19.11.2026: отдельные лендинги тунца х/к (fishki.f2b.group/o/tunec-opt, /o/tunec-horeca)
+    "ТН-ОПТ": "акция тунец опт",
+    "ТН-РЕСТ": "акция тунец хорека",
 }
 # Клиент стёр код, но оставил суть – тег без направления.
 FALLBACK_TAG = "акция форель"
-CODE_RE = re.compile(r"ФТ\s*[-–]\s*(ОПТ|РЕСТ)", re.I)
+CODE_RE = re.compile(r"(ФТ|ТН)\s*[-–]\s*(ОПТ|РЕСТ)", re.I)
 
 # Поля контакта amoCRM, куда Wazzup пишет id чата (reference_f2b_wazzup_channels_and_fields)
 CHAT_ID_FIELDS = {2244321, 2224427, 2245217, 2245219}
@@ -43,10 +46,12 @@ def detect(text: str) -> Optional[str]:
         return None
     m = CODE_RE.search(text)
     if m:
-        return PROMOS["ФТ-" + m.group(1).upper()]
+        return PROMOS[m.group(1).upper() + "-" + m.group(2).upper()]
     low = text.lower()
     if "по акции" in low and "форел" in low:
         return FALLBACK_TAG
+    if "по акции" in low and "тун" in low:
+        return "акция тунец"
     return None
 
 
