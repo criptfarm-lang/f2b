@@ -343,6 +343,7 @@ async def _finalize(db, bot, rid, uid, order_no, items, reason, comment, agent_n
                                [InlineKeyboardButton("Официальный возврат", callback_data=f"cret:{rid}:official")]])
     import edo_unsigned
     file_ids: list[str] = []
+    deciders = _recipients(mchat, edo_unsigned._rudneva_chat_id())
     for cid in _recipients(mchat, edo_unsigned._rudneva_chat_id(), dc._logist_chat_ids()):
         try:
             if photos:
@@ -353,7 +354,12 @@ async def _finalize(db, bot, rid, uid, order_no, items, reason, comment, agent_n
                     sent = await bot.send_media_group(chat_id=cid, media=[InputMediaPhoto(x) for x in src])
                 if not file_ids:
                     file_ids = [m.photo[-1].file_id for m in sent if m.photo]
-            await bot.send_message(chat_id=cid, text=text, reply_markup=kb)
+            if cid in deciders:
+                await bot.send_message(chat_id=cid, text=text, reply_markup=kb)
+            else:                                # логисту – без кнопок, решают менеджер и бухгалтер
+                await bot.send_message(chat_id=cid, text=text.replace(
+                    "\n\nРешите с клиентом: вычерк из отгрузки или официальный возврат с корректировочной.",
+                    "\n\nДля сведения: форму возврата решает менеджер с клиентом, от логиста нажимать ничего не нужно."))
         except Exception as e:
             logger.warning("client_returns %s → %s: %s", rid, cid, e)
     if file_ids:
