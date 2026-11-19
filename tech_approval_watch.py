@@ -213,7 +213,10 @@ def analyze(supply: dict) -> dict | None:
         qty[uom] = qty.get(uom, 0.0) + float(p.get("quantity") or 0)
     if not groups:
         return None
-    day = date.fromisoformat((supply.get("moment") or "")[:10])
+    # Срок считаем от фактического прихода: документ часто датируют задним числом
+    # (дата УПД), а приёмку создают в день приезда – берём более позднюю из двух дат.
+    day = max(date.fromisoformat((supply.get(k) or supply.get("moment") or "")[:10])
+              for k in ("moment", "created"))
     return {
         "id": supply.get("id"),
         "name": supply.get("name") or "?",
@@ -307,7 +310,7 @@ def render(cards: list[dict], today: date) -> str:
         upd = f" · УПД {escape(c['upd'])}" if c["upd"] else ""
         kind = "охл." if c["chilled"] else "с/м"
         lines.append(
-            f"\n• {link}{upd} от {c['day'].strftime('%d.%m')}\n"
+            f"\n• {link}{upd} · приход {c['day'].strftime('%d.%m')}\n"
             f"  {escape(items)} – {_qty(c['qty'])} ({kind})\n"
             f"  без осмотра {c['age']} {_plural_days(c['age'])}, просрочка "
             f"{c['overdue']} {_plural_days(c['overdue'])} · закупка: {buyers(c)}"
