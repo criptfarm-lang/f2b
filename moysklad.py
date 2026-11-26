@@ -985,7 +985,6 @@ MANAGER_TAGS = {
     "баласанян": "Карина Баласанян",
     "дьяченко":  "Ирина Дьяченко",
     "коликов":   "Денис Коликов",
-    "кормилицын": "Антон Кормилицын",
     "белов": "Руслан Белов",
     "скляр":     "Инесса Скляр",
 }
@@ -1424,7 +1423,6 @@ def resolve_tag(query: str) -> str:
         "скляр": "скляр",
         "инесса": "скляр",
         "коликов": "коликов",
-        "кормилицын": "кормилицын",
     }
     # Типы
     type_map = {
@@ -1716,7 +1714,6 @@ PDZ_MANAGER_TAG_MAP = {
     "белов": "Руслан Белов",
     "дьяченко": "Ирина Дьяченко",
     "коликов": "Денис Коликов",
-    "кормилицын": "Антон Кормилицын",
 }
 
 # Исключение из штрафа по дебиторке (штрафы включены с 2026-07): показываем блёкло,
@@ -1738,7 +1735,6 @@ PDZ_MANAGER_TG_IDS = {
     "белов": 555437878,  # Белов Р.В. (с 01.10.2026 вместо Мерзляковой)
     "дьяченко":  649712597,
     "коликов":   683079752,
-    "кормилицын": 1001757704,
 }
 
 # Технический лаг от первой обещанной даты (ppm_initial). В пределах этого окна
@@ -2358,14 +2354,24 @@ async def _overdue_by_demand_fifo(agent_id: str, today, delay: Optional[int] = N
         async with aiohttp.ClientSession() as session:
             # Дней отсрочки из карточки контрагента
             if delay is None:
+                # Карточку читаем с повторами: при сбое (429 МС) раньше молча
+                # ставилась отсрочка 0, и клиент с 14 днями по договору попадал
+                # в ПДЗ на день (Редькина 25.11.2026: 32 380 ₽ / 12 дн при
+                # реальном 0). Не прочли карточку – None, без выдуманной просрочки.
+                cp = None
+                for _try in range(3):
+                    async with session.get(f"{MS_BASE}/entity/counterparty/{agent_id}?expand=attributes",
+                                            headers=get_headers()) as r:
+                        if r.status == 200:
+                            cp = await r.json()
+                            break
+                    await asyncio.sleep(1.5 * (_try + 1))
+                if cp is None:
+                    return None
                 delay = 0
-                async with session.get(f"{MS_BASE}/entity/counterparty/{agent_id}?expand=attributes",
-                                        headers=get_headers()) as r:
-                    if r.status == 200:
-                        cp = await r.json()
-                        for a in cp.get("attributes", []) or []:
-                            if a.get("name") == "Дней отсрочки" and isinstance(a.get("value"), (int, float)):
-                                delay = int(a["value"]); break
+                for a in cp.get("attributes", []) or []:
+                    if a.get("name") == "Дней отсрочки" and isinstance(a.get("value"), (int, float)):
+                        delay = int(a["value"]); break
             # Все отгрузки asc
             demands = []; offset = 0
             while True:
@@ -4346,7 +4352,6 @@ async def get_manager_shipments(date_from: str, date_to: str, details: dict | No
         "баласанян":  "Карина Баласанян",
         "дьяченко":   "Ирина Дьяченко",
         "коликов":    "Денис Коликов",
-        "кормилицын": "Антон Кормилицын",
     }
 
     result = {name: {"shipments": 0, "revenue": 0.0, "clients": 0, "new_clients": 0,
@@ -4490,7 +4495,6 @@ async def get_attracted_goods_by_manager(date_from: str, date_to: str) -> dict:
         "баласанян":  "Карина Баласанян",
         "дьяченко":   "Ирина Дьяченко",
         "коликов":    "Денис Коликов",
-        "кормилицын": "Антон Кормилицын",
     }
     GROUP_NAMES = ["ПРИВЛЕЧЕННЫЕ ТОВАРЫ", "Акционный прайс-лист"]
 
@@ -4589,7 +4593,6 @@ async def get_lost_clients_by_manager(date_from: str, date_to: str) -> dict:
         "баласанян":  "Карина Баласанян",
         "дьяченко":   "Ирина Дьяченко",
         "коликов":    "Денис Коликов",
-        "кормилицын": "Антон Кормилицын",
     }
 
     result = {name: 0 for name in MANAGERS.values()}
